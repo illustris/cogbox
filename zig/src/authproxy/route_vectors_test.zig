@@ -27,9 +27,11 @@ const fixtures = [_]struct { name: []const u8, json: []const u8 }{
 	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
 	\\"grants":[{"id":"gg-io","scope":"instance","caps":["issues"]}]}]}
 	},
+	// A namespace grant carrying BOTH mr and git-read: mr drives the api-mr/
+	// api-project rows, git-read the api-group-projects enumeration rows.
 	.{ .name = "ns-mr", .json =
 	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
-	\\"grants":[{"id":"gg-ns","scope":"namespace","repo":"grp/sub/*","prefix":"/grp/sub/","caps":["mr"],
+	\\"grants":[{"id":"gg-ns","scope":"namespace","repo":"grp/sub/*","prefix":"/grp/sub/","caps":["git-read","mr"],
 	\\"projects":[{"id":42,"path":"grp/sub/a"},{"id":77,"path":"grp/sub/b"}]}]}]}
 	},
 	// A CONCRETE issues grant and nothing else: the api-project scope rows

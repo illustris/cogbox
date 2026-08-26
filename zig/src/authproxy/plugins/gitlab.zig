@@ -1,24 +1,25 @@
 // gitlab -- plugin #1, at parity with the compiled-rule tier plus the approved
-// v1 archive route (plan decision 3).
+// v1 archive route (plan decision 3) and the v1.1 namespace-enumeration route.
 //
-// The 9-route table (addendum E.4), first match wins, unmatched => gate-1 deny:
+// The 10-route table (addendum E.4), first match wins, unmatched => gate-1 deny:
 //
-//   git-refs     GET        <project-ref>[.git]/info/refs?service=...   stream
-//   git-upload   POST       <project-ref>[.git]/git-upload-pack         stream
-//   git-receive  POST       <project-ref>[.git]/git-receive-pack        stream
-//   api-user     GET,HEAD   /api/v4/user
-//   api-version  GET,HEAD   /api/v4/version
-//   api-project  GET,HEAD   /api/v4/projects/:id
-//   api-issues   GET,HEAD,POST,PUT  /api/v4/projects/:id/issues[/...]
-//   api-mr       GET,HEAD,POST,PUT  /api/v4/projects/:id/merge_requests[/...]
-//   api-archive  GET,HEAD   /api/v4/projects/:id/repository/archive[.<ext>]  stream
+//   git-refs            GET        <project-ref>[.git]/info/refs?service=...   stream
+//   git-upload          POST       <project-ref>[.git]/git-upload-pack         stream
+//   git-receive         POST       <project-ref>[.git]/git-receive-pack        stream
+//   api-user            GET,HEAD   /api/v4/user
+//   api-version         GET,HEAD   /api/v4/version
+//   api-project         GET,HEAD   /api/v4/projects/:id
+//   api-group-projects  GET,HEAD   /api/v4/groups/<group-path>/projects
+//   api-issues          GET,HEAD,POST,PUT  /api/v4/projects/:id/issues[/...]
+//   api-mr              GET,HEAD,POST,PUT  /api/v4/projects/:id/merge_requests[/...]
+//   api-archive         GET,HEAD   /api/v4/projects/:id/repository/archive[.<ext>]  stream
 //
-// Everything else -- access_tokens, variables, deploy_keys, groups, /-/**,
-// /uploads, /assets, raw, registries, /oauth/**, /admin, info/lfs/**,
-// gitlab-lfs/**, git-upload-archive -- routes NOWHERE, and DELETE is in no
-// capability's method set. `service` is a parameter of exactly ONE route
-// (git-refs), and /api/** can never be a git route, so the service-laundering
-// class closes structurally.
+// Everything else -- access_tokens, variables, deploy_keys, every OTHER groups
+// tail (and the group node itself), /-/**, /uploads, /assets, raw, registries,
+// /oauth/**, /admin, info/lfs/**, gitlab-lfs/**, git-upload-archive -- routes
+// NOWHERE, and DELETE is in no capability's method set. `service` is a parameter
+// of exactly ONE route (git-refs), and /api/** can never be a git route, so the
+// service-laundering class closes structurally.
 
 const std = @import("std");
 const canon = @import("../canon.zig");
@@ -149,6 +150,7 @@ const rid_git_receive = "git-receive";
 const rid_api_user = "api-user";
 const rid_api_version = "api-version";
 const rid_api_project = "api-project";
+const rid_api_group_projects = "api-group-projects";
 const rid_api_issues = "api-issues";
 const rid_api_mr = "api-mr";
 const rid_api_archive = "api-archive";
@@ -186,6 +188,19 @@ fn classify(ctx: *const anyopaque, req: *const plugin_mod.Request) ?plugin_mod.R
 				if (archiveExt(segs[5])) |ext| {
 					return apiRoute(rid_api_archive, .{ .project = pid, .archive_ext = ext }, true);
 				}
+			}
+			return null;
+		}
+		if (segs.len >= 4 and std.mem.eql(u8, segs[2], "groups")) {
+			// ONE group route: the namespace-enumeration listing
+			// `/api/v4/groups/<group-path>/projects`. Every reserved group tail
+			// (access_tokens, deploy_tokens, variables, ...) and the group node
+			// itself stay unrouted -- a NAMED gate-1 deny, exactly as before. The
+			// numeric group form is recognized here but authorize scope-denies it
+			// (the policy doc carries no group id to verify it against).
+			if (segs.len == 5 and std.mem.eql(u8, segs[4], "projects")) {
+				const gid = parseGroupId(segs[3]) orelse return null;
+				return apiRoute(rid_api_group_projects, .{ .project = gid }, false);
 			}
 			return null;
 		}
@@ -249,6 +264,21 @@ fn parseProjectId(seg: []const u8) ?plugin_mod.ProjectId {
 	if (canon.numericId(seg)) |n| return .{ .numeric = n };
 	const view = RefView{ .head = &.{}, .last = seg };
 	if (!view.wellFormed()) return null;
+	return .{ .path = seg };
+}
+
+/// A group `:id` for the enumeration route. Numeric (`^[0-9]{1,19}$`) is
+/// recognized but always scope-denied downstream -- the policy doc carries no
+/// group id, so a numeric group can never be verified against a grant and
+/// fails closed. Otherwise a single decoded segment whose value is a
+/// well-formed group PATH: unlike a project reference a single top-level
+/// component (`acme`) is well-formed, because a group need not be namespaced,
+/// while the per-component refusals (empty / `.` / `..` / the reserved `-`
+/// infix) are shared with the project form.
+fn parseGroupId(seg: []const u8) ?plugin_mod.ProjectId {
+	if (canon.numericId(seg)) |n| return .{ .numeric = n };
+	const view = RefView{ .head = &.{}, .last = seg };
+	if (!view.wellFormedGroup()) return null;
 	return .{ .path = seg };
 }
 
@@ -333,6 +363,19 @@ const RefView = struct {
 	/// embedded `%2F.` would otherwise smuggle one past the whole-segment
 	/// dot refusal) or GitLab's reserved `-` infix.
 	fn wellFormed(self: *const RefView) bool {
+		return self.componentsSane(2);
+	}
+
+	/// A well-formed group reference: like wellFormed but a single top-level
+	/// component is legitimate (a group need not be namespaced). Same
+	/// per-component refusals.
+	fn wellFormedGroup(self: *const RefView) bool {
+		return self.componentsSane(1);
+	}
+
+	/// Every component non-empty and none of `.`, `..` or the reserved `-`
+	/// infix, and at least `min` of them.
+	fn componentsSane(self: *const RefView, min: usize) bool {
 		var it = self.iter();
 		var n: usize = 0;
 		while (it.next()) |comp| {
@@ -341,7 +384,7 @@ const RefView = struct {
 			if (std.mem.eql(u8, comp, "-")) return false;
 			n += 1;
 		}
-		return n >= 2;
+		return n >= min;
 	}
 
 	/// Component-wise equality against a `/`-joined path string.
@@ -371,6 +414,25 @@ const RefView = struct {
 			if (!std.mem.eql(u8, got, want)) return false;
 		}
 		return it.next() != null;
+	}
+
+	/// EQUAL-to or strictly-under the slash-terminated namespace prefix
+	/// ("/grp/sub/"): all prefix components match, and the reference either ends
+	/// exactly there (the namespace group node itself) OR carries more (a
+	/// subgroup). This is the enumeration boundary: a namespace read grant must
+	/// list its OWN group as well as any subgroup, which strict underPrefix
+	/// would exclude. `grp-secret`, a sibling and a bare parent still fail --
+	/// a component that only shares a string prefix is a different component.
+	fn groupUnderOrEqualPrefix(self: *const RefView, prefix: []const u8) bool {
+		const trimmed = std.mem.trim(u8, prefix, "/");
+		if (trimmed.len == 0) return false;
+		var it = self.iter();
+		var pit = std.mem.splitScalar(u8, trimmed, '/');
+		while (pit.next()) |want| {
+			const got = it.next() orelse return false;
+			if (!std.mem.eql(u8, got, want)) return false;
+		}
+		return true; // equal (no trailing component) or under (some follow)
 	}
 };
 
@@ -405,13 +467,13 @@ fn authorize(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const 
 	if (c.grants.len == 0) return .{ .deny = .no_grant };
 
 	// The ambient TWO -- /user and /version, which name no project -- are
-	// allowed when the instance holds ANY grant carrying issues or mr
-	// (mirroring the compiled ambient reads), with no scope test. api-project
-	// is NOT ambient: it names a project, and the legacy tier compiled it as
-	// EXACT rules bound to the grant's own project (numeric and path form),
-	// so it takes the scope test like every other :id route. Skipping it
-	// would let any issues/mr grant read the metadata of ANY project the
-	// owner's token can see -- an enumeration oracle.
+	// allowed when the instance holds ANY grant carrying issues, mr or git-read
+	// (any read grant reaches them), with no scope test. api-project and
+	// api-group-projects are NOT ambient: they name a project / a namespace, and
+	// take the scope test like every other :id route. Making api-project ambient
+	// would let any grant read the metadata of ANY project the owner's token can
+	// see -- an enumeration oracle -- and making the group route ambient would
+	// hand out instance-wide enumeration.
 	const ambient = std.mem.eql(u8, route.id, rid_api_user) or
 		std.mem.eql(u8, route.id, rid_api_version);
 
@@ -437,10 +499,13 @@ fn grantHasCap(g: *const CGrant, route: *const plugin_mod.Route) bool {
 	if (std.mem.eql(u8, route.id, rid_git_upload)) return g.caps.git_read;
 	if (std.mem.eql(u8, route.id, rid_git_receive)) return g.caps.git_write;
 	if (std.mem.eql(u8, route.id, rid_api_archive)) return g.caps.git_read;
+	if (std.mem.eql(u8, route.id, rid_api_group_projects)) return g.caps.git_read;
 	if (std.mem.eql(u8, route.id, rid_api_issues)) return g.caps.issues;
 	if (std.mem.eql(u8, route.id, rid_api_mr)) return g.caps.mr;
-	// the ambient two + api-project (which additionally takes the scope test)
-	return g.caps.issues or g.caps.mr;
+	// The ambient two (api-user/api-version) + api-project. `git-read` now
+	// unlocks discovery/inspection (the "read = discover + inspect" decision),
+	// so it joins issues/mr here; api-project additionally takes the scope test.
+	return g.caps.issues or g.caps.mr or g.caps.git_read;
 }
 
 /// The three scope tests, reusing the existing predicates' semantics verbatim
@@ -449,6 +514,10 @@ fn grantHasCap(g: *const CGrant, route: *const plugin_mod.Route) bool {
 /// slash-terminated prefix or the numeric id is in projects[]; instance =>
 /// any well-formed reference (classify already enforced well-formedness).
 fn scopeOk(g: *const CGrant, route: *const plugin_mod.Route) bool {
+	// The group-enumeration route has its OWN scope test: namespace-scope
+	// grants only, path form only, equals-or-under the prefix.
+	if (std.mem.eql(u8, route.id, rid_api_group_projects)) return groupScopeOk(g, route);
+
 	var view: ?RefView = null;
 	var numeric: ?i64 = null;
 	if (route.params.project) |pid| switch (pid) {
@@ -477,6 +546,23 @@ fn scopeOk(g: *const CGrant, route: *const plugin_mod.Route) bool {
 		},
 		.instance => return true,
 	}
+}
+
+/// The enumeration route's scope test. NAMESPACE-scope grants only (a concrete
+/// or instance grant never authorizes it -- which is what preserves the "no
+/// instance-wide enumeration oracle" property), the group id in PATH form only
+/// (a numeric group fails closed: the policy doc carries no group id to verify
+/// it against), and the group path EQUAL-to or UNDER the grant's
+/// slash-terminated prefix.
+fn groupScopeOk(g: *const CGrant, route: *const plugin_mod.Route) bool {
+	if (g.scope != .namespace) return false;
+	const pid = route.params.project orelse return false;
+	const path = switch (pid) {
+		.numeric => return false,
+		.path => |p| p,
+	};
+	const view = RefView{ .head = &.{}, .last = path };
+	return view.groupUnderOrEqualPrefix(g.prefix.?);
 }
 
 /// RFC 3986 unreserved bytes pass; everything else is %XX-encoded. Used for
@@ -556,6 +642,10 @@ fn upstream(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const p
 		try out.appendPath("/api/v4/user");
 	} else if (std.mem.eql(u8, route.id, rid_api_version)) {
 		try out.appendPath("/api/v4/version");
+	} else if (std.mem.eql(u8, route.id, rid_api_group_projects)) {
+		try out.appendPath("/api/v4/groups/");
+		try appendId(out, route.params.project.?);
+		try out.appendPath("/projects");
 	} else {
 		try out.appendPath("/api/v4/projects/");
 		try appendId(out, route.params.project.?);
@@ -575,12 +665,48 @@ fn upstream(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const p
 			try appendEncoded(out, seg);
 		}
 	}
-	// API pass-through query, re-emitted as parsed pairs (never the raw
-	// string): the forbidden keys were already refused by the core.
-	for (req.query, 0..) |p, i| {
-		if (i > 0) try out.appendQuery("&");
-		try out.appendQuery(p.raw);
+	// The query is route-specific. The two READ routes FORCE `simple=true`:
+	// bodies stream unfiltered (main.zig streamResponse; the plugin never sees
+	// them), and only the non-simple project/group representation carries
+	// `runners_token` and other secret fields -- so `simple=true` is the single
+	// place that leak is closed, and a client `simple=false` must never override
+	// it. The group-enumeration route additionally forces `include_subgroups=true`
+	// and drops everything but a small pagination/search allowlist (so a client
+	// cannot append an order_by/owned/... that changes the response shape).
+	// issues/mr/archive/user/version keep the blanket pass-through (v1's one
+	// named non-allowlisted spot); the forbidden keys were already refused by
+	// the core.
+	if (std.mem.eql(u8, route.id, rid_api_group_projects)) {
+		try out.appendQuery("simple=true&include_subgroups=true");
+		for (req.query) |p| {
+			if (!groupProjectsQueryAllowed(p.key)) continue;
+			try out.appendQuery("&");
+			try out.appendQuery(p.raw);
+		}
+	} else if (std.mem.eql(u8, route.id, rid_api_project)) {
+		try out.appendQuery("simple=true");
+		for (req.query) |p| {
+			if (std.mem.eql(u8, p.key, "simple")) continue; // forced above
+			try out.appendQuery("&");
+			try out.appendQuery(p.raw);
+		}
+	} else {
+		for (req.query, 0..) |p, i| {
+			if (i > 0) try out.appendQuery("&");
+			try out.appendQuery(p.raw);
+		}
 	}
+}
+
+/// The group-enumeration route's query allowlist: pagination and search only,
+/// so a client cannot re-open `simple=false`/`include_subgroups=false` (both
+/// forced above) or steer the listing with an owned/order_by/... parameter.
+fn groupProjectsQueryAllowed(key: []const u8) bool {
+	const allowed = [_][]const u8{ "per_page", "page", "page_token", "search" };
+	for (&allowed) |a| {
+		if (std.mem.eql(u8, key, a)) return true;
+	}
+	return false;
 }
 
 /// Basic on the three git routes (base64(git_user ":" token), byte-identical
@@ -910,4 +1036,133 @@ test "gitlab: numeric-form namespace authorization rides projects[], concrete ri
 	const req3 = mkReq(.GET, &segs3, &.{});
 	const route3 = policy.vtable.classify(policy.ctx, &req3).?;
 	try t.expectEqual(plugin_mod.DenyReason.scope_mismatch, policy.vtable.authorize(policy.ctx, &route3, &req3).deny);
+}
+
+test "gitlab: api-group-projects classifies a group path/subgroup/numeric, never a reserved tail or the group node" {
+	const g = try conf.parseGeneration(t.allocator, undefined, conf.test_conf_json, 1, .skip, null);
+	defer {
+		g.arena.deinit();
+		t.allocator.destroy(g);
+	}
+	const policy = g.entries[0].policy;
+
+	const Case = struct { segs: []const []const u8, want: ?[]const u8 };
+	const cases = [_]Case{
+		// a single top-level group is well-formed here (unlike a project ref)
+		.{ .segs = &.{ "api", "v4", "groups", "acme", "projects" }, .want = "api-group-projects" },
+		// a subgroup path form (one segment whose value holds a slash)
+		.{ .segs = &.{ "api", "v4", "groups", "grp/sub", "projects" }, .want = "api-group-projects" },
+		// the numeric form is recognized at classify (authorize scope-denies it)
+		.{ .segs = &.{ "api", "v4", "groups", "77", "projects" }, .want = "api-group-projects" },
+		// a reserved tail routes NOWHERE, exactly as before the enumeration route
+		.{ .segs = &.{ "api", "v4", "groups", "77", "access_tokens" }, .want = null },
+		// the group NODE itself is not a route (probe a repo under it, or enumerate)
+		.{ .segs = &.{ "api", "v4", "groups", "77" }, .want = null },
+		// a `-` infix component is refused, so no route
+		.{ .segs = &.{ "api", "v4", "groups", "-", "projects" }, .want = null },
+	};
+	for (cases) |c| {
+		const req = mkReq(.GET, c.segs, &.{});
+		const route = policy.vtable.classify(policy.ctx, &req);
+		if (c.want) |w| {
+			try t.expectEqualStrings(w, route.?.id);
+		} else {
+			try t.expect(route == null);
+		}
+	}
+}
+
+test "gitlab: api-group-projects is namespace-scoped, equals-or-under, path-form only" {
+	// The fixture's gg-0002 is a namespace grant on /grp/sub/ carrying git-read.
+	const g = try conf.parseGeneration(t.allocator, undefined, conf.test_conf_json, 1, .skip, null);
+	defer {
+		g.arena.deinit();
+		t.allocator.destroy(g);
+	}
+	const policy = g.entries[0].policy;
+
+	const Case = struct { group: []const u8, want_allow: bool, grant: []const u8 = "" };
+	const cases = [_]Case{
+		// the namespace node itself (equal) and a subgroup (strictly under)
+		.{ .group = "grp/sub", .want_allow = true, .grant = "gg-0002" },
+		.{ .group = "grp/sub/team", .want_allow = true, .grant = "gg-0002" },
+		// a sibling, the parent, and a string-prefix sibling all stay OUT
+		.{ .group = "grp/other", .want_allow = false },
+		.{ .group = "grp", .want_allow = false },
+		.{ .group = "grp/sub-secret", .want_allow = false },
+		// the numeric form fails closed even though 77 is in gg-0002's projects[]
+		// (those are project ids, never a group id)
+		.{ .group = "77", .want_allow = false },
+	};
+	for (cases) |c| {
+		const segs = [_][]const u8{ "api", "v4", "groups", c.group, "projects" };
+		const req = mkReq(.GET, &segs, &.{});
+		const route = policy.vtable.classify(policy.ctx, &req).?;
+		try t.expectEqualStrings("api-group-projects", route.id);
+		const d = policy.vtable.authorize(policy.ctx, &route, &req);
+		if (c.want_allow) {
+			try t.expectEqualStrings(c.grant, d.allow);
+		} else {
+			try t.expectEqual(plugin_mod.DenyReason.scope_mismatch, d.deny);
+		}
+	}
+
+	// A concrete grant and an instance grant never authorize enumeration, so the
+	// no-instance-wide-enumeration-oracle property holds even under the widest
+	// fixture (which carries an instance git-read grant, gg-0003).
+	const only_ns = try conf.parseGeneration(t.allocator, undefined,
+		\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+		\\"grants":[{"id":"gg-inst","scope":"instance","caps":["git-read"]},
+		\\{"id":"gg-proj","scope":"project","repo":"grp/sub/a","project_id":"42","caps":["git-read"]}]}]}
+	, 1, .skip, null);
+	defer {
+		only_ns.arena.deinit();
+		t.allocator.destroy(only_ns);
+	}
+	const pol2 = only_ns.entries[0].policy;
+	const segs = [_][]const u8{ "api", "v4", "groups", "grp/sub", "projects" };
+	const req = mkReq(.GET, &segs, &.{});
+	const route = pol2.vtable.classify(pol2.ctx, &req).?;
+	// git-read IS present (cap seen), but neither scope authorizes the group route
+	try t.expectEqual(plugin_mod.DenyReason.scope_mismatch, pol2.vtable.authorize(pol2.ctx, &route, &req).deny);
+}
+
+test "gitlab: the two read routes FORCE simple=true in the constructed upstream query" {
+	const g = try conf.parseGeneration(t.allocator, undefined, conf.test_conf_json, 1, .skip, null);
+	defer {
+		g.arena.deinit();
+		t.allocator.destroy(g);
+	}
+	const policy = g.entries[0].policy;
+
+	// group enumeration: simple + include_subgroups forced; a pagination param
+	// kept; an off-allowlist order_by and a client simple=false both dropped.
+	const q = [_]canon.QueryParam{
+		.{ .key = "per_page", .value_raw = "100", .raw = "per_page=100" },
+		.{ .key = "order_by", .value_raw = "id", .raw = "order_by=id" },
+		.{ .key = "simple", .value_raw = "false", .raw = "simple=false" },
+	};
+	const segs = [_][]const u8{ "api", "v4", "groups", "grp/sub", "projects" };
+	const req = mkReq(.GET, &segs, &q);
+	const route = policy.vtable.classify(policy.ctx, &req).?;
+	var up: plugin_mod.Upstream = .{};
+	try policy.vtable.upstream(policy.ctx, &route, &req, &up);
+	try t.expectEqualStrings("/api/v4/groups/grp%2Fsub/projects", up.path());
+	try t.expectEqualStrings("simple=true&include_subgroups=true&per_page=100", up.query());
+
+	// concrete project metadata: simple forced, a client simple=false dropped, an
+	// unrelated statistics=true kept -- this is the S9 runners_token residual on
+	// the existing api-project route, now closed unconditionally.
+	const q2 = [_]canon.QueryParam{
+		.{ .key = "simple", .value_raw = "false", .raw = "simple=false" },
+		.{ .key = "statistics", .value_raw = "true", .raw = "statistics=true" },
+	};
+	const segs2 = [_][]const u8{ "api", "v4", "projects", "grp/proj" };
+	const req2 = mkReq(.GET, &segs2, &q2);
+	const route2 = policy.vtable.classify(policy.ctx, &req2).?;
+	try t.expectEqualStrings("api-project", route2.id);
+	var up2: plugin_mod.Upstream = .{};
+	try policy.vtable.upstream(policy.ctx, &route2, &req2, &up2);
+	try t.expectEqualStrings("/api/v4/projects/grp%2Fproj", up2.path());
+	try t.expectEqualStrings("simple=true&statistics=true", up2.query());
 }

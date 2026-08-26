@@ -100,6 +100,11 @@ route	GET	/api/v4/projects/1234/merge_requests/5/approve	api-mr	subtree still co
 route	GET	/api/v4/projects/1234/repository/archive.tar.gz	api-archive	closed ext
 route	HEAD	/api/v4/projects/1234/repository/archive	api-archive	bare archive
 route	GET	/api/v4/projects/grp%2Fproj/repository/archive.zip	api-archive	path-form id
+# the namespace-enumeration route: a top-level group, a subgroup path form, and
+# the numeric form (recognized at classify; authorize scope-denies it)
+route	GET	/api/v4/groups/acme/projects	api-group-projects	single top-level group is well-formed here
+route	GET	/api/v4/groups/grp%2Fsub/projects	api-group-projects	subgroup path form (one segment holding a slash)
+route	GET	/api/v4/groups/77/projects	api-group-projects	numeric group recognized; scope-denied downstream
 # unrouted: a NAMED 403, not an accidental one
 route	GET	/api/v4/projects/1234/repository/archive.rar	-	ext outside the closed set
 route	GET	/api/v4/projects/1234/access_tokens	-	the minting surface, routed nowhere
@@ -138,7 +143,7 @@ route	DELETE	/api/v4/projects/1234/issues	api-issues	classify is method-agnostic
 #               instance [git-read,mr]
 #   inst-read   instance [git-read]
 #   issues-only instance [issues]
-#   ns-mr       namespace /grp/sub/ [mr] projects{42,77}  (NO instance grant)
+#   ns-mr       namespace /grp/sub/ [git-read,mr] projects{42,77}  (NO instance grant)
 #   proj-issues project grp/proj#1234 [issues]            (NO instance grant)
 
 # --- the git smart-HTTP tier: cap + scope ---
@@ -156,7 +161,8 @@ authz	deny	full	GET	/api/v4/projects/999/issues	scope_mismatch: 999 is under no 
 authz	deny	full	DELETE	/api/v4/projects/1234/issues	method_not_allowed: DELETE is in no cap
 authz	allow	full	GET	/api/v4/user	ambient: the instance holds issues|mr
 authz	allow	full	HEAD	/api/v4/version	ambient
-authz	deny	inst-read	GET	/api/v4/user	cap_missing: git-read is not issues|mr
+authz	allow	inst-read	GET	/api/v4/user	any read grant reaches the ambient user route (read = discover + inspect)
+authz	allow	inst-read	HEAD	/api/v4/version	any read grant reaches the ambient version route
 authz	allow	full	GET	/api/v4/projects/1234/repository/archive.tar.gz	archive rides git-read
 authz	deny	issues-only	GET	/api/v4/projects/1234/repository/archive.tar.gz	cap_missing: no git-read
 
@@ -180,8 +186,22 @@ authz	allow	ns-mr	GET	/api/v4/projects/42	namespace grant: numeric form rides pr
 authz	allow	ns-mr	GET	/api/v4/projects/grp%2Fsub%2Fchild	namespace grant: path form under the prefix
 authz	deny	ns-mr	GET	/api/v4/projects/99	namespace grant: 99 is not in projects[]
 authz	deny	ns-mr	GET	/api/v4/projects/other%2Fsecret	namespace grant: outside the prefix
-authz	deny	inst-read	GET	/api/v4/projects/1234	cap_missing: git-read alone never reads project metadata
+authz	allow	inst-read	GET	/api/v4/projects/1234	git-read now inspects project metadata; instance scope covers any well-formed id
 authz	allow	full	GET	/api/v4/projects/999	the instance-scope mr grant covers any well-formed id (by design)
+
+# --- api-group-projects: namespace enumeration, equals-or-under, path-form only, git-read ---
+# A namespace read grant may list its OWN group and any subgroup (the fix for
+# "clone-without-discovery"), but never a sibling, the parent, or a string-prefix
+# sibling; a concrete/instance grant never authorizes it (no instance-wide
+# enumeration oracle); the numeric group form fails closed (no group id in the doc).
+authz	allow	ns-mr	GET	/api/v4/groups/grp%2Fsub/projects	the namespace group node itself (equals the prefix)
+authz	allow	ns-mr	GET	/api/v4/groups/grp%2Fsub%2Fteam/projects	a subgroup, strictly under the prefix
+authz	deny	ns-mr	GET	/api/v4/groups/grp%2Fother/projects	a sibling group is OUT
+authz	deny	ns-mr	GET	/api/v4/groups/grp/projects	the parent group is OUT (not equal, not under)
+authz	deny	ns-mr	GET	/api/v4/groups/grp%2Fsub-secret/projects	grp-secret stays excluded by the slash boundary
+authz	deny	ns-mr	GET	/api/v4/groups/77/projects	the numeric group form fails closed
+authz	deny	inst-read	GET	/api/v4/groups/grp%2Fsub/projects	instance git-read never enumerates (scope, not cap)
+authz	deny	issues-only	GET	/api/v4/groups/grp%2Fsub/projects	cap_missing: enumeration is a git-read capability
 
 # ============ authz: THE SIX ESCAPE ROWS, FLIPPED TO DENY (the acceptance block) ============
 # In the LEGACY oracle each of these MATCHED an allow rule and reached a token

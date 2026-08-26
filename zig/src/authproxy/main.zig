@@ -701,11 +701,18 @@ fn deny(ctx: *Context, request: *std.http.Server.Request, m: *const ReqMeta, hos
 	// Clear any 100-continue expectation so respond() does not tell a denied
 	// client to send its body.
 	request.head.expect = null;
+	// A coarse machine-readable deny reason for the guest: a fixed enum
+	// (outcome.reason -- the same vocabulary the audit line carries), never free
+	// text and never a secret, so the in-sandbox agent can tell scope_mismatch /
+	// cap_missing / no_route / no_grant apart from "no grant at all" instead of
+	// reading a bare empty-body 403 as "no access". Header only: the empty body,
+	// keep_alive=false and the framing-ambiguity posture are untouched.
 	// Every deny closes the connection (keep_alive=false): assert-safe and it
 	// makes the framing boundary ambiguity unexploitable.
 	request.respond("", .{
 		.status = @enumFromInt(outcome.status),
 		.keep_alive = false,
+		.extra_headers = &.{.{ .name = "X-Cogbox-Deny", .value = outcome.reason }},
 	}) catch {};
 	ctx.finishAudit(m, host, outcome);
 }

@@ -298,7 +298,7 @@ test "e2e: two hosts back-to-back on one pooled connection route independently" 
 		\\{{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"{s}","git_user":"oauth2",
 		\\"grants":[{{"id":"gg-a","scope":"instance","caps":["issues","mr"]}}]}},
 		\\{{"host":"api.example.com","plugin":"gitlab","scheme":"http","cred_file":"{s}","git_user":"oauth2",
-		\\"grants":[{{"id":"gg-b","scope":"instance","caps":["git-read"]}}]}}
+		\\"grants":[{{"id":"gg-b","scope":"instance","caps":["git-write"]}}]}}
 		\\]}}
 	, .{ h.cred_path, h.cred_path });
 	defer gpa.free(cj);
@@ -311,8 +311,10 @@ test "e2e: two hosts back-to-back on one pooled connection route independently" 
 	defer fake.deinit();
 
 	// Request 1: git.example.com, an ambient read -> allowed. Request 2:
-	// api.example.com, but that host's grant is git-read only, so an ambient
+	// api.example.com, but that host's grant is git-write only, so an ambient
 	// API read is cap_missing -> deny, and the upstream is NOT dialed for it.
+	// (git-read WOULD reach the ambient routes now -- read = discover + inspect
+	// -- so a write-only grant is the one that still denies a bare read here.)
 	const two = "GET /api/v4/user HTTP/1.1\r\nHost: git.example.com\r\n" ++
 		"X-Cogbox-Host: git.example.com\r\nX-Cogbox-Vetted: 10.0.0.5:443\r\n\r\n" ++
 		"GET /api/v4/user HTTP/1.1\r\nHost: api.example.com\r\n" ++
@@ -1324,4 +1326,67 @@ test "e2e: a mediate-synthesized exchange with a header the relay cannot emit is
 	try t.expect(std.mem.indexOf(u8, run.audit, " decision=deny ") != null);
 	try t.expect(std.mem.indexOf(u8, run.audit, " reason=BadResponseHeader ") != null);
 	try t.expectEqual(@as(usize, 0), refusing.calls); // minted locally: no dial to refuse
+}
+
+test "e2e: a deny carries the X-Cogbox-Deny reason header (fixed enum, no secret, no dial)" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try h.confJson(); // an instance grant carrying every cap
+	defer gpa.free(cj);
+	var refusing = upstream.RefusingTransport{};
+
+	// gate-1 (unrouted) -> no_route on the header AND the audit line
+	{
+		const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+		var run = try serve(gpa, h.io, gen, refusing.t(), gitReq("/api/v4/projects/1234/access_tokens"));
+		defer run.deinit(gpa);
+		try t.expect(std.mem.indexOf(u8, run.response, "403") != null);
+		try t.expect(std.ascii.indexOfIgnoreCase(run.response, "X-Cogbox-Deny: no_route") != null);
+		try t.expect(std.mem.indexOf(u8, run.audit, "reason=no_route") != null);
+	}
+	// gate-2 (scope) -> scope_mismatch: an instance grant does NOT enumerate a
+	// namespace group, and the coarse reason says so (never "no grant at all")
+	{
+		const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+		var run = try serve(gpa, h.io, gen, refusing.t(), gitReq("/api/v4/groups/acme/projects"));
+		defer run.deinit(gpa);
+		try t.expect(std.mem.indexOf(u8, run.response, "403") != null);
+		try t.expect(std.ascii.indexOfIgnoreCase(run.response, "X-Cogbox-Deny: scope_mismatch") != null);
+	}
+	// the header never carries a secret and the deny never dialed the upstream
+	try t.expectEqual(@as(usize, 0), refusing.calls);
+}
+
+test "e2e: a namespace git-read grant enumerates its group -- simple=true forced, owner Bearer, no client override" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	// a NAMESPACE git-read grant on acme/* -- the enumeration case
+	const cj = try std.fmt.allocPrint(gpa,
+		\\{{"version":1,"providers":[{{"host":"git.example.com","plugin":"gitlab","scheme":"http","insecure":false,
+		\\"cred_file":"{s}","cred_format":"raw","git_user":"oauth2",
+		\\"grants":[{{"id":"gg-ns","scope":"namespace","repo":"acme/*","prefix":"/acme/","caps":["git-read"]}}]}}]}}
+	, .{h.cred_path});
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+	var fake = upstream.FakeTransport.init(gpa, &.{"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n[]"});
+	defer fake.deinit();
+
+	// the guest tries to force the raw representation and a subgroup toggle off;
+	// both are dropped, and a pagination param survives
+	var run = try serve(gpa, h.io, gen, fake.t(), gitReq("/api/v4/groups/acme/projects?simple=false&include_subgroups=false&per_page=50"));
+	defer run.deinit(gpa);
+	try t.expect(std.mem.indexOf(u8, run.response, "200 OK") != null);
+	try t.expectEqual(@as(usize, 1), fake.calls);
+	const up_req = fake.captured.items[0];
+	// the constructed upstream line: simple=true + include_subgroups=true FORCED,
+	// the pagination param kept, the client's simple=false / include_subgroups=false gone
+	try t.expect(std.mem.startsWith(u8, up_req, "GET /api/v4/groups/acme/projects?simple=true&include_subgroups=true&per_page=50 HTTP/1.1\r\n"));
+	try t.expect(std.mem.indexOf(u8, up_req, "simple=false") == null);
+	try t.expect(std.mem.indexOf(u8, up_req, "include_subgroups=false") == null);
+	// the OWNER token as Bearer (an API route), not the guest stub
+	try t.expect(std.mem.indexOf(u8, up_req, "authorization: Bearer glpat-FAKEFAKEFAKE\r\n") != null);
+	try t.expect(std.mem.indexOf(u8, run.audit, "route=api-group-projects") != null);
+	try t.expect(std.mem.indexOf(u8, run.audit, "decision=allow") != null);
 }
