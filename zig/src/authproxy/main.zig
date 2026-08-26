@@ -361,6 +361,24 @@ fn handleRequest(ctx: *Context, request: *std.http.Server.Request, sock: ?c_int)
 	// Every deny above returned WITHOUT taking a body reader and WITHOUT any
 	// upstream dial -- the "no upstream call on deny" invariant.
 
+	// A LOCAL self-discovery route (Route.local, set by the plugin's classify on
+	// its reflection surface -- gitlab's /_cogbox/grants): answered HERE from the
+	// plugin's compiled policy, with NO inflight slot, NO credential and NO
+	// upstream leg. authorize has already run (the method clamp), so a
+	// non-GET/HEAD reached a method_not_allowed deny above.
+	if (route.local) {
+		var outcome: Outcome = .{
+			.plugin = entry.plugin_name,
+			.method = @tagName(request.head.method),
+			.decision = .allow,
+			.gate = 2,
+			.reason = "ok",
+			.route_id = route.id,
+			.grant = grant,
+		};
+		return serveLocal(ctx, request, &m, checked.host, &outcome, entry, &route, &req);
+	}
+
 	// --- the acting-request phase: credential + upstream ---
 	if (!ctx.acquireInflight()) {
 		deny(ctx, request, &m, checked.host, .{ .plugin = entry.plugin_name, .route_id = route.id, .reason = "overloaded", .status = 503 });
@@ -929,6 +947,56 @@ fn deny2(ctx: *Context, request: *std.http.Server.Request, m: *const ReqMeta, ho
 	outcome.reason = reason;
 	outcome.status = status;
 	deny(ctx, request, m, host, outcome.*);
+}
+
+/// The local self-discovery body cap. The reflected policy cannot exceed the
+/// policy document it is derived from (the verb refuses a document over 64 KiB),
+/// so 64 KiB with margin is generous; a render that overflows it is fail-closed
+/// to a 500, never a partial or unbounded body.
+pub const local_response_cap: usize = 64 * 1024;
+
+/// The local self-discovery answer (Route.local, set by a plugin's classify on
+/// its reflection surface -- gitlab's /_cogbox/grants). The plugin RENDERS the
+/// full body from its compiled policy; the core relays it as a 200
+/// application/json with NO upstream leg and NO credential use, then closes the
+/// connection -- the deny path's local-answer idiom (`request.respond`), a body
+/// instead of empty, and NO `X-Cogbox-Deny` on the success path. std's respond
+/// frames Content-Length and omits the body on a HEAD. Fail-closed: a route
+/// marked local by a plugin that exposes no renderer, an OOM, or a render that
+/// overflows the bounded buffer is a 500 -- never a partial or a raw byte.
+fn serveLocal(ctx: *Context, request: *std.http.Server.Request, m: *const ReqMeta, host: []const u8, outcome: *Outcome, entry: *const conf.Entry, route: *const plugin_mod.Route, req: *const plugin_mod.Request) bool {
+	const render = entry.policy.vtable.localResponse orelse {
+		deny2(ctx, request, m, host, outcome, "local-unsupported", 500);
+		return false;
+	};
+	const buf = ctx.gpa.alloc(u8, local_response_cap) catch {
+		deny2(ctx, request, m, host, outcome, "oom", 500);
+		return false;
+	};
+	defer ctx.gpa.free(buf);
+	var w: std.Io.Writer = .fixed(buf);
+	render(entry.policy.ctx, route, req, &w) catch {
+		deny2(ctx, request, m, host, outcome, "local-too-large", 500);
+		return false;
+	};
+	const body = w.buffered();
+
+	_ = ctx.counters.allow.fetchAdd(1, .monotonic);
+	outcome.status = 200;
+	outcome.bytes_out = body.len;
+	// Clear any 100-continue expectation so respond() does not tell the client
+	// to send a body (a GET/HEAD carries none, but the field can be set).
+	request.head.expect = null;
+	// The success path carries NO X-Cogbox-Deny -- only Content-Type. keep_alive
+	// is false, the local-answer idiom (deny closes too): a body a client left
+	// unread cannot then be parsed as the next request on a reused connection.
+	request.respond(body, .{
+		.status = .ok,
+		.keep_alive = false,
+		.extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+	}) catch {};
+	ctx.finishAudit(m, host, outcome.*);
+	return false;
 }
 
 fn writeCannedError(out: *std.Io.Writer, status: std.http.Status) void {

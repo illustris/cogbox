@@ -90,6 +90,7 @@ Typed route table, first match wins, unmatched ⇒ gate-1 deny. Exactly parity's
 | `api-issues` | GET, HEAD, POST, PUT | `/api/v4/projects/:id/issues[/…]` |
 | `api-mr` | GET, HEAD, POST, PUT | `/api/v4/projects/:id/merge_requests[/…]` |
 | `api-archive` | GET, HEAD | `/api/v4/projects/:id/repository/archive[.<ext>]` — v1 addition |
+| `cogbox-grants` | GET, HEAD | `/_cogbox/grants` — **plugin-owned LOCAL route**, matched **before** the table above and answered locally (never proxied); see [Self-discovery](#self-discovery-_cogboxgrants) |
 
 `:id` is accepted in **both** forms: a numeric id (`^[0-9]{1,19}$`, ASCII digits only, no sign, no leading zero, compared as i64) or a single segment whose decoded value is a project path. A **group path** for `api-group-projects` is a single decoded segment whose value is a well-formed group path — unlike a project id a single top-level component (`acme`) is well-formed, because a group need not be namespaced; a numeric group form is recognized but always scope-denied (the policy document carries no group id). Archive extensions are a **closed set** (`tar.gz`, `tar.bz2`, `tar`, `tar.zst`, `zip`), never a wildcard suffix.
 
@@ -111,6 +112,28 @@ The **"read = discover + inspect"** decision: a `git-read` grant no longer means
 Only `api-user` and `api-version` are **ambient** (allowed by any `issues`/`mr`/`git-read` grant with no scope test — they name no project). `api-project` names one, and `api-group-projects` names a namespace: both take the scope test like every other `:id` route. An ambient project lookup would let any grant use the owner's token as an enumeration oracle over every project it can see; an ambient group listing would hand out instance-wide enumeration.
 
 Scope tests reuse the existing predicates' semantics: `project` ⇒ the project ref equals the normalized `repo`, or the numeric id equals `project_id`; `namespace` ⇒ the path form is under the **slash-terminated** `prefix` (so `grp-secret` stays excluded), or the numeric id is in `projects[]`; `instance` ⇒ any well-formed project reference. **`api-group-projects` has its own scope test**: **namespace-scope grants only** (a concrete or instance grant never authorizes it — preserving the no-instance-wide-enumeration-oracle property), the group path **equal-to or under** the slash-terminated `prefix` (equals-or-under, not strictly-under, so the grant lists its *own* group node as well as any subgroup, while a sibling, the parent and `grp-secret` still fail), and **path form only** (a numeric group fails closed). `authenticate` returns `Authorization: Basic base64(git_user:token)` on the three git routes and `Authorization: Bearer <token>` on the API routes — byte-identical to the addon's git-vs-API split, so upstream behaviour does not change.
+
+### Self-discovery: `/_cogbox/grants`
+
+An in-sandbox agent needs to answer *"what repos do I have access to"* without a human naming the group. The `cogbox-grants` route reflects **this sandbox's own grants** back to the guest, so the agent can discover its access from inside the box. It is a **plugin-owned local route**, not a GitLab surface:
+
+- **Reserved first segment.** `classify` recognizes a `_cogbox` first segment **before any GitLab route/segment matching**, so it can never collide with — or fall through to — a real GitLab path. A real GitLab top-level group named `_cogbox` is implausible and is intentionally shadowed; any `_cogbox/**` path other than `/_cogbox/grants` is a named gate-1 deny.
+- **Answered locally.** The route is marked `Route.local`; the core answers it from the plugin's `localResponse` hook — rendering the body **from the already-compiled in-memory policy** — with **no upstream round-trip and no credential use** (the deny path's local-answer idiom, a body instead of empty, and **no `X-Cogbox-Deny`** on the success path). `authorize` still runs the method clamp (**GET/HEAD only**; any other method is the same `method_not_allowed` deny the API tier gives), but `upstream`/`authenticate` never do.
+- **Non-secret policy reflection.** The response is the sandbox's grants as the *policy shape only*, built from the same typed grants `authorize` enforces (zero drift). It **never** emits a token, a numeric project id (`project_id`/`projects[]` stay internal), or any upstream byte — only what the policy document already carries as non-secret prefixes and caps.
+
+Response — `200`, `Content-Type: application/json` (an empty/ungranted sandbox is `{"grants":[]}`, still `200`):
+
+```json
+{ "grants": [
+  { "scope": "namespace", "repo": "acme/iac/*", "prefix": "acme/iac", "caps": ["git-read"] },
+  { "scope": "project",   "repo": "acme/app",   "caps": ["git-read", "issues"] },
+  { "scope": "instance",  "caps": ["git-read", "mr"] } ] }
+```
+
+- `scope` is `namespace | project | instance`.
+- `repo` is the grant's repo (the wildcard `grp/sub/*` on a namespace grant, the concrete `grp/proj` on a project grant); it is **omitted** on an `instance`-scope grant, which names no repo.
+- `prefix` is the **path form** of a namespace grant's slash-terminated internal prefix (`"/grp/sub/"` → `"grp/sub"`, no leading/trailing slash); it appears on **namespace-scope grants only**.
+- `caps` is the grant's capability subset (`git-read`, `git-write`, `issues`, `mr`).
 
 ## The policy document
 

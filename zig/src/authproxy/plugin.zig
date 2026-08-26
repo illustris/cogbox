@@ -23,6 +23,9 @@ pub const CompileError = error{ InvalidEntry, OutOfMemory };
 pub const UpstreamError = error{Overflow};
 pub const AuthError = error{ CredentialUnavailable, AuthFailed };
 pub const MediateError = error{ CredentialUnavailable, UpstreamFailed, MediateFailed };
+/// A `localResponse` render fails only when the caller's BOUNDED body writer
+/// overflows -- the core turns that into a 500 (never a partial body).
+pub const LocalError = std.Io.Writer.Error;
 
 pub const Plugin = struct {
 	/// Must equal the doc's "plugin" value. Selection is exact match; an
@@ -60,6 +63,15 @@ pub const Policy = struct {
 		// derived-token invalidation (drop a plugin-minted token on 401).
 		// null == none.
 		onUpstreamStatus: ?*const fn (ctx: *const anyopaque, route: *const Route, status: u16, headers: *const HeaderSet, cred: *Cred) void = null,
+		// the LOCAL-answer case (a Route the plugin's classify marked `local`):
+		// the plugin RENDERS the whole response body from its compiled policy
+		// into the caller's BOUNDED writer, and the core relays it as a 200 with
+		// NO upstream leg and NO credential use -- the self-discovery reflection
+		// surface (gitlab's /_cogbox/grants). null == the plugin exposes no local
+		// routes; a non-null hook is REQUIRED once its classify can set
+		// Route.local (a local route with no renderer is the core's 500). PURE
+		// over the compiled policy, like authorize: no IO, no credential.
+		localResponse: ?*const fn (ctx: *const anyopaque, route: *const Route, req: *const Request, out: *std.Io.Writer) LocalError!void = null,
 	};
 };
 
@@ -141,6 +153,14 @@ pub const Route = struct {
 	/// `simple=true` does NOT strip on a single-project GET. Set TRUE only on
 	/// api-project; every other route streams its body unfiltered.
 	project_response: bool = false,
+	/// A LOCAL-answer route: the core answers it from the plugin's
+	/// `localResponse` hook -- rendering the body from the compiled policy --
+	/// with NO upstream leg and NO credential use, then closes the connection
+	/// (the deny path's local-answer idiom, a body instead of empty). Set TRUE
+	/// only on a self-discovery reflection route (gitlab's /_cogbox/grants);
+	/// authorize still runs (the method clamp), but `upstream`/`authenticate`
+	/// never do.
+	local: bool = false,
 };
 
 pub const DenyReason = enum {

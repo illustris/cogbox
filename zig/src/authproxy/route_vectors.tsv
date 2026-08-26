@@ -135,6 +135,15 @@ route	POST	/grp/proj.git/git-upload-archive	-	git-upload-archive reserved
 route	GET	/api/v4/projects/%D9%A3/issues	-	a non-ASCII single-segment id is not a well-formed path
 route	GET	/proj/info/refs?service=git-upload-pack	-	a single-component ref is not well-formed
 route	DELETE	/api/v4/projects/1234/issues	api-issues	classify is method-agnostic; authorize clamps DELETE
+# the plugin-owned LOCAL self-discovery route: a reserved `_cogbox` first
+# segment, matched BEFORE any GitLab route/segment matching and answered locally
+# (never proxied upstream). Method-agnostic at classify; authorize clamps it.
+route	GET	/_cogbox/grants	cogbox-grants	self-discovery, answered locally (no upstream)
+route	HEAD	/_cogbox/grants	cogbox-grants	HEAD too
+route	POST	/_cogbox/grants	cogbox-grants	method-agnostic at classify; authorize clamps non-GET/HEAD
+route	GET	/_cogbox	-	the _cogbox node itself is not a route
+route	GET	/_cogbox/other	-	an unknown _cogbox path routes NOWHERE (never upstream)
+route	GET	/_cogbox/grants/extra	-	a deeper path is not the grants route
 
 # ================= authz: classify + authorize under a fixture ==================
 # fixtures (defined in route_vectors_test.zig):
@@ -202,6 +211,18 @@ authz	deny	ns-mr	GET	/api/v4/groups/grp%2Fsub-secret/projects	grp-secret stays e
 authz	deny	ns-mr	GET	/api/v4/groups/77/projects	the numeric group form fails closed
 authz	deny	inst-read	GET	/api/v4/groups/grp%2Fsub/projects	instance git-read never enumerates (scope, not cap)
 authz	deny	issues-only	GET	/api/v4/groups/grp%2Fsub/projects	cap_missing: enumeration is a git-read capability
+
+# --- the local self-discovery route: GET/HEAD authorize on method ALONE ---
+# It reflects THIS sandbox's grants (an empty sandbox still gets a 200
+# {"grants":[]}), reads no credential and takes no scope test, so it allows
+# under ANY fixture; a non-GET/HEAD method is method_not_allowed. The body's
+# shape (one tuple per grant, path-form prefix, no numeric id, no token) is
+# pinned by the in-memory e2e in tests.zig -- authz here checks only the verdict.
+authz	allow	full	GET	/_cogbox/grants	self-discovery: allowed on method alone
+authz	allow	inst-read	HEAD	/_cogbox/grants	HEAD too, under any fixture
+authz	allow	proj-issues	GET	/_cogbox/grants	allowed with no instance grant (it only reflects)
+authz	deny	full	POST	/_cogbox/grants	method_not_allowed: only GET/HEAD
+authz	deny	full	DELETE	/_cogbox/grants	method_not_allowed
 
 # ============ authz: THE SIX ESCAPE ROWS, FLIPPED TO DENY (the acceptance block) ============
 # In the LEGACY oracle each of these MATCHED an allow rule and reached a token

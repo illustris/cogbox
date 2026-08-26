@@ -20,6 +20,16 @@
 // NOWHERE, and DELETE is in no capability's method set. `service` is a parameter
 // of exactly ONE route (git-refs), and /api/** can never be a git route, so the
 // service-laundering class closes structurally.
+//
+// Plus ONE plugin-owned LOCAL route, matched BEFORE the table above and NEVER
+// proxied upstream (Route.local, answered by localResponse):
+//
+//   cogbox-grants       GET,HEAD   /_cogbox/grants   local self-discovery JSON
+//
+// `_cogbox` is a RESERVED first segment: the guest reaches it through the
+// retargeted host, but it reflects THIS sandbox's own grants back as JSON from
+// the compiled policy -- no credential, no upstream. Any other `_cogbox/**`
+// path is a named gate-1 deny.
 
 const std = @import("std");
 const canon = @import("../canon.zig");
@@ -40,6 +50,8 @@ const vtable: plugin_mod.Policy.VTable = .{
 	// owner token is refreshed only by cogworx (spec §3.2).
 	.mediate = null,
 	.onUpstreamStatus = null,
+	// The /_cogbox/grants self-discovery reflection route (Route.local).
+	.localResponse = localResponse,
 };
 
 const Caps = struct {
@@ -154,6 +166,10 @@ const rid_api_group_projects = "api-group-projects";
 const rid_api_issues = "api-issues";
 const rid_api_mr = "api-mr";
 const rid_api_archive = "api-archive";
+// The plugin-owned LOCAL self-discovery route -- NOT a GitLab surface. A
+// reserved `_cogbox` first segment, answered locally from the compiled policy,
+// never proxied upstream and never touching a credential.
+const rid_cogbox_grants = "cogbox-grants";
 
 /// The closed archive extension set -- never a wildcard suffix.
 const archive_exts = [_][]const u8{ "tar.gz", "tar.bz2", "tar", "tar.zst", "zip" };
@@ -162,6 +178,30 @@ fn classify(ctx: *const anyopaque, req: *const plugin_mod.Request) ?plugin_mod.R
 	_ = ctx;
 	const segs = req.segments;
 	if (segs.len == 0) return null;
+
+	// The plugin-owned LOCAL self-discovery surface, recognized BEFORE any
+	// GitLab route/segment matching so a `_cogbox` first segment can never
+	// collide with, or fall through to, a real GitLab path. `_cogbox` is a
+	// RESERVED first segment (a real GitLab top-level group named `_cogbox` is
+	// implausible and is intentionally shadowed). The one route,
+	// `/_cogbox/grants`, reflects THIS sandbox's grants back as JSON, answered
+	// LOCALLY (Route.local) with no upstream round-trip and no credential use;
+	// every OTHER `_cogbox` path is a NAMED gate-1 deny that likewise never
+	// reaches the origin. Method-agnostic here (like the API routes); authorize
+	// clamps it to GET/HEAD.
+	if (std.mem.eql(u8, segs[0], "_cogbox")) {
+		if (segs.len == 2 and std.mem.eql(u8, segs[1], "grants")) {
+			return .{
+				.id = rid_cogbox_grants,
+				.layer = .api,
+				.method_class = .read,
+				.params = .{},
+				.stream = false,
+				.local = true,
+			};
+		}
+		return null;
+	}
 
 	if (std.mem.eql(u8, segs[0], "api")) {
 		// /api/** can never be a git route (spec §6.1); only the v4 REST
@@ -450,6 +490,7 @@ fn refView(segs: []const []const u8) ?RefView {
 }
 
 fn methodAllowed(route_id: []const u8, method: std.http.Method) bool {
+	if (std.mem.eql(u8, route_id, rid_cogbox_grants)) return method == .GET or method == .HEAD;
 	if (std.mem.eql(u8, route_id, rid_git_refs)) return method == .GET;
 	if (std.mem.eql(u8, route_id, rid_git_upload) or std.mem.eql(u8, route_id, rid_git_receive)) {
 		return method == .POST;
@@ -465,6 +506,12 @@ fn methodAllowed(route_id: []const u8, method: std.http.Method) bool {
 fn authorize(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const plugin_mod.Request) plugin_mod.Decision {
 	const c = compiled(ctx);
 	if (!methodAllowed(route.id, req.method)) return .{ .deny = .method_not_allowed };
+	// The local self-discovery route authorizes on method alone: it reflects
+	// THIS sandbox's grants (an EMPTY sandbox included -> {"grants":[]}), reads
+	// no credential and takes no scope test, so it must run BEFORE the no_grant
+	// gate below. The audit grant label is "-": there is no single grant behind
+	// it, and the body it renders enumerates them all.
+	if (route.local) return .{ .allow = "-" };
 	if (std.mem.eql(u8, route.id, rid_git_refs) and route.params.service == null) {
 		return .{ .deny = .service_invalid };
 	}
@@ -747,6 +794,52 @@ fn authenticate(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *con
 		const v = std.fmt.bufPrint(&value, "Bearer {s}", .{tok}) catch return error.AuthFailed;
 		out.set("authorization", v) catch return error.AuthFailed;
 	}
+}
+
+/// Render THIS sandbox's grants as the `/_cogbox/grants` self-discovery JSON --
+/// `{"grants":[{"scope":..,"repo":..,"prefix":..,"caps":[..]},..]}` -- built
+/// from the already-compiled in-memory grants, so it is zero upstream, zero
+/// credential and zero drift from what `authorize` enforces. It reflects only
+/// the NON-SECRET policy shape and NEVER emits a token, a numeric project id
+/// (`project_id`/`projects[]` stay internal) or any upstream byte. `repo` is
+/// emitted whenever the grant carries one (absent on an instance-scope grant,
+/// which names no repo). `prefix` is the CLEAN path form -- the internal
+/// slash-terminated `"/grp/sub/"` trimmed to `"grp/sub"`, no leading/trailing
+/// slash -- and appears on namespace-scope grants only. An empty/ungranted
+/// sandbox renders `{"grants":[]}`.
+fn localResponse(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const plugin_mod.Request, out: *std.Io.Writer) plugin_mod.LocalError!void {
+	_ = route;
+	_ = req;
+	const c = compiled(ctx);
+	var jw: std.json.Stringify = .{ .writer = out };
+	try jw.beginObject();
+	try jw.objectField("grants");
+	try jw.beginArray();
+	for (c.grants) |*g| {
+		try jw.beginObject();
+		try jw.objectField("scope");
+		try jw.write(@tagName(g.scope));
+		if (g.repo) |repo| {
+			try jw.objectField("repo");
+			try jw.write(repo);
+		}
+		if (g.scope == .namespace) {
+			if (g.prefix) |p| {
+				try jw.objectField("prefix");
+				try jw.write(std.mem.trim(u8, p, "/"));
+			}
+		}
+		try jw.objectField("caps");
+		try jw.beginArray();
+		if (g.caps.git_read) try jw.write("git-read");
+		if (g.caps.git_write) try jw.write("git-write");
+		if (g.caps.issues) try jw.write("issues");
+		if (g.caps.mr) try jw.write("mr");
+		try jw.endArray();
+		try jw.endObject();
+	}
+	try jw.endArray();
+	try jw.endObject();
 }
 
 // --- Tests ---
@@ -1178,4 +1271,92 @@ test "gitlab: the two read routes FORCE simple=true in the constructed upstream 
 	try policy.vtable.upstream(policy.ctx, &route2, &req2, &up2);
 	try t.expectEqualStrings("/api/v4/projects/grp%2Fproj", up2.path());
 	try t.expectEqualStrings("simple=true&statistics=true", up2.query());
+}
+
+test "gitlab: /_cogbox/grants is a local route -- classify marks it, authorize allows GET/HEAD on method alone, clamps the rest" {
+	const g = try conf.parseGeneration(t.allocator, undefined, conf.test_conf_json, 1, .skip, null);
+	defer {
+		g.arena.deinit();
+		t.allocator.destroy(g);
+	}
+	const policy = g.entries[0].policy;
+
+	// classify recognizes the reserved surface and marks it local
+	const segs = [_][]const u8{ "_cogbox", "grants" };
+	for ([_]std.http.Method{ .GET, .HEAD, .POST, .DELETE }) |method| {
+		const req = mkReq(method, &segs, &.{});
+		const route = policy.vtable.classify(policy.ctx, &req).?;
+		try t.expectEqualStrings("cogbox-grants", route.id);
+		try t.expect(route.local);
+		try t.expectEqual(plugin_mod.Layer.api, route.layer);
+		try t.expect(!route.stream);
+		const d = policy.vtable.authorize(policy.ctx, &route, &req);
+		if (method == .GET or method == .HEAD) {
+			// allowed on method alone -- no scope, the grant label is "-"
+			try t.expectEqualStrings("-", d.allow);
+		} else {
+			try t.expectEqual(plugin_mod.DenyReason.method_not_allowed, d.deny);
+		}
+	}
+
+	// any OTHER _cogbox path (and the node itself) routes NOWHERE
+	const other = [_][]const u8{ "_cogbox", "secrets" };
+	try t.expect(policy.vtable.classify(policy.ctx, &mkReq(.GET, &other, &.{})) == null);
+	const node = [_][]const u8{"_cogbox"};
+	try t.expect(policy.vtable.classify(policy.ctx, &mkReq(.GET, &node, &.{})) == null);
+	const deeper = [_][]const u8{ "_cogbox", "grants", "x" };
+	try t.expect(policy.vtable.classify(policy.ctx, &mkReq(.GET, &deeper, &.{})) == null);
+}
+
+test "gitlab: /_cogbox/grants renders the grants JSON -- every scope, path-form prefix, and NO numeric id or token" {
+	// The fixture carries all three scopes: a project (repo grp/proj, project_id
+	// 1234, projects[] 42/77 internal), a namespace (/grp/sub/), an instance.
+	const g = try conf.parseGeneration(t.allocator, undefined, conf.test_conf_json, 1, .skip, null);
+	defer {
+		g.arena.deinit();
+		t.allocator.destroy(g);
+	}
+	const policy = g.entries[0].policy;
+	const segs = [_][]const u8{ "_cogbox", "grants" };
+	const req = mkReq(.GET, &segs, &.{});
+	const route = policy.vtable.classify(policy.ctx, &req).?;
+
+	var buf: [4096]u8 = undefined;
+	var w: std.Io.Writer = .fixed(&buf);
+	try policy.vtable.localResponse.?(policy.ctx, &route, &req, &w);
+	const body = w.buffered();
+
+	// structural parse: three grants, path-form prefix on the namespace only
+	var arena = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena.deinit();
+	const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
+	const grants = parsed.object.get("grants").?.array;
+	try t.expectEqual(@as(usize, 3), grants.items.len);
+	var saw_ns = false;
+	var saw_instance = false;
+	for (grants.items) |gv| {
+		const o = gv.object;
+		const scope = o.get("scope").?.string;
+		if (std.mem.eql(u8, scope, "namespace")) {
+			saw_ns = true;
+			try t.expectEqualStrings("grp/sub", o.get("prefix").?.string); // clean path form
+			try t.expectEqualStrings("grp/sub/*", o.get("repo").?.string);
+		} else {
+			try t.expect(o.get("prefix") == null); // prefix is namespace-only
+			if (std.mem.eql(u8, scope, "instance")) {
+				saw_instance = true;
+				try t.expect(o.get("repo") == null); // an instance grant names no repo
+			}
+		}
+	}
+	try t.expect(saw_ns and saw_instance);
+
+	// NEVER a numeric project id (project_id 1234 / projects[] 42,77), a
+	// credential, or a projected upstream secret -- only the non-secret shape.
+	for ([_][]const u8{ "1234", "project_id", "\"42\"", "\"77\"", "glpat", "runners_token" }) |needle| {
+		if (std.mem.indexOf(u8, body, needle) != null) {
+			std.debug.print("/_cogbox/grants body leaked {s}: {s}\n", .{ needle, body });
+			return error.GrantsBodyLeak;
+		}
+	}
 }

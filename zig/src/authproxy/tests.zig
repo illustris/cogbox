@@ -1696,3 +1696,132 @@ test "e2e: api-project drops a non-object namespace and a pathologically deep fi
 	defer parsed.deinit();
 	try t.expect(parsed.value == .object);
 }
+
+// --- /_cogbox/grants: the local self-discovery reflection route ------------
+//
+// These drive the WHOLE core over an inline conf and a REFUSING upstream: the
+// local answer must never dial (refusing.calls stays 0), reads no credential,
+// and carries no X-Cogbox-Deny on the success path. Fictional names only
+// (git.example.com, org `acme`), per the OSS convention.
+
+fn cogboxReq(comptime method: []const u8, comptime target: []const u8) []const u8 {
+	return method ++ " " ++ target ++ " HTTP/1.1\r\n" ++
+		"Host: git.example.com\r\n" ++
+		"X-Cogbox-Host: git.example.com\r\n" ++
+		"X-Cogbox-Vetted: 10.0.0.5:443\r\n" ++
+		"X-Cogbox-Proto: https\r\n" ++
+		"Accept: */*\r\n\r\n";
+}
+
+/// Parse an inline conf and drive one local-route request against a REFUSING
+/// upstream. The local route reads no credential, so the conf's cred_file need
+/// not exist. Caller owns the Run; the gen is owned by serve's static store.
+fn serveLocalReq(gpa: std.mem.Allocator, conf_json: []const u8, request_bytes: []const u8, refusing: *upstream.RefusingTransport) !Run {
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const gen = try conf.parseGeneration(gpa, io, conf_json, 1, .skip, null);
+	return serve(gpa, io, gen, refusing.t(), request_bytes);
+}
+
+const ns_grant_conf =
+	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","insecure":false,
+	\\"cred_file":"/nonexistent/store/git-gitlab","cred_format":"raw","git_user":"oauth2",
+	\\"grants":[{"id":"gg-ns","scope":"namespace","repo":"acme/iac/*","prefix":"/acme/iac/","caps":["git-read"]}]}]}
+;
+
+const empty_grant_conf =
+	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","insecure":false,
+	\\"cred_file":"/nonexistent/store/git-gitlab","cred_format":"raw","git_user":"oauth2",
+	\\"grants":[]}]}
+;
+
+// The exact self-discovery JSON the ns_grant_conf reflects (the skill's contract).
+const ns_grants_body =
+	\\{"grants":[{"scope":"namespace","repo":"acme/iac/*","prefix":"acme/iac","caps":["git-read"]}]}
+;
+
+test "e2e: /_cogbox/grants reflects a namespace grant locally -- exact JSON, no upstream, no deny header, no token/numeric id" {
+	const gpa = t.allocator;
+	var refusing = upstream.RefusingTransport{};
+	var run = try serveLocalReq(gpa, ns_grant_conf, cogboxReq("GET", "/_cogbox/grants"), &refusing);
+	defer run.deinit(gpa);
+
+	// answered LOCALLY: the refusing upstream was never dialed
+	try t.expectEqual(@as(usize, 0), refusing.calls);
+	// 200 application/json, and NO X-Cogbox-Deny on the success path
+	try t.expect(std.mem.indexOf(u8, run.response, "200 OK") != null);
+	try t.expect(std.mem.indexOf(u8, run.response, "content-type: application/json") != null);
+	try t.expect(std.ascii.indexOfIgnoreCase(run.response, "Cogbox-Deny") == null);
+	// the EXACT contract body: one tuple, path-form prefix, git-read
+	const body = httpBody(run.response);
+	try t.expectEqualStrings(ns_grants_body, body);
+	try t.expectEqual(body.len, contentLength(run.response).?);
+	// never a numeric id or the owner credential
+	try t.expect(std.mem.indexOf(u8, body, "project_id") == null);
+	try t.expect(std.mem.indexOf(u8, body, "glpat") == null);
+	// audit: an allow on the local route, token-free, and no grant behind it
+	try t.expect(std.mem.indexOf(u8, run.audit, "decision=allow") != null);
+	try t.expect(std.mem.indexOf(u8, run.audit, "route=cogbox-grants") != null);
+	try t.expect(std.mem.indexOf(u8, run.audit, "status=200") != null);
+	try t.expect(std.mem.indexOf(u8, run.audit, "grant=-") != null);
+	try t.expect(std.mem.indexOf(u8, run.audit, "glpat") == null);
+}
+
+test "e2e: /_cogbox/grants on an ungranted sandbox is a 200 {grants:[]}, still local, still no deny header" {
+	const gpa = t.allocator;
+	var refusing = upstream.RefusingTransport{};
+	var run = try serveLocalReq(gpa, empty_grant_conf, cogboxReq("GET", "/_cogbox/grants"), &refusing);
+	defer run.deinit(gpa);
+	try t.expectEqual(@as(usize, 0), refusing.calls);
+	try t.expect(std.mem.indexOf(u8, run.response, "200 OK") != null);
+	try t.expect(std.ascii.indexOfIgnoreCase(run.response, "Cogbox-Deny") == null);
+	try t.expectEqualStrings("{\"grants\":[]}", httpBody(run.response));
+}
+
+test "e2e: /_cogbox/grants HEAD is head-only (Content-Length declared, no body), answered locally" {
+	const gpa = t.allocator;
+	var refusing = upstream.RefusingTransport{};
+	var run = try serveLocalReq(gpa, ns_grant_conf, cogboxReq("HEAD", "/_cogbox/grants"), &refusing);
+	defer run.deinit(gpa);
+	try t.expectEqual(@as(usize, 0), refusing.calls);
+	try t.expect(std.mem.indexOf(u8, run.response, "200 OK") != null);
+	// the GET body's Content-Length is declared, but no body follows (std omits it)
+	try t.expectEqual(@as(usize, ns_grants_body.len), contentLength(run.response).?);
+	try t.expectEqualStrings("", httpBody(run.response));
+}
+
+fn cogboxBodyReq(comptime method: []const u8, comptime target: []const u8) []const u8 {
+	// A body-bearing method MUST declare its framing (framing 411s a bodyless
+	// one), so a request that reaches gate 2 carries a Content-Length body.
+	return method ++ " " ++ target ++ " HTTP/1.1\r\n" ++
+		"Host: git.example.com\r\n" ++
+		"X-Cogbox-Host: git.example.com\r\n" ++
+		"X-Cogbox-Vetted: 10.0.0.5:443\r\n" ++
+		"Content-Type: application/json\r\n" ++
+		"Content-Length: 2\r\n\r\n{}";
+}
+
+test "e2e: /_cogbox/grants refuses a non-GET/HEAD method with method_not_allowed, never dialing upstream" {
+	const gpa = t.allocator;
+	// POST/DELETE carrying a body reach gate 2 and get the SAME method_not_allowed
+	// deny the API tier gives DELETE -- never the grants body, never an upstream
+	// dial. (The pure classify/authorize clamp is also pinned by the route_vectors
+	// authz rows and the gitlab unit test.)
+	const reqs = [_][]const u8{
+		cogboxBodyReq("POST", "/_cogbox/grants"), // a body-bearing POST reaches gate 2
+		cogboxReq("DELETE", "/_cogbox/grants"), // a bodyless DELETE also reaches gate 2
+	};
+	for (reqs) |req| {
+		var refusing = upstream.RefusingTransport{};
+		var run = try serveLocalReq(gpa, ns_grant_conf, req, &refusing);
+		defer run.deinit(gpa);
+		try t.expectEqual(@as(usize, 0), refusing.calls);
+		try t.expect(std.mem.indexOf(u8, run.response, "403") != null);
+		try t.expect(std.mem.indexOf(u8, run.response, "method_not_allowed") != null);
+		try t.expect(std.mem.indexOf(u8, run.audit, "reason=method_not_allowed") != null);
+		try t.expect(std.mem.indexOf(u8, run.audit, "route=cogbox-grants") != null);
+		// the grants body is NEVER rendered for a refused method
+		try t.expect(std.mem.indexOf(u8, run.response, "acme/iac") == null);
+	}
+}
