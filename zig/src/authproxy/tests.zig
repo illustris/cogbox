@@ -1390,3 +1390,309 @@ test "e2e: a namespace git-read grant enumerates its group -- simple=true forced
 	try t.expect(std.mem.indexOf(u8, run.audit, "route=api-group-projects") != null);
 	try t.expect(std.mem.indexOf(u8, run.audit, "decision=allow") != null);
 }
+
+// --- api-project response-body projection (the runners_token fix) -----------
+
+/// The body of an HTTP response the harness captured: the bytes after the first
+/// CRLFCRLF.
+fn httpBody(resp: []const u8) []const u8 {
+	const i = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return "";
+	return resp[i + 4 ..];
+}
+
+/// The declared Content-Length of a captured response (case-insensitive).
+fn contentLength(resp: []const u8) ?usize {
+	const key = "content-length:";
+	const i = std.ascii.indexOfIgnoreCase(resp, key) orelse return null;
+	const rest = resp[i + key.len ..];
+	const end = std.mem.indexOf(u8, rest, "\r\n") orelse return null;
+	return std.fmt.parseInt(usize, std.mem.trim(u8, rest[0..end], " "), 10) catch null;
+}
+
+/// An `HTTP/1.1 <status> <phrase>` response over a JSON body, Content-Length
+/// computed from the body (the fake upstream's script bytes; caller frees).
+fn jsonResponse(gpa: std.mem.Allocator, status_line: []const u8, body: []const u8) ![]u8 {
+	return std.fmt.allocPrint(gpa, "HTTP/1.1 {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\n\r\n{s}", .{ status_line, body.len, body });
+}
+
+/// A conf naming the temp cred file with an instance grant carrying exactly the
+/// given caps -- so a test can prove the api-project projection is route-driven,
+/// not cap-driven (it runs the same under git-read and under issues).
+fn instanceConf(gpa: std.mem.Allocator, cred_path: []const u8, caps_json: []const u8) ![]u8 {
+	return std.fmt.allocPrint(gpa,
+		\\{{"version":1,"providers":[{{"host":"git.example.com","plugin":"gitlab","scheme":"http","insecure":false,
+		\\"cred_file":"{s}","cred_format":"raw","git_user":"oauth2",
+		\\"grants":[{{"id":"gg-inst","scope":"instance","caps":{s}}}]}}]}}
+	, .{ cred_path, caps_json });
+}
+
+/// A GitLab single-project GET body carrying BOTH the allowlisted safe fields
+/// and the secret/omitted ones (runners_token, import_url, permissions, _links,
+/// a registry field, and a bogus namespace.runners_token) -- the projection must
+/// keep the former and drop the latter.
+const full_project_json =
+	\\{"id":1234,"description":"a repo","name":"proj","name_with_namespace":"grp / proj","path":"proj","path_with_namespace":"grp/proj","created_at":"2026-01-02T03:04:05Z","default_branch":"main","tag_list":["x"],"topics":["x"],"ssh_url_to_repo":"git@git.example.com:grp/proj.git","http_url_to_repo":"http://git.example.com/grp/proj.git","web_url":"http://git.example.com/grp/proj","readme_url":null,"avatar_url":null,"forks_count":0,"star_count":1,"last_activity_at":"2026-01-02T03:04:05Z","visibility":"private","archived":false,"empty_repo":false,"runners_token":"GR1348secret","import_url":"http://internal/import","permissions":{"project_access":{"access_level":40}},"_links":{"self":"http://git.example.com/x"},"container_registry_image_prefix":"reg.example.com/grp/proj","namespace":{"id":5,"name":"grp","path":"grp","kind":"group","full_path":"grp","parent_id":null,"avatar_url":null,"web_url":"http://git.example.com/groups/grp","runners_token":"NSsecret"}}
+;
+
+fn assertProjected(gpa: std.mem.Allocator, resp: []const u8) !void {
+	try t.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
+	const body = httpBody(resp);
+	// the secret / omitted fields are all gone -- by name AND by value
+	const gone = [_][]const u8{ "runners_token", "import_url", "permissions", "_links", "GR1348secret", "NSsecret", "container_registry_image_prefix" };
+	for (gone) |needle| try t.expect(std.mem.indexOf(u8, body, needle) == null);
+	// the allowlisted fields the agent needs are kept
+	const kept = [_][]const u8{ "path_with_namespace", "default_branch", "http_url_to_repo", "visibility" };
+	for (kept) |needle| try t.expect(std.mem.indexOf(u8, body, needle) != null);
+	// the nested namespace was projected through its own allowlist (kept, minus
+	// its bogus secret already asserted gone above)
+	try t.expect(std.mem.indexOf(u8, body, "\"namespace\":") != null);
+	try t.expect(std.mem.indexOf(u8, body, "full_path") != null);
+	// Content-Length was recomputed for the projected body, and it shrank
+	try t.expectEqual(body.len, contentLength(resp).?);
+	try t.expect(body.len < full_project_json.len);
+	// the projected body is still valid JSON (parses as an object)
+	const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+	defer parsed.deinit();
+	try t.expect(parsed.value == .object);
+}
+
+test "e2e: api-project projects the response body -- secret fields stripped, allowlist kept, Content-Length recomputed (git-read)" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try instanceConf(gpa, h.cred_path, "[\"git-read\"]");
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+
+	const script = try jsonResponse(gpa, "200 OK", full_project_json);
+	defer gpa.free(script);
+	var fake = upstream.FakeTransport.init(gpa, &.{script});
+	defer fake.deinit();
+
+	var run = try serve(gpa, h.io, gen, fake.t(), gitReq("/api/v4/projects/1234"));
+	defer run.deinit(gpa);
+	try t.expectEqual(@as(usize, 1), fake.calls);
+	// the upstream still saw the owner Bearer and the forced simple=true
+	const up_req = fake.captured.items[0];
+	try t.expect(std.mem.startsWith(u8, up_req, "GET /api/v4/projects/1234?simple=true HTTP/1.1\r\n"));
+	try t.expect(std.mem.indexOf(u8, up_req, "authorization: Bearer glpat-FAKEFAKEFAKE\r\n") != null);
+	try assertProjected(gpa, run.response);
+	try t.expect(std.mem.indexOf(u8, run.audit, "route=api-project") != null);
+	try t.expect(std.mem.indexOf(u8, run.audit, "decision=allow") != null);
+	// the audit line never carried the leaked secret
+	try t.expect(std.mem.indexOf(u8, run.audit, "runners_token") == null);
+}
+
+test "e2e: the api-project projection runs regardless of which cap authorized it (issues grant)" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	// an issues-only instance grant: api-project is authorized by issues too, and
+	// the projection is route-driven, so it must strip the secret just the same
+	const cj = try instanceConf(gpa, h.cred_path, "[\"issues\"]");
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+
+	const script = try jsonResponse(gpa, "200 OK", full_project_json);
+	defer gpa.free(script);
+	var fake = upstream.FakeTransport.init(gpa, &.{script});
+	defer fake.deinit();
+
+	var run = try serve(gpa, h.io, gen, fake.t(), gitReq("/api/v4/projects/1234"));
+	defer run.deinit(gpa);
+	try t.expectEqual(@as(usize, 1), fake.calls);
+	try assertProjected(gpa, run.response);
+	try t.expect(std.mem.indexOf(u8, run.audit, "route=api-project") != null);
+}
+
+test "e2e: an api-project 200 body over the cap fails closed (502), never relaying the secret" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try instanceConf(gpa, h.cred_path, "[\"git-read\"]");
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+
+	// a 200 body larger than project_response_cap, with the secret up front
+	const filler = try gpa.alloc(u8, main.project_response_cap + 4096);
+	defer gpa.free(filler);
+	@memset(filler, 'x');
+	const body = try std.fmt.allocPrint(gpa, "{{\"runners_token\":\"GR1348secret\",\"description\":\"{s}\",\"id\":1}}", .{filler});
+	defer gpa.free(body);
+	const script = try jsonResponse(gpa, "200 OK", body);
+	defer gpa.free(script);
+	var fake = upstream.FakeTransport.init(gpa, &.{script});
+	defer fake.deinit();
+
+	var run = try serve(gpa, h.io, gen, fake.t(), gitReq("/api/v4/projects/1234"));
+	defer run.deinit(gpa);
+	try t.expectEqual(@as(usize, 1), fake.calls); // it dialed and read...
+	try t.expect(std.mem.indexOf(u8, run.response, "502") != null); // ...then failed closed
+	try t.expect(std.ascii.indexOfIgnoreCase(run.response, "X-Cogbox-Deny: response_too_large") != null);
+	// the oversize (unprojected) body was NEVER relayed -- no secret on the wire
+	try t.expect(std.mem.indexOf(u8, run.response, "GR1348secret") == null);
+	try t.expect(std.mem.indexOf(u8, run.response, "runners_token") == null);
+	try t.expect(std.mem.indexOf(u8, run.audit, "reason=response_too_large") != null);
+}
+
+test "e2e: a non-200 api-project response is relayed unchanged (the projection is success-only)" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try instanceConf(gpa, h.cred_path, "[\"git-read\"]");
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+
+	// a 404 error body carries no project secret and must pass through verbatim
+	const err_body = "{\"message\":\"404 Project Not Found\"}";
+	const script = try jsonResponse(gpa, "404 Not Found", err_body);
+	defer gpa.free(script);
+	var fake = upstream.FakeTransport.init(gpa, &.{script});
+	defer fake.deinit();
+
+	var run = try serve(gpa, h.io, gen, fake.t(), gitReq("/api/v4/projects/1234"));
+	defer run.deinit(gpa);
+	try t.expectEqual(@as(usize, 1), fake.calls);
+	try t.expect(std.mem.indexOf(u8, run.response, "404 Not Found") != null);
+	// relayed unchanged: the exact upstream body, not a projected object
+	try t.expectEqualStrings(err_body, httpBody(run.response));
+	try t.expectEqual(err_body.len, contentLength(run.response).?);
+}
+
+test "e2e: the group-projects LIST route is NOT projected -- its body relays verbatim" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	// a namespace git-read grant authorizes the enumeration LIST
+	const cj = try std.fmt.allocPrint(gpa,
+		\\{{"version":1,"providers":[{{"host":"git.example.com","plugin":"gitlab","scheme":"http","insecure":false,
+		\\"cred_file":"{s}","cred_format":"raw","git_user":"oauth2",
+		\\"grants":[{{"id":"gg-ns","scope":"namespace","repo":"acme/*","prefix":"/acme/","caps":["git-read"]}}]}}]}}
+	, .{h.cred_path});
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+
+	// GitLab's simple=true already stripped this list upstream; the fake carries a
+	// field that api-project WOULD strip, to prove no proxy-side projection runs
+	// on the list route -- the body must relay byte for byte.
+	const list_body = "[{\"id\":1,\"path_with_namespace\":\"acme/a\",\"_links\":{\"self\":\"http://x\"}}]";
+	const script = try jsonResponse(gpa, "200 OK", list_body);
+	defer gpa.free(script);
+	var fake = upstream.FakeTransport.init(gpa, &.{script});
+	defer fake.deinit();
+
+	var run = try serve(gpa, h.io, gen, fake.t(), gitReq("/api/v4/groups/acme/projects"));
+	defer run.deinit(gpa);
+	try t.expectEqual(@as(usize, 1), fake.calls);
+	try t.expect(std.mem.indexOf(u8, run.response, "200 OK") != null);
+	try t.expectEqualStrings(list_body, httpBody(run.response)); // verbatim, unprojected
+	try t.expectEqual(list_body.len, contentLength(run.response).?);
+	try t.expect(std.mem.indexOf(u8, run.audit, "route=api-group-projects") != null);
+}
+
+test "e2e: api-project forces identity + full response -- accept-encoding and range are NOT forwarded (projection soundness)" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try instanceConf(gpa, h.cred_path, "[\"git-read\"]");
+	defer gpa.free(cj);
+
+	// A guest that advertises gzip and asks for a byte range: forwarding either
+	// to GitLab would break or bypass the projection -- a gzip 200 body fails the
+	// JSON parse (502), and a 206 Partial Content falls outside the status==200
+	// guard and would stream the raw, secret-bearing partial body. On api-project
+	// both must be stripped so the origin returns a full, identity-encoded 200.
+	const proj_req = "GET /api/v4/projects/1234 HTTP/1.1\r\n" ++
+		"Host: git.example.com\r\n" ++
+		"X-Cogbox-Host: git.example.com\r\n" ++
+		"X-Cogbox-Vetted: 10.0.0.5:443\r\n" ++
+		"Accept: */*\r\n" ++
+		"Accept-Encoding: gzip, deflate\r\n" ++
+		"Range: bytes=0-100\r\n\r\n";
+	{
+		const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+		const script = try jsonResponse(gpa, "200 OK", full_project_json);
+		defer gpa.free(script);
+		var fake = upstream.FakeTransport.init(gpa, &.{script});
+		defer fake.deinit();
+		var run = try serve(gpa, h.io, gen, fake.t(), proj_req);
+		defer run.deinit(gpa);
+		try t.expectEqual(@as(usize, 1), fake.calls);
+		const up_req = fake.captured.items[0];
+		// neither guest-forwarded header reached the origin on this route
+		try t.expect(std.ascii.indexOfIgnoreCase(up_req, "accept-encoding:") == null);
+		try t.expect(std.ascii.indexOfIgnoreCase(up_req, "range:") == null);
+		// the projection still ran (secret stripped, allowlist kept)
+		try assertProjected(gpa, run.response);
+	}
+
+	// The strip is route-scoped: a NON-project route (api-archive, which streams)
+	// still forwards both headers unchanged.
+	{
+		const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+		const arch_req = "GET /api/v4/projects/1234/repository/archive.tar.gz HTTP/1.1\r\n" ++
+			"Host: git.example.com\r\n" ++
+			"X-Cogbox-Host: git.example.com\r\n" ++
+			"X-Cogbox-Vetted: 10.0.0.5:443\r\n" ++
+			"Accept: */*\r\n" ++
+			"Accept-Encoding: gzip, deflate\r\n" ++
+			"Range: bytes=0-100\r\n\r\n";
+		var fake = upstream.FakeTransport.init(gpa, &.{"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nPACK"});
+		defer fake.deinit();
+		var run = try serve(gpa, h.io, gen, fake.t(), arch_req);
+		defer run.deinit(gpa);
+		try t.expectEqual(@as(usize, 1), fake.calls);
+		const up_req = fake.captured.items[0];
+		try t.expect(std.ascii.indexOfIgnoreCase(up_req, "accept-encoding:") != null);
+		try t.expect(std.ascii.indexOfIgnoreCase(up_req, "range:") != null);
+	}
+}
+
+test "e2e: api-project drops a non-object namespace and a pathologically deep field (allowlist posture, no re-emit overflow)" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try instanceConf(gpa, h.cred_path, "[\"git-read\"]");
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+
+	// A hostile/buggy upstream: `namespace` is an ARRAY (not an object) hiding a
+	// secret, and `tag_list` is nested far deeper than any real value. The
+	// projection must DROP both -- the array namespace whole (never passed
+	// through) and the deep field (jw.write recurses natively per level, so it is
+	// dropped rather than re-serialized) -- while keeping the flat allowlist
+	// fields, and never crash.
+	const depth = 40; // > the re-emit depth bound
+	var deep_buf: [2 * depth]u8 = undefined;
+	@memset(deep_buf[0..depth], '[');
+	@memset(deep_buf[depth..], ']');
+	const body = try std.fmt.allocPrint(gpa, "{{\"id\":7,\"path_with_namespace\":\"grp/proj\",\"default_branch\":\"main\"," ++
+		"\"http_url_to_repo\":\"http://git.example.com/grp/proj.git\",\"visibility\":\"private\"," ++
+		"\"tag_list\":{s},\"namespace\":[{{\"runners_token\":\"ARRSECRET\"}}]}}", .{deep_buf[0..]});
+	defer gpa.free(body);
+	const script = try jsonResponse(gpa, "200 OK", body);
+	defer gpa.free(script);
+	var fake = upstream.FakeTransport.init(gpa, &.{script});
+	defer fake.deinit();
+
+	var run = try serve(gpa, h.io, gen, fake.t(), gitReq("/api/v4/projects/1234"));
+	defer run.deinit(gpa);
+	try t.expectEqual(@as(usize, 1), fake.calls);
+	try t.expect(std.mem.indexOf(u8, run.response, "200 OK") != null);
+	const rbody = httpBody(run.response);
+	// the array namespace was dropped whole -- neither the key nor its secret
+	// (the substring "namespace" still rides in the kept `path_with_namespace`,
+	// so match the quoted namespace field key, as assertProjected does)
+	try t.expect(std.mem.indexOf(u8, rbody, "\"namespace\":") == null);
+	try t.expect(std.mem.indexOf(u8, rbody, "ARRSECRET") == null);
+	// the deep field was dropped (and the re-emit did not overflow)
+	try t.expect(std.mem.indexOf(u8, rbody, "tag_list") == null);
+	// the flat allowlist fields survive, and it is still a valid JSON object
+	for ([_][]const u8{ "path_with_namespace", "default_branch", "http_url_to_repo", "visibility" }) |k| {
+		try t.expect(std.mem.indexOf(u8, rbody, k) != null);
+	}
+	try t.expectEqual(rbody.len, contentLength(run.response).?);
+	const parsed = try std.json.parseFromSlice(std.json.Value, gpa, rbody, .{});
+	defer parsed.deinit();
+	try t.expect(parsed.value == .object);
+}

@@ -244,6 +244,10 @@ fn apiRoute(id: []const u8, params: plugin_mod.Params, stream: bool) plugin_mod.
 		.method_class = .read, // authorize decides per method; the class is informational for API routes
 		.params = params,
 		.stream = stream,
+		// api-project alone gets the response-body projection: its single-project
+		// GET returns the FULL project object (runners_token et al.), which
+		// `simple=true` does NOT strip on a single-project GET.
+		.project_response = std.mem.eql(u8, id, rid_api_project),
 	};
 }
 
@@ -665,12 +669,20 @@ fn upstream(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const p
 			try appendEncoded(out, seg);
 		}
 	}
-	// The query is route-specific. The two READ routes FORCE `simple=true`:
-	// bodies stream unfiltered (main.zig streamResponse; the plugin never sees
-	// them), and only the non-simple project/group representation carries
-	// `runners_token` and other secret fields -- so `simple=true` is the single
-	// place that leak is closed, and a client `simple=false` must never override
-	// it. The group-enumeration route additionally forces `include_subgroups=true`
+	// The query is route-specific. Both READ routes FORCE `simple=true`, but it
+	// means DIFFERENT things on the two:
+	//   - api-group-projects (a LIST): GitLab honours `simple` on list
+	//     endpoints, so `simple=true` is what strips `runners_token` and the
+	//     other secret fields from every listed project, and a client
+	//     `simple=false` must never override it.
+	//   - api-project (a single-project GET): GitLab does NOT honour `simple`
+	//     here -- a single-project GET returns the FULL object regardless -- so
+	//     `simple=true` is INERT for the leak and kept only as belt-and-braces.
+	//     The runners_token leak on this route is closed proxy-side by the
+	//     RESPONSE-BODY projection (route.project_response -> main.zig
+	//     projectProjectResponse), not by this query, and that same projection
+	//     closes the pre-existing issues/mr residual once rolled.
+	// The group-enumeration route additionally forces `include_subgroups=true`
 	// and drops everything but a small pagination/search allowlist (so a client
 	// cannot append an order_by/owned/... that changes the response shape).
 	// issues/mr/archive/user/version keep the blanket pass-through (v1's one
@@ -1150,9 +1162,10 @@ test "gitlab: the two read routes FORCE simple=true in the constructed upstream 
 	try t.expectEqualStrings("/api/v4/groups/grp%2Fsub/projects", up.path());
 	try t.expectEqualStrings("simple=true&include_subgroups=true&per_page=100", up.query());
 
-	// concrete project metadata: simple forced, a client simple=false dropped, an
-	// unrelated statistics=true kept -- this is the S9 runners_token residual on
-	// the existing api-project route, now closed unconditionally.
+	// concrete project metadata: simple forced (belt-and-braces only -- GitLab
+	// does NOT honour `simple` on a single-project GET, so the runners_token leak
+	// here is closed by the response projection, not this query), a client
+	// simple=false dropped, an unrelated statistics=true kept.
 	const q2 = [_]canon.QueryParam{
 		.{ .key = "simple", .value_raw = "false", .raw = "simple=false" },
 		.{ .key = "statistics", .value_raw = "true", .raw = "statistics=true" },

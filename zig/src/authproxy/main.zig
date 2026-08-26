@@ -488,6 +488,21 @@ fn handleRequest(ctx: *Context, request: *std.http.Server.Request, sock: ?c_int)
 		// otherwise keep reading through (a use-after-free the moment a later
 		// refactor lets the block outlive this frame).
 		auth_headers.copyFrom(&inbound);
+		// The projection re-emits a FRESH 200 body parsed from the origin's, so
+		// two guest-forwarded headers must not reach the origin on this route:
+		//   - accept-encoding: a gzip 200 body would fail the JSON parse (502
+		//     bad_upstream_json), breaking the route for clients that default to
+		//     gzip -- so force identity by dropping it.
+		//   - range: a 206 Partial Content falls outside the status==200
+		//     projection guard and would stream the raw, secret-bearing partial
+		//     body -- so forbid a partial response by construction (never trust
+		//     the origin to ignore a guest-controlled Range).
+		// Only api-project sets project_response; every other route keeps
+		// forwarding both unchanged.
+		if (route.project_response) {
+			auth_headers.remove("accept-encoding");
+			auth_headers.remove("range");
+		}
 		entry.policy.vtable.authenticate(entry.policy.ctx, &route, &mut_req, &cred, auth_headers) catch |err| {
 			switch (err) {
 				error.CredentialUnavailable => {
@@ -526,6 +541,39 @@ fn handleRequest(ctx: *Context, request: *std.http.Server.Request, sock: ?c_int)
 	_ = ctx.counters.allow.fetchAdd(1, .monotonic);
 	outcome.status = exchange.status;
 	outcome.bytes_in = uio.body_bytes;
+
+	// The api-project response-body projection (route.project_response, set only
+	// on that route): a single-project GET returns GitLab's FULL project object,
+	// and `simple=true` does NOT strip runners_token (et al.) on a single-project
+	// GET -- GitLab honours `simple` only on LIST endpoints. So the SUCCESS body
+	// is read into a bounded buffer and re-emitted as the ProjectSimpleEntity
+	// allowlist, fail-closed (502, never the raw body) over the cap or on
+	// unparseable JSON. A non-200 (403/404) carries no project secret and is
+	// relayed unchanged; a HEAD / 204 / 304 carries no body to project. The
+	// projected bytes live in `proj_slice` (freed after the relay completes,
+	// which is before this frame's defers run) behind `proj_reader`; they never
+	// carry the credential, so they stay outside the scratch block's scrub.
+	var proj_reader: std.Io.Reader = undefined;
+	var proj_slice: ?[]u8 = null;
+	defer if (proj_slice) |p| ctx.gpa.free(p);
+	if (route.project_response and exchange.status == 200 and exchange.body != null) {
+		const slice = projectProjectResponse(ctx.gpa, exchange) catch |err| {
+			const reason: []const u8 = switch (err) {
+				error.ResponseTooLarge => "response_too_large",
+				error.BadUpstreamJson => "bad_upstream_json",
+				error.UpstreamRead => "upstream-read",
+				error.OutOfMemory => "oom",
+			};
+			_ = ctx.counters.upstream_err.fetchAdd(1, .monotonic);
+			deny2(ctx, request, &m, checked.host, &outcome, reason, 502);
+			return false;
+		};
+		proj_slice = slice;
+		proj_reader = std.Io.Reader.fixed(slice);
+		exchange.body = &proj_reader;
+		exchange.content_length = slice.len; // streamResponse re-frames Content-Length
+		exchange.chunked = false;
+	}
 	return streamResponse(ctx, request, &m, checked.host, &outcome, exchange, deadline, body_drained, sock);
 }
 
@@ -659,6 +707,165 @@ fn streamResponse(ctx: *Context, request: *std.http.Server.Request, m: *const Re
 fn abortRelay(request: *std.http.Server.Request, bw: *std.http.BodyWriter) void {
 	bw.writer.flush() catch {};
 	request.server.out.flush() catch {};
+}
+
+/// The api-project response projection cap: a single-project JSON is a few KB,
+/// so 256 KiB is generous; a body larger than this is refused (fail closed),
+/// never streamed unprojected. Read into an allocation, not the stack.
+pub const project_response_cap: usize = 256 * 1024;
+
+const ProjectionError = error{
+	/// The 200 body exceeded project_response_cap -> 502, never a partial or
+	/// unprojected relay.
+	ResponseTooLarge,
+	/// The body did not parse as a JSON object -> 502, never the raw body.
+	BadUpstreamJson,
+	/// The upstream read failed mid-body (before any response head is out) -> 502.
+	UpstreamRead,
+	OutOfMemory,
+};
+
+/// The GitLab 18.5 ProjectSimpleEntity allowlist -- the safe subset an agent
+/// needs, with NO runners_token, import_url, permissions, _links or CI/registry
+/// config. A VERSIONED artifact, like the route table: re-review it against the
+/// deployment's GitLab on each release, and err toward FEWER fields (an omitted
+/// field just isn't shown; a wrongly-included one could be a future leak). An
+/// ALLOWLIST, not a denylist, so a new secret field GitLab adds is dropped by
+/// default.
+const project_simple_fields = [_][]const u8{
+	"id",
+	"description",
+	"name",
+	"name_with_namespace",
+	"path",
+	"path_with_namespace",
+	"created_at",
+	"default_branch",
+	"tag_list",
+	"topics",
+	"ssh_url_to_repo",
+	"http_url_to_repo",
+	"web_url",
+	"readme_url",
+	"avatar_url",
+	"forks_count",
+	"star_count",
+	"last_activity_at",
+	"visibility",
+	"archived",
+	"empty_repo",
+	"namespace",
+};
+
+/// The nested `namespace` object's own allowlist (GitLab's namespace simple form
+/// carries no secret, but it is allowlisted rather than passed through whole, so
+/// a future secret field there is dropped too).
+const project_namespace_fields = [_][]const u8{
+	"id",
+	"name",
+	"path",
+	"kind",
+	"full_path",
+	"parent_id",
+	"avatar_url",
+	"web_url",
+};
+
+/// Read the exchange's 200 body into a bounded buffer, parse it, and re-emit a
+/// NEW object carrying only the ProjectSimpleEntity allowlist. Returns the
+/// projected bytes (caller-owned; the caller frees them after the relay). The
+/// read buffer and parse arena are internal and released here; none of them
+/// carries the credential.
+fn projectProjectResponse(gpa: std.mem.Allocator, ex: *upstream.Exchange) ProjectionError![]u8 {
+	const body_reader = ex.body.?;
+	// .limited(cap + 1): allocRemaining returns StreamTooLong once it has read
+	// `limit` bytes, so cap+1 admits a body of exactly the cap and refuses only a
+	// strictly larger one.
+	const body = body_reader.allocRemaining(gpa, .limited(project_response_cap + 1)) catch |err| switch (err) {
+		error.StreamTooLong => return error.ResponseTooLarge,
+		error.ReadFailed => return error.UpstreamRead,
+		error.OutOfMemory => return error.OutOfMemory,
+	};
+	defer gpa.free(body);
+
+	var arena = std.heap.ArenaAllocator.init(gpa);
+	defer arena.deinit();
+	const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch |err| switch (err) {
+		error.OutOfMemory => return error.OutOfMemory,
+		else => return error.BadUpstreamJson,
+	};
+	if (root != .object) return error.BadUpstreamJson;
+
+	var out: std.Io.Writer.Allocating = .init(gpa);
+	errdefer out.deinit();
+	writeProjectSimple(&out.writer, root.object) catch |err| switch (err) {
+		// The only failure of an Allocating writer is OOM.
+		error.WriteFailed => return error.OutOfMemory,
+	};
+	return out.toOwnedSlice();
+}
+
+/// The re-emit recursion bound. `std.json.Stringify.write` (and `Value`'s own
+/// `jsonStringify`) recurses NATIVELY once per nesting level, while std's parse
+/// is iterative (a heap BitStack) -- so a value nested deeper than any real
+/// project field is DROPPED by writeProjectSimple rather than re-serialized,
+/// which on a compromised/buggy upstream's deeply-nested response would risk a
+/// native-stack overflow. 32 is far above a real ProjectSimpleEntity (an object
+/// one or two levels deep; tag_list/topics are one-level string arrays).
+const max_reemit_depth: usize = 32;
+
+/// Whether `v` nests no deeper than `budget` levels. Recurses at most `budget`
+/// frames (it decrements on every array/object descent and stops at 0), so the
+/// CHECK is itself overflow-safe on arbitrarily deep input.
+fn depthOk(v: std.json.Value, budget: usize) bool {
+	if (budget == 0) return false;
+	switch (v) {
+		.array => |a| {
+			for (a.items) |item| {
+				if (!depthOk(item, budget - 1)) return false;
+			}
+		},
+		.object => |o| {
+			var it = o.iterator();
+			while (it.next()) |e| {
+				if (!depthOk(e.value_ptr.*, budget - 1)) return false;
+			}
+		},
+		else => {},
+	}
+	return true;
+}
+
+/// Emit `{ <allowlisted project fields> }`, projecting the nested `namespace`
+/// object through its own allowlist. Absent fields are simply skipped -- the
+/// projection is future-proof against new (possibly secret) fields by
+/// construction.
+fn writeProjectSimple(w: *std.Io.Writer, obj: std.json.ObjectMap) std.Io.Writer.Error!void {
+	var jw: std.json.Stringify = .{ .writer = w };
+	try jw.beginObject();
+	for (project_simple_fields) |key| {
+		const v = obj.get(key) orelse continue;
+		// A non-object `namespace` (a hostile or future upstream returning an
+		// array or a scalar) is DROPPED, not passed through whole -- the same
+		// "emit only what the allowlist covers" rule the field list itself is.
+		if (std.mem.eql(u8, key, "namespace") and v != .object) continue;
+		// Bound the re-emit recursion (see max_reemit_depth): a pathologically
+		// deep value is dropped rather than re-serialized.
+		if (!depthOk(v, max_reemit_depth)) continue;
+		try jw.objectField(key);
+		if (std.mem.eql(u8, key, "namespace")) {
+			try jw.beginObject();
+			for (project_namespace_fields) |nk| {
+				const nv = v.object.get(nk) orelse continue;
+				try jw.objectField(nk);
+				try jw.write(nv);
+			}
+			try jw.endObject();
+		} else {
+			try jw.write(v);
+		}
+	}
+	try jw.endObject();
 }
 
 /// C.4: the total relay deadline -- none on a stream route, now + 60s on an

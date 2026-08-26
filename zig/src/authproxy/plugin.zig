@@ -134,6 +134,13 @@ pub const Route = struct {
 	/// Body-bearing bulk route (git pack, archive): no total response
 	/// deadline, idle timeout only.
 	stream: bool,
+	/// The core projects this route's SUCCESS response body through the
+	/// ProjectSimpleEntity allowlist before relaying it (main.zig
+	/// projectProjectResponse): a single-project GET returns GitLab's FULL
+	/// project object -- `runners_token` and other secret fields -- which
+	/// `simple=true` does NOT strip on a single-project GET. Set TRUE only on
+	/// api-project; every other route streams its body unfiltered.
+	project_response: bool = false,
 };
 
 pub const DenyReason = enum {
@@ -228,6 +235,28 @@ pub const HeaderSet = struct {
 			if (std.ascii.eqlIgnoreCase(self.names[i], name)) return self.values[i];
 		}
 		return null;
+	}
+
+	/// Drop the FIRST entry named `name` (case-insensitive), shifting the tail
+	/// down; a no-op if absent. Used to strip a forwarded request header the
+	/// core must not send on a particular route (the api-project projection
+	/// removes `range`/`accept-encoding` so the origin returns a full,
+	/// identity-encoded 200 the projection can parse and never a 206 it would
+	/// skip). The dropped value's bytes stay in `storage` (unreferenced); a set
+	/// later scrubbed by `zeroize` zeroes them with the rest.
+	pub fn remove(self: *HeaderSet, name: []const u8) void {
+		var i: usize = 0;
+		while (i < self.len) : (i += 1) {
+			if (std.ascii.eqlIgnoreCase(self.names[i], name)) {
+				var j = i;
+				while (j + 1 < self.len) : (j += 1) {
+					self.names[j] = self.names[j + 1];
+					self.values[j] = self.values[j + 1];
+				}
+				self.len -= 1;
+				return;
+			}
+		}
 	}
 
 	/// Zero the storage (a set that carried an Authorization value is scrubbed
@@ -388,6 +417,27 @@ test "HeaderSet: copyFrom re-homes the slices; struct assignment does not (N4)" 
 	again.copyFrom(&by_copy);
 	try t.expect(again.get("stale") == null);
 	try t.expectEqual(@as(usize, 3), again.len);
+}
+
+test "HeaderSet: remove drops the first match, shifts the tail, is a no-op when absent (api-project strip)" {
+	var h: HeaderSet = .{};
+	try h.append("accept", "*/*");
+	try h.append("accept-encoding", "gzip");
+	try h.append("range", "bytes=0-1");
+	try h.append("user-agent", "git/2.43");
+	try t.expectEqual(@as(usize, 4), h.len);
+	h.remove("Accept-Encoding"); // case-insensitive
+	try t.expectEqual(@as(usize, 3), h.len);
+	try t.expect(h.get("accept-encoding") == null);
+	// order preserved, the tail shifted down over the removed slot
+	try t.expectEqualStrings("accept", h.names[0]);
+	try t.expectEqualStrings("range", h.names[1]);
+	try t.expectEqualStrings("user-agent", h.names[2]);
+	// removing an absent name is a no-op, the remaining values intact
+	h.remove("if-none-match");
+	try t.expectEqual(@as(usize, 3), h.len);
+	try t.expectEqualStrings("bytes=0-1", h.get("range").?);
+	try t.expectEqualStrings("git/2.43", h.get("user-agent").?);
 }
 
 test "Upstream: fixed-buffer append with overflow refusal" {
