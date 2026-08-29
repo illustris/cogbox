@@ -238,7 +238,7 @@ VM -- no rebuild needed.
 | `vcpu` | int | 16 | Virtual CPUs |
 | `mem` | int | 32768 | RAM in megabytes |
 | `sshPort` | int | 2222 | Host port forwarded to guest SSH (22) |
-| `httpPort` | int | 8080 | Host port forwarded to guest 8080 |
+| `httpPort` | int | 8080 | Host port forwarded to guest 8080. Guest **8080 is reserved for the app relay** (the `app-relay` plugin listens there); bind sandbox services to another port. |
 | `overlaySize` | string | `128M` | Persistent harness overlay image |
 | `storeOverlaySize` | string | absent | Optional override for the writable nix store tmpfs. Absent means "whatever the guest declares" (half of RAM). It used to be seeded as `16G`, which is more than the guest's entire RAM, so a large in-guest `nix build` OOM-killed the guest instead of failing with `ENOSPC`. |
 | `bindAddr` | string | `127.0.0.1` | Host bind address for port forwards |
@@ -307,7 +307,7 @@ variables -- see [Internals](docs/internals.md#host-side-path-overrides).
 | Writable nix store | tmpfs overlay, half of RAM |
 | Harness overlay (shared) | 128 MB ext4 image, per-harness subdirs |
 | SSH | 127.0.0.1:2222 -> 22 |
-| HTTP | 127.0.0.1:8080 -> 8080 |
+| HTTP | 127.0.0.1:8080 -> 8080 (guest 8080 is reserved for the `app-relay` plugin) |
 | Network | rules (private/bogon denied, public allowed) |
 | Docker | enabled |
 | Storage profile | `workstation` (see below) |
