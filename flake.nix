@@ -3405,6 +3405,37 @@
 									fi
 									${pkgs.coreutils}/bin/truncate -s "$size" "$img"
 									${pkgs.e2fsprogs}/bin/mkfs.ext4 -q -F "$img"
+								else
+									# Valid superblock, but a host crash with the VM running
+									# can still leave corrupt INTERNAL metadata (bitmaps,
+									# extent/dir checksums) that journal replay does not fix;
+									# the harness-rw mount then fails and the guest drops to
+									# emergency.target with no sshd (observed 3x). The
+									# reformat arm above correctly skips this, so fsck before
+									# the mount. Preen (-fp) no-ops a clean image and fixes
+									# mild drift (exit 0/1/2); it exits >=4 on anything
+									# needing a real decision -- which the observed
+									# corruptions hit -- so then repair with -fy twice (the
+									# second pass settles the journal replay) and gate on a
+									# read-only -fn. The exit 1 is diagnostic only: the mount
+									# merely Wants= this unit, so the kernel mount attempt
+									# still decides the boot either way. -fy can drop mangled
+									# files into lost+found, and the overlay holds real
+									# in-guest harness state (transcripts, credentials) --
+									# accepted, since the reformat arm already takes a full
+									# wipe of the same image as the harsher fallback.
+									rc=0
+									${pkgs.e2fsprogs}/bin/e2fsck -fp "$img" || rc=$?
+									if [ "$rc" -ge 4 ]; then
+										echo "harness-overlay: preen declined $img (exit $rc); escalating to full repair" >&2
+										${pkgs.e2fsprogs}/bin/e2fsck -fy "$img" || true
+										${pkgs.e2fsprogs}/bin/e2fsck -fy "$img" || true
+										if ! ${pkgs.e2fsprogs}/bin/e2fsck -fn "$img" >/dev/null 2>&1; then
+											echo "harness-overlay: $img still inconsistent after auto-repair; manual e2fsck required" >&2
+											exit 1
+										fi
+										echo "harness-overlay: auto-repaired $img" >&2
+									fi
 								fi
 							'';
 						};
