@@ -71,6 +71,13 @@ refuse	/a/x%0D%0Ay/b	an embedded CRLF
 refuse	/a/%09/b	a tab is a C0 control
 refuse	/a/%C2%85/b	NEL is a C1 control
 refuse	/a/%zz/b	a malformed percent-escape
+# ----- refuse: an encoded dot component under each v2 prefix -----
+# The new collection prefixes buy no new escape: an encoded `..` inside ANY
+# segment is still a dot component and the canonicalizer refuses it outright,
+# before classify ever sees which collection it sat under.
+refuse	/api/v4/projects/1234/pipelines%2F..	a dot component welded onto the pipelines collection
+refuse	/api/v4/projects/1234/repository/files/..%2Fx	a dot component inside a repository file path
+refuse	/api/v4/projects/1234/wikis/a%2F..%2F..%2Faccess_tokens	a wiki slug laundering a walk to the mint surface
 # ----- refuse: query VALUES (re-emitted raw into the constructed upstream line) -----
 refuse	/api/v4/projects/1234/issues?a=b%0Dc	a query value decoding to a CR (header injection at the origin)
 refuse	/api/v4/projects/1234/issues?a=b%0Ac	...or a LF
@@ -96,7 +103,7 @@ route	GET	/api/v4/projects/1234/issues	api-issues	collection
 route	PUT	/api/v4/projects/1234/issues/9	api-issues	subtree
 route	GET	/api/v4/projects/1234/issues/9/notes	api-issues	deeper subtree
 route	POST	/api/v4/projects/1234/merge_requests	api-mr	collection
-route	GET	/api/v4/projects/1234/merge_requests/5/approve	api-mr	subtree still covers approve (parity)
+route	GET	/api/v4/projects/1234/merge_requests/5/approve	api-mr-merge	v2: approve is the MERGE class, not ordinary mr
 route	GET	/api/v4/projects/1234/repository/archive.tar.gz	api-archive	closed ext
 route	HEAD	/api/v4/projects/1234/repository/archive	api-archive	bare archive
 route	GET	/api/v4/projects/grp%2Fproj/repository/archive.zip	api-archive	path-form id
@@ -145,6 +152,50 @@ route	GET	/_cogbox	-	the _cogbox node itself is not a route
 route	GET	/_cogbox/other	-	an unknown _cogbox path routes NOWHERE (never upstream)
 route	GET	/_cogbox/grants/extra	-	a deeper path is not the grants route
 
+# ----- v2 route shapes: the merge class, pipelines/jobs, repository read, wikis ---
+# classify stays method-agnostic everywhere (authorize owns the clamps), so a
+# row here says only "which capability question does this path ask".
+route	PUT	/api/v4/projects/1234/merge_requests/5/merge	api-mr-merge	the merge class proper
+route	POST	/api/v4/projects/1234/merge_requests/5/rebase	api-mr-merge	rebase is a merge-class action
+route	POST	/api/v4/projects/1234/merge_requests/5/cancel_merge_when_pipeline_succeeds	api-mr-merge	the long tail
+route	GET	/api/v4/projects/1234/merge_requests/5/approvals	api-mr-merge	reading it is still this route; mr:read governs the GET
+route	GET	/api/v4/projects/1234/merge_requests/5/approvals/x	api-mr-merge	a deeper path under a merge-class tail stays merge-class
+route	POST	/api/v4/projects/1234/merge_requests/5/approval_rules	api-mr-merge	approval_rules is the same protection as approvals through the current API
+route	PUT	/api/v4/projects/1234/merge_requests/5/approval_rules/7	api-mr-merge	...and one rule under it
+route	GET	/api/v4/projects/1234/merge_requests/5/approval_rules	api-mr-merge	reading the rules is this route too; mr:read governs the GET
+route	POST	/api/v4/projects/1234/merge_requests/5/notes	api-mr	a note is ordinary mr, not the merge class
+route	GET	/api/v4/projects/1234/merge_requests/5/changes	api-mr	nor is a diff
+route	GET	/api/v4/projects/1234/pipelines	api-pipelines	collection
+route	GET	/api/v4/projects/1234/pipelines/9	api-pipelines	one pipeline
+route	POST	/api/v4/projects/1234/pipelines/9/retry	api-pipelines	the write tail (the clamp is authorize's)
+route	GET	/api/v4/projects/1234/pipelines/9/variables	-	a pipeline's variables are a NAMED no_route
+route	GET	/api/v4/projects/1234/pipelines/9/variables/x	-	...and so is anything under them
+route	POST	/api/v4/projects/1234/pipeline	api-pipeline-trigger	the trigger leaf
+route	GET	/api/v4/projects/1234/pipeline/9	-	the trigger is a LEAF: it has no subtree
+route	GET	/api/v4/projects/1234/pipeline_schedules	-	a near-miss of the trigger leaf routes NOWHERE
+route	GET	/api/v4/projects/1234/jobs	api-jobs	collection
+route	GET	/api/v4/projects/1234/jobs/7/trace	api-jobs	the trace subtree
+route	GET	/api/v4/projects/1234/jobs/7/artifacts	api-jobs	artifacts ride the read half
+route	POST	/api/v4/projects/1234/jobs/7/erase	api-jobs	classified; the write-tail clamp is what refuses it
+route	GET	/api/v4/projects/1234/repository/tree	api-repo	a read collection
+route	GET	/api/v4/projects/1234/repository/commits/abc123	api-repo	commits, deeper
+route	GET	/api/v4/projects/1234/repository/files/src%2Fmain.go/raw	api-repo	an encoded file path is ONE segment
+route	POST	/api/v4/projects/1234/repository/commits	api-repo	classified; the GET/HEAD clamp is what makes repository writes unroutable
+route	GET	/api/v4/projects/1234/repository	-	the repository node itself is not a route
+route	GET	/api/v4/projects/1234/repository/submodules/x	-	outside the closed collection set (a write surface)
+route	GET	/api/v4/projects/1234/wiki	-	the collection is `wikis`; a near-miss routes NOWHERE
+route	GET	/api/v4/projects/1234/wikis	api-wiki	collection
+route	PUT	/api/v4/projects/1234/wikis/home	api-wiki	one page
+route	POST	/api/v4/projects/1234/wikis/attachments	api-wiki	the attachment upload
+route	DELETE	/api/v4/projects/1234/wikis/home	api-wiki	classify is method-agnostic; authorize clamps DELETE
+# the new prefixes are not new escape hatches: an id that merely LOOKS like a
+# collection cannot absorb a minting tail (the %2F is a typed fact INSIDE the id)
+route	GET	/api/v4/projects/grp%2Fpipelines/access_tokens	-	the pipelines-named id twin
+route	GET	/api/v4/projects/grp%2Fjobs/deploy_keys	-	the jobs twin
+route	GET	/api/v4/projects/grp%2Fwikis/access_tokens	-	the wikis twin
+route	GET	/api/v4/projects/grp%2Frepository/access_tokens	-	the repository twin
+route	GET	/api/v4/projects/1234%2Fpipelines/access_tokens	-	the all-digit-namespace twin
+
 # ================= authz: classify + authorize under a fixture ==================
 # fixtures (defined in route_vectors_test.zig):
 #   full        project grp/proj#1234 [git-read,git-write,issues]; namespace
@@ -154,6 +205,14 @@ route	GET	/_cogbox/grants/extra	-	a deeper path is not the grants route
 #   issues-only instance [issues]
 #   ns-mr       namespace /grp/sub/ [git-read,mr] projects{42,77}  (NO instance grant)
 #   proj-issues project grp/proj#1234 [issues]            (NO instance grant)
+#   -- v2, one cap half per fixture --
+#   v2-issues-ro    instance [issues:read]
+#   v2-mr-nomerge   instance [mr:read,mr:write]              (NO mr:merge)
+#   v2-pipelines-ro instance [pipelines:read]
+#   v2-pipelines-rw instance [pipelines:read,pipelines:write]
+#   v2-repo         project grp/proj#1234 [repo:read]        (NO git-read)
+#   v2-wiki-rw      project grp/proj#1234 [wiki:read,wiki:write]
+#   v1-coarse       instance [issues,mr]                     (the LEGACY dialect)
 
 # --- the git smart-HTTP tier: cap + scope ---
 authz	allow	full	GET	/grp/proj.git/info/refs?service=git-upload-pack	git-read on the concrete project
@@ -223,6 +282,77 @@ authz	allow	inst-read	HEAD	/_cogbox/grants	HEAD too, under any fixture
 authz	allow	proj-issues	GET	/_cogbox/grants	allowed with no instance grant (it only reflects)
 authz	deny	full	POST	/_cogbox/grants	method_not_allowed: only GET/HEAD
 authz	deny	full	DELETE	/_cogbox/grants	method_not_allowed
+
+# --- v2: the read/write split, one row per half ---
+# The point of the split: a cap that could only be all-or-nothing under the
+# compiled-rule tier now denies its own other half.
+authz	allow	v2-issues-ro	GET	/api/v4/projects/1234/issues	issues:read reads the tracker
+authz	deny	v2-issues-ro	POST	/api/v4/projects/1234/issues	cap_missing: filing one needs issues:write
+authz	deny	v2-issues-ro	PUT	/api/v4/projects/1234/issues/9	cap_missing: PUT is a write whatever the depth
+authz	deny	v2-issues-ro	GET	/api/v4/projects/1234/merge_requests	cap_missing: issues:read is not mr:read
+authz	allow	v2-issues-ro	GET	/api/v4/user	the ambient two are reachable by ANY capability
+authz	allow	v2-mr-nomerge	POST	/api/v4/projects/1234/merge_requests/5/notes	mr:write comments
+authz	allow	v2-mr-nomerge	GET	/api/v4/projects/1234/merge_requests/5/approvals	mr:read READS the merge class
+authz	deny	v2-mr-nomerge	PUT	/api/v4/projects/1234/merge_requests/5/merge	cap_missing: merging needs mr:merge
+authz	deny	v2-mr-nomerge	POST	/api/v4/projects/1234/merge_requests/5/approve	cap_missing: approving is the merge class
+authz	deny	v2-mr-nomerge	PUT	/api/v4/projects/1234/merge_requests/5/approvals	cap_missing: WRITING the merge class needs mr:merge
+authz	deny	v2-mr-nomerge	POST	/api/v4/projects/1234/merge_requests/5/approval_rules	cap_missing: relaxing approvals_required through approval_rules is the merge class too
+authz	deny	v2-mr-nomerge	PUT	/api/v4/projects/1234/merge_requests/5/approval_rules/7	cap_missing: and one rule under it
+authz	allow	v2-mr-nomerge	GET	/api/v4/projects/1234/merge_requests/5/approval_rules	mr:read READS the merge class, rules included
+
+# --- v2: pipelines and jobs (one area, two caps), and the variables no_route ---
+authz	allow	v2-pipelines-ro	GET	/api/v4/projects/1234/pipelines	pipelines:read lists
+authz	allow	v2-pipelines-ro	GET	/api/v4/projects/1234/jobs/7/trace	a job trace is a pipelines read
+authz	deny	v2-pipelines-ro	POST	/api/v4/projects/1234/pipelines/9/retry	cap_missing: retry is a write
+authz	deny	v2-pipelines-ro	POST	/api/v4/projects/1234/pipeline	cap_missing: triggering is a write
+authz	deny	v2-pipelines-ro	GET	/api/v4/projects/1234/pipelines/9/variables	no_route: a pipeline's variables are never readable
+authz	allow	v2-pipelines-rw	POST	/api/v4/projects/1234/pipeline	pipelines:write triggers
+authz	allow	v2-pipelines-rw	POST	/api/v4/projects/1234/pipelines/9/retry	...and retries
+authz	allow	v2-pipelines-rw	POST	/api/v4/projects/1234/jobs/7/play	...and plays a manual job
+authz	deny	v2-pipelines-rw	POST	/api/v4/projects/1234/jobs/7/erase	method_not_allowed: erase destroys artifacts, outside the write set
+authz	deny	v2-pipelines-rw	POST	/api/v4/projects/1234/pipelines	method_not_allowed: creation goes through /pipeline, not the collection
+authz	deny	v2-pipelines-rw	DELETE	/api/v4/projects/1234/pipelines/9	method_not_allowed: DELETE is in no cap's set
+authz	deny	v2-pipelines-rw	GET	/api/v4/projects/1234/pipelines/9/variables	no_route even under a WRITE grant
+authz	deny	v2-pipelines-rw	GET	/api/v4/projects/1234/repository/tree	cap_missing: pipelines caps are not repo:read
+
+# --- v2: the repository READ API, and the write invariant ---
+authz	allow	v2-repo	GET	/api/v4/projects/1234/repository/tree	repo:read
+authz	allow	v2-repo	GET	/api/v4/projects/1234/repository/files/src%2Fmain.go/raw	an encoded file path stays ONE segment
+authz	allow	v2-repo	GET	/api/v4/projects/1234/repository/archive.tar.gz	archive rides repo:read as well as git-read
+authz	allow	v2-repo	GET	/api/v4/user	any capability reaches the ambient two
+authz	deny	v2-repo	POST	/api/v4/projects/1234/repository/commits	method_not_allowed: repository WRITES are unroutable (they would bypass push rules)
+authz	deny	v2-repo	PUT	/api/v4/projects/1234/repository/files/x	method_not_allowed: the file-write twin
+authz	deny	v2-repo	POST	/api/v4/projects/1234/repository/branches	method_not_allowed: branch creation goes through git push
+authz	deny	v2-repo	GET	/grp/proj.git/info/refs?service=git-upload-pack	cap_missing: repo:read is not a clone
+authz	deny	v2-repo	GET	/api/v4/projects/999/repository/tree	scope_mismatch: outside the concrete grant
+authz	deny	v2-repo	GET	/api/v4/projects/1234%2Fpipelines/repository/tree	scope_mismatch: a path-form id that merely CONTAINS a collection name
+
+# --- v2: wikis ---
+authz	allow	v2-wiki-rw	GET	/api/v4/projects/1234/wikis	wiki:read lists
+authz	allow	v2-wiki-rw	PUT	/api/v4/projects/1234/wikis/home	wiki:write edits
+authz	allow	v2-wiki-rw	POST	/api/v4/projects/1234/wikis/attachments	the attachment upload is a wiki write
+authz	allow	v2-wiki-rw	GET	/api/v4/projects/1234/wikis/home%2Fsub	an encoded slug stays ONE segment
+authz	deny	v2-wiki-rw	DELETE	/api/v4/projects/1234/wikis/home	method_not_allowed: DELETE is in no cap's set
+authz	deny	v2-wiki-rw	GET	/api/v4/projects/1234/repository/tree	cap_missing: wiki caps are not repo:read
+authz	deny	v2-wiki-rw	GET	/api/v4/projects/grp%2Fother/wikis	scope_mismatch: outside the concrete grant
+
+# --- the LEGACY dialect still expands (an unedited grant row must not lose reach) ---
+authz	allow	v1-coarse	GET	/api/v4/projects/1234/issues	`issues` expands to read+write
+authz	allow	v1-coarse	POST	/api/v4/projects/1234/issues	...both halves
+authz	allow	v1-coarse	PUT	/api/v4/projects/1234/merge_requests/5/merge	v1 `mr` INCLUDED approve/merge, so it expands to the triple
+authz	allow	v1-coarse	POST	/api/v4/projects/1234/merge_requests/5/notes	...and the ordinary write half
+authz	deny	v1-coarse	GET	/api/v4/projects/1234/pipelines	the coarse dialect never reached pipelines
+authz	deny	v1-coarse	GET	/api/v4/projects/1234/repository/tree	nor the repository read API
+authz	deny	v1-coarse	GET	/api/v4/projects/1234/wikis	nor wikis
+authz	deny	v1-coarse	POST	/grp/proj.git/git-receive-pack	nor git-write
+authz	deny	v1-coarse	GET	/api/v4/projects/1234/repository/archive.tar.gz	cap_missing: archive needs git-read or repo:read
+
+# --- the widest COARSE fixture reaches none of the new areas (they are opt-in) ---
+authz	deny	full	GET	/api/v4/projects/1234/pipelines	cap_missing: no pipelines cap in the fixture
+authz	deny	full	GET	/api/v4/projects/1234/wikis	cap_missing: no wiki cap
+authz	deny	full	GET	/api/v4/projects/1234/repository/tree	cap_missing: git-read is not repo:read
+authz	deny	full	GET	/api/v4/projects/grp%2Fpipelines/access_tokens	the new prefixes open no minting tail, under the widest fixture
+authz	deny	full	GET	/api/v4/projects/grp%2Fwikis/access_tokens	the wikis twin, under the widest fixture
 
 # ============ authz: THE SIX ESCAPE ROWS, FLIPPED TO DENY (the acceptance block) ============
 # In the LEGACY oracle each of these MATCHED an allow rule and reached a token

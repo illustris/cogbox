@@ -10,7 +10,7 @@ The git integration used to compile per-user grants into generic L7 path-prefix 
 
 - **Path-prefix escapes.** The enforcer decides on a *decoded, flattened* path and forwards a *different* (raw) one, matched left-anchored only. An encoded slash inflates one addressed segment into several, so an `allow …/projects/*/issues` rule is escaped by `…/projects/mygroup%2Fissues/access_tokens` — the tail lands on the id's own last component and absorbs the mint endpoint. The concrete resolved-id tier (`…/projects/1234/issues`) has the same escape with *no wildcard at all*, which is the one an auditor misses. The vector table pins six such live rows; under the auth proxy they all flip to **deny**.
 - **Dual-matcher coupling.** Two independent matchers (the Zig proxy and the mitmproxy addon) had to agree byte-for-byte on one path language, kept in step only by a shared oracle. The auth proxy has its own typed engine with its own oracle (`zig/src/authproxy/route_vectors.tsv`); the shared table stays for the *generic* L7 language (network-tab rules, plugins, templates), which does not move.
-- **Language-capped capability granularity.** With no mid-path wildcard, an `mr` capability necessarily includes self-`/approve` and self-`/merge`. A typed route table makes finer capabilities expressible (a v2 item).
+- **Language-capped capability granularity.** With no mid-path wildcard, an `mr` capability necessarily includes self-`/approve` and self-`/merge`. A typed route table makes finer capabilities expressible — **shipped in v2**: twelve caps instead of four, `mr:merge` split out of `mr:write`, and four API areas (pipelines, jobs, the repository read API, wikis) that the rule language could not reach at all.
 
 A **per-sandbox** process (rather than a central gateway) keeps token custody exactly where it is today — one enforcer holds one owner's credential — instead of concentrating every owner's token into one fleet-wide availability dependency, and needs no new sandbox→control-plane data channel.
 
@@ -67,49 +67,72 @@ One plugin per service, registered by the `plugin` string in the policy document
 - `authorize(route, req) → Decision` — gate 2. Pure, over the compiled policy only — never the raw grant rows, never a live lookup in v1.
 - `upstream(route, req) → Upstream` — the upstream request, **constructed** from the route's typed params and the route's query allowlist, never copied from the request. The **core** then refuses any `Upstream` whose host is not in `entry.hosts` — a gate the plugin cannot bypass.
 - `authenticate(route, req, cred) → headers` — headers to **set** (never append). `cred.token()` reads the store file lazily and fails closed (403) when unreadable.
-- `mediate(route, req, cred, io) → ?Response` *(optional)* — the inline data-plane case (harbor's token dance). Drives the exchange through the core's client, which enforces the host allowlist, timeouts, in-flight cap and header allowlist on every leg.
+- `mediate(route, req, cred, io) → bool` *(optional)* — the inline data-plane case: the only hook that sees the request **body**. It drives its exchange through the core's client, which enforces the host allowlist, timeouts, in-flight cap and header allowlist on every leg. Returning `false` falls back to the default single round trip **with the body reader untouched**; returning `true` hands back either an open exchange or a `deny` — a refusal reached over the body, **before any dial** (gate 3). gitlab uses it for push rules (below); the harbor token dance is its other intended shape.
 - `onUpstreamStatus(route, status, headers, cred)` *(optional)* — derived-token invalidation (drop a minted token on 401).
 
 `Request` is the core's canonical value object and the only view a plugin gets: `method`, `segments` (segment-first, single-decoded — a segment may contain `/`), parsed `query`, allowlisted `headers`, `content_type`, a bounded `body`, `host` (from `X-Cogbox-Host`), and `raw_target` **for audit only** — a plugin that reads `raw_target` for a decision is a review finding.
 
-`mediate` and `onUpstreamStatus` are genuinely absent (null) for gitlab; they exist in v1 so harbor slots in with no interface change.
+`onUpstreamStatus` is genuinely absent (null) for gitlab — the owner token is refreshed only by the control plane, so there is no derived token to invalidate. `mediate` is present for exactly one route (push rules, below) and answers `false` for every other, so the interface's "absent, not a no-op" discipline still reads off the vtable.
 
-## The gitlab plugin (v1)
+## The gitlab plugin (v2)
 
-Typed route table, first match wins, unmatched ⇒ gate-1 deny. Exactly parity's surface plus one addition (the archive route):
+Typed route table, first match wins, unmatched ⇒ gate-1 deny. Parity's surface plus the archive route, the namespace-enumeration route, and the v2 additions (the merge-class split and four new API areas):
 
 | route id | methods | shape |
 |---|---|---|
 | `git-refs` | GET | `<project-ref>[.git]/info/refs`, required `?service ∈ {git-upload-pack, git-receive-pack}` — the **only** route that consults `service`, and the only place one exists |
 | `git-upload` | POST | `<project-ref>[.git]/git-upload-pack` |
-| `git-receive` | POST | `<project-ref>[.git]/git-receive-pack` |
+| `git-receive` | POST | `<project-ref>[.git]/git-receive-pack` — the one **mediated** route: under a grant carrying `push` rules its command section is read and matched before any dial (see [Branch rules on push](#branch-rules-on-push-the-mediate-hook)) |
 | `api-user` | GET, HEAD | `/api/v4/user` |
 | `api-version` | GET, HEAD | `/api/v4/version` |
 | `api-project` | GET, HEAD | `/api/v4/projects/:id` — response **projected** to the ProjectSimpleEntity allowlist (see Responses under Hardening); `simple=true` forced but **inert** on a single-project GET |
 | `api-group-projects` | GET, HEAD | `/api/v4/groups/<group-path>/projects` — `simple=true` + `include_subgroups=true` **forced** — v1.1 addition |
 | `api-issues` | GET, HEAD, POST, PUT | `/api/v4/projects/:id/issues[/…]` |
-| `api-mr` | GET, HEAD, POST, PUT | `/api/v4/projects/:id/merge_requests[/…]` |
+| `api-mr` | GET, HEAD, POST, PUT | `/api/v4/projects/:id/merge_requests[/…]` — everything **not** in the merge class |
+| `api-mr-merge` | GET, HEAD, POST, PUT | `.../merge_requests/<iid>/<tail>[/…]`, tail ∈ {`merge`, `approve`, `unapprove`, `approvals`, `approval_rules`, `reset_approvals`, `rebase`, `cancel_merge_when_pipeline_succeeds`} — v2 addition |
+| `api-pipelines` | GET, HEAD; POST only at `<id>/{retry,cancel}` | `.../pipelines[/…]` — `.../pipelines/<id>/variables` is a **named `no_route`** — v2 addition |
+| `api-pipeline-trigger` | POST | `.../pipeline` (a leaf, no subtree) — v2 addition |
+| `api-jobs` | GET, HEAD; POST only at `<id>/{retry,cancel,play}` | `.../jobs[/…]` (`trace`, `artifacts`); `erase` is **not** in the write set — v2 addition |
+| `api-repo` | GET, HEAD | `.../repository/<collection>[/…]`, collection ∈ {`tree`, `branches`, `commits`, `compare`, `tags`, `blobs`, `files`, `contributors`, `merge_base`, `changelog`} — v2 addition |
+| `api-wiki` | GET, HEAD, POST, PUT | `.../wikis[/…]`, `/wikis/attachments` included — v2 addition |
 | `api-archive` | GET, HEAD | `/api/v4/projects/:id/repository/archive[.<ext>]` — v1 addition |
 | `cogbox-grants` | GET, HEAD | `/_cogbox/grants` — **plugin-owned LOCAL route**, matched **before** the table above and answered locally (never proxied); see [Self-discovery](#self-discovery-_cogboxgrants) |
+
+Three invariants the table encodes, each pinned by `route_vectors.tsv`:
+
+1. **`DELETE` is in no capability's method set, on any route.** It is irreversible and nothing in the headline flows needs it; a future `*:delete` cap is the extension point.
+2. **Repository writes through the API are unroutable.** `api-repo` is clamped to GET/HEAD, so `POST /repository/commits`, `POST|PUT /repository/files/*` and the branch/tag write endpoints are refused with `method_not_allowed` however wide the grant — a `git-write` one included. They would otherwise write a branch without passing through receive-pack, i.e. straight past the per-grant push rules; repository mutation goes through `git push`, where those rules live.
+3. **`/pipelines/:id/variables` is a named `no_route`, not a method clamp** — a pipeline's variables are secrets a `pipelines:read` grant must not read, so a GET must find no route at all rather than an admitted method.
+
+The merge class splits off `api-mr` **by its tail, not its depth**: any path whose second tail component is a merge-class name is `api-mr-merge`, deeper ones included, so a sub-resource of `/approvals` is an approvals write too (fail closed). Reading the merge class (`GET /approvals`, the merge status) is ordinary `mr:read`; only the act of approving/merging/rebasing needs `mr:merge`. `approval_rules` sits in the class for the same reason `approvals` does — it is GitLab's current API for the *same* protection, so leaving it in `api-mr` would let a deliberately merge-less `mr:read + mr:write` grant set `approvals_required: 0` and relax the requirement `mr:merge` exists to hold. Two endpoints for one protection belong to one class.
 
 `:id` is accepted in **both** forms: a numeric id (`^[0-9]{1,19}$`, ASCII digits only, no sign, no leading zero, compared as i64) or a single segment whose decoded value is a project path. A **group path** for `api-group-projects` is a single decoded segment whose value is a well-formed group path — unlike a project id a single top-level component (`acme`) is well-formed, because a group need not be namespaced; a numeric group form is recognized but always scope-denied (the policy document carries no group id). Archive extensions are a **closed set** (`tar.gz`, `tar.bz2`, `tar`, `tar.zst`, `zip`), never a wildcard suffix.
 
 Both read routes **force `simple=true`**, but it does different work on each. On **`api-group-projects`** (a LIST) GitLab honours `simple`, so `simple=true` is what strips `runners_token` and the other secret fields from every listed project, and a client `simple=false` can never override it. On **`api-project`** (a single-project GET) GitLab does **not** honour `simple` — a single-project GET returns the full object regardless — so `simple=true` is **inert** for the leak there and kept only as belt-and-braces; the `runners_token` (and `import_url`/`permissions`/`_links`/CI-registry) leak on that route is closed proxy-side by a **response-body projection** (see Responses under Hardening), not by the query. `api-group-projects` additionally forces `include_subgroups=true` and drops every query key but a small pagination/search allowlist (`per_page`, `page`, `page_token`, `search`); `issues`/`mr` keep the raw pass-through.
 
-Everything else — `access_tokens`, `variables`, `deploy_keys`, every *other* `groups` tail **and the group node itself** (`/api/v4/groups/:id`), `/-/**`, `/uploads`, `/assets`, `raw`, registries, `/oauth/**`, `/admin`, `info/lfs/**`, `gitlab-lfs/**`, `git-upload-archive` — routes **nowhere** (a *named* 403), and `DELETE` is in no capability's method set.
+Everything else — `access_tokens`, `variables` (the CI/CD kind **and** `/pipelines/:id/variables`), `deploy_keys`, every *other* `groups` tail **and the group node itself** (`/api/v4/groups/:id`), `/-/**`, `/uploads`, `/assets`, `raw`, registries, `/oauth/**`, `/admin`, `info/lfs/**`, `gitlab-lfs/**`, `git-upload-archive`, GraphQL, snippets, packages, the repository *write* endpoints and every group-level API — routes **nowhere** (a *named* 403).
 
-Capability → route:
+Capability → route. The twelve are **orthogonal**: `issues:write` does not imply `issues:read`, `mr:merge` does not imply `mr:write`. The document is a compiled artifact whose meaning must be readable without an implication table three codebases could drift on, and the v1 narrowing is only well-defined with orthogonal caps; the control plane's UI auto-ticks the read half as a **client courtesy**, never enforced here.
 
-| cap | routes |
+| cap | routes (method half) |
 |---|---|
-| `git-read` | `git-refs` (`service=git-upload-pack`), `git-upload`, `api-archive`, `api-group-projects`, `api-project`, the ambient two |
-| `git-write` | `git-refs` (`service=git-receive-pack`), `git-receive` |
-| `issues` | the ambient two (`api-user`/`api-version`) + `api-project` + `api-issues` |
-| `mr` | the ambient two + `api-project` + `api-mr` |
+| `git-read` | `git-refs` (`service=git-upload-pack`), `git-upload`, `api-archive`, `api-group-projects` |
+| `git-write` | `git-refs` (`service=git-receive-pack`), `git-receive` — narrowed further by the grant's `push` rules, if it has any |
+| `issues:read` / `issues:write` | `api-issues`, GET/HEAD / POST/PUT |
+| `mr:read` / `mr:write` | `api-mr`, GET/HEAD / POST/PUT; `mr:read` also reads `api-mr-merge` |
+| `mr:merge` | `api-mr-merge`, POST/PUT |
+| `pipelines:read` / `pipelines:write` | `api-pipelines` and `api-jobs`, GET/HEAD / POST; `pipelines:write` alone reaches `api-pipeline-trigger` |
+| `repo:read` | `api-repo`, and `api-archive` (the bulk form of the same read) |
+| `wiki:read` / `wiki:write` | `api-wiki`, GET/HEAD / POST/PUT |
+| *any capability* | the ambient two (`api-user`, `api-version`) + `api-project` (scope-tested) |
+
+**The legacy dialect still expands.** A grant row the owner has not edited still ships `issues` / `mr`, and `compile` expands them — `issues` → `issues:read`+`issues:write`, `mr` → `mr:read`+`mr:write`+`mr:merge` (v1 `mr` *included* approve/merge) — the mirror of the control plane's `NormalizeGitCaps`. Anything else in `caps` still fails the **whole** conf, as it always has. `/_cogbox/grants` reflects the **expanded** v2 names, because the reflection states what this binary enforces rather than echoing the document.
 
 The **"read = discover + inspect"** decision: a `git-read` grant no longer means clone-without-discovery. It reaches the ambient two, inspects concrete project metadata (`api-project`), and — for a **namespace-scope** grant only — enumerates its group's projects (`api-group-projects`). Discovery is what makes a namespace read grant usable; without it the agent could clone a *known* repo but had no way to *list* the names.
 
-Only `api-user` and `api-version` are **ambient** (allowed by any `issues`/`mr`/`git-read` grant with no scope test — they name no project). `api-project` names one, and `api-group-projects` names a namespace: both take the scope test like every other `:id` route. An ambient project lookup would let any grant use the owner's token as an enumeration oracle over every project it can see; an ambient group listing would hand out instance-wide enumeration.
+Only `api-user` and `api-version` are **ambient** (allowed by **any** capability, with no scope test — they name the owner's identity and the server version, nothing resource-scoped). `api-project` names one project, and `api-group-projects` names a namespace: both take the scope test like every other `:id` route. An ambient project lookup would let any grant use the owner's token as an enumeration oracle over every project it can see; an ambient group listing would hand out instance-wide enumeration.
+
+**That row WIDENED on this roll, and it is by design.** Under v1 the ambient two and `api-project` hung off `git-read`, `issues` and `mr` specifically, so a `git-write`-only grant reached none of them; from this build every capability does, and grants nobody edited gain the owner's identity, the server version and one project's metadata the moment the enforcer image rolls. Three reasons it is the intended shape rather than an oversight. It is what makes the v2 caps usable at all: `pipelines:read`, `repo:read` and `wiki:read` all address a project and need to resolve it, and hanging their prerequisites off a *different* cap would put an implication table back into a vocabulary whose whole point is orthogonality. It is scope-bounded where it can be: `api-project` still takes the same scope test as any `:id` route, so a grant only inspects the project (or namespace) it already covers. And it is not a leak surface: the `api-project` response is projected through the ProjectSimpleEntity allowlist, so `runners_token` and friends never reach the guest whatever cap opened the route. The widest thing any grant gains here is the owner's own login and metadata for a project it could already act on.
 
 Scope tests reuse the existing predicates' semantics: `project` ⇒ the project ref equals the normalized `repo`, or the numeric id equals `project_id`; `namespace` ⇒ the path form is under the **slash-terminated** `prefix` (so `grp-secret` stays excluded), or the numeric id is in `projects[]`; `instance` ⇒ any well-formed project reference. **`api-group-projects` has its own scope test**: **namespace-scope grants only** (a concrete or instance grant never authorizes it — preserving the no-instance-wide-enumeration-oracle property), the group path **equal-to or under** the slash-terminated `prefix` (equals-or-under, not strictly-under, so the grant lists its *own* group node as well as any subgroup, while a sibling, the parent and `grp-secret` still fail), and **path form only** (a numeric group fails closed). `authenticate` returns `Authorization: Basic base64(git_user:token)` on the three git routes and `Authorization: Bearer <token>` on the API routes — byte-identical to the addon's git-vs-API split, so upstream behaviour does not change.
 
@@ -126,40 +149,77 @@ Response — `200`, `Content-Type: application/json` (an empty/ungranted sandbox
 ```json
 { "grants": [
   { "scope": "namespace", "repo": "acme/iac/*", "prefix": "acme/iac", "caps": ["git-read"] },
-  { "scope": "project",   "repo": "acme/app",   "caps": ["git-read", "issues"] },
-  { "scope": "instance",  "caps": ["git-read", "mr"] } ] }
+  { "scope": "project",   "repo": "acme/app",   "caps": ["git-read", "issues:read", "issues:write"] },
+  { "scope": "project",   "repo": "acme/svc",   "caps": ["git-read", "git-write"],
+    "push_refs": ["refs/heads/agent/*"], "push_deny_delete": true, "push_deny_tags": true },
+  { "scope": "instance",  "caps": ["git-read", "mr:read", "mr:write", "mr:merge"] } ] }
 ```
 
 - `scope` is `namespace | project | instance`.
 - `repo` is the grant's repo (the wildcard `grp/sub/*` on a namespace grant, the concrete `grp/proj` on a project grant); it is **omitted** on an `instance`-scope grant, which names no repo.
 - `prefix` is the **path form** of a namespace grant's slash-terminated internal prefix (`"/grp/sub/"` → `"grp/sub"`, no leading/trailing slash); it appears on **namespace-scope grants only**.
-- `caps` is the grant's capability subset (`git-read`, `git-write`, `issues`, `mr`).
+- `caps` is the grant's capability subset, always in the **v2 vocabulary and canonical order** (`git-read`, `git-write`, `issues:read`, `issues:write`, `mr:read`, `mr:write`, `mr:merge`, `pipelines:read`, `pipelines:write`, `repo:read`, `wiki:read`, `wiki:write`) whatever dialect the document used — a v1 `mr` really is the mr triple here.
+- The push rules ride as **flat** keys — `push_refs`, `push_deny_delete`, `push_deny_tags` — and appear only on a grant that carries them (absent means *unrestricted*, which an empty `push_refs` array would not say). Flat, never a nested `push` object: the deployed grant-check client splits this body on braces and a nested one would break every copy in the field.
+
+### Branch rules on push: the `mediate` hook
+
+Every other decision in this proxy is made on the request **head**. Branch rules cannot be: *which* refs a push moves is in the **body**, so they live in the one hook that sees it — `mediate`, on the `git-receive` route only, and only when a covering grant carries a `push` object. `zig/src/authproxy/pktline.zig` reads the command section; `mediateReceivePack` in the plugin decides.
+
+**The wire, and what it does and does not allow.** A smart-HTTP push is `POST <repo>.git/git-receive-pack` whose body is `*shallow-line (command-list | push-cert) [push-options] [packfile]`. Every line is a pkt-line — a 4-hex length **including** the four bytes, at most 65520 — and the command list ends at the first flush-pkt `0000`:
+
+```
+PKT-LINE(<old-oid> SP <new-oid> SP <refname> [NUL capability-list] [LF])
+```
+
+- **Protocol v2 has no receive-pack.** `git -c protocol.version=2 push` negotiates v2 on `info/refs` and the server answers v0, so the POST body is always the v0/v1 command list. `0001` (delim) and `0002` (response-end) are v2-only framing and are **refused** here rather than skipped.
+- **A push is never gzipped.** git's `remote-curl.c` sets `gzip_request` only in `fetch_git`, and `Content-Encoding` is not in the forward allowlist anyway — an encoded body simply fails the hex-length check as `push_malformed`.
+- **A push over `http.postBuffer` (1 MiB) is chunked, and is preceded by a probe POST whose body is a lone `0000`.** Zero commands is a legitimate parse, not an error: it forwards untouched, or every large push would break. `Expect: 100-continue` is already answered by the core before the hook runs.
+- **A signed push (`push-cert`) is refused** (`push_cert_unsupported`): the commands live inside a certificate this parser does not read, GitLab does not verify push certs, and waving one through would be a rule bypass.
+- **sha256 repositories use 64-hex oids.** 40 and 64 are both accepted and the zero-oid (a delete) is per length; a command mixing the two lengths is malformed.
+- **Force-push is not distinguishable.** A non-fast-forward update is `<old ≠ 0> <new ≠ 0> <ref>` exactly like a fast-forward and the proxy has no object graph. GitLab **protected branches remain the backstop** for force-push, whatever the rules say — the confirmation copy in the control plane says so, and so does the skill.
+
+**Evaluation.** A refname is matched **component-wise** against the grant's patterns after splitting on `/`: a literal component matches itself, `*` matches **exactly one** component, `**` matches **one or more** (never zero, so `refs/heads/**` does not match `refs/heads`). Both wildcards are whole components — `compile` already refused a partial-component pattern like `ag*ent`, so `refs/heads/agent/*` never matches `refs/heads/agent-x`. No patterns at all means "any refname" (the rule object then carries only the deny flags). `deny_tags` **short-circuits** the patterns for any `refs/tags/…` command and `deny_delete` for any all-zero new oid, so a listed tag pattern plus `deny_tags` refuses the tag. Refnames themselves pass a subset of `git check-ref-format` (anchored at `refs/`, no empty component, no `..`, no dot-leading component, no `.lock` suffix, no `@{`, no `\`, none of `` ~^:?*[ ``, no space or control byte, at most 64 components); a violation is `push_malformed`, never a pattern match attempt.
+
+**Grants are a UNION, exactly as in `authorize`.** A command passes if **any** covering `git-write` grant admits it, so a rule-free project grant is not narrowed by a namespace grant that happens to carry rules — a narrower grant can only ever add reach. And a push is **all or nothing**: one refused command refuses the whole push (it is one transaction to the client, and its commands share one packfile).
+
+**The three properties the implementation is shaped around**, each pinned by a test:
+
+1. **The fast path costs one string compare.** Every route but `git-receive`, and every push no covering grant restricts, returns `false` before the body reader is touched — the core then runs the ordinary single round trip, byte for byte what it ran before the hook existed.
+2. **A refusal happens before any dial.** Nothing of a rejected push reaches the origin: not the commands, not the packfile. The audit line records `gate=3`, and the counters rollup carries `deny_gate3`.
+3. **An admitted push is forwarded unchanged.** The buffered command section is replayed ahead of the live body through a `PrefixReader`, so `Content-Length` still describes the bytes, the pack's own framing is untouched, and a chunked body is re-framed by the emitter with its prefix intact.
+
+**Bounds.** The command section is buffered whole before a verdict exists: at most **256 KiB** (one pkt-line may be 65520 bytes, and 1024 commands of a realistic size already exceed 64 KiB) and at most **1024 commands**; over either is `too_many_refs` (413), never a truncated — and therefore weaker — evaluation. Worst case that is ~310 KiB per in-flight mediated push, ×8 in-flight ≈ 2.5 MiB. The buffer carries oids and refnames, never a credential, so it lives outside the scratch block and is freed as soon as `open` returns; the mediate leg's **header** set (which does carry `Authorization`) is `ConnStorage.mediate_headers`, inside the scratch block and covered by its scrub.
 
 ## The policy document
 
 Delivered by `cogbox l7 policy --from-stdin` into `.network.l7.authpolicy` inside `config.json`. It is a **compiled artifact, not a mirror of the grant table**: inert grants are already dropped, suspension already applied, unresolved API caps already withheld, the `COGWORX_GIT_ALLOW_ALL` kill switch already applied by omission. **Route knowledge never appears in it** — no path prefixes, no method lists, no `service=`, no wildcards. Semantic tuples only; the routes are the plugin's table.
 
 ```json
-{ "version": 1, "providers": [
+{ "version": 2, "providers": [
   { "provider": "GitLab", "plugin": "gitlab", "hosts": ["git.example.com"],
     "secret": "git-gitlab", "git_user": "oauth2", "scheme": "https",
     "grants": [
       { "id": "gg-…", "scope": "project", "repo": "grp/proj", "project_id": "1234",
-        "caps": ["git-read", "git-write", "issues"] },
+        "caps": ["git-read", "git-write", "issues:read", "issues:write"],
+        "push": { "deny_delete": true, "deny_tags": true, "refs": ["refs/heads/agent/*"] } },
       { "id": "gg-…", "scope": "namespace", "repo": "grp/sub/*", "prefix": "/grp/sub/",
-        "caps": ["git-read", "issues", "mr"],
+        "caps": ["git-read", "pipelines:read", "repo:read", "wiki:read"],
         "projects": [ {"id": 42, "path": "grp/sub/a"} ] },
-      { "id": "gg-…", "scope": "instance", "caps": ["git-read", "mr"] } ] } ] }
+      { "id": "gg-…", "scope": "instance", "caps": ["git-read", "mr:read", "mr:write", "mr:merge"] } ] } ] }
 ```
 
-`caps` is exactly four values — `git-read`, `git-write`, `issues`, `mr` — and the plugin fails closed on anything else. `scheme` comes from the provider's token URL (never hardcode https — a live http-only host exists). The verb refuses a malformed document or an unknown `version` **before** writing anything, refuses a document over 64 KiB, and **accepts** the empty document `{"version":1,"providers":[]}` (share teardown pushes it to withdraw a policy). Canonical rendering (sorted keys, providers by name, grants by id, `projects[]` id-ascending, no insignificant whitespace) is what keeps an unchanged policy skippable tick after tick; the control-plane fingerprint hashes those bytes.
+**Two versions are live, `1` and `2`.** Version 1 is the four coarse caps and no `push`; version 2 adds the twelve fine caps and per-grant push rules. The control plane renders the **lowest version that carries the grant set losslessly**, so an unchanged coarse grant set stays byte-identical v1 (its fingerprint never moves, and an older agent is only ever probed with v2 when a v2 feature is actually in use), and the empty share-suspension document stays `{"version":1,"providers":[]}` forever. `caps` is the twelve v2 names plus the two legacy coarse ones, which **expand**; the plugin fails closed on anything else. `push` is accepted only on a grant carrying `git-write`, with at most 8 patterns of at most 128 bytes each, every pattern anchored at `refs/heads/` or `refs/tags/` and built from whole components (`*` = one component, `**` = one or more) — a violation of any of that fails the **whole** conf, never a silently relaxed rule.
+
+`scheme` comes from the provider's token URL (never hardcode https — a live http-only host exists). The verb refuses a malformed document or an unknown `version` **before** writing anything, refuses a document over 64 KiB, and **accepts** the empty document (share teardown pushes it to withdraw a policy). Canonical rendering (sorted keys, providers by name, grants by id, `projects[]` id-ascending, no insignificant whitespace) is what keeps an unchanged policy skippable tick after tick; the control-plane fingerprint hashes those bytes.
+
+The document version and the rendered **conf** version are independent. The document version says what vocabulary the control plane sent; the conf version (`l7-auth-conf.json`) says what its *reader* must understand to enforce what the render just wrote — and the render (`cogbox l7 policy`, the **agent** image) and the reader (`authproxy/conf.zig`, the **enforcer** image) roll on separate tags, so the conf version is the only whole-file fail-closed lever across that skew. It is `1` for every conf that needs nothing newer — byte-identical to the pre-v2 render — and `2` for exactly one reason: some emitted grant carries `push`. A pre-v2 `parseGrants` reads only the fields it knows, so an unknown `push` object would be **silently dropped** and a branch-restricted grant would relay every ref; bumping the file version makes that reader refuse the whole conf (empty policy → 403 `no-policy`) instead. Fine cap *names* need no bump — the plugin's `compile` already refuses an unknown cap and fails the whole conf. The grants otherwise ride in **verbatim**: the render never learns the cap vocabulary, so a fine cap or a `push` object reaches `compile` untouched.
 
 ## The three gates (enforcer side)
 
 `renderAuthProxyConf` walks the bound secrets and emits an `l7-auth-conf.json` element only when **all three** hold:
 
 1. the resolved secret is **bound**, its kind is `gitlab-authproxy`, and its `audience` is set;
-2. `.network.l7.authpolicy` (version 1) carries a provider entry whose `hosts[]` include that audience;
+2. `.network.l7.authpolicy` (version 1 **or** 2 — an out-of-range version is dead text, not live policy) carries a provider entry whose `hosts[]` include that audience;
 3. an L7 rule **names** the audience (the funnel rule).
 
 Gate 3 is the mirror of the addon's fail-closed inject gate: it covers the window before the funnel lands and a control plane that withdrew the rules but left the bind (no rule → no element → 403s). A stale document after a mode **flip-back** is neutralised by gate 1, not gate 3: the flip-back re-applies the legacy rules (which do name the host) and re-binds under the legacy kind, so the kind check is what makes that document **dead text**. The emitted element carries `host`, `plugin`, `scheme`, `insecure`, `cred_file`, `cred_format`, `git_user` and the doc's `grants[]` verbatim. `cred_file` is the store's value path, noted into the credential-grant transaction at the statement that writes it, so what the auth proxy may read and what the conf names it can never diverge. `insecure` is single-sourced from the same rule scan the addon's upstream-verification toggle uses.
@@ -172,10 +232,14 @@ A migrated provider's token is bound under kind `gitlab-authproxy`. Two independ
 |---|---|---|
 | the verb `cogbox l7 policy` | exit 64, stderr exactly `cogbox l7: error: UnknownSubcommand` | classified → the instance falls back to the **unchanged** legacy per-grant rules this pass |
 | the kind `--kind gitlab-authproxy` | exit 65 (`validKind` refuses it) | the bind fails by the old binary's own hand — no credential exists, no control-plane bookkeeping |
+| a **version-2 document** on a pre-v2 binary | exit 65, stderr `cogbox l7: error: unknown policy document version (expected 1)`, refused **before** any write | classified → the control plane re-delivers the **narrowed v1** document (fine caps that are not a full coarse set, push rules and the new areas are dropped, never widened) and marks the grant "limited on this sandbox agent" |
+| a **version-2 conf** (some grant carries `push`) on a pre-v2 **enforcer** — a v2 agent rendering for an older enforcer image | the reader refuses the unknown conf version and falls to the **empty** entry set | every request to that host is denied `no-policy` (403). The alternative is the bug this row exists to prevent: a pre-v2 reader that accepted the file would drop the `push` object it does not know and relay **every** ref. Note the agent's exit-65 gate cannot catch this — the document is delivered to a v2-capable *agent*; only the conf version reaches the enforcer |
+
+The refusal's **prefix** `cogbox l7: error: unknown policy document version` is a cross-repo contract — the control plane's classifier keys on it as a substring, so only the parenthetical moves as versions land (this binary says `(expected 1 or 2)`). The two independent version gates are `validatePolicyDoc` in the delivery verb (`zig/src/l7/main.zig`, `policy_doc_versions`) and `authPolicyProviders` in the conf render (`zig/src/rules/reload.zig`): the verb refuses an unknown version at delivery, the render makes one that got in by a hand edit or a rollback dead text. A **newer** binary reading an older document is always fine — v1 is accepted forever.
 
 The kind does double duty: it is the version gate **and** the inject suppressor. The addon's inject-spec seeding keys on `gitlab-oauth`, so a token bound under the new kind is never seeded as an inject spec → no inject → the addon cannot double-stamp a host the auth proxy authenticates. The catastrophic skew this avoids: a whole-host tagged allow plus a still-bound `gitlab-oauth` secret would inject the owner token on every path. Sequencing is document → funnel → token, bound under the new kind; the addon additionally skips its injection block unconditionally for any host in `l7-auth-hosts`, and logs once per host per conf generation if both a spec and an auth entry exist (a control-plane bug).
 
-Every skew fails closed: an old cogbox + new control plane falls back byte-identically; a buggy control plane that withdrew the rules but left the bind is saved by gate 3 (no rule names the host → no element → 403s, not owner-token-on-every-path); a new cogbox + old control plane has no document → the auth proxy refuses every host.
+Every skew fails closed: an old cogbox + new control plane falls back byte-identically; a buggy control plane that withdrew the rules but left the bind is saved by gate 3 (no rule names the host → no element → 403s, not owner-token-on-every-path); a new cogbox + old control plane has no document → the auth proxy refuses every host; and a **new agent + old enforcer** (the container backend's two images roll on independent tags) is caught by the conf version, not by the document version — a push-rule conf an old enforcer cannot read denies with `no-policy` rather than relaying every ref. Pin agent and enforcer from one cc-sandbox build where you can; where they can diverge, roll the enforcer first. A GCE bake puts both in one image, so no window exists there.
 
 ## Hardening
 
@@ -191,8 +255,8 @@ Enforced once in the core, so the escape classes close for all plugins:
 - **The constructed head is guarded at the emitter, too.** Every line of the upstream head is printed verbatim, so the one byte source framing never saw — the credential — is checked where it is read: a store value carrying any control byte (an interior CR/LF the trailing trim cannot reach, which `Bearer <value>` would splice raw into an `Authorization` line under the owner's identity) is refused as `credential unavailable` (403), never emitted. The conf `host` must be a plain DNS name (it becomes the `Host:` line and the SNI). Under both, the emitter refuses any header name that is not a token, any value or host with a control byte, and any control byte or space in the rebuilt path/query, **before** dialing (502, reason `BadHeader`) — the belt that also covers a plugin's or a mediate leg's own headers.
 - **Canonicalization, fail-closed at every step:** split the target at the first `?` and parse the query separately; split the path on `/` **first**, then percent-decode each segment exactly once (so `grp%2Fproj` stays *one* segment whose value contains `/` — the segment positions stay stable and an encoded slash becomes a typed fact rather than structural inflation); refuse an invalid `%`-escape, a C0/C1 byte, a `.`/`..` segment, an over-long segment or too many segments; no second decode pass, ever. Query **values** are re-emitted raw on pass-through routes, so they are validated by the same byte rules (a raw or `%`-decoded control byte, an invalid escape, invalid UTF-8 → refused): a CR in a value would be header injection on the constructed upstream request line.
 - **Streaming, no buffering** on pack/archive/blob routes — a multi-GB clone must not buffer. Timeouts: 10 s for the request head, 10 s upstream connect, 30 s for the upstream response head, and a 60 s **idle** bound on both sockets for the body relay **in either direction** — the request body (a `git push` pack, which the addon streams) moves both sockets to the idle bound before the upload and the upstream socket back to the 30 s head bound for the head wait once it is out; the response body moves both to the idle bound again once the head is in. API routes additionally carry a 60 s **total** relay deadline that starts ahead of the request-body upload and spans both directions, checked between 64 KiB slices: an upload still trickling past it is refused with a 408 (no response head is out yet, and the connection closes), a response still streaming past it is cut mid-body. Stream routes (pack, archive) carry none.
-- **Audit: one line per request, metadata only** — the matched **route id**, never the raw path; coarse reasons from a fixed enum, never free text; never a credential byte, a header value or a body byte; `bytes_in`/`bytes_out`/`dur_ms` measured. A raw path is logged only behind `COGBOX_L7_AUTH_DEBUG_PATH=1`, quoted and length-capped, with query values dropped except `service`. The counters rollup (`authproxy stats …`) is emitted on the accept-loop tick at most once a minute, and only when the request counter moved.
-- **A coarse deny reason to the guest: `X-Cogbox-Deny`.** Every deny carries a response header `X-Cogbox-Deny: <reason>` whose value is the *same* fixed enum the audit line records (`no_route`, `no_grant`, `cap_missing`, `scope_mismatch`, `method_not_allowed`, `service_invalid`, and the pre-plugin framing/`no-policy`/`forbidden-query`/`overloaded`/… reasons). It is a fixed vocabulary — **never free text, never a secret, never a tenant-supplied byte** — added only to the empty-body deny response; the body, the `keep_alive=false` close and the framing-ambiguity posture are untouched. It exists so the in-sandbox agent (and grant-check clients) can tell a *scoped* denial under a live grant (`scope_mismatch`/`cap_missing`) apart from "no grant at all" (`no_grant`/`no-policy`), instead of reading a bare empty-body 403 as "no access."
+- **Audit: one line per request, metadata only** — the matched **route id**, never the raw path; coarse reasons from a fixed enum, never free text; never a credential byte, a header value or a body byte (a rejected push's **refnames** are body bytes and never appear); `gate` names which of the four decided (0 framing/canon, 1 classify, 2 authorize, 3 mediate); `bytes_in`/`bytes_out`/`dur_ms` measured. A raw path is logged only behind `COGBOX_L7_AUTH_DEBUG_PATH=1`, quoted and length-capped, with query values dropped except `service`. The counters rollup (`authproxy stats …`) is emitted on the accept-loop tick at most once a minute, and only when the request counter moved.
+- **A coarse deny reason to the guest: `X-Cogbox-Deny`.** Every deny carries a response header `X-Cogbox-Deny: <reason>` whose value is the *same* fixed enum the audit line records (`no_route`, `no_grant`, `cap_missing`, `scope_mismatch`, `method_not_allowed`, `service_invalid`, and the pre-plugin framing/`no-policy`/`forbidden-query`/`overloaded`/… reasons). The v2 **areas** add no new reason — they reuse the three that already say what happened: a cap half the grant lacks is `cap_missing`, a verb outside a route's clamp (a repository write, a job `erase`, any `DELETE`) is `method_not_allowed`, and a named exclusion (`/pipelines/:id/variables`) is `no_route`. Push **rules** add four, all of them gate-3 verdicts over a request body: `ref_denied` (403 — a pushed ref the rules do not admit, a delete under `deny_delete`, a tag under `deny_tags`; git surfaces it as `error: RPC failed; HTTP 403`), `push_malformed` (400 — a command section this proxy cannot parse, an unusable refname included), `too_many_refs` (413 — over the 256 KiB / 1024-command bounds) and `push_cert_unsupported` (403 — a signed push). It is a fixed vocabulary — **never free text, never a secret, never a tenant-supplied byte** — added only to the empty-body deny response; the body, the `keep_alive=false` close and the framing-ambiguity posture are untouched. It exists so the in-sandbox agent (and grant-check clients) can tell a *scoped* denial under a live grant (`scope_mismatch`/`cap_missing`) apart from "no grant at all" (`no_grant`/`no-policy`), instead of reading a bare empty-body 403 as "no access."
 - **Custody:** the owner credential lives in memory for the duration of one upstream request, sourced from the enforcer-private store, never written anywhere, never in a log or an error string. Every buffer it passes through — the plugin's token copy, the header set that carries it to the origin, the connection buffers it is serialized through — lives in ONE per-request heap block (`RequestScratch`) scrubbed by one call on every exit path, and that scrub is pinned by an end-to-end test that serves a request through a retaining allocator and scans the retired block for the token in both its raw and base64 forms. A buffer that carries the credential and does not live in that block is a custody bug by construction.
 
 ### TLS limitations (OSS generality)
@@ -216,6 +280,8 @@ The current deployment's provider is plain HTTP, so none of these affects it, bu
 | cred file unreadable (EACCES / unbound / revoked) | 403 `credential unavailable` — never forward the guest's stub as auth |
 | cred file value carries a control byte (an interior CR/LF) | 403 `credential unavailable` — never spliced into the `Authorization` line; not cached |
 | a stale `gitlab-oauth` bind on a migrated host | the addon skips its injection block unconditionally for any host in `l7-auth-hosts`, so no double-stamp |
+| a push whose command section is unparseable, signed, or over the 256 KiB / 1024-command bounds | 400 / 403 / 413 with the reason in `X-Cogbox-Deny`, decided **before any dial** — never forwarded on the theory that the origin will sort it out |
+| the guest's body read fails mid-command-section | 502, the connection closed — a transport failure is never reported to the guest as a malformed push |
 
 ## Supervision and lifecycle
 
@@ -240,6 +306,26 @@ wait; test -s "$rt/authproxy.pid"                           # pid written; the l
 
 The process must survive the whole window (its exit is the `timeout`'s 124, never a trap), the pid file must be non-empty, and both probes must be refused with the audit line's fixed reason — a machine that boots the proxy for ten seconds catches the class of bug the suite structurally cannot.
 
+Run it a **second** time with a populated **v2** conf (`"version": 2` — mandatory once a grant carries `push`; fine caps plus a `push` object, a `cred_file` holding a fake token) and probe the three deny shapes, the local reflection and one **refused push** — the last is the only real-clock probe of the mediate arm that needs no reachable origin, precisely because the verdict is reached before any dial:
+
+```sh
+h=(-H 'Host: git.example.com' -H 'X-Cogbox-Host: git.example.com' -H 'X-Cogbox-Vetted: 192.0.2.10:80')
+curl -s "${h[@]}" http://127.0.0.1:18043/_cogbox/grants
+                              # v2 cap names + flat push_refs/push_deny_delete/push_deny_tags
+#  GET  .../pipelines/9/variables          -> 403 no_route
+#  POST .../repository/commits             -> 403 method_not_allowed   (Content-Length: 0)
+#  POST .../issues without issues:write    -> 403 cap_missing
+
+# a push to a ref the grant's rules do not admit: 403 X-Cogbox-Deny: ref_denied,
+# `gate=3` on the audit line, and NO upstream connection attempt in the log
+old=$(printf '1%.0s' $(seq 40)); new=$(printf '2%.0s' $(seq 40))
+line="$old $new refs/heads/main"; printf -v pkt '%04x%s0000' $(( ${#line} + 4 )) "$line"
+curl -s -D- -o /dev/null "${h[@]}" -H 'Content-Type: application/x-git-receive-pack-request' \
+     --data-binary "$pkt" http://127.0.0.1:18043/grp/proj.git/git-receive-pack
+```
+
+A conf whose grants the plugin refuses falls the whole entry set to empty, so "the v2 conf parsed" is exactly the `conf generation 1 loaded (1 entries)` line — a silent `(0 entries)` is the failure this second run exists to catch.
+
 ## Known residuals
 
 Found on the first live run and deliberately not fixed in v1; none is an authorization gap.
@@ -252,6 +338,8 @@ Found on the first live run and deliberately not fixed in v1; none is an authori
 
 - No live project-identity resolution in v1 — the namespace snapshot stays the numeric-form authorizer; path-form addressing is *better* than today with no resolver.
 - **Namespace enumeration is path-form and namespace-scope only.** A numeric group id (`/api/v4/groups/<n>/projects`) fails closed — the policy document ships no group id to verify it against — and enumeration is *not* offered under an `instance` (`*`) scope grant, which keeps the no-instance-wide-enumeration-oracle property. A numeric group form would need the control plane to ship a group id.
-- The `*`-scope read **narrows** to the routed read set (deny-by-default over-blocking rather than over-allowing); the route table becomes a versioned artifact needing a per-provider-release review.
+- The `*`-scope read **narrows** to the routed read set (deny-by-default over-blocking rather than over-allowing); the route table is a versioned artifact needing a per-provider-release review.
 - The `gitNSProjectCap = 20` cap is kept although its stated derivation no longer applies.
-- forgejo and harbor plugins, finer capabilities-as-data, a pooled upstream connection, and an `authproxy-strict` delivery mode that publishes `restart-required` instead of falling back — all v2.
+- **DELETE stays globally denied**, and GraphQL, snippets, packages, the registry and the group-level APIs stay unrouted. `pipelines:read` does expose job traces, which can carry secrets the owner can see, and `pipelines:write` lets the sandbox trigger a pipeline as the owner; `/pipelines/:id/variables` is named-denied for that reason and the cap is opt-in per grant.
+- **Force-push is not distinguishable in-proxy** (a non-fast-forward update looks exactly like a fast-forward on the wire and the proxy has no object graph), so GitLab protected branches remain the backstop for it whatever the push rules say — see [Branch rules on push](#branch-rules-on-push-the-mediate-hook). Push **options** (the pkt-lines after the command flush) are likewise not inspected: the parser stops at that flush by design, so they stream to the origin unread.
+- forgejo and harbor plugins, a pooled upstream connection, and an `authproxy-strict` delivery mode that publishes `restart-required` instead of falling back — still deferred. Finer capabilities-as-data **landed** (v2, above).

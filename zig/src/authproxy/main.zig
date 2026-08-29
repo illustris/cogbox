@@ -51,16 +51,21 @@ pub const Counters = struct {
 	allow: std.atomic.Value(u64) = .init(0),
 	deny_gate1: std.atomic.Value(u64) = .init(0),
 	deny_gate2: std.atomic.Value(u64) = .init(0),
+	/// Gate 3: a `mediate` hook's own pre-dial refusal (gitlab's push rules).
+	/// Its own counter, not deny_gate2's, because it is the only deny reached
+	/// over a request BODY -- an operator watching it climb is watching branch
+	/// rules bite, not a scope or cap mistake.
+	deny_gate3: std.atomic.Value(u64) = .init(0),
 	cred_unavailable: std.atomic.Value(u64) = .init(0),
 	upstream_err: std.atomic.Value(u64) = .init(0),
 	mediate: std.atomic.Value(u64) = .init(0),
 
 	pub fn rollup(self: *const Counters, w: *std.Io.Writer) !void {
-		try w.print("authproxy stats requests={d} allow={d} deny_gate1={d} deny_gate2={d} cred_unavailable={d} upstream_err={d} mediate={d}\n", .{
+		try w.print("authproxy stats requests={d} allow={d} deny_gate1={d} deny_gate2={d} deny_gate3={d} cred_unavailable={d} upstream_err={d} mediate={d}\n", .{
 			self.requests.load(.monotonic),         self.allow.load(.monotonic),
 			self.deny_gate1.load(.monotonic),       self.deny_gate2.load(.monotonic),
-			self.cred_unavailable.load(.monotonic), self.upstream_err.load(.monotonic),
-			self.mediate.load(.monotonic),
+			self.deny_gate3.load(.monotonic),       self.cred_unavailable.load(.monotonic),
+			self.upstream_err.load(.monotonic),     self.mediate.load(.monotonic),
 		});
 	}
 };
@@ -72,7 +77,7 @@ const Outcome = struct {
 	plugin: []const u8 = "-",
 	method: []const u8 = "-",
 	decision: enum { allow, deny } = .deny,
-	gate: u8 = 0, // 0 = framing/canon (pre-plugin), 1 = classify, 2 = authorize
+	gate: u8 = 0, // 0 = framing/canon (pre-plugin), 1 = classify, 2 = authorize, 3 = mediate
 	reason: []const u8 = "-",
 	route_id: []const u8 = "-",
 	service: []const u8 = "-",
@@ -486,12 +491,27 @@ fn handleRequest(ctx: *Context, request: *std.http.Server.Request, sock: ?c_int)
 	// owner credential, so it lives in the scratch block (scrubbed with it).
 	const auth_headers = &scratch.auth_headers;
 	if (entry.policy.vtable.mediate) |mediateFn| {
-		_ = ctx.counters.mediate.fetchAdd(1, .monotonic);
 		var resp: plugin_mod.Response = .{};
 		const used = mediateFn(entry.policy.ctx, &route, &mut_req, &cred, &uio, &resp) catch |err| {
 			return upstreamErrorResponse(ctx, request, &m, checked.host, &outcome, gen, err);
 		};
 		if (used) {
+			// Counted only when the hook TOOK the request over: gitlab's mediate
+			// answers false for every route but a rules-bearing push, and a
+			// passthrough is not a mediated request.
+			_ = ctx.counters.mediate.fetchAdd(1, .monotonic);
+			// GATE 3: the hook refused over the request body, before any dial --
+			// gitlab's push rules. Checked before the exchange so a hook that
+			// somehow set both fails closed. The body reader has been taken and
+			// is only partly read by now; `deny` responds with keep_alive=false,
+			// so std's discard-and-reuse path (the one that asserts on a
+			// half-read body) is never entered and the connection closes.
+			if (resp.deny) |reason| {
+				_ = ctx.counters.deny_gate3.fetchAdd(1, .monotonic);
+				outcome.gate = 3;
+				deny2(ctx, request, &m, checked.host, &outcome, reason, resp.deny_status);
+				return false;
+			}
 			exchange = resp.exchange orelse {
 				deny2(ctx, request, &m, checked.host, &outcome, "mediate-empty", 502);
 				return false;

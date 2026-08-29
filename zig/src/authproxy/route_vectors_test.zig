@@ -40,6 +40,42 @@ const fixtures = [_]struct { name: []const u8, json: []const u8 }{
 	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
 	\\"grants":[{"id":"gg-pi","scope":"project","repo":"grp/proj","project_id":"1234","caps":["issues"]}]}]}
 	},
+	// --- v2: the fine-grained halves, each on its own fixture so a row proves
+	// exactly one cap. The instance scope keeps the scope test out of the way
+	// (the scope rows above already pin it) EXCEPT on v2-repo/v2-wiki-rw, which
+	// are project-scoped so the %2F-bearing escape rows have something to be
+	// scope-denied against.
+	.{ .name = "v2-issues-ro", .json =
+	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+	\\"grants":[{"id":"gg-ir","scope":"instance","caps":["issues:read"]}]}]}
+	},
+	.{ .name = "v2-mr-nomerge", .json =
+	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+	\\"grants":[{"id":"gg-mrw","scope":"instance","caps":["mr:read","mr:write"]}]}]}
+	},
+	.{ .name = "v2-pipelines-ro", .json =
+	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+	\\"grants":[{"id":"gg-pr","scope":"instance","caps":["pipelines:read"]}]}]}
+	},
+	.{ .name = "v2-pipelines-rw", .json =
+	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+	\\"grants":[{"id":"gg-pw","scope":"instance","caps":["pipelines:read","pipelines:write"]}]}]}
+	},
+	.{ .name = "v2-repo", .json =
+	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+	\\"grants":[{"id":"gg-rr","scope":"project","repo":"grp/proj","project_id":"1234","caps":["repo:read"]}]}]}
+	},
+	.{ .name = "v2-wiki-rw", .json =
+	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+	\\"grants":[{"id":"gg-ww","scope":"project","repo":"grp/proj","project_id":"1234","caps":["wiki:read","wiki:write"]}]}]}
+	},
+	// The v1 dialect, still on the wire from an unedited grant row: `issues`
+	// and `mr` must EXPAND to the fine sets (mr including merge), or a
+	// pre-existing grant silently loses reach the day the enforcer rolls.
+	.{ .name = "v1-coarse", .json =
+	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+	\\"grants":[{"id":"gg-v1","scope":"instance","caps":["issues","mr"]}]}]}
+	},
 };
 
 const Row = struct {
@@ -137,7 +173,7 @@ test "route_vectors: canon rows split segment-first and decode once" {
 		}
 		seen += 1;
 	}
-	try t.expect(seen >= 12);
+	try t.expect(seen >= 14);
 }
 
 test "route_vectors: refuse rows are refused outright (by the path canonicalizer OR the query parser)" {
@@ -158,7 +194,7 @@ test "route_vectors: refuse rows are refused outright (by the path canonicalizer
 		if (std.mem.indexOfScalar(u8, r.fields[0], '?') != null) query_refusals += 1;
 		seen += 1;
 	}
-	try t.expect(seen >= 8);
+	try t.expect(seen >= 26);
 	// At least one row must exercise the QUERY-side refusal (S7).
 	try t.expect(query_refusals >= 1);
 }
@@ -201,7 +237,7 @@ test "route_vectors: route rows classify to the expected route id" {
 		}
 		seen += 1;
 	}
-	try t.expect(seen >= 20);
+	try t.expect(seen >= 83);
 }
 
 test "route_vectors: authz rows allow/deny under their fixture (incl. the six escape rows)" {
@@ -247,7 +283,7 @@ test "route_vectors: authz rows allow/deny under their fixture (incl. the six es
 		if (r.n > 4 and std.mem.startsWith(u8, r.fields[4], ":")) escape_rows += 1;
 		seen += 1;
 	}
-	try t.expect(seen >= 20);
+	try t.expect(seen >= 103);
 	// The labelled six-escape block must all be present and all deny.
 	try t.expect(escape_rows >= 6);
 }

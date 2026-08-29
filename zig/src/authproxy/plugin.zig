@@ -56,9 +56,13 @@ pub const Policy = struct {
 		// the simple credential case. Headers to SET (never append) on the
 		// upstream request. cred.token() reads the store file lazily.
 		authenticate: *const fn (ctx: *const anyopaque, route: *const Route, req: *const Request, cred: *Cred, out: *HeaderSet) AuthError!void,
-		// the INLINE data-plane case (harbor's token dance). null == "use the
-		// default single round trip" -- absent, not a no-op implementation.
-		// Returning false also falls back to the default round trip.
+		// the INLINE data-plane case (harbor's token dance; gitlab's push-rule
+		// body inspection). null == "use the default single round trip" --
+		// absent, not a no-op implementation. Returning false also falls back to
+		// the default round trip, with the body reader UNTOUCHED -- which is
+		// what makes gitlab's fast path (no grant carries rules) byte-identical
+		// to the unmediated relay. Returning true with `out.deny` set is a
+		// pre-dial refusal (gate 3).
 		mediate: ?*const fn (ctx: *const anyopaque, route: *const Route, req: *const Request, cred: *Cred, io: *upstream_mod.UpstreamIO, out: *Response) MediateError!bool = null,
 		// derived-token invalidation (drop a plugin-minted token on 401).
 		// null == none.
@@ -170,6 +174,16 @@ pub const DenyReason = enum {
 	scope_mismatch,
 	method_not_allowed,
 	service_invalid,
+	// The four a `mediate` hook can reach, all of them decided over a request
+	// BODY and all of them BEFORE any dial (gate 3): a pushed ref the grant's
+	// push rules do not admit, a receive-pack command section this proxy cannot
+	// parse, one larger than the bounded prefix (or with more commands than the
+	// cap), and a signed push, whose commands live inside a certificate the
+	// rules cannot be evaluated over.
+	ref_denied,
+	push_malformed,
+	too_many_refs,
+	push_cert_unsupported,
 };
 
 pub const Decision = union(enum) {
@@ -350,11 +364,20 @@ pub const Cred = struct {
 	}
 };
 
-/// A mediate plugin's final answer: the last upstream leg's exchange, handed
-/// back still-open so the core streams its body downstream through the same
-/// relay the default path uses.
+/// A mediate plugin's final answer: EITHER the last upstream leg's exchange,
+/// handed back still-open so the core streams its body downstream through the
+/// same relay the default path uses, OR a deny the hook decided on its own.
+///
+/// `deny` is the seam gitlab's push rules need: the verdict is reached over the
+/// request BODY, which only `mediate` sees, and it must be reached BEFORE any
+/// dial -- a rejected push must not reach the origin at all. It is a
+/// `@tagName(DenyReason)` (the fixed vocabulary `X-Cogbox-Deny` and the audit
+/// line share), never free text; the core answers it as gate 3. A hook that
+/// sets both is denied: fail closed.
 pub const Response = struct {
 	exchange: ?*upstream_mod.Exchange = null,
+	deny: ?[]const u8 = null,
+	deny_status: u16 = 403,
 };
 
 // --- Tests ---

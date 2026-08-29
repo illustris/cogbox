@@ -133,19 +133,27 @@ pub const ConnStorage = struct {
 	transfer_buf: [4096]u8 = undefined,
 	body_buf: [4096]u8 = undefined,
 	mediate_body_reader: std.Io.Reader = undefined,
+	/// The header set a `mediate` hook hands its own leg. The default path uses
+	/// the core's `scratch.auth_headers`, which a hook cannot reach; this is its
+	/// twin, and it lives HERE precisely so it is inside the per-request scratch
+	/// block and one `scrub()` covers it -- it carries `Authorization` exactly
+	/// as the default path's set does (spec §7 custody).
+	mediate_headers: plugin_mod.HeaderSet = .{},
 	exchange: Exchange = undefined,
 
 	/// Scrub the write-side buffers before the storage is freed: the serialized
 	/// request head -- Authorization included -- sat in `wbuf` (and, for TLS,
-	/// `tls_write_buf`) and the request body in `body_buf`. Custody (spec §7):
-	/// the credential lives in memory for one upstream request and nowhere
-	/// after it, so heap reuse can never hand the next request's frame a
-	/// stale token. The read side carries the origin's response, never the
-	/// credential, and is left alone.
+	/// `tls_write_buf`), the request body in `body_buf`, and a mediate leg's
+	/// Authorization in `mediate_headers`. Custody (spec §7): the credential
+	/// lives in memory for one upstream request and nowhere after it, so heap
+	/// reuse can never hand the next request's frame a stale token. The read
+	/// side carries the origin's response, never the credential, and is left
+	/// alone.
 	pub fn scrub(self: *ConnStorage) void {
 		std.crypto.secureZero(u8, &self.wbuf);
 		std.crypto.secureZero(u8, &self.tls_write_buf);
 		std.crypto.secureZero(u8, &self.body_buf);
+		self.mediate_headers.zeroize();
 	}
 };
 
@@ -706,6 +714,16 @@ const t_ = std.testing;
 var test_bundle: std.crypto.Certificate.Bundle = .empty;
 var test_lock: std.Io.RwLock = .init;
 
+/// A heap ConnStorage (far too large for a test frame), zero-INITIALIZED and
+/// not merely allocated: production builds it as part of `RequestScratch.{}`,
+/// and the request path reads defaulted fields off it -- `conn` before a dial,
+/// and now `mediate_headers.used` in `scrub`.
+fn testStorage() *ConnStorage {
+	const s = t_.allocator.create(ConnStorage) catch unreachable;
+	s.* = .{};
+	return s;
+}
+
 fn testUio(tr: *const Transport, storage: *ConnStorage, scheme_https_refused: bool) UpstreamIO {
 	return .{
 		.transport = tr,
@@ -727,7 +745,7 @@ test "UpstreamIO: constructs the head, re-frames the body, parses the response, 
 		"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nset-cookie: s=1\r\nx-custom: keep\r\nconnection: close\r\n\r\nhello",
 	});
 	defer fake.deinit();
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(fake.t(), storage, false);
 
@@ -771,7 +789,7 @@ test "UpstreamIO: constructs the head, re-frames the body, parses the response, 
 
 test "UpstreamIO: the emitter refuses a control byte in any header, the host or the target BEFORE dialing (F1)" {
 	var refusing = RefusingTransport{};
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(refusing.t(), storage, false);
 	var up: plugin_mod.Upstream = .{ .scheme = .http, .host = "git.example.com" };
@@ -835,7 +853,7 @@ test "headersEmittable: the outbound rule mirrors framing's inbound one" {
 
 test "UpstreamIO: the host gate refuses a plugin-returned host outside the entry" {
 	var refusing = RefusingTransport{};
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(refusing.t(), storage, false);
 	var up: plugin_mod.Upstream = .{ .scheme = .http, .host = "api.example.com" };
@@ -848,7 +866,7 @@ test "UpstreamIO: the host gate refuses a plugin-returned host outside the entry
 
 test "UpstreamIO: an https leg over an empty bundle is refused before any dial" {
 	var refusing = RefusingTransport{};
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(refusing.t(), storage, true);
 	var up: plugin_mod.Upstream = .{ .scheme = .https, .host = "git.example.com" };
@@ -863,7 +881,7 @@ test "UpstreamIO: a CL+TE response is refused; the leg budget caps a mediate loo
 		"HTTP/1.1 200 OK\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n",
 	});
 	defer fake.deinit();
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(fake.t(), storage, false);
 	var up: plugin_mod.Upstream = .{ .scheme = .http, .host = "git.example.com" };
@@ -880,7 +898,7 @@ test "UpstreamIO: an upstream 1xx is refused, never relayed (B1's second arm)" {
 		"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
 	});
 	defer fake.deinit();
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(fake.t(), storage, false);
 	var up: plugin_mod.Upstream = .{ .scheme = .http, .host = "git.example.com" };
@@ -892,7 +910,7 @@ test "UpstreamIO: an upstream 1xx is refused, never relayed (B1's second arm)" {
 test "UpstreamIO: the body relay is re-armed to the idle bound once the head is in (S6 pin)" {
 	var fake = FakeTransport.init(t_.allocator, &.{"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"});
 	defer fake.deinit();
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(fake.t(), storage, false);
 	var up: plugin_mod.Upstream = .{ .scheme = .http, .host = "git.example.com" };
@@ -910,7 +928,7 @@ test "UpstreamIO: the body relay is re-armed to the idle bound once the head is 
 test "UpstreamIO: a body-bearing leg uploads under the idle bound, waits for the head under the head bound, then relays idle (S6, request direction)" {
 	var fake = FakeTransport.init(t_.allocator, &.{"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"});
 	defer fake.deinit();
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(fake.t(), storage, false);
 	var up: plugin_mod.Upstream = .{ .scheme = .http, .host = "git.example.com" };
@@ -939,7 +957,7 @@ test "UpstreamIO: an origin header std parsed without inspecting REFUSES the exc
 	};
 	var fake = FakeTransport.init(t_.allocator, &scripts);
 	defer fake.deinit();
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(fake.t(), storage, false);
 	var up: plugin_mod.Upstream = .{ .scheme = .http, .host = "git.example.com" };
@@ -972,7 +990,7 @@ test "UpstreamIO: multi-valued origin headers are all relayed; a duplicated sing
 		"HTTP/1.1 302 Found\r\ncontent-length: 0\r\nlocation: /a\r\nlocation: /b\r\n\r\n",
 	});
 	defer fake.deinit();
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(fake.t(), storage, false);
 	var up: plugin_mod.Upstream = .{ .scheme = .http, .host = "git.example.com" };
@@ -1025,7 +1043,7 @@ test "UpstreamIO: bytes_in meters the relayed request body across legs" {
 		"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
 	});
 	defer fake.deinit();
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(fake.t(), storage, false);
 	var up: plugin_mod.Upstream = .{ .scheme = .http, .host = "git.example.com" };
@@ -1037,22 +1055,26 @@ test "UpstreamIO: bytes_in meters the relayed request body across legs" {
 }
 
 test "ConnStorage.scrub zeroes the write-side buffers that carried the credential" {
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
-	storage.* = .{};
 	@memset(&storage.wbuf, 0x41);
 	@memset(&storage.tls_write_buf, 0x42);
 	@memset(&storage.body_buf, 0x43);
+	// the mediate leg's own header set is inside the block, and carries the
+	// credential exactly as the default path's does
+	try storage.mediate_headers.set("authorization", "Basic SECRETSECRET");
 	storage.scrub();
 	try t_.expect(std.mem.allEqual(u8, &storage.wbuf, 0));
 	try t_.expect(std.mem.allEqual(u8, &storage.tls_write_buf, 0));
 	try t_.expect(std.mem.allEqual(u8, &storage.body_buf, 0));
+	try t_.expectEqual(@as(usize, 0), storage.mediate_headers.len);
+	try t_.expect(std.mem.indexOf(u8, &storage.mediate_headers.storage, "SECRET") == null);
 }
 
 test "UpstreamIO: a body shorter than its declared length never reaches the origin whole" {
 	var fake = FakeTransport.init(t_.allocator, &.{"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"});
 	defer fake.deinit();
-	const storage = t_.allocator.create(ConnStorage) catch unreachable;
+	const storage = testStorage();
 	defer t_.allocator.destroy(storage);
 	var uio = testUio(fake.t(), storage, false);
 	var up: plugin_mod.Upstream = .{ .scheme = .http, .host = "git.example.com" };

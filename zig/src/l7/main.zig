@@ -390,15 +390,28 @@ fn readStdinCapped(allocator: std.mem.Allocator, io: std.Io, limit: usize) ![]u8
 /// as malformed anyway, but refusing BEFORE the parse keeps the failure named.
 pub const max_policy_bytes: usize = 64 * 1024;
 
-/// The auth-proxy policy document schema version this binary understands.
-/// An unknown value is refused BEFORE any write (fail closed both here and in
-/// the enforcer-side conf render, which treats a non-1 doc as dead text).
-pub const policy_doc_version: i64 = 1;
+/// The auth-proxy policy document schema versions this binary understands.
+/// Version 2 adds the fine-grained cap vocabulary (`issues:read`, `mr:merge`,
+/// `pipelines:*`, `repo:read`, `wiki:*`) and per-grant push rules; version 1
+/// stays accepted FOREVER, because the control plane renders the LOWEST
+/// version that carries the grant set losslessly and the empty
+/// share-suspension document `{"version":1,"providers":[]}` is byte-pinned at
+/// version 1. An unknown value is refused BEFORE any write (fail closed both
+/// here and in the enforcer-side conf render, which treats an out-of-range doc
+/// as dead text).
+pub const policy_doc_versions = [_]i64{ 1, 2 };
+
+fn policyDocVersionKnown(v: i64) bool {
+	for (policy_doc_versions) |known| {
+		if (v == known) return true;
+	}
+	return false;
+}
 
 pub const PolicyDocError = error{ MalformedPolicy, UnknownPolicyVersion, OutOfMemory };
 
 /// Validate a policy document WITHOUT writing anything: a JSON object carrying
-/// `"version": 1` and a `providers` array. The EMPTY document
+/// a KNOWN `"version"` (1 or 2) and a `providers` array. The EMPTY document
 /// `{"version":1,"providers":[]}` is ACCEPTED -- refusing it would leave the
 /// previous policy live with the control plane unable to withdraw it, the same
 /// reason `l7 replace` accepts an empty batch. Deeper validation is deliberately
@@ -414,7 +427,7 @@ pub fn validatePolicyDoc(allocator: std.mem.Allocator, payload: []const u8) Poli
 	const root = parsed.value;
 	if (root != .object) return error.MalformedPolicy;
 	const v = root.object.get("version") orelse return error.MalformedPolicy;
-	if (v != .integer or v.integer != policy_doc_version) return error.UnknownPolicyVersion;
+	if (v != .integer or !policyDocVersionKnown(v.integer)) return error.UnknownPolicyVersion;
 	const p = root.object.get("providers") orelse return error.MalformedPolicy;
 	if (p != .array) return error.MalformedPolicy;
 }
@@ -462,7 +475,11 @@ fn cmdPolicy(
 	validatePolicyDoc(allocator, payload) catch |err| switch (err) {
 		error.OutOfMemory => return err,
 		error.MalformedPolicy => return die(allocator, io, "invalid policy document (expected a JSON object with version + providers[])", .{}, 65),
-		error.UnknownPolicyVersion => return die(allocator, io, "unknown policy document version (expected {d})", .{policy_doc_version}, 65),
+		// The control plane's classifier keys on the SUBSTRING
+		// "cogbox l7: error: unknown policy document version" (a newer control
+		// plane re-renders the narrowed v1 document on it), so the prefix is a
+		// cross-repo contract; only the parenthetical moves as versions land.
+		error.UnknownPolicyVersion => return die(allocator, io, "unknown policy document version (expected 1 or 2)", .{}, 65),
 	};
 
 	// Re-parse INTO THE CONFIG TREE's arena. alloc_always: the stdin buffer is
@@ -596,6 +613,24 @@ test "validatePolicyDoc: a populated v1 document is accepted" {
 	);
 }
 
+test "validatePolicyDoc: a populated v2 document (fine caps + push rules) is accepted" {
+	// Version 2 is the fine-grained vocabulary plus per-grant push rules. This
+	// verb still validates only the envelope: what the caps and the push object
+	// MEAN is the auth proxy plugin's `compile`, which fails closed on anything
+	// it does not fully understand.
+	try validatePolicyDoc(t.allocator,
+		\\{"version":2,"providers":[{
+		\\  "provider":"GitLab","plugin":"gitlab","hosts":["git.example.com"],
+		\\  "secret":"git-gitlab","git_user":"oauth2","scheme":"https",
+		\\  "grants":[{"id":"gg-1","scope":"project","repo":"grp/proj","project_id":"1234",
+		\\             "caps":["git-read","git-write","issues:read","mr:merge"],
+		\\             "push":{"deny_delete":true,"deny_tags":true,"refs":["refs/heads/agent/*"]}}]}]}
+	);
+	// ...and the empty document stays valid at BOTH versions (the control plane
+	// pins the share-suspension form at v1, but a v2 empty doc is not malformed).
+	try validatePolicyDoc(t.allocator, "{\"version\":2,\"providers\":[]}");
+}
+
 test "validatePolicyDoc: malformed and unknown-version documents are refused" {
 	// Malformed JSON / wrong shapes -- all refused BEFORE any write.
 	try t.expectError(error.MalformedPolicy, validatePolicyDoc(t.allocator, ""));
@@ -605,8 +640,11 @@ test "validatePolicyDoc: malformed and unknown-version documents are refused" {
 	try t.expectError(error.MalformedPolicy, validatePolicyDoc(t.allocator, "{\"version\":1}"));
 	try t.expectError(error.MalformedPolicy, validatePolicyDoc(t.allocator, "{\"version\":1,\"providers\":{}}"));
 	// An unknown (or non-integer) version is its own named refusal: a NEWER
-	// schema must never be half-interpreted by an older binary.
-	try t.expectError(error.UnknownPolicyVersion, validatePolicyDoc(t.allocator, "{\"version\":2,\"providers\":[]}"));
+	// schema must never be half-interpreted by an older binary. 3 is the next
+	// unlanded one; 0 and a negative are the rolled-back/hand-edited forms.
+	try t.expectError(error.UnknownPolicyVersion, validatePolicyDoc(t.allocator, "{\"version\":3,\"providers\":[]}"));
+	try t.expectError(error.UnknownPolicyVersion, validatePolicyDoc(t.allocator, "{\"version\":0,\"providers\":[]}"));
+	try t.expectError(error.UnknownPolicyVersion, validatePolicyDoc(t.allocator, "{\"version\":-1,\"providers\":[]}"));
 	try t.expectError(error.UnknownPolicyVersion, validatePolicyDoc(t.allocator, "{\"version\":\"1\",\"providers\":[]}"));
 }
 

@@ -24,6 +24,7 @@ test {
 	std.testing.refAllDecls(@import("conf.zig"));
 	std.testing.refAllDecls(@import("upstream.zig"));
 	std.testing.refAllDecls(@import("plugin.zig"));
+	std.testing.refAllDecls(@import("pktline.zig"));
 	std.testing.refAllDecls(@import("plugins/gitlab.zig"));
 	_ = @import("route_vectors_test.zig");
 }
@@ -311,13 +312,15 @@ test "e2e: two hosts back-to-back on one pooled connection route independently" 
 	defer fake.deinit();
 
 	// Request 1: git.example.com, an ambient read -> allowed. Request 2:
-	// api.example.com, but that host's grant is git-write only, so an ambient
-	// API read is cap_missing -> deny, and the upstream is NOT dialed for it.
-	// (git-read WOULD reach the ambient routes now -- read = discover + inspect
-	// -- so a write-only grant is the one that still denies a bare read here.)
+	// api.example.com, whose grant is git-write only, asking for that host's
+	// ISSUES tracker: `issues:read` is absent, so gate 2 denies with
+	// cap_missing and the upstream is NOT dialed for it. (The ambient two are
+	// reachable by ANY capability under v2 -- they name the owner's identity
+	// and the server version, nothing resource-scoped -- so a resource route is
+	// what separates the two hosts' policies here.)
 	const two = "GET /api/v4/user HTTP/1.1\r\nHost: git.example.com\r\n" ++
 		"X-Cogbox-Host: git.example.com\r\nX-Cogbox-Vetted: 10.0.0.5:443\r\n\r\n" ++
-		"GET /api/v4/user HTTP/1.1\r\nHost: api.example.com\r\n" ++
+		"GET /api/v4/projects/1234/issues HTTP/1.1\r\nHost: api.example.com\r\n" ++
 		"X-Cogbox-Host: api.example.com\r\nX-Cogbox-Vetted: 10.0.0.6:443\r\nConnection: close\r\n\r\n";
 	var run = try serve(gpa, h.io, gen, fake.t(), two);
 	defer run.deinit(gpa);
@@ -1824,4 +1827,379 @@ test "e2e: /_cogbox/grants refuses a non-GET/HEAD method with method_not_allowed
 		// the grants body is NEVER rendered for a refused method
 		try t.expect(std.mem.indexOf(u8, run.response, "acme/iac") == null);
 	}
+}
+
+// --- push rules: the gitlab mediate hook, end to end -------------------------
+//
+// The pins here are the ones the units structurally cannot reach: that an
+// admitted push arrives at the origin BYTE-IDENTICAL under the owner's Basic
+// credential, that a refused one never opens a socket, and that a deny taken
+// AFTER the body reader was handed to the plugin still closes the connection
+// cleanly instead of tripping std's discard-and-reuse assert.
+
+const pktline = @import("pktline.zig");
+
+const push_oid_a = "1" ** 40;
+const push_oid_b = "2" ** 40;
+const push_oid_zero = "0" ** 40;
+
+/// One command line plus the flush that ends the section. `inline` so the
+/// fixtures below stay comptime-known and can be `++`ed with a packfile.
+inline fn cmdSection(comptime line: []const u8) []const u8 {
+	return pktline.frame(line) ++ pktline.flush_pkt;
+}
+
+/// A conf whose single instance grant may push ONLY under refs/heads/agent/**,
+/// with deletes and tags denied -- the shape the control plane renders for a
+/// branch-fenced grant.
+fn confJsonPush(h: *Harness) ![]u8 {
+	return std.fmt.allocPrint(h.gpa,
+		\\{{"version":1,"providers":[{{"host":"git.example.com","plugin":"gitlab","scheme":"http","insecure":false,
+		\\"cred_file":"{s}","cred_format":"raw","git_user":"oauth2",
+		\\"grants":[{{"id":"gg-push","scope":"instance","caps":["git-read","git-write"],
+		\\"push":{{"refs":["refs/heads/agent/**"],"deny_delete":true,"deny_tags":true}}}}]}}]}}
+	, .{h.cred_path});
+}
+
+fn pushReq(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
+	return std.fmt.allocPrint(gpa, "POST /grp/proj.git/git-receive-pack HTTP/1.1\r\n" ++
+		"Host: git.example.com\r\n" ++
+		"X-Cogbox-Host: git.example.com\r\n" ++
+		"X-Cogbox-Vetted: 10.0.0.5:443\r\n" ++
+		"X-Cogbox-Proto: https\r\n" ++
+		"Content-Type: application/x-git-receive-pack-request\r\n" ++
+		"Content-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+}
+
+/// serve() with the request-path counters handed back. An ADMITTED push and the
+/// same push on the default relay put identical bytes on the wire -- that is the
+/// whole point of the forwarding path -- so the counters are the only way a test
+/// can tell which arm ran, and every byte-identity assertion below is paired
+/// with one.
+const Metered = struct {
+	run: Run,
+	mediate: u64,
+	deny_gate3: u64,
+	allow: u64,
+
+	fn deinit(self: *Metered, gpa: std.mem.Allocator) void {
+		self.run.deinit(gpa);
+	}
+};
+
+fn serveMetered(gpa: std.mem.Allocator, io: std.Io, gen: *conf.Generation, transport: *const upstream.Transport, request_bytes: []const u8) !Metered {
+	var store = conf.Store.initStatic(gpa, io, gen);
+	defer store.deinit();
+	var audit = std.Io.Writer.Allocating.init(gpa);
+	defer audit.deinit();
+	var ctx = main.Context{ .gpa = gpa, .io = io, .store = &store, .transport = transport, .audit = &audit.writer };
+	var in = std.Io.Reader.fixed(request_bytes);
+	var out = std.Io.Writer.Allocating.init(gpa);
+	defer out.deinit();
+	main.serveConnection(&ctx, &in, &out.writer);
+	return .{
+		.run = .{ .response = try gpa.dupe(u8, out.written()), .audit = try gpa.dupe(u8, audit.written()) },
+		.mediate = ctx.counters.mediate.load(.monotonic),
+		.deny_gate3 = ctx.counters.deny_gate3.load(.monotonic),
+		.allow = ctx.counters.allow.load(.monotonic),
+	};
+}
+
+/// The bytes after the head of a captured upstream request.
+fn upstreamBody(req: []const u8) []const u8 {
+	const sep = std.mem.indexOf(u8, req, "\r\n\r\n") orelse return "";
+	return req[sep + 4 ..];
+}
+
+/// Decode a chunked body back to its bytes, so "re-framed, not rewritten" is
+/// asserted on the CONTENT rather than on the framing that carries it.
+fn dechunk(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
+	var out = std.Io.Writer.Allocating.init(gpa);
+	errdefer out.deinit();
+	var i: usize = 0;
+	while (true) {
+		const eol = std.mem.indexOfPos(u8, body, i, "\r\n") orelse return error.BadChunk;
+		const n = try std.fmt.parseInt(usize, body[i..eol], 16);
+		i = eol + 2;
+		if (n == 0) break;
+		if (i + n + 2 > body.len) return error.BadChunk;
+		try out.writer.writeAll(body[i .. i + n]);
+		i += n + 2;
+	}
+	return out.toOwnedSlice();
+}
+
+test "e2e: an admitted push forwards the WHOLE body byte-identically under the owner's Basic credential" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try confJsonPush(&h);
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+
+	// A real push shape: the command line with its capability list, the flush,
+	// then a packfile carrying bytes no text encoding would survive.
+	const body = cmdSection(push_oid_a ++ " " ++ push_oid_b ++ " refs/heads/agent/x\x00report-status side-band-64k") ++
+		"PACK\x00\x02\x00\x00\x00\x01\xff\xfe";
+	const req = try pushReq(gpa, body);
+	defer gpa.free(req);
+
+	var fake = upstream.FakeTransport.init(gpa, &.{"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"});
+	defer fake.deinit();
+	var met = try serveMetered(gpa, h.io, gen, fake.t(), req);
+	defer met.deinit(gpa);
+	const run = met.run;
+
+	try t.expect(std.mem.startsWith(u8, run.response, "HTTP/1.1 200 OK\r\n"));
+	// the MEDIATE arm ran (and admitted): without this the assertions below hold
+	// just as well on the default relay, which is exactly the trap
+	try t.expectEqual(@as(u64, 1), met.mediate);
+	try t.expectEqual(@as(u64, 0), met.deny_gate3);
+	try t.expectEqual(@as(u64, 1), met.allow);
+	try t.expectEqual(@as(usize, 1), fake.calls);
+	const up_req = fake.captured.items[0];
+	try t.expect(std.mem.startsWith(u8, up_req, "POST /grp/proj.git/git-receive-pack HTTP/1.1\r\n"));
+	// the OWNER credential, in the git tier's Basic form -- base64("oauth2:glpat-FAKEFAKEFAKE")
+	try t.expect(std.mem.indexOf(u8, up_req, "authorization: Basic b2F1dGgyOmdscGF0LUZBS0VGQUtFRkFLRQ==\r\n") != null);
+	// the framing is UNCHANGED: the same declared length, and the same bytes --
+	// the buffered command section replayed ahead of the live packfile
+	var cl_buf: [64]u8 = undefined;
+	try t.expect(std.mem.indexOf(u8, up_req, std.fmt.bufPrint(&cl_buf, "content-length: {d}\r\n", .{body.len}) catch unreachable) != null);
+	try t.expectEqualStrings(body, upstreamBody(up_req));
+	// the whole guest body was consumed by the forward, so the connection is
+	// still reusable -- a mediate arm that left a tail unread would show up here
+	// as a forced close
+	try t.expect(std.mem.indexOf(u8, run.response, "connection: close\r\n") == null);
+	try t.expect(std.mem.indexOf(u8, run.audit, " decision=allow ") != null);
+	try t.expect(std.mem.indexOf(u8, run.audit, " route=git-receive ") != null);
+	var bi_buf: [64]u8 = undefined;
+	try t.expect(std.mem.indexOf(u8, run.audit, std.fmt.bufPrint(&bi_buf, " bytes_in={d} ", .{body.len}) catch unreachable) != null);
+}
+
+test "e2e: the same push under a grant with NO rules never enters the mediate arm (fast-path pin)" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	// the ordinary conf: git-write, no push object anywhere
+	const cj = try h.confJson();
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+
+	const body = cmdSection(push_oid_a ++ " " ++ push_oid_b ++ " refs/heads/main\x00report-status") ++ "PACKDATA";
+	const req = try pushReq(gpa, body);
+	defer gpa.free(req);
+	var fake = upstream.FakeTransport.init(gpa, &.{"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"});
+	defer fake.deinit();
+	var met = try serveMetered(gpa, h.io, gen, fake.t(), req);
+	defer met.deinit(gpa);
+
+	// the hook was consulted and declined BEFORE reading a byte: the counter
+	// stays at zero and the core's default relay carried the request
+	try t.expectEqual(@as(u64, 0), met.mediate);
+	try t.expectEqual(@as(u64, 0), met.deny_gate3);
+	try t.expect(std.mem.startsWith(u8, met.run.response, "HTTP/1.1 200 OK\r\n"));
+	// ...to the same bytes: `refs/heads/main` is refused under rules and relayed
+	// without them, which is the whole difference push rules make
+	try t.expectEqualStrings(body, upstreamBody(fake.captured.items[0]));
+}
+
+test "e2e: a push the rules refuse is a 403 ref_denied at gate 3 with NO dial" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try confJsonPush(&h);
+	defer gpa.free(cj);
+
+	const Case = struct { body: []const u8, why: []const u8 };
+	const cases = [_]Case{
+		.{
+			.body = cmdSection(push_oid_a ++ " " ++ push_oid_b ++ " refs/heads/main\x00report-status") ++ "PACKDATA",
+			.why = "a branch outside the patterns",
+		},
+		.{
+			// a DELETE of an ALLOWED ref: deny_delete, not the patterns, refuses it
+			.body = cmdSection(push_oid_a ++ " " ++ push_oid_zero ++ " refs/heads/agent/x"),
+			.why = "a delete under deny_delete",
+		},
+		.{
+			.body = cmdSection(push_oid_a ++ " " ++ push_oid_b ++ " refs/tags/v1.0") ++ "PACKDATA",
+			.why = "a tag under deny_tags",
+		},
+	};
+	for (cases) |c| {
+		const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+		const req = try pushReq(gpa, c.body);
+		defer gpa.free(req);
+		var refusing = upstream.RefusingTransport{};
+		var met = try serveMetered(gpa, h.io, gen, refusing.t(), req);
+		defer met.deinit(gpa);
+		const run = met.run;
+		if (!std.mem.startsWith(u8, run.response, "HTTP/1.1 403 ")) {
+			std.debug.print("{s}: response was {s}\n", .{ c.why, run.response });
+			return error.NotRefused;
+		}
+		try t.expect(std.ascii.indexOfIgnoreCase(run.response, "X-Cogbox-Deny: ref_denied") != null);
+		try t.expect(std.mem.indexOf(u8, run.response, "connection: close\r\n") != null);
+		// NOTHING of the push reached the origin -- not the commands, not the pack
+		try t.expectEqual(@as(usize, 0), refusing.calls);
+		try t.expectEqual(@as(u64, 1), met.mediate);
+		try t.expectEqual(@as(u64, 1), met.deny_gate3);
+		try t.expectEqual(@as(u64, 0), met.allow);
+		try t.expect(std.mem.indexOf(u8, run.audit, " gate=3 ") != null);
+		try t.expect(std.mem.indexOf(u8, run.audit, " reason=ref_denied ") != null);
+		try t.expect(std.mem.indexOf(u8, run.audit, " route=git-receive ") != null);
+		try t.expect(std.mem.indexOf(u8, run.audit, " status=403 ") != null);
+		// the audit never names a ref (the C04 rule: route ids, never request data)
+		try t.expect(std.mem.indexOf(u8, run.audit, "refs/") == null);
+	}
+}
+
+test "e2e: git's lone-flush probe body and an unparseable one -- one forwards, the other is a 400 with no dial" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try confJsonPush(&h);
+	defer gpa.free(cj);
+
+	// The probe POST git sends ahead of a chunked push is exactly `0000`: zero
+	// commands is a legitimate parse and MUST relay, or every push over
+	// http.postBuffer breaks.
+	{
+		const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+		const req = try pushReq(gpa, pktline.flush_pkt);
+		defer gpa.free(req);
+		var fake = upstream.FakeTransport.init(gpa, &.{"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"});
+		defer fake.deinit();
+		var met = try serveMetered(gpa, h.io, gen, fake.t(), req);
+		defer met.deinit(gpa);
+		try t.expect(std.mem.startsWith(u8, met.run.response, "HTTP/1.1 200 OK\r\n"));
+		// parsed by the mediate arm (zero commands is a PARSE, not a bypass) and
+		// then relayed unchanged
+		try t.expectEqual(@as(u64, 1), met.mediate);
+		try t.expectEqual(@as(u64, 0), met.deny_gate3);
+		try t.expectEqual(@as(usize, 1), fake.calls);
+		try t.expectEqualStrings(pktline.flush_pkt, upstreamBody(fake.captured.items[0]));
+	}
+	// A body whose framing this proxy cannot read is a 400 -- never forwarded on
+	// the theory that the origin will sort it out.
+	{
+		const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+		const req = try pushReq(gpa, "zzzz" ++ pktline.flush_pkt);
+		defer gpa.free(req);
+		var refusing = upstream.RefusingTransport{};
+		var run = try serve(gpa, h.io, gen, refusing.t(), req);
+		defer run.deinit(gpa);
+		try t.expect(std.mem.startsWith(u8, run.response, "HTTP/1.1 400 "));
+		try t.expect(std.ascii.indexOfIgnoreCase(run.response, "X-Cogbox-Deny: push_malformed") != null);
+		try t.expectEqual(@as(usize, 0), refusing.calls);
+	}
+}
+
+test "e2e: a chunked push is re-framed upstream with the buffered prefix intact" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try confJsonPush(&h);
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+
+	// A push over http.postBuffer arrives chunked: the command section and the
+	// pack land in separate chunks, and the guest's framing is never forwarded.
+	const section = cmdSection(push_oid_a ++ " " ++ push_oid_b ++ " refs/heads/agent/deep/x\x00report-status");
+	const pack = "PACK\x00\x02CHUNKEDPAYLOAD";
+	const req = try std.fmt.allocPrint(gpa, "POST /grp/proj.git/git-receive-pack HTTP/1.1\r\n" ++
+		"Host: git.example.com\r\n" ++
+		"X-Cogbox-Host: git.example.com\r\n" ++
+		"X-Cogbox-Vetted: 10.0.0.5:443\r\n" ++
+		"Content-Type: application/x-git-receive-pack-request\r\n" ++
+		"Transfer-Encoding: chunked\r\n\r\n" ++
+		"{x}\r\n{s}\r\n{x}\r\n{s}\r\n0\r\n\r\n", .{ section.len, section, pack.len, pack });
+	defer gpa.free(req);
+
+	var fake = upstream.FakeTransport.init(gpa, &.{"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"});
+	defer fake.deinit();
+	var met = try serveMetered(gpa, h.io, gen, fake.t(), req);
+	defer met.deinit(gpa);
+
+	try t.expect(std.mem.startsWith(u8, met.run.response, "HTTP/1.1 200 OK\r\n"));
+	try t.expectEqual(@as(u64, 1), met.mediate);
+	try t.expectEqual(@as(usize, 1), fake.calls);
+	const up_req = fake.captured.items[0];
+	// re-framed by the emitter (never the guest's chunk sizes), and no length
+	try t.expect(std.mem.indexOf(u8, up_req, "transfer-encoding: chunked\r\n") != null);
+	try t.expect(std.mem.indexOf(u8, up_req, "content-length:") == null);
+	// ...and the CONTENT is the original stream: prefix first, then the pack
+	const decoded = try dechunk(gpa, upstreamBody(up_req));
+	defer gpa.free(decoded);
+	try t.expectEqualStrings(section ++ pack, decoded);
+}
+
+test "e2e: a gate-3 deny with the body reader already taken closes the connection cleanly" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try confJsonPush(&h);
+	defer gpa.free(cj);
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+
+	// 40 KiB of packfile the verdict never reads: before this arm existed, no
+	// deny had ever been taken after `readerExpectContinue` handed the body out,
+	// and std's discard-and-reuse path asserts on a half-read body. keep_alive
+	// is false, so that path is never entered -- and the unread tail must not be
+	// parsed as a second request either.
+	const body = cmdSection(push_oid_a ++ " " ++ push_oid_b ++ " refs/heads/main\x00report-status") ++
+		("P" ** (40 * 1024));
+	const req = try pushReq(gpa, body);
+	defer gpa.free(req);
+	var refusing = upstream.RefusingTransport{};
+	var run = try serve(gpa, h.io, gen, refusing.t(), req);
+	defer run.deinit(gpa);
+
+	try t.expect(std.mem.startsWith(u8, run.response, "HTTP/1.1 403 "));
+	try t.expect(std.mem.indexOf(u8, run.response, "connection: close\r\n") != null);
+	try t.expect(std.mem.endsWith(u8, run.response, "\r\n\r\n")); // head only, empty body
+	try t.expectEqual(@as(usize, 0), refusing.calls);
+	// EXACTLY one request was served: the unread pack was not re-parsed
+	try t.expectEqual(@as(usize, 1), std.mem.count(u8, run.audit, "authproxy request "));
+	try t.expectEqual(@as(usize, 1), std.mem.count(u8, run.response, "HTTP/1.1 "));
+}
+
+test "e2e: a mediated push scrubs its credential too -- mediate_headers is inside the scratch block (S5 pin extension)" {
+	const gpa = t.allocator;
+	var h = try Harness.init(gpa);
+	defer h.deinit();
+	const cj = try confJsonPush(&h);
+	defer gpa.free(cj);
+	const raw_token = "glpat-FAKEFAKEFAKE";
+	const basic_form = "b2F1dGgyOmdscGF0LUZBS0VGQUtFRkFLRQ==";
+
+	var ra = RetainingAllocator{ .backing = gpa };
+	defer ra.deinit();
+	const gen = try conf.parseGeneration(gpa, h.io, cj, 1, .skip, null);
+	var store = conf.Store.initStatic(gpa, h.io, gen);
+	defer store.deinit();
+	var fake = upstream.FakeTransport.init(gpa, &.{"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"});
+	defer fake.deinit();
+
+	const body = cmdSection(push_oid_a ++ " " ++ push_oid_b ++ " refs/heads/agent/x") ++ "PACKDATA";
+	const req = try pushReq(gpa, body);
+	defer gpa.free(req);
+	// the request path (and the mediate hook's prefix buffer) allocate from ctx.gpa
+	var ctx = main.Context{ .gpa = ra.allocator(), .io = h.io, .store = &store, .transport = fake.t() };
+	var in = std.Io.Reader.fixed(req);
+	var out = std.Io.Writer.Allocating.init(gpa);
+	defer out.deinit();
+	main.serveConnection(&ctx, &in, &out.writer);
+
+	// positive control: the credential DID reach the origin through the mediate
+	// leg's own header set
+	try t.expect(std.mem.startsWith(u8, out.written(), "HTTP/1.1 200 OK\r\n"));
+	try t.expect(std.mem.indexOf(u8, fake.captured.items[0], basic_form) != null);
+	var saw_scratch = false;
+	for (ra.retired.items) |r| {
+		if (r.block.len >= @sizeOf(main.RequestScratch)) saw_scratch = true;
+		try t.expect(std.mem.indexOf(u8, r.block, raw_token) == null);
+		try t.expect(std.mem.indexOf(u8, r.block, basic_form) == null);
+	}
+	try t.expect(saw_scratch);
 }

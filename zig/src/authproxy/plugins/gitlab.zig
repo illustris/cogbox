@@ -1,25 +1,52 @@
 // gitlab -- plugin #1, at parity with the compiled-rule tier plus the approved
-// v1 archive route (plan decision 3) and the v1.1 namespace-enumeration route.
+// v1 archive route (plan decision 3), the v1.1 namespace-enumeration route and
+// the v2 fine-capability split (the four coarse caps become twelve, and four
+// new API areas -- pipelines, jobs, the repository READ API and wikis -- become
+// expressible).
 //
-// The 10-route table (addendum E.4), first match wins, unmatched => gate-1 deny:
+// The 16-route table, first match wins, unmatched => gate-1 deny:
 //
-//   git-refs            GET        <project-ref>[.git]/info/refs?service=...   stream
-//   git-upload          POST       <project-ref>[.git]/git-upload-pack         stream
-//   git-receive         POST       <project-ref>[.git]/git-receive-pack        stream
-//   api-user            GET,HEAD   /api/v4/user
-//   api-version         GET,HEAD   /api/v4/version
-//   api-project         GET,HEAD   /api/v4/projects/:id
-//   api-group-projects  GET,HEAD   /api/v4/groups/<group-path>/projects
-//   api-issues          GET,HEAD,POST,PUT  /api/v4/projects/:id/issues[/...]
-//   api-mr              GET,HEAD,POST,PUT  /api/v4/projects/:id/merge_requests[/...]
-//   api-archive         GET,HEAD   /api/v4/projects/:id/repository/archive[.<ext>]  stream
+//   git-refs             GET        <project-ref>[.git]/info/refs?service=...   stream
+//   git-upload           POST       <project-ref>[.git]/git-upload-pack         stream
+//   git-receive          POST       <project-ref>[.git]/git-receive-pack        stream
+//   api-user             GET,HEAD   /api/v4/user
+//   api-version          GET,HEAD   /api/v4/version
+//   api-project          GET,HEAD   /api/v4/projects/:id
+//   api-group-projects   GET,HEAD   /api/v4/groups/<group-path>/projects
+//   api-issues           GET,HEAD,POST,PUT  /api/v4/projects/:id/issues[/...]
+//   api-mr               GET,HEAD,POST,PUT  .../merge_requests[/...], NOT the merge class
+//   api-mr-merge         GET,HEAD,POST,PUT  .../merge_requests/<iid>/<merge-class tail>[/...]
+//   api-pipelines        GET,HEAD + POST on <id>/{retry,cancel}   .../pipelines[/...]
+//   api-pipeline-trigger POST       .../pipeline
+//   api-jobs             GET,HEAD + POST on <id>/{retry,cancel,play}  .../jobs[/...]
+//   api-repo             GET,HEAD   .../repository/<collection>[/...]
+//   api-wiki             GET,HEAD,POST,PUT  .../wikis[/...]
+//   api-archive          GET,HEAD   .../repository/archive[.<ext>]              stream
 //
-// Everything else -- access_tokens, variables, deploy_keys, every OTHER groups
-// tail (and the group node itself), /-/**, /uploads, /assets, raw, registries,
-// /oauth/**, /admin, info/lfs/**, gitlab-lfs/**, git-upload-archive -- routes
-// NOWHERE, and DELETE is in no capability's method set. `service` is a parameter
-// of exactly ONE route (git-refs), and /api/** can never be a git route, so the
-// service-laundering class closes structurally.
+// Everything else -- access_tokens, variables (the CI/CD kind AND
+// `/pipelines/:id/variables`), deploy_keys, every OTHER groups tail (and the
+// group node itself), /-/**, /uploads, /assets, raw, registries, /oauth/**,
+// /admin, info/lfs/**, gitlab-lfs/**, git-upload-archive, GraphQL, snippets and
+// packages -- routes NOWHERE. `service` is a parameter of exactly ONE route
+// (git-refs), and /api/** can never be a git route, so the service-laundering
+// class closes structurally.
+//
+// Three invariants the table encodes, each load-bearing:
+//
+//   1. DELETE is in NO capability's method set, on any route. It is
+//      irreversible and nothing in the headline flows needs it; a future
+//      `*:delete` cap is the extension point.
+//   2. REPOSITORY WRITES THROUGH THE API ARE UNROUTABLE. `api-repo` is clamped
+//      to GET/HEAD, so `POST /repository/commits`, `POST|PUT
+//      /repository/files/*` and the branch/tag write endpoints are refused
+//      (`method_not_allowed`) no matter how wide the grant -- including a
+//      `git-write` one. They would otherwise write to a branch without ever
+//      passing through receive-pack, i.e. straight past the per-grant push
+//      rules. Repository mutation goes through `git push`, where the rules
+//      live. `archive` stays its own streaming route (`api-archive`).
+//   3. `/pipelines/:id/variables` is a NAMED no_route, not a method clamp: the
+//      variables of a pipeline are secrets the sandbox may not read even with
+//      `pipelines:read`.
 //
 // Plus ONE plugin-owned LOCAL route, matched BEFORE the table above and NEVER
 // proxied upstream (Route.local, answered by localResponse):
@@ -30,11 +57,19 @@
 // retargeted host, but it reflects THIS sandbox's own grants back as JSON from
 // the compiled policy -- no credential, no upstream. Any other `_cogbox/**`
 // path is a named gate-1 deny.
+//
+// ONE route is additionally MEDIATED: `git-receive`, and only under a grant
+// that carries push rules. The receive-pack command list is read out of the
+// request body and matched against the grant's ref patterns BEFORE any dial
+// (see "push rules" below). Every other route -- and every push no covering
+// grant restricts -- takes the pure-passthrough arm with the body untouched.
 
 const std = @import("std");
 const canon = @import("../canon.zig");
 const conf = @import("../conf.zig");
 const plugin_mod = @import("../plugin.zig");
+const pktline = @import("../pktline.zig");
+const upstream_mod = @import("../upstream.zig");
 
 pub const plugin: plugin_mod.Plugin = .{
 	.name = "gitlab",
@@ -46,20 +81,72 @@ const vtable: plugin_mod.Policy.VTable = .{
 	.authorize = authorize,
 	.upstream = upstream,
 	.authenticate = authenticate,
-	// Genuinely ABSENT, not no-op: gitlab needs no inline mediation and the
-	// owner token is refreshed only by cogworx (spec §3.2).
-	.mediate = null,
+	// The ONE body-aware seam: per-grant push rules, which can only be decided
+	// over a receive-pack command list. It answers `false` -- pure passthrough,
+	// body reader untouched -- for every other route AND for a push no covering
+	// grant restricts, so the unrestricted relay is byte-identical to what it
+	// was when this was null.
+	.mediate = mediateReceivePack,
+	// Genuinely ABSENT, not no-op: the owner token is refreshed only by cogworx
+	// (spec §3.2), so there is no derived token to invalidate on a 401.
 	.onUpstreamStatus = null,
 	// The /_cogbox/grants self-discovery reflection route (Route.local).
 	.localResponse = localResponse,
 };
 
+/// The twelve v2 capabilities, ORTHOGONAL: `issues:write` does not imply
+/// `issues:read`, `mr:merge` does not imply `mr:write`. The document is a
+/// compiled artifact whose meaning must be readable without an implication
+/// table three codebases could drift on; the control plane's UI auto-ticks the
+/// read half as a client courtesy, and that courtesy is never enforced here.
 const Caps = struct {
 	git_read: bool = false,
 	git_write: bool = false,
-	issues: bool = false,
-	mr: bool = false,
+	issues_read: bool = false,
+	issues_write: bool = false,
+	mr_read: bool = false,
+	mr_write: bool = false,
+	mr_merge: bool = false,
+	pipelines_read: bool = false,
+	pipelines_write: bool = false,
+	repo_read: bool = false,
+	wiki_read: bool = false,
+	wiki_write: bool = false,
+
+	/// Any capability at all -- the gate on the routes that name no resource
+	/// class of their own (the ambient two and api-project, which additionally
+	/// takes the scope test).
+	fn anyCap(self: Caps) bool {
+		inline for (@typeInfo(Caps).@"struct".fields) |f| {
+			if (@field(self, f.name)) return true;
+		}
+		return false;
+	}
 };
+
+/// One `refs/...` glob from a grant's push rules, pre-split into components.
+/// `raw` is kept for the self-discovery reflection, which echoes the pattern
+/// the owner typed rather than a re-joined normalization.
+const RefPattern = struct {
+	raw: []const u8,
+	comps: []const []const u8,
+};
+
+/// A grant's compiled push rules. `refs` empty means "any refname"; the two
+/// deny flags are independent of the patterns. Evaluated against the
+/// receive-pack command list, never against a route.
+const PushRules = struct {
+	refs: []const RefPattern,
+	deny_delete: bool,
+	deny_tags: bool,
+};
+
+/// At most this many ref patterns per grant, each at most this many bytes: the
+/// mirror of the control plane's admission check, so a document that somehow
+/// got past it still fails closed here rather than costing an unbounded walk
+/// per pushed command.
+const max_push_patterns = 8;
+const max_push_pattern_bytes = 128;
 
 const Scope = enum { project, namespace, instance };
 
@@ -71,6 +158,8 @@ const CGrant = struct {
 	project_id: ?i64,
 	projects: []const conf.Project,
 	caps: Caps,
+	/// null == unrestricted push (and the receive-pack fast path).
+	push: ?PushRules,
 };
 
 const Compiled = struct {
@@ -80,32 +169,119 @@ const Compiled = struct {
 	grants: []CGrant,
 };
 
-/// Compile the entry's grants[] into scope tests + cap sets. Fails closed on
-/// an unknown cap, an unknown scope, a malformed prefix or project_id, or a
-/// scope missing its required field. It never sees an empty project_id on a
-/// concrete grant carrying issues/mr -- the cogworx compiler already filtered
-/// those caps (spec §4.3's error-resolve rule); re-deriving that rule here
-/// would put grant policy in every plugin.
+/// Fold one capability string into the set. Accepts the twelve v2 names and
+/// the two LEGACY coarse ones, which EXPAND (the mirror of cogworx's
+/// NormalizeGitCaps): `issues` was read+write, and v1 `mr` INCLUDED
+/// approve/merge, so it becomes the whole mr triple. Returns false on anything
+/// unrecognized -- api-read/api-full do not exist in the code and never did.
+fn applyCap(caps: *Caps, cap: []const u8) bool {
+	if (std.mem.eql(u8, cap, "git-read")) {
+		caps.git_read = true;
+	} else if (std.mem.eql(u8, cap, "git-write")) {
+		caps.git_write = true;
+	} else if (std.mem.eql(u8, cap, "issues:read")) {
+		caps.issues_read = true;
+	} else if (std.mem.eql(u8, cap, "issues:write")) {
+		caps.issues_write = true;
+	} else if (std.mem.eql(u8, cap, "mr:read")) {
+		caps.mr_read = true;
+	} else if (std.mem.eql(u8, cap, "mr:write")) {
+		caps.mr_write = true;
+	} else if (std.mem.eql(u8, cap, "mr:merge")) {
+		caps.mr_merge = true;
+	} else if (std.mem.eql(u8, cap, "pipelines:read")) {
+		caps.pipelines_read = true;
+	} else if (std.mem.eql(u8, cap, "pipelines:write")) {
+		caps.pipelines_write = true;
+	} else if (std.mem.eql(u8, cap, "repo:read")) {
+		caps.repo_read = true;
+	} else if (std.mem.eql(u8, cap, "wiki:read")) {
+		caps.wiki_read = true;
+	} else if (std.mem.eql(u8, cap, "wiki:write")) {
+		caps.wiki_write = true;
+	} else if (std.mem.eql(u8, cap, "issues")) {
+		caps.issues_read = true;
+		caps.issues_write = true;
+	} else if (std.mem.eql(u8, cap, "mr")) {
+		caps.mr_read = true;
+		caps.mr_write = true;
+		caps.mr_merge = true;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+/// A ref pattern's grammar, checked at COMPILE time so a malformed one can
+/// never be evaluated per push: at most `max_push_pattern_bytes`, anchored at
+/// `refs/heads/` or `refs/tags/` (nothing else is pushable through
+/// receive-pack that a branch rule should speak about), no trailing `/`, and
+/// every component either `*` (exactly one component), `**` (one or more) or a
+/// literal drawn from `[A-Za-z0-9._-]` that is not `.`/`..`, does not begin
+/// with `.` and does not end in `.lock` -- the pattern-side subset of
+/// `git check-ref-format`. Returns the split components (arena-owned) or null.
+fn compileRefPattern(arena: std.mem.Allocator, raw: []const u8) plugin_mod.CompileError!?RefPattern {
+	if (raw.len == 0 or raw.len > max_push_pattern_bytes) return null;
+	if (!std.mem.startsWith(u8, raw, "refs/heads/") and !std.mem.startsWith(u8, raw, "refs/tags/")) return null;
+	if (raw[raw.len - 1] == '/') return null;
+	var n: usize = 1;
+	for (raw) |b| {
+		if (b == '/') n += 1;
+	}
+	const comps = try arena.alloc([]const u8, n);
+	var it = std.mem.splitScalar(u8, raw, '/');
+	var i: usize = 0;
+	while (it.next()) |comp| : (i += 1) {
+		if (!refPatternComponentOk(comp)) return null;
+		comps[i] = comp;
+	}
+	return .{ .raw = raw, .comps = comps };
+}
+
+fn refPatternComponentOk(comp: []const u8) bool {
+	if (comp.len == 0) return false;
+	if (std.mem.eql(u8, comp, "*") or std.mem.eql(u8, comp, "**")) return true;
+	if (comp[0] == '.') return false; // `.`, `..` and any dotfile component
+	if (std.mem.endsWith(u8, comp, ".lock")) return false;
+	for (comp) |b| {
+		const ok = (b >= 'A' and b <= 'Z') or (b >= 'a' and b <= 'z') or
+			(b >= '0' and b <= '9') or b == '.' or b == '_' or b == '-';
+		if (!ok) return false;
+	}
+	return true;
+}
+
+/// Compile a grant's `push` object. Refused (fail closed, whole conf) when the
+/// grant has no `git-write` -- a rule on a grant that cannot push is either a
+/// control-plane bug or a document someone hand-edited into a false sense of
+/// restriction -- when there are more than `max_push_patterns`, or when any
+/// pattern fails the grammar.
+fn compilePush(arena: std.mem.Allocator, p: conf.Grant.Push, caps: Caps) plugin_mod.CompileError!PushRules {
+	if (!caps.git_write) return error.InvalidEntry;
+	if (p.refs.len > max_push_patterns) return error.InvalidEntry;
+	const refs = try arena.alloc(RefPattern, p.refs.len);
+	for (p.refs, 0..) |raw, i| {
+		refs[i] = (try compileRefPattern(arena, raw)) orelse return error.InvalidEntry;
+	}
+	return .{ .refs = refs, .deny_delete = p.deny_delete, .deny_tags = p.deny_tags };
+}
+
+/// Compile the entry's grants[] into scope tests + cap sets + push rules. Fails
+/// closed on an unknown cap, an unknown scope, a malformed prefix or
+/// project_id, a scope missing its required field, or a push rule set that is
+/// unusable (see compilePush). It never sees an empty project_id on a concrete
+/// grant carrying an API cap -- the cogworx compiler already filtered those
+/// caps (spec §4.3's error-resolve rule); re-deriving that rule here would put
+/// grant policy in every plugin.
 fn compile(arena: std.mem.Allocator, entry: *const conf.Entry) plugin_mod.CompileError!plugin_mod.Policy {
 	const c = try arena.create(Compiled);
 	const grants = try arena.alloc(CGrant, entry.grants.len);
 	for (entry.grants, 0..) |g, i| {
 		var caps: Caps = .{};
 		for (g.caps) |cap| {
-			// Four caps, no more (contract H#12): api-read/api-full do not
-			// exist in the code and anything unrecognized fails closed.
-			if (std.mem.eql(u8, cap, "git-read")) {
-				caps.git_read = true;
-			} else if (std.mem.eql(u8, cap, "git-write")) {
-				caps.git_write = true;
-			} else if (std.mem.eql(u8, cap, "issues")) {
-				caps.issues = true;
-			} else if (std.mem.eql(u8, cap, "mr")) {
-				caps.mr = true;
-			} else {
-				return error.InvalidEntry;
-			}
+			if (!applyCap(&caps, cap)) return error.InvalidEntry;
 		}
+		const push: ?PushRules = if (g.push) |p| try compilePush(arena, p, caps) else null;
 		const scope: Scope = if (std.mem.eql(u8, g.scope, "project"))
 			.project
 		else if (std.mem.eql(u8, g.scope, "namespace"))
@@ -140,6 +316,7 @@ fn compile(arena: std.mem.Allocator, entry: *const conf.Entry) plugin_mod.Compil
 			.project_id = project_id,
 			.projects = g.projects,
 			.caps = caps,
+			.push = push,
 		};
 	}
 	c.* = .{
@@ -165,6 +342,12 @@ const rid_api_project = "api-project";
 const rid_api_group_projects = "api-group-projects";
 const rid_api_issues = "api-issues";
 const rid_api_mr = "api-mr";
+const rid_api_mr_merge = "api-mr-merge";
+const rid_api_pipelines = "api-pipelines";
+const rid_api_pipeline_trigger = "api-pipeline-trigger";
+const rid_api_jobs = "api-jobs";
+const rid_api_repo = "api-repo";
+const rid_api_wiki = "api-wiki";
 const rid_api_archive = "api-archive";
 // The plugin-owned LOCAL self-discovery route -- NOT a GitLab surface. A
 // reserved `_cogbox` first segment, answered locally from the compiled policy,
@@ -173,6 +356,60 @@ const rid_cogbox_grants = "cogbox-grants";
 
 /// The closed archive extension set -- never a wildcard suffix.
 const archive_exts = [_][]const u8{ "tar.gz", "tar.bz2", "tar", "tar.zst", "zip" };
+
+/// The merge-request tails that belong to the MERGE class (`mr:merge`), split
+/// out of `api-mr` so `mr:write` can mean "comment, edit, label" without also
+/// meaning "approve and merge" -- the granularity the compiled-rule tier could
+/// not express. `approvals` is here in both directions: reading it is
+/// `mr:read`, writing it (setting approvals_required) is `mr:merge`.
+///
+/// `approval_rules` rides with `approvals` because it is the SAME protection
+/// through GitLab's current API: `POST|PUT .../merge_requests/:iid/approval_rules`
+/// sets the MR's required-approvals configuration, so leaving it in `api-mr`
+/// would let a deliberately merge-less `mr:read + mr:write` grant relax the
+/// requirement `mr:merge` was carved out to hold. Two endpoints for one
+/// protection must sit in one class; reading the rules stays `mr:read` for free
+/// through this route's own read/write split.
+const mr_merge_tails = [_][]const u8{
+	"merge",
+	"approve",
+	"unapprove",
+	"approvals",
+	"approval_rules",
+	"reset_approvals",
+	"rebase",
+	"cancel_merge_when_pipeline_succeeds",
+};
+
+/// The repository READ collections (`repo:read`). A CLOSED set, and the whole
+/// of `api-repo`: every write verb on these is refused by the method clamp
+/// (invariant 2 in the file header). `archive` is deliberately absent -- it
+/// keeps its own streaming route.
+const repo_collections = [_][]const u8{
+	"tree",
+	"branches",
+	"commits",
+	"compare",
+	"tags",
+	"blobs",
+	"files",
+	"contributors",
+	"merge_base",
+	"changelog",
+};
+
+/// The pipeline/job tails a `pipelines:write` grant may POST. `erase` is
+/// deliberately absent from the job set: erasing a job destroys its artifacts
+/// and trace irreversibly, which is the DELETE argument in a POST's clothing.
+const pipeline_write_tails = [_][]const u8{ "retry", "cancel" };
+const job_write_tails = [_][]const u8{ "retry", "cancel", "play" };
+
+fn inSet(set: []const []const u8, s: []const u8) bool {
+	for (set) |e| {
+		if (std.mem.eql(u8, e, s)) return true;
+	}
+	return false;
+}
 
 fn classify(ctx: *const anyopaque, req: *const plugin_mod.Request) ?plugin_mod.Route {
 	_ = ctx;
@@ -218,16 +455,53 @@ fn classify(ctx: *const anyopaque, req: *const plugin_mod.Request) ?plugin_mod.R
 			if (segs.len == 4) {
 				return apiRoute(rid_api_project, .{ .project = pid }, false);
 			}
+			// Everything below the `:id` is one collection segment plus a tail;
+			// `rest` is that tail, re-emitted (re-encoded) by `upstream`.
+			const rest = segs[5..];
 			if (std.mem.eql(u8, segs[4], "issues")) {
-				return apiRoute(rid_api_issues, .{ .project = pid, .rest = segs[5..] }, false);
+				return apiRoute(rid_api_issues, .{ .project = pid, .rest = rest }, false);
 			}
 			if (std.mem.eql(u8, segs[4], "merge_requests")) {
-				return apiRoute(rid_api_mr, .{ .project = pid, .rest = segs[5..] }, false);
-			}
-			if (segs.len == 6 and std.mem.eql(u8, segs[4], "repository")) {
-				if (archiveExt(segs[5])) |ext| {
-					return apiRoute(rid_api_archive, .{ .project = pid, .archive_ext = ext }, true);
+				// The merge class splits off by its TAIL, not by its depth: any
+				// path whose second rest component is a merge-class tail needs
+				// `mr:merge` to write, deeper ones included (fail closed -- a
+				// sub-resource of `/approvals` is an approvals write too).
+				if (rest.len >= 2 and inSet(&mr_merge_tails, rest[1])) {
+					return apiRoute(rid_api_mr_merge, .{ .project = pid, .rest = rest }, false);
 				}
+				return apiRoute(rid_api_mr, .{ .project = pid, .rest = rest }, false);
+			}
+			if (std.mem.eql(u8, segs[4], "pipelines")) {
+				// A pipeline's variables are secrets, so `/pipelines/:id/variables`
+				// (and anything under it) is a NAMED no_route -- never merely a
+				// method clamp, which a GET would pass.
+				if (rest.len >= 2 and std.mem.eql(u8, rest[1], "variables")) return null;
+				return apiRoute(rid_api_pipelines, .{ .project = pid, .rest = rest }, false);
+			}
+			if (segs.len == 5 and std.mem.eql(u8, segs[4], "pipeline")) {
+				// The trigger endpoint: a leaf, POST-only, no tail of its own.
+				return apiRoute(rid_api_pipeline_trigger, .{ .project = pid }, false);
+			}
+			if (std.mem.eql(u8, segs[4], "jobs")) {
+				return apiRoute(rid_api_jobs, .{ .project = pid, .rest = rest }, false);
+			}
+			if (std.mem.eql(u8, segs[4], "wikis")) {
+				return apiRoute(rid_api_wiki, .{ .project = pid, .rest = rest }, false);
+			}
+			if (std.mem.eql(u8, segs[4], "repository")) {
+				// archive keeps its own streaming route and is matched FIRST, so
+				// the closed extension set still governs it.
+				if (segs.len == 6) {
+					if (archiveExt(segs[5])) |ext| {
+						return apiRoute(rid_api_archive, .{ .project = pid, .archive_ext = ext }, true);
+					}
+				}
+				if (segs.len >= 6 and inSet(&repo_collections, segs[5])) {
+					// `rest` deliberately INCLUDES the collection segment: the
+					// upstream path is rebuilt as `/repository/<coll>[/...]`.
+					return apiRoute(rid_api_repo, .{ .project = pid, .rest = rest }, false);
+				}
+				return null;
 			}
 			return null;
 		}
@@ -489,23 +763,50 @@ fn refView(segs: []const []const u8) ?RefView {
 	return view;
 }
 
-fn methodAllowed(route_id: []const u8, method: std.http.Method) bool {
-	if (std.mem.eql(u8, route_id, rid_cogbox_grants)) return method == .GET or method == .HEAD;
-	if (std.mem.eql(u8, route_id, rid_git_refs)) return method == .GET;
-	if (std.mem.eql(u8, route_id, rid_git_upload) or std.mem.eql(u8, route_id, rid_git_receive)) {
+/// Read (GET/HEAD) vs write (everything else the clamp lets through). The one
+/// place the method becomes a capability question.
+fn methodClassOf(method: std.http.Method) plugin_mod.MethodClass {
+	return if (method == .GET or method == .HEAD) .read else .write;
+}
+
+/// The per-route method clamp. It takes the whole ROUTE, not just its id,
+/// because on the pipeline and job routes the admissible write set depends on
+/// the TAIL: a POST is a retry/cancel (a control action) only at
+/// `<id>/<verb>`, and every other POST under those trees -- creating,
+/// deleting, erasing -- is refused here rather than left to the origin.
+/// DELETE is in no route's set anywhere (file-header invariant 1).
+fn methodAllowed(route: *const plugin_mod.Route, method: std.http.Method) bool {
+	const id = route.id;
+	if (std.mem.eql(u8, id, rid_cogbox_grants)) return method == .GET or method == .HEAD;
+	if (std.mem.eql(u8, id, rid_git_refs)) return method == .GET;
+	if (std.mem.eql(u8, id, rid_git_upload) or std.mem.eql(u8, id, rid_git_receive)) {
 		return method == .POST;
 	}
-	if (std.mem.eql(u8, route_id, rid_api_issues) or std.mem.eql(u8, route_id, rid_api_mr)) {
-		// DELETE is in no capability's method set, matching today's clamp.
+	if (std.mem.eql(u8, id, rid_api_issues) or std.mem.eql(u8, id, rid_api_mr) or
+		std.mem.eql(u8, id, rid_api_mr_merge) or std.mem.eql(u8, id, rid_api_wiki))
+	{
 		return method == .GET or method == .HEAD or method == .POST or method == .PUT;
 	}
-	// the ambient three + api-archive
+	if (std.mem.eql(u8, id, rid_api_pipelines)) {
+		if (method == .GET or method == .HEAD) return true;
+		return method == .POST and route.params.rest.len == 2 and
+			inSet(&pipeline_write_tails, route.params.rest[1]);
+	}
+	if (std.mem.eql(u8, id, rid_api_jobs)) {
+		if (method == .GET or method == .HEAD) return true;
+		return method == .POST and route.params.rest.len == 2 and
+			inSet(&job_write_tails, route.params.rest[1]);
+	}
+	if (std.mem.eql(u8, id, rid_api_pipeline_trigger)) return method == .POST;
+	// The ambient two + api-project + api-group-projects + api-archive +
+	// api-repo. api-repo lands here BY DESIGN: repository writes through the API
+	// are unroutable (file-header invariant 2).
 	return method == .GET or method == .HEAD;
 }
 
 fn authorize(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const plugin_mod.Request) plugin_mod.Decision {
 	const c = compiled(ctx);
-	if (!methodAllowed(route.id, req.method)) return .{ .deny = .method_not_allowed };
+	if (!methodAllowed(route, req.method)) return .{ .deny = .method_not_allowed };
 	// The local self-discovery route authorizes on method alone: it reflects
 	// THIS sandbox's grants (an EMPTY sandbox included -> {"grants":[]}), reads
 	// no credential and takes no scope test, so it must run BEFORE the no_grant
@@ -518,10 +819,10 @@ fn authorize(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const 
 	if (c.grants.len == 0) return .{ .deny = .no_grant };
 
 	// The ambient TWO -- /user and /version, which name no project -- are
-	// allowed when the instance holds ANY grant carrying issues, mr or git-read
-	// (any read grant reaches them), with no scope test. api-project and
-	// api-group-projects are NOT ambient: they name a project / a namespace, and
-	// take the scope test like every other :id route. Making api-project ambient
+	// allowed under ANY capability (they carry the owner's identity and the
+	// server version, nothing resource-scoped), with no scope test. api-project
+	// and api-group-projects are NOT ambient: they name a project / a namespace,
+	// and take the scope test like every other :id route. Making api-project ambient
 	// would let any grant read the metadata of ANY project the owner's token can
 	// see -- an enumeration oracle -- and making the group route ambient would
 	// hand out instance-wide enumeration.
@@ -530,17 +831,24 @@ fn authorize(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const 
 
 	var saw_cap = false;
 	for (c.grants) |*g| {
-		if (!grantHasCap(g, route)) continue;
+		if (!grantHasCap(g, route, req.method)) continue;
 		saw_cap = true;
 		if (ambient or scopeOk(g, route)) return .{ .allow = g.id };
 	}
 	return .{ .deny = if (saw_cap) .scope_mismatch else .cap_missing };
 }
 
-/// The cap -> route map (addendum E.4). api-archive rides git-read: it is the
-/// tarball form of a clone, and the v1 addition that closes the
-/// container-vs-VM fetch asymmetry.
-fn grantHasCap(g: *const CGrant, route: *const plugin_mod.Route) bool {
+/// The cap -> (route, method class) map. The METHOD is a parameter because v2
+/// splits every API area into a read and a write half: the same route id means
+/// `issues:read` under GET/HEAD and `issues:write` under POST/PUT. The method
+/// clamp has already run in `authorize`, so anything reaching here is a method
+/// the route admits.
+///
+/// api-archive rides `git-read` OR `repo:read`: it is the tarball form of a
+/// clone (the v1 addition that closed the container-vs-VM fetch asymmetry) and
+/// equally the bulk form of the repository read API.
+fn grantHasCap(g: *const CGrant, route: *const plugin_mod.Route, method: std.http.Method) bool {
+	const write = methodClassOf(method) == .write;
 	if (std.mem.eql(u8, route.id, rid_git_refs)) {
 		return switch (route.params.service orelse return false) {
 			.upload_pack => g.caps.git_read,
@@ -549,14 +857,32 @@ fn grantHasCap(g: *const CGrant, route: *const plugin_mod.Route) bool {
 	}
 	if (std.mem.eql(u8, route.id, rid_git_upload)) return g.caps.git_read;
 	if (std.mem.eql(u8, route.id, rid_git_receive)) return g.caps.git_write;
-	if (std.mem.eql(u8, route.id, rid_api_archive)) return g.caps.git_read;
+	if (std.mem.eql(u8, route.id, rid_api_archive)) return g.caps.git_read or g.caps.repo_read;
 	if (std.mem.eql(u8, route.id, rid_api_group_projects)) return g.caps.git_read;
-	if (std.mem.eql(u8, route.id, rid_api_issues)) return g.caps.issues;
-	if (std.mem.eql(u8, route.id, rid_api_mr)) return g.caps.mr;
-	// The ambient two (api-user/api-version) + api-project. `git-read` now
-	// unlocks discovery/inspection (the "read = discover + inspect" decision),
-	// so it joins issues/mr here; api-project additionally takes the scope test.
-	return g.caps.issues or g.caps.mr or g.caps.git_read;
+	if (std.mem.eql(u8, route.id, rid_api_issues)) {
+		return if (write) g.caps.issues_write else g.caps.issues_read;
+	}
+	if (std.mem.eql(u8, route.id, rid_api_mr)) {
+		return if (write) g.caps.mr_write else g.caps.mr_read;
+	}
+	if (std.mem.eql(u8, route.id, rid_api_mr_merge)) {
+		// Reading the merge class (`/approvals`, the merge status) is ordinary
+		// mr:read; only the ACT of approving/merging/rebasing needs mr:merge.
+		return if (write) g.caps.mr_merge else g.caps.mr_read;
+	}
+	if (std.mem.eql(u8, route.id, rid_api_pipelines) or std.mem.eql(u8, route.id, rid_api_jobs)) {
+		return if (write) g.caps.pipelines_write else g.caps.pipelines_read;
+	}
+	if (std.mem.eql(u8, route.id, rid_api_pipeline_trigger)) return g.caps.pipelines_write;
+	if (std.mem.eql(u8, route.id, rid_api_repo)) return g.caps.repo_read;
+	if (std.mem.eql(u8, route.id, rid_api_wiki)) {
+		return if (write) g.caps.wiki_write else g.caps.wiki_read;
+	}
+	// The ambient two (api-user/api-version) + api-project: any capability at
+	// all reaches them. They name the OWNER's identity, the server version and
+	// (scope-tested, never ambient) one project's metadata -- nothing a grant
+	// holder is not already entitled to see somewhere in its own subtree.
+	return g.caps.anyCap();
 }
 
 /// The three scope tests, reusing the existing predicates' semantics verbatim
@@ -700,10 +1026,24 @@ fn upstream(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const p
 	} else {
 		try out.appendPath("/api/v4/projects/");
 		try appendId(out, route.params.project.?);
+		// The collection segment is a LITERAL of this table, never a copied
+		// byte: `rest` (which upstream re-encodes below) starts after it -- except
+		// on api-repo, whose `rest` begins WITH its collection so the closed set
+		// is what the path carries.
 		if (std.mem.eql(u8, route.id, rid_api_issues)) {
 			try out.appendPath("/issues");
-		} else if (std.mem.eql(u8, route.id, rid_api_mr)) {
+		} else if (std.mem.eql(u8, route.id, rid_api_mr) or std.mem.eql(u8, route.id, rid_api_mr_merge)) {
 			try out.appendPath("/merge_requests");
+		} else if (std.mem.eql(u8, route.id, rid_api_pipelines)) {
+			try out.appendPath("/pipelines");
+		} else if (std.mem.eql(u8, route.id, rid_api_pipeline_trigger)) {
+			try out.appendPath("/pipeline");
+		} else if (std.mem.eql(u8, route.id, rid_api_jobs)) {
+			try out.appendPath("/jobs");
+		} else if (std.mem.eql(u8, route.id, rid_api_wiki)) {
+			try out.appendPath("/wikis");
+		} else if (std.mem.eql(u8, route.id, rid_api_repo)) {
+			try out.appendPath("/repository");
 		} else if (std.mem.eql(u8, route.id, rid_api_archive)) {
 			try out.appendPath("/repository/archive");
 			if (route.params.archive_ext.?.len > 0) {
@@ -732,9 +1072,10 @@ fn upstream(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const p
 	// The group-enumeration route additionally forces `include_subgroups=true`
 	// and drops everything but a small pagination/search allowlist (so a client
 	// cannot append an order_by/owned/... that changes the response shape).
-	// issues/mr/archive/user/version keep the blanket pass-through (v1's one
-	// named non-allowlisted spot); the forbidden keys were already refused by
-	// the core.
+	// Every other API route -- issues, both mr routes, pipelines, the trigger,
+	// jobs, the repository read collections, wikis, archive, user, version --
+	// keeps the blanket pass-through (v1's one named non-allowlisted spot); the
+	// forbidden keys were already refused by the core.
 	if (std.mem.eql(u8, route.id, rid_api_group_projects)) {
 		try out.appendQuery("simple=true&include_subgroups=true");
 		for (req.query) |p| {
@@ -796,6 +1137,201 @@ fn authenticate(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *con
 	}
 }
 
+// --- push rules: the receive-pack mediate hook ---------------------------
+//
+// Everything above decides on the request HEAD. Branch rules cannot: which
+// refs a push moves is in the BODY, so they live in the one hook that sees it.
+// The shape of that hook is chosen so the blast radius stays at "a push under a
+// grant that carries rules":
+//
+//   - Every other route, and every push no covering grant restricts, returns
+//     `false` before the body reader is touched -- the core then runs its
+//     ordinary single round trip, byte for byte what it ran before this
+//     existed. A clone, an API call and an unrestricted push cost one string
+//     compare.
+//   - A refusal is decided BEFORE any dial. Nothing of a rejected push reaches
+//     the origin: not the commands, not the packfile.
+//   - An admitted push is forwarded UNCHANGED -- the buffered command section
+//     is replayed ahead of the live body through `PrefixReader`, so
+//     `Content-Length` still describes the bytes and the pack's own framing is
+//     untouched.
+//
+// The rules are a fail-closed FILTER, never a promise: a force-push is
+// indistinguishable from a fast-forward on the wire (a non-fast-forward update
+// is `<old != 0> <new != 0> <ref>` exactly like any other and the proxy has no
+// object graph), so GitLab protected branches remain the backstop for that.
+
+/// Component-wise glob. `*` matches EXACTLY one component, `**` one or more --
+/// never zero, so `refs/heads/**` does not match `refs/heads`. Both are WHOLE
+/// components; `compileRefPattern` already refused a partial-component wildcard
+/// (`ag*ent`), so no byte-level matching is needed or wanted here. The
+/// backtracking is the classic star walk: `**` first takes one component and
+/// grows only when the rest of the pattern fails.
+fn globComps(pat: []const []const u8, name: []const []const u8) bool {
+	var pi: usize = 0;
+	var ni: usize = 0;
+	var star_pi: ?usize = null; // the last `**` seen
+	var star_ni: usize = 0; // how far it currently reaches into `name`
+	while (true) {
+		if (ni < name.len and pi < pat.len) {
+			if (std.mem.eql(u8, pat[pi], "**")) {
+				// the mandatory first component of a `**`
+				star_pi = pi;
+				ni += 1;
+				star_ni = ni;
+				pi += 1;
+				continue;
+			}
+			if (std.mem.eql(u8, pat[pi], "*") or std.mem.eql(u8, pat[pi], name[ni])) {
+				pi += 1;
+				ni += 1;
+				continue;
+			}
+		} else if (ni == name.len and pi == pat.len) {
+			return true;
+		}
+		// A mismatch, or one side ran out: extend the last `**` by one component
+		// and retry the pattern behind it.
+		const sp = star_pi orelse return false;
+		if (star_ni >= name.len) return false;
+		star_ni += 1;
+		ni = star_ni;
+		pi = sp + 1;
+	}
+}
+
+/// Whether any of the grant's patterns admits this refname. NO patterns means
+/// "any refname" -- the rule object then carries only the two deny flags.
+fn refMatches(rules: *const PushRules, name: []const []const u8) bool {
+	if (rules.refs.len == 0) return true;
+	for (rules.refs) |p| {
+		if (globComps(p.comps, name)) return true;
+	}
+	return false;
+}
+
+/// Split a refname into its `/` components. `pktline` already bounded the
+/// count, so the null arm is unreachable defence-in-depth (and fails closed).
+fn splitRef(ref: []const u8, out: *[pktline.max_ref_components][]const u8) ?[]const []const u8 {
+	var n: usize = 0;
+	var it = std.mem.splitScalar(u8, ref, '/');
+	while (it.next()) |comp| {
+		if (n == out.len) return null;
+		out[n] = comp;
+		n += 1;
+	}
+	return out[0..n];
+}
+
+/// UNION semantics: one command passes if ANY covering git-write grant admits
+/// it. A rule-free project grant is therefore NOT narrowed by a namespace grant
+/// that happens to carry rules -- the tuples are additive, exactly as they are
+/// in `authorize`, and a narrower grant can only ever add reach.
+fn commandAdmitted(grants: []const CGrant, route: *const plugin_mod.Route, cmd: *const pktline.Command, comps: []const []const u8) bool {
+	for (grants) |*g| {
+		if (!g.caps.git_write) continue;
+		const p = g.push orelse {
+			// unrestricted: any ref, delete and tag included
+			if (scopeOk(g, route)) return true;
+			continue;
+		};
+		if (cmd.is_delete and p.deny_delete) continue;
+		// deny_tags short-circuits the patterns: a `refs/tags/*` pattern plus
+		// deny_tags is a contradiction the flag wins.
+		if (cmd.is_tag and p.deny_tags) continue;
+		if (!refMatches(&p, comps)) continue;
+		if (scopeOk(g, route)) return true;
+	}
+	return false;
+}
+
+fn mediateReceivePack(
+	ctx: *const anyopaque,
+	route: *const plugin_mod.Route,
+	req: *const plugin_mod.Request,
+	cred: *plugin_mod.Cred,
+	io: *upstream_mod.UpstreamIO,
+	out: *plugin_mod.Response,
+) plugin_mod.MediateError!bool {
+	const c = compiled(ctx);
+	if (!std.mem.eql(u8, route.id, rid_git_receive)) return false;
+
+	// THE FAST PATH. `authorize` already proved some git-write grant covers this
+	// project; if none of THOSE carries rules there is nothing to enforce, so
+	// the body is never read and the core relays it exactly as before. The scope
+	// test is what makes this per-project: a rules-bearing grant on another
+	// repository must not drag this push onto the slow path.
+	var any_rules = false;
+	for (c.grants) |*g| {
+		if (g.caps.git_write and g.push != null and scopeOk(g, route)) {
+			any_rules = true;
+			break;
+		}
+	}
+	if (!any_rules) return false;
+	// A receive-pack POST with no body at all is GitLab's to answer, not ours.
+	const body = req.body orelse return false;
+
+	// The command section is buffered whole before a verdict exists. It carries
+	// no credential (only oids and refnames), so it lives outside the scratch
+	// block -- and it is freed the moment `open` returns, which is after `open`
+	// has pumped the entire body synchronously.
+	const buf = io.gpa.alloc(u8, pktline.max_prefix_bytes) catch return error.MediateFailed;
+	defer io.gpa.free(buf);
+	const cmds = io.gpa.alloc(pktline.Command, pktline.max_commands) catch return error.MediateFailed;
+	defer io.gpa.free(cmds);
+
+	const section = switch (pktline.readCommandSection(body, buf, cmds) catch return error.MediateFailed) {
+		.refuse => |r| {
+			// The mapping is written out rather than passed through @tagName so
+			// the two vocabularies are compile-checked against each other.
+			const reason: plugin_mod.DenyReason = switch (r) {
+				.push_malformed => .push_malformed,
+				.too_many_refs => .too_many_refs,
+				.push_cert_unsupported => .push_cert_unsupported,
+			};
+			out.deny = @tagName(reason);
+			out.deny_status = switch (r) {
+				.push_malformed => 400,
+				.too_many_refs => 413,
+				.push_cert_unsupported => 403,
+			};
+			return true;
+		},
+		.ok => |s| s,
+	};
+
+	// ALL-OR-NOTHING: one refused command refuses the whole push. A push is a
+	// single transaction to the client and the packfile is shared across its
+	// commands, so there is no honest way to forward a subset.
+	var comps_buf: [pktline.max_ref_components][]const u8 = undefined;
+	for (section.commands) |cmd| {
+		const comps = splitRef(cmd.ref, &comps_buf);
+		if (comps == null or !commandAdmitted(c.grants, route, &cmd, comps.?)) {
+			out.deny = @tagName(plugin_mod.DenyReason.ref_denied);
+			out.deny_status = 403;
+			return true;
+		}
+	}
+
+	// Admitted. From here it is the default round trip, hand-rolled because the
+	// body reader is no longer at byte zero: the same constructed upstream, the
+	// same `authenticate`, and the ORIGINAL byte stream (buffered prefix, then
+	// the live body) under the unchanged Content-Length -- null when the guest
+	// chunked it, which `open` then re-frames as chunked upstream.
+	var up: plugin_mod.Upstream = .{};
+	upstream(ctx, route, req, &up) catch return error.MediateFailed;
+	const hs = &io.storage.mediate_headers;
+	hs.copyFrom(req.headers);
+	authenticate(ctx, route, req, cred, hs) catch |err| switch (err) {
+		error.CredentialUnavailable => return error.CredentialUnavailable,
+		error.AuthFailed => return error.MediateFailed,
+	};
+	var pr = pktline.PrefixReader.init(buf[0..section.prefix_len], body);
+	out.exchange = io.open(&up, req.method, hs, &pr.interface, req.content_length) catch return error.UpstreamFailed;
+	return true;
+}
+
 /// Render THIS sandbox's grants as the `/_cogbox/grants` self-discovery JSON --
 /// `{"grants":[{"scope":..,"repo":..,"prefix":..,"caps":[..]},..]}` -- built
 /// from the already-compiled in-memory grants, so it is zero upstream, zero
@@ -807,6 +1343,13 @@ fn authenticate(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *con
 /// slash-terminated `"/grp/sub/"` trimmed to `"grp/sub"`, no leading/trailing
 /// slash -- and appears on namespace-scope grants only. An empty/ungranted
 /// sandbox renders `{"grants":[]}`.
+///
+/// `caps` is always the v2 vocabulary, in the canonical order, whatever
+/// dialect the document used: the reflection states what this binary
+/// ENFORCES, and a v1 `mr` really is the mr triple here. A grant's push rules
+/// ride as FLAT keys -- `push_refs`, `push_deny_delete`, `push_deny_tags` --
+/// never a nested object: the deployed grant-check client splits this body on
+/// braces and a nested one would break every copy in the field.
 fn localResponse(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *const plugin_mod.Request, out: *std.Io.Writer) plugin_mod.LocalError!void {
 	_ = route;
 	_ = req;
@@ -833,9 +1376,27 @@ fn localResponse(ctx: *const anyopaque, route: *const plugin_mod.Route, req: *co
 		try jw.beginArray();
 		if (g.caps.git_read) try jw.write("git-read");
 		if (g.caps.git_write) try jw.write("git-write");
-		if (g.caps.issues) try jw.write("issues");
-		if (g.caps.mr) try jw.write("mr");
+		if (g.caps.issues_read) try jw.write("issues:read");
+		if (g.caps.issues_write) try jw.write("issues:write");
+		if (g.caps.mr_read) try jw.write("mr:read");
+		if (g.caps.mr_write) try jw.write("mr:write");
+		if (g.caps.mr_merge) try jw.write("mr:merge");
+		if (g.caps.pipelines_read) try jw.write("pipelines:read");
+		if (g.caps.pipelines_write) try jw.write("pipelines:write");
+		if (g.caps.repo_read) try jw.write("repo:read");
+		if (g.caps.wiki_read) try jw.write("wiki:read");
+		if (g.caps.wiki_write) try jw.write("wiki:write");
 		try jw.endArray();
+		if (g.push) |p| {
+			try jw.objectField("push_refs");
+			try jw.beginArray();
+			for (p.refs) |r| try jw.write(r.raw);
+			try jw.endArray();
+			try jw.objectField("push_deny_delete");
+			try jw.write(p.deny_delete);
+			try jw.objectField("push_deny_tags");
+			try jw.write(p.deny_tags);
+		}
 		try jw.endObject();
 	}
 	try jw.endArray();
@@ -1048,7 +1609,7 @@ test "gitlab: service validation -- present/absent/duplicated/arbitrary, and non
 	try t.expectEqualStrings("", up.query());
 }
 
-test "gitlab: DELETE is denied on every route; the ambient three need issues|mr" {
+test "gitlab: DELETE is denied on every route; the ambient two take ANY capability but only GET/HEAD" {
 	const g = try conf.parseGeneration(t.allocator, undefined, conf.test_conf_json, 1, .skip, null);
 	defer {
 		g.arena.deinit();
@@ -1068,6 +1629,25 @@ test "gitlab: DELETE is denied on every route; the ambient three need issues|mr"
 	const upost = mkReq(.POST, &usegs, &.{});
 	const uroute2 = policy.vtable.classify(policy.ctx, &upost).?;
 	try t.expectEqual(plugin_mod.DenyReason.method_not_allowed, policy.vtable.authorize(policy.ctx, &uroute2, &upost).deny);
+
+	// A grant carrying ONLY git-write reaches the ambient two under v2 (they
+	// name the owner's identity and the server version -- nothing a grant that
+	// can already push as the owner is not entitled to), but is still
+	// cap_missing on every route that names a resource class.
+	const wo = try conf.parseGeneration(t.allocator, undefined,
+		\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+		\\"grants":[{"id":"gg-w","scope":"instance","caps":["git-write"]}]}]}
+	, 1, .skip, null);
+	defer {
+		wo.arena.deinit();
+		t.allocator.destroy(wo);
+	}
+	const wp = wo.entries[0].policy;
+	const wroute = wp.vtable.classify(wp.ctx, &ureq).?;
+	try t.expect(wp.vtable.authorize(wp.ctx, &wroute, &ureq) == .allow);
+	const ireq = mkReq(.GET, &segs, &.{});
+	const iroute = wp.vtable.classify(wp.ctx, &ireq).?;
+	try t.expectEqual(plugin_mod.DenyReason.cap_missing, wp.vtable.authorize(wp.ctx, &iroute, &ireq).deny);
 }
 
 test "gitlab: api-project is SCOPED, not ambient -- a non-granted project denies in both id forms (B2)" {
@@ -1358,5 +1938,724 @@ test "gitlab: /_cogbox/grants renders the grants JSON -- every scope, path-form 
 			std.debug.print("/_cogbox/grants body leaked {s}: {s}\n", .{ needle, body });
 			return error.GrantsBodyLeak;
 		}
+	}
+}
+
+// --- v2 units: the twelve caps, the push-rule grammar, the new clamps ---
+
+/// Parse a conf and hand back the generation; the caller deinits. `undefined`
+/// io is safe under `.skip` (no trust store is loaded), matching the units
+/// above.
+fn testGen(json: []const u8) !*conf.Generation {
+	return conf.parseGeneration(t.allocator, undefined, json, 1, .skip, null);
+}
+
+fn freeGen(g: *conf.Generation) void {
+	g.arena.deinit();
+	t.allocator.destroy(g);
+}
+
+/// One instance-scope grant with the given caps and (optional) push object.
+fn testCapConf(caps_json: []const u8, push_json: ?[]const u8) ![]u8 {
+	return std.fmt.allocPrint(t.allocator,
+		"{{\"version\":1,\"providers\":[{{\"host\":\"git.example.com\",\"plugin\":\"gitlab\"," ++
+			"\"scheme\":\"http\",\"cred_file\":\"/x\",\"git_user\":\"oauth2\"," ++
+			"\"grants\":[{{\"id\":\"g\",\"scope\":\"instance\",\"caps\":{s}{s}{s}}}]}}]}}",
+		.{ caps_json, if (push_json != null) ",\"push\":" else "", push_json orelse "" });
+}
+
+test "gitlab: compile takes the v2 cap names and EXPANDS the v1 coarse ones; anything else fails closed" {
+	const g = try testGen(conf.test_conf_v2_json);
+	defer freeGen(g);
+	// gg-v2a names all twelve, so every field of the set must be on -- the one
+	// assertion that catches a cap string added to the doc but not to applyCap.
+	const all = compiled(g.entries[0].policy.ctx).grants[0].caps;
+	inline for (@typeInfo(Caps).@"struct".fields) |f| {
+		if (!@field(all, f.name)) {
+			std.debug.print("v2 fixture did not set caps.{s}\n", .{f.name});
+			return error.CapNotCompiled;
+		}
+	}
+
+	// The LEGACY dialect expands, and expands EXACTLY: `issues` is the two
+	// halves, and v1 `mr` included approve/merge so it is the whole triple.
+	const v1 = try testGen(conf.test_conf_json);
+	defer freeGen(v1);
+	const gr = compiled(v1.entries[0].policy.ctx).grants;
+	try t.expect(gr[0].caps.issues_read and gr[0].caps.issues_write); // gg-0001 ["...","issues"]
+	try t.expect(!gr[0].caps.mr_read and !gr[0].caps.mr_merge); // and nothing it did not name
+	const mr = gr[2].caps; // gg-0003 ["git-read","mr"]
+	try t.expect(mr.mr_read and mr.mr_write and mr.mr_merge);
+	try t.expect(!mr.issues_read and !mr.pipelines_read and !mr.repo_read and !mr.wiki_read);
+	try t.expect(gr[2].push == null); // no push key, no rules -- the fast path
+
+	// An unrecognized cap still fails the WHOLE conf (the four-cap era's
+	// posture, unchanged): a near-miss of a v2 name is not a v2 name.
+	for ([_][]const u8{ "admin", "api-full", "issues:admin", "mr:", "ISSUES:READ", "repo:write" }) |bad| {
+		const caps = try std.fmt.allocPrint(t.allocator, "[\"{s}\"]", .{bad});
+		defer t.allocator.free(caps);
+		const json = try testCapConf(caps, null);
+		defer t.allocator.free(json);
+		try t.expectError(error.BadConf, conf.parseGeneration(t.allocator, undefined, json, 1, .skip, null));
+	}
+}
+
+test "gitlab: push rules compile only on a git-write grant, bounded and grammar-checked" {
+	const g = try testGen(conf.test_conf_v2_json);
+	defer freeGen(g);
+	const grants = compiled(g.entries[0].policy.ctx).grants;
+	const p = grants[0].push.?;
+	try t.expect(p.deny_delete and p.deny_tags);
+	try t.expectEqual(@as(usize, 2), p.refs.len);
+	try t.expectEqualStrings("refs/heads/agent/*", p.refs[0].raw);
+	try t.expectEqual(@as(usize, 4), p.refs[0].comps.len);
+	try t.expectEqualStrings("refs", p.refs[0].comps[0]);
+	try t.expectEqualStrings("heads", p.refs[0].comps[1]);
+	try t.expectEqualStrings("agent", p.refs[0].comps[2]);
+	try t.expectEqualStrings("*", p.refs[0].comps[3]);
+	try t.expectEqualStrings("**", p.refs[1].comps[3]);
+	try t.expect(grants[1].push == null); // a grant without the key is unrestricted
+
+	// Every refusal fails the WHOLE conf: a push rule that cannot be evaluated
+	// must never degrade into "no restriction".
+	const Bad = struct { caps: []const u8, push: []const u8, why: []const u8 };
+	const bad = [_]Bad{
+		.{ .caps = "[\"git-read\"]", .push = "{\"refs\":[\"refs/heads/x\"]}", .why = "rules on a grant that cannot push" },
+		.{ .caps = "[\"git-read\"]", .push = "{\"deny_delete\":true}", .why = "...even flags alone" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/heads/a\",\"refs/heads/b\",\"refs/heads/c\",\"refs/heads/d\",\"refs/heads/e\",\"refs/heads/f\",\"refs/heads/g\",\"refs/heads/h\",\"refs/heads/i\"]}", .why = "nine patterns, one over the cap" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"main\"]}", .why = "not anchored at refs/" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/remotes/x\"]}", .why = "anchored, but not heads/tags" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/heads/\"]}", .why = "a trailing slash" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/heads//x\"]}", .why = "an empty component" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/heads/..\"]}", .why = "a dot-dot component" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/heads/.hidden\"]}", .why = "a component starting with a dot" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/heads/x.lock\"]}", .why = "a .lock suffix" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/heads/a b\"]}", .why = "whitespace" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/heads/a^b\"]}", .why = "a revision-syntax byte" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/heads/a?b\"]}", .why = "a glob byte outside the two wildcards" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/heads/ag*ent\"]}", .why = "a wildcard must be a WHOLE component" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"refs/tags/v*\"]}", .why = "...a trailing one too" },
+		.{ .caps = "[\"git-write\"]", .push = "{\"refs\":[\"\"]}", .why = "an empty pattern" },
+		.{
+			.caps = "[\"git-write\"]",
+			.push = "{\"refs\":[\"refs/heads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]}",
+			.why = "129 bytes, one over the cap",
+		},
+	};
+	for (bad) |b| {
+		const json = try testCapConf(b.caps, b.push);
+		defer t.allocator.free(json);
+		if (conf.parseGeneration(t.allocator, undefined, json, 1, .skip, null)) |accepted| {
+			freeGen(accepted);
+			std.debug.print("push rule ACCEPTED that must fail closed: {s}\n", .{b.why});
+			return error.PushRuleAccepted;
+		} else |err| {
+			try t.expect(err == error.BadConf);
+		}
+	}
+
+	// The accepted grammar, end to end: both wildcards (WHOLE components only --
+	// `refs/tags/v*` is in the refusal list above), a tag anchor, and the eighth
+	// pattern still inside the cap.
+	const okj = try testCapConf("[\"git-write\"]",
+		"{\"refs\":[\"refs/heads/main\",\"refs/heads/*\",\"refs/heads/**\",\"refs/tags/*\"," ++
+			"\"refs/heads/a-b\",\"refs/heads/a_b\",\"refs/heads/a.b\",\"refs/heads/*/sub/**\"]}");
+	defer t.allocator.free(okj);
+	const okg = try testGen(okj);
+	defer freeGen(okg);
+	try t.expectEqual(@as(usize, 8), compiled(okg.entries[0].policy.ctx).grants[0].push.?.refs.len);
+}
+
+test "gitlab: the method clamps -- pipeline/job POSTs only on the control tails, repository writes nowhere, DELETE nowhere" {
+	// The v2 fixture's first grant is a CONCRETE grant on 1234 carrying all
+	// twelve caps, so a deny here is the clamp's and never a missing cap.
+	const g = try testGen(conf.test_conf_v2_json);
+	defer freeGen(g);
+	const policy = g.entries[0].policy;
+
+	const Case = struct { m: std.http.Method, segs: []const []const u8, allow: bool };
+	const cases = [_]Case{
+		// pipelines: retry/cancel at <id>/<verb>, and nothing else
+		.{ .m = .POST, .segs = &.{ "api", "v4", "projects", "1234", "pipelines", "9", "retry" }, .allow = true },
+		.{ .m = .POST, .segs = &.{ "api", "v4", "projects", "1234", "pipelines", "9", "cancel" }, .allow = true },
+		.{ .m = .POST, .segs = &.{ "api", "v4", "projects", "1234", "pipelines" }, .allow = false },
+		.{ .m = .POST, .segs = &.{ "api", "v4", "projects", "1234", "pipelines", "9" }, .allow = false },
+		.{ .m = .POST, .segs = &.{ "api", "v4", "projects", "1234", "pipelines", "9", "retry", "x" }, .allow = false },
+		.{ .m = .PUT, .segs = &.{ "api", "v4", "projects", "1234", "pipelines", "9", "retry" }, .allow = false },
+		.{ .m = .GET, .segs = &.{ "api", "v4", "projects", "1234", "pipelines", "9" }, .allow = true },
+		// jobs: retry/cancel/play, but never erase (irreversible)
+		.{ .m = .POST, .segs = &.{ "api", "v4", "projects", "1234", "jobs", "7", "play" }, .allow = true },
+		.{ .m = .POST, .segs = &.{ "api", "v4", "projects", "1234", "jobs", "7", "erase" }, .allow = false },
+		// the trigger leaf is POST-only
+		.{ .m = .POST, .segs = &.{ "api", "v4", "projects", "1234", "pipeline" }, .allow = true },
+		.{ .m = .GET, .segs = &.{ "api", "v4", "projects", "1234", "pipeline" }, .allow = false },
+		// repository: reads yes, WRITES never (file-header invariant 2)
+		.{ .m = .GET, .segs = &.{ "api", "v4", "projects", "1234", "repository", "tree" }, .allow = true },
+		.{ .m = .POST, .segs = &.{ "api", "v4", "projects", "1234", "repository", "commits" }, .allow = false },
+		.{ .m = .PUT, .segs = &.{ "api", "v4", "projects", "1234", "repository", "files", "x" }, .allow = false },
+		.{ .m = .POST, .segs = &.{ "api", "v4", "projects", "1234", "repository", "branches" }, .allow = false },
+		// wikis take the full read/write method set...
+		.{ .m = .PUT, .segs = &.{ "api", "v4", "projects", "1234", "wikis", "home" }, .allow = true },
+		// ...and DELETE is in no route's set anywhere (invariant 1)
+		.{ .m = .DELETE, .segs = &.{ "api", "v4", "projects", "1234", "wikis", "home" }, .allow = false },
+		.{ .m = .DELETE, .segs = &.{ "api", "v4", "projects", "1234", "repository", "tree" }, .allow = false },
+		.{ .m = .DELETE, .segs = &.{ "api", "v4", "projects", "1234", "merge_requests", "5", "merge" }, .allow = false },
+	};
+	for (cases) |c| {
+		const req = mkReq(c.m, c.segs, &.{});
+		const route = policy.vtable.classify(policy.ctx, &req).?;
+		const d = policy.vtable.authorize(policy.ctx, &route, &req);
+		if (c.allow) {
+			if (d != .allow) {
+				std.debug.print("clamp denied {s} on {s}: {s}\n", .{ @tagName(c.m), route.id, @tagName(d.deny) });
+				return error.UnexpectedDeny;
+			}
+		} else {
+			try t.expectEqual(plugin_mod.DenyReason.method_not_allowed, d.deny);
+		}
+	}
+
+	// `/pipelines/:id/variables` is a NAMED no_route, not a clamp: even a GET
+	// under the all-twelve grant never gets a route at all.
+	const vars = [_][]const u8{ "api", "v4", "projects", "1234", "pipelines", "9", "variables" };
+	try t.expect(policy.vtable.classify(policy.ctx, &mkReq(.GET, &vars, &.{})) == null);
+	const vars_deep = [_][]const u8{ "api", "v4", "projects", "1234", "pipelines", "9", "variables", "K" };
+	try t.expect(policy.vtable.classify(policy.ctx, &mkReq(.GET, &vars_deep, &.{})) == null);
+}
+
+test "gitlab: upstream rebuilds the new collections from LITERALS and re-encodes the %2F-bearing tails" {
+	const g = try testGen(conf.test_conf_v2_json);
+	defer freeGen(g);
+	const policy = g.entries[0].policy;
+
+	const Case = struct { m: std.http.Method, segs: []const []const u8, id: []const u8, path: []const u8 };
+	const cases = [_]Case{
+		.{
+			.m = .POST,
+			.segs = &.{ "api", "v4", "projects", "1234", "pipelines", "9", "retry" },
+			.id = "api-pipelines",
+			.path = "/api/v4/projects/1234/pipelines/9/retry",
+		},
+		.{
+			.m = .POST,
+			.segs = &.{ "api", "v4", "projects", "1234", "pipeline" },
+			.id = "api-pipeline-trigger",
+			.path = "/api/v4/projects/1234/pipeline",
+		},
+		.{
+			.m = .GET,
+			.segs = &.{ "api", "v4", "projects", "1234", "jobs", "7", "trace" },
+			.id = "api-jobs",
+			.path = "/api/v4/projects/1234/jobs/7/trace",
+		},
+		.{
+			.m = .PUT,
+			.segs = &.{ "api", "v4", "projects", "1234", "merge_requests", "5", "merge" },
+			.id = "api-mr-merge",
+			.path = "/api/v4/projects/1234/merge_requests/5/merge",
+		},
+		// A file path is ONE segment holding slashes: it must come back out as
+		// %2F under the /repository/files/ literal, never as real separators.
+		.{
+			.m = .GET,
+			.segs = &.{ "api", "v4", "projects", "1234", "repository", "files", "src/main.go", "raw" },
+			.id = "api-repo",
+			.path = "/api/v4/projects/1234/repository/files/src%2Fmain.go/raw",
+		},
+		// The same for a wiki slug, under a path-form project id.
+		.{
+			.m = .GET,
+			.segs = &.{ "api", "v4", "projects", "grp/proj", "wikis", "home/sub" },
+			.id = "api-wiki",
+			.path = "/api/v4/projects/grp%2Fproj/wikis/home%2Fsub",
+		},
+	};
+	for (cases) |c| {
+		const req = mkReq(c.m, c.segs, &.{});
+		const route = policy.vtable.classify(policy.ctx, &req).?;
+		try t.expectEqualStrings(c.id, route.id);
+		var up: plugin_mod.Upstream = .{};
+		try policy.vtable.upstream(policy.ctx, &route, &req, &up);
+		try t.expectEqualStrings(c.path, up.path());
+		try t.expectEqualStrings("", up.query());
+	}
+}
+
+test "gitlab: /_cogbox/grants reflects the TWELVE v2 names in canonical order and FLAT push keys" {
+	const g = try testGen(conf.test_conf_v2_json);
+	defer freeGen(g);
+	const policy = g.entries[0].policy;
+	const segs = [_][]const u8{ "_cogbox", "grants" };
+	const req = mkReq(.GET, &segs, &.{});
+	const route = policy.vtable.classify(policy.ctx, &req).?;
+
+	var buf: [4096]u8 = undefined;
+	var w: std.Io.Writer = .fixed(&buf);
+	try policy.vtable.localResponse.?(policy.ctx, &route, &req, &w);
+	const body = w.buffered();
+
+	// The push rules are FLAT: the grant-check client's splitter assumes no nested
+	// braces, so a `"push":{...}` object would break every deployed copy.
+	try t.expect(std.mem.indexOf(u8, body, "\"push\":") == null);
+
+	var arena = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena.deinit();
+	const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
+	const grants = parsed.object.get("grants").?.array;
+	try t.expectEqual(@as(usize, 2), grants.items.len);
+
+	const want_order = [_][]const u8{
+		"git-read",
+		"git-write",
+		"issues:read",
+		"issues:write",
+		"mr:read",
+		"mr:write",
+		"mr:merge",
+		"pipelines:read",
+		"pipelines:write",
+		"repo:read",
+		"wiki:read",
+		"wiki:write",
+	};
+	const first = grants.items[0].object;
+	const caps = first.get("caps").?.array;
+	try t.expectEqual(want_order.len, caps.items.len);
+	for (want_order, 0..) |want, i| try t.expectEqualStrings(want, caps.items[i].string);
+	const refs = first.get("push_refs").?.array;
+	try t.expectEqual(@as(usize, 2), refs.items.len);
+	try t.expectEqualStrings("refs/heads/agent/*", refs.items[0].string);
+	try t.expect(first.get("push_deny_delete").?.bool);
+	try t.expect(first.get("push_deny_tags").?.bool);
+
+	// A grant with no rules emits NO push keys at all (absent means
+	// unrestricted; an empty array would read as "no ref is allowed").
+	const second = grants.items[1].object;
+	try t.expect(second.get("push_refs") == null);
+	try t.expect(second.get("push_deny_delete") == null);
+	try t.expectEqualStrings("grp/sub", second.get("prefix").?.string);
+
+	// Still no numeric id and no credential, exactly as under v1.
+	for ([_][]const u8{ "1234", "project_id", "\"42\"", "glpat", "runners_token" }) |needle| {
+		if (std.mem.indexOf(u8, body, needle) != null) {
+			std.debug.print("/_cogbox/grants body leaked {s}: {s}\n", .{ needle, body });
+			return error.GrantsBodyLeak;
+		}
+	}
+}
+
+test "gitlab: /_cogbox/grants reflects what this binary ENFORCES -- a v1 coarse doc comes back expanded" {
+	// The reflection is the enforcement surface, not an echo of the document:
+	// an unedited `mr` grant enforces the mr triple here, so it must SAY so or
+	// the in-sandbox agent (and grant-check clients) reads a stale vocabulary.
+	const g = try testGen(conf.test_conf_json);
+	defer freeGen(g);
+	const policy = g.entries[0].policy;
+	const segs = [_][]const u8{ "_cogbox", "grants" };
+	const req = mkReq(.GET, &segs, &.{});
+	const route = policy.vtable.classify(policy.ctx, &req).?;
+
+	var buf: [4096]u8 = undefined;
+	var w: std.Io.Writer = .fixed(&buf);
+	try policy.vtable.localResponse.?(policy.ctx, &route, &req, &w);
+	const body = w.buffered();
+	try t.expect(std.mem.indexOf(u8, body, "\"issues:read\"") != null);
+	try t.expect(std.mem.indexOf(u8, body, "\"issues:write\"") != null);
+	try t.expect(std.mem.indexOf(u8, body, "\"mr:merge\"") != null);
+	// the coarse spellings are gone from the wire
+	try t.expect(std.mem.indexOf(u8, body, "\"issues\"") == null);
+	try t.expect(std.mem.indexOf(u8, body, "\"mr\"") == null);
+	// and no push keys anywhere: a v1 document carries none
+	try t.expect(std.mem.indexOf(u8, body, "push_") == null);
+}
+
+// --- push-rule units: the glob, the two deny flags, the union, the fast path ---
+
+const oid_x = "1" ** 40;
+const oid_y = "2" ** 40;
+const oid_zero = "0" ** 40;
+
+/// A `git-receive` route for `<segs>` -- the shape the mediate hook runs on.
+/// The returned route borrows `segs`, which the caller keeps alive.
+fn pushRoute(policy: plugin_mod.Policy, segs: []const []const u8) plugin_mod.Route {
+	const req = mkReq(.POST, segs, &.{});
+	return policy.vtable.classify(policy.ctx, &req).?;
+}
+
+fn mkCmd(ref: []const u8, is_delete: bool) pktline.Command {
+	return .{
+		.old_oid = oid_x,
+		.new_oid = if (is_delete) oid_zero else oid_y,
+		.ref = ref,
+		.is_delete = is_delete,
+		.is_tag = std.mem.startsWith(u8, ref, "refs/tags/"),
+	};
+}
+
+/// Evaluate one refname against one compiled pattern.
+fn matchOne(arena: std.mem.Allocator, pat: []const u8, ref: []const u8) !bool {
+	const p = (try compileRefPattern(arena, pat)) orelse return error.PatternRefused;
+	const one = [_]RefPattern{p};
+	const rules = PushRules{ .refs = &one, .deny_delete = false, .deny_tags = false };
+	var buf: [pktline.max_ref_components][]const u8 = undefined;
+	return refMatches(&rules, splitRef(ref, &buf).?);
+}
+
+test "gitlab: refMatches is component-wise -- * is exactly one, ** is one or more, and neither matches a partial component" {
+	var arena = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena.deinit();
+	const a = arena.allocator();
+
+	const Case = struct { pat: []const u8, ref: []const u8, want: bool };
+	const cases = [_]Case{
+		// literals
+		.{ .pat = "refs/heads/main", .ref = "refs/heads/main", .want = true },
+		.{ .pat = "refs/heads/main", .ref = "refs/heads/main2", .want = false },
+		.{ .pat = "refs/heads/main", .ref = "refs/heads/main/x", .want = false },
+		// `*` is EXACTLY one component
+		.{ .pat = "refs/heads/*", .ref = "refs/heads/x", .want = true },
+		.{ .pat = "refs/heads/*", .ref = "refs/heads/a/b", .want = false },
+		.{ .pat = "refs/heads/*", .ref = "refs/heads", .want = false },
+		// ...and a component boundary is a boundary: agent-x is not under agent/
+		.{ .pat = "refs/heads/agent/*", .ref = "refs/heads/agent/x", .want = true },
+		.{ .pat = "refs/heads/agent/*", .ref = "refs/heads/agent-x", .want = false },
+		.{ .pat = "refs/heads/agent/*", .ref = "refs/heads/agent", .want = false },
+		.{ .pat = "refs/heads/agent/*", .ref = "refs/heads/agent/a/b", .want = false },
+		// `**` is one or more -- never zero
+		.{ .pat = "refs/heads/**", .ref = "refs/heads/a", .want = true },
+		.{ .pat = "refs/heads/**", .ref = "refs/heads/a/b/c", .want = true },
+		.{ .pat = "refs/heads/**", .ref = "refs/heads", .want = false },
+		.{ .pat = "refs/heads/**", .ref = "refs/tags/a", .want = false },
+		// a `**` in the middle backtracks until the tail lines up
+		.{ .pat = "refs/heads/**/sub", .ref = "refs/heads/a/sub", .want = true },
+		.{ .pat = "refs/heads/**/sub", .ref = "refs/heads/a/b/sub", .want = true },
+		.{ .pat = "refs/heads/**/sub", .ref = "refs/heads/sub", .want = false },
+		.{ .pat = "refs/heads/**/sub", .ref = "refs/heads/a/sub/x", .want = false },
+		.{ .pat = "refs/heads/*/sub/**", .ref = "refs/heads/x/sub/a", .want = true },
+		.{ .pat = "refs/heads/*/sub/**", .ref = "refs/heads/x/sub", .want = false },
+		// the tag anchor is a different subtree, not a prefix
+		.{ .pat = "refs/tags/*", .ref = "refs/tags/v1.0", .want = true },
+		.{ .pat = "refs/tags/*", .ref = "refs/heads/v1.0", .want = false },
+	};
+	for (cases) |c| {
+		const got = try matchOne(a, c.pat, c.ref);
+		if (got != c.want) {
+			std.debug.print("refMatches({s}, {s}) = {}, want {}\n", .{ c.pat, c.ref, got, c.want });
+			return error.WrongMatch;
+		}
+	}
+
+	// Several patterns are a union, and NO pattern means "any refname" (the
+	// rule object then carries only the deny flags).
+	const p1 = (try compileRefPattern(a, "refs/heads/agent/*")).?;
+	const p2 = (try compileRefPattern(a, "refs/tags/*")).?;
+	const two = [_]RefPattern{ p1, p2 };
+	const union_rules = PushRules{ .refs = &two, .deny_delete = false, .deny_tags = false };
+	var buf: [pktline.max_ref_components][]const u8 = undefined;
+	try t.expect(refMatches(&union_rules, splitRef("refs/tags/v1", &buf).?));
+	try t.expect(refMatches(&union_rules, splitRef("refs/heads/agent/x", &buf).?));
+	try t.expect(!refMatches(&union_rules, splitRef("refs/heads/main", &buf).?));
+	const anyref = PushRules{ .refs = &.{}, .deny_delete = false, .deny_tags = false };
+	try t.expect(refMatches(&anyref, splitRef("refs/heads/main", &buf).?));
+}
+
+test "gitlab: deny_delete and deny_tags short-circuit the patterns" {
+	// gg-v2a: push rules refs/heads/agent/* + refs/heads/release/**, BOTH deny
+	// flags on, on the concrete project grp/proj.
+	const g = try testGen(conf.test_conf_v2_json);
+	defer freeGen(g);
+	const grants = compiled(g.entries[0].policy.ctx).grants;
+	const segs = [_][]const u8{ "grp", "proj.git", "git-receive-pack" };
+	const route = pushRoute(g.entries[0].policy, &segs);
+
+	const Case = struct { ref: []const u8, del: bool, want: bool, why: []const u8 };
+	const cases = [_]Case{
+		.{ .ref = "refs/heads/agent/x", .del = false, .want = true, .why = "an update on a matched ref" },
+		.{ .ref = "refs/heads/release/1/2", .del = false, .want = true, .why = "** spans two components" },
+		.{ .ref = "refs/heads/main", .del = false, .want = false, .why = "an unmatched ref" },
+		.{ .ref = "refs/heads/agent/x", .del = true, .want = false, .why = "a DELETE of a matched ref under deny_delete" },
+		// deny_tags wins even though refs/tags/* would be reachable if the owner
+		// had listed it -- and here no tag pattern is listed either.
+		.{ .ref = "refs/tags/v1", .del = false, .want = false, .why = "a tag under deny_tags" },
+	};
+	for (cases) |c| {
+		const cmd = mkCmd(c.ref, c.del);
+		var buf: [pktline.max_ref_components][]const u8 = undefined;
+		const got = commandAdmitted(grants, &route, &cmd, splitRef(c.ref, &buf).?);
+		if (got != c.want) {
+			std.debug.print("commandAdmitted({s}) = {}, want {} -- {s}\n", .{ c.ref, got, c.want, c.why });
+			return error.WrongVerdict;
+		}
+	}
+
+	// The flags are independent of the patterns: a grant that lists a tag
+	// pattern but sets deny_tags still refuses the tag, and one with no patterns
+	// at all still refuses a delete.
+	const g2 = try testGen(
+		\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+		\\"grants":[{"id":"gg-flags","scope":"instance","caps":["git-write"],
+		\\ "push":{"refs":["refs/tags/*"],"deny_delete":true,"deny_tags":true}}]}]}
+	);
+	defer freeGen(g2);
+	const grants2 = compiled(g2.entries[0].policy.ctx).grants;
+	const route2 = pushRoute(g2.entries[0].policy, &segs);
+	var buf2: [pktline.max_ref_components][]const u8 = undefined;
+	const tag = mkCmd("refs/tags/v1", false);
+	try t.expect(!commandAdmitted(grants2, &route2, &tag, splitRef("refs/tags/v1", &buf2).?));
+}
+
+test "gitlab: push rules are a UNION -- a rule-free covering grant admits what a rules-bearing one denies" {
+	// Two grants over the same project: a namespace grant fenced to
+	// refs/heads/agent/*, and a concrete grant with no rules at all. The
+	// tuples are additive in `authorize`, and they are additive here too.
+	const g = try testGen(
+		\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+		\\"grants":[{"id":"gg-ns","scope":"namespace","repo":"grp/*","prefix":"/grp/","caps":["git-read","git-write"],
+		\\ "push":{"refs":["refs/heads/agent/*"],"deny_delete":true,"deny_tags":true}},
+		\\{"id":"gg-free","scope":"project","repo":"grp/proj","project_id":"1234","caps":["git-read","git-write"]}]}]}
+	);
+	defer freeGen(g);
+	const grants = compiled(g.entries[0].policy.ctx).grants;
+	var buf: [pktline.max_ref_components][]const u8 = undefined;
+
+	// grp/proj is covered by BOTH: the rule-free one admits main, the delete and
+	// the tag the namespace rules refuse.
+	const covered = [_][]const u8{ "grp", "proj.git", "git-receive-pack" };
+	const route_both = pushRoute(g.entries[0].policy, &covered);
+	for ([_]pktline.Command{
+		mkCmd("refs/heads/main", false),
+		mkCmd("refs/heads/main", true),
+		mkCmd("refs/tags/v1", false),
+	}) |cmd| {
+		try t.expect(commandAdmitted(grants, &route_both, &cmd, splitRef(cmd.ref, &buf).?));
+	}
+
+	// grp/other is covered by the NAMESPACE grant only, so its rules bind there.
+	const ns_only = [_][]const u8{ "grp", "other.git", "git-receive-pack" };
+	const route_ns = pushRoute(g.entries[0].policy, &ns_only);
+	const agent = mkCmd("refs/heads/agent/x", false);
+	try t.expect(commandAdmitted(grants, &route_ns, &agent, splitRef(agent.ref, &buf).?));
+	for ([_]pktline.Command{
+		mkCmd("refs/heads/main", false),
+		mkCmd("refs/heads/agent/x", true),
+		mkCmd("refs/tags/v1", false),
+	}) |cmd| {
+		try t.expect(!commandAdmitted(grants, &route_ns, &cmd, splitRef(cmd.ref, &buf).?));
+	}
+
+	// A grant WITHOUT git-write is not a candidate at all, however wide its
+	// scope: the fixture's namespace grant covers grp/sub but reads only.
+	const g2 = try testGen(conf.test_conf_v2_json);
+	defer freeGen(g2);
+	const sub = [_][]const u8{ "grp", "sub", "a.git", "git-receive-pack" };
+	const route_sub = pushRoute(g2.entries[0].policy, &sub);
+	const any = mkCmd("refs/heads/main", false);
+	try t.expect(!commandAdmitted(compiled(g2.entries[0].policy.ctx).grants, &route_sub, &any, splitRef(any.ref, &buf).?));
+}
+
+// The mediate hook itself, driven directly: a refusing transport proves every
+// verdict is reached BEFORE any dial, and a credential that would error proves
+// none of them read one.
+
+var mediate_test_bundle: std.crypto.Certificate.Bundle = .empty;
+var mediate_test_lock: std.Io.RwLock = .init;
+
+fn testUio(tr: *const upstream_mod.Transport, storage: *upstream_mod.ConnStorage) upstream_mod.UpstreamIO {
+	return .{
+		.transport = tr,
+		.gpa = t.allocator,
+		.io = undefined, // the refusing transport never touches io
+		.entry_host = "git.example.com",
+		.insecure = false,
+		.vetted_ip = .{ .ipv4 = .{ 10, 0, 0, 5 } },
+		.vetted_port = 443,
+		.bundle = &mediate_test_bundle,
+		.bundle_lock = &mediate_test_lock,
+		.bundle_empty = false,
+		.storage = storage,
+	};
+}
+
+fn neverToken(_: *anyopaque) plugin_mod.Cred.TokenError![]const u8 {
+	return error.CredentialUnavailable;
+}
+
+/// Run `mediate` over `body` on a `git-receive` route for `segs`, with a
+/// transport that refuses every dial. Returns whether the hook took the request
+/// over; the caller inspects `out`, `refusing.calls` and the body's seek.
+fn runMediate(
+	policy: plugin_mod.Policy,
+	segs: []const []const u8,
+	method: std.http.Method,
+	body: ?*std.Io.Reader,
+	refusing: *upstream_mod.RefusingTransport,
+	out: *plugin_mod.Response,
+) !bool {
+	const storage = try t.allocator.create(upstream_mod.ConnStorage);
+	defer t.allocator.destroy(storage);
+	storage.* = .{};
+	var uio = testUio(refusing.t(), storage);
+	var dummy: u8 = 0;
+	var cred: plugin_mod.Cred = .{ .ctx = &dummy, .tokenFn = neverToken };
+	var req = mkReq(method, segs, &.{});
+	req.body = body;
+	const route = policy.vtable.classify(policy.ctx, &req).?;
+	return policy.vtable.mediate.?(policy.ctx, &route, &req, &cred, &uio, out);
+}
+
+test "gitlab: mediate is a pure passthrough unless a covering grant carries push rules (fast-path pin)" {
+	const push_body = pktline.frame(oid_x ++ " " ++ oid_y ++ " refs/heads/main\x00report-status") ++
+		pktline.flush_pkt ++ "PACKDATA";
+
+	// (a) the v1 fixture: git-write grants, NO push rules anywhere.
+	{
+		const g = try testGen(conf.test_conf_json);
+		defer freeGen(g);
+		var body: std.Io.Reader = .fixed(push_body);
+		var refusing = upstream_mod.RefusingTransport{};
+		var out: plugin_mod.Response = .{};
+		const segs = [_][]const u8{ "grp", "proj.git", "git-receive-pack" };
+		try t.expect(!try runMediate(g.entries[0].policy, &segs, .POST, &body, &refusing, &out));
+		// the body reader is EXACTLY where the core left it: the default round
+		// trip relays byte-identically to what it did before mediate existed
+		try t.expectEqual(@as(usize, 0), body.seek);
+		try t.expectEqual(@as(usize, 0), refusing.calls);
+		try t.expect(out.deny == null and out.exchange == null);
+	}
+
+	// (b) the v2 fixture (gg-v2a DOES carry rules) on a route that is not
+	// git-receive: the hook answers false on the id alone.
+	{
+		const g = try testGen(conf.test_conf_v2_json);
+		defer freeGen(g);
+		var body: std.Io.Reader = .fixed(push_body);
+		var refusing = upstream_mod.RefusingTransport{};
+		var out: plugin_mod.Response = .{};
+		const segs = [_][]const u8{ "grp", "proj.git", "git-upload-pack" };
+		try t.expect(!try runMediate(g.entries[0].policy, &segs, .POST, &body, &refusing, &out));
+		try t.expectEqual(@as(usize, 0), body.seek);
+	}
+
+	// (c) the v2 fixture on a project its rules-bearing grant does NOT cover:
+	// gg-v2b (grp/sub) has no git-write, so no candidate carries rules.
+	{
+		const g = try testGen(conf.test_conf_v2_json);
+		defer freeGen(g);
+		var body: std.Io.Reader = .fixed(push_body);
+		var refusing = upstream_mod.RefusingTransport{};
+		var out: plugin_mod.Response = .{};
+		const segs = [_][]const u8{ "grp", "sub", "a.git", "git-receive-pack" };
+		try t.expect(!try runMediate(g.entries[0].policy, &segs, .POST, &body, &refusing, &out));
+		try t.expectEqual(@as(usize, 0), body.seek);
+	}
+
+	// (d) the scope test inside the fast-path scan: rules on ONE project must not
+	// drag a push to a DIFFERENT project (covered by a rule-free grant) onto the
+	// slow path -- and, since the rules there would have refused `main`, this is
+	// the arm where getting the scope test wrong would show up as a spurious 403.
+	{
+		const g = try testGen(
+			\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+			\\"grants":[{"id":"gg-fenced","scope":"project","repo":"grp/proj","project_id":"1234","caps":["git-write"],
+			\\ "push":{"refs":["refs/heads/agent/*"]}},
+			\\{"id":"gg-open","scope":"project","repo":"grp/other","project_id":"5678","caps":["git-write"]}]}]}
+		);
+		defer freeGen(g);
+		var body: std.Io.Reader = .fixed(push_body);
+		var refusing = upstream_mod.RefusingTransport{};
+		var out: plugin_mod.Response = .{};
+		const segs = [_][]const u8{ "grp", "other.git", "git-receive-pack" };
+		try t.expect(!try runMediate(g.entries[0].policy, &segs, .POST, &body, &refusing, &out));
+		try t.expectEqual(@as(usize, 0), body.seek);
+		// ...while the fenced project itself DOES take the slow path and refuses
+		var body2: std.Io.Reader = .fixed(push_body);
+		var out2: plugin_mod.Response = .{};
+		const fenced = [_][]const u8{ "grp", "proj.git", "git-receive-pack" };
+		try t.expect(try runMediate(g.entries[0].policy, &fenced, .POST, &body2, &refusing, &out2));
+		try t.expectEqualStrings("ref_denied", out2.deny.?);
+		try t.expectEqual(@as(usize, 0), refusing.calls);
+	}
+}
+
+test "gitlab: every mediate verdict is reached before any dial and without a credential" {
+	const g = try testGen(conf.test_conf_v2_json);
+	defer freeGen(g);
+	const policy = g.entries[0].policy;
+	const segs = [_][]const u8{ "grp", "proj.git", "git-receive-pack" };
+
+	const Case = struct { body: []const u8, reason: []const u8, status: u16, why: []const u8 };
+	const cases = [_]Case{
+		.{
+			.body = pktline.frame(oid_x ++ " " ++ oid_y ++ " refs/heads/main\x00report-status") ++
+				pktline.flush_pkt ++ "PACK",
+			.reason = "ref_denied",
+			.status = 403,
+			.why = "a ref outside the patterns",
+		},
+		.{
+			// one allowed, one denied: the WHOLE push goes, never a subset
+			.body = pktline.frame(oid_x ++ " " ++ oid_y ++ " refs/heads/agent/x") ++
+				pktline.frame(oid_x ++ " " ++ oid_y ++ " refs/heads/main") ++
+				pktline.flush_pkt ++ "PACK",
+			.reason = "ref_denied",
+			.status = 403,
+			.why = "a mixed push",
+		},
+		.{
+			.body = pktline.frame(oid_x ++ " " ++ oid_zero ++ " refs/heads/agent/x") ++ pktline.flush_pkt,
+			.reason = "ref_denied",
+			.status = 403,
+			.why = "a delete under deny_delete",
+		},
+		.{
+			.body = pktline.frame(oid_x ++ " " ++ oid_y ++ " refs/tags/v1") ++ pktline.flush_pkt ++ "PACK",
+			.reason = "ref_denied",
+			.status = 403,
+			.why = "a tag under deny_tags",
+		},
+		.{
+			.body = "0001" ++ pktline.flush_pkt,
+			.reason = "push_malformed",
+			.status = 400,
+			.why = "a protocol-v2 delim pkt in a receive-pack body",
+		},
+		.{
+			.body = pktline.frame("push-cert\x00atomic") ++ pktline.flush_pkt,
+			.reason = "push_cert_unsupported",
+			.status = 403,
+			.why = "a signed push",
+		},
+	};
+	for (cases) |c| {
+		var body: std.Io.Reader = .fixed(c.body);
+		var refusing = upstream_mod.RefusingTransport{};
+		var out: plugin_mod.Response = .{};
+		try t.expect(try runMediate(policy, &segs, .POST, &body, &refusing, &out));
+		if (out.deny == null or !std.mem.eql(u8, out.deny.?, c.reason) or out.deny_status != c.status) {
+			std.debug.print("mediate verdict for {s}: {?s}/{d}, want {s}/{d}\n", .{ c.why, out.deny, out.deny_status, c.reason, c.status });
+			return error.WrongVerdict;
+		}
+		try t.expect(out.exchange == null);
+		try t.expectEqual(@as(usize, 0), refusing.calls); // BEFORE any dial
+	}
+
+	// The command cap is the same refusal, one status up.
+	{
+		var line = std.Io.Writer.Allocating.init(t.allocator);
+		defer line.deinit();
+		var i: usize = 0;
+		while (i < pktline.max_commands + 1) : (i += 1) {
+			const payload = try std.fmt.allocPrint(t.allocator, "{s} {s} refs/heads/agent/b{d}", .{ oid_x, oid_y, i });
+			defer t.allocator.free(payload);
+			try line.writer.print("{x:0>4}{s}", .{ payload.len + 4, payload });
+		}
+		try line.writer.writeAll(pktline.flush_pkt);
+		var body: std.Io.Reader = .fixed(line.written());
+		var refusing = upstream_mod.RefusingTransport{};
+		var out: plugin_mod.Response = .{};
+		try t.expect(try runMediate(policy, &segs, .POST, &body, &refusing, &out));
+		try t.expectEqualStrings("too_many_refs", out.deny.?);
+		try t.expectEqual(@as(u16, 413), out.deny_status);
+		try t.expectEqual(@as(usize, 0), refusing.calls);
 	}
 }

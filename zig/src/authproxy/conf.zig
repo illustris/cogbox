@@ -15,6 +15,14 @@
 //   { "version": 1, "providers": [ { "host", "plugin", "scheme", "insecure",
 //     "cred_file", "cred_format", "git_user", "grants": [...] } ] }
 // An unknown "version" is refused before building any entry.
+//
+// Conf version 2 means "some grant carries `push` rules". It exists purely as
+// a whole-file fail-closed lever across an agent/enforcer image skew: the
+// render (rules/reload.zig, the AGENT image) and this reader (the ENFORCER
+// image) roll on independent tags, and a pre-v2 reader's parseGrants would
+// silently DROP an unknown `push` object -- turning a branch-restricted grant
+// into an unrestricted one. Bumping the conf version instead makes that reader
+// refuse the whole conf and fall to the empty policy (403 `no-policy`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,6 +40,18 @@ fn opLog(comptime fmt: []const u8, args: anytype) void {
 pub const max_conf_bytes: usize = 1 << 20; // 1 MiB, the readStdinAll cap's twin
 pub const cred_value_cap: usize = 64 * 1024;
 
+/// The conf-file schema versions this reader interprets. Keep in step with
+/// rules/reload.zig `conf_version_push` (the writer): a version this binary
+/// does not know is the whole-file fail-closed lever described in the header.
+pub const conf_versions = [_]i64{ 1, 2 };
+
+fn confVersionKnown(v: i64) bool {
+	for (conf_versions) |known| {
+		if (v == known) return true;
+	}
+	return false;
+}
+
 pub const Project = struct {
 	id: i64,
 	path: []const u8,
@@ -48,6 +68,20 @@ pub const Grant = struct {
 	project_id: ?[]const u8 = null,
 	projects: []const Project = &.{},
 	caps: []const []const u8 = &.{},
+	/// Policy-document v2's per-grant push rules. null == absent == the grant
+	/// is unrestricted on push (the FAST PATH: the receive-pack body is never
+	/// inspected). Shape only here -- whether the patterns are well-formed, and
+	/// whether the grant may carry rules at all, is the plugin's `compile`.
+	push: ?Push = null,
+
+	/// Branch/tag rules on `git push`, evaluated against the receive-pack
+	/// command list. Empty `refs` means "any ref" (the deny flags can still
+	/// restrict); the flags are independent of the patterns.
+	pub const Push = struct {
+		refs: []const []const u8 = &.{},
+		deny_delete: bool = false,
+		deny_tags: bool = false,
+	};
 };
 
 /// One rendered conf element (one host). `cred_file` is an absolute store
@@ -147,7 +181,7 @@ pub fn parseGeneration(
 	if (root != .object) return error.BadConf;
 	// Refuse an unknown version BEFORE building any entry (contract H#9).
 	const version = root.object.get("version") orelse return error.BadConf;
-	if (version != .integer or version.integer != 1) return error.BadConf;
+	if (version != .integer or !confVersionKnown(version.integer)) return error.BadConf;
 	const providers = root.object.get("providers") orelse return error.BadConf;
 	if (providers != .array) return error.BadConf;
 
@@ -214,6 +248,7 @@ fn parseGrants(arena: std.mem.Allocator, o: std.json.ObjectMap) ParseError![]Gra
 			.project_id = strField(go, "project_id"),
 			.projects = try parseProjects(arena, go),
 			.caps = try parseCaps(arena, go),
+			.push = try parsePush(arena, go),
 		};
 	}
 	return grants;
@@ -233,6 +268,36 @@ fn parseProjects(arena: std.mem.Allocator, go: std.json.ObjectMap) ParseError![]
 		};
 	}
 	return projects;
+}
+
+/// The v2 `push` object, or null when the grant carries none. ABSENT is the
+/// only tolerated shape: a `push` that is present but not an object, whose
+/// `refs` is not an array of strings, or whose deny flags are not booleans, is
+/// `BadConf` for the WHOLE conf (never a silently dropped restriction -- a
+/// half-read push rule would relax a grant the owner tightened).
+fn parsePush(arena: std.mem.Allocator, go: std.json.ObjectMap) ParseError!?Grant.Push {
+	const pv = go.get("push") orelse return null;
+	if (pv != .object) return error.BadConf;
+	const po = pv.object;
+	var out: Grant.Push = .{};
+	if (po.get("refs")) |rv| {
+		if (rv != .array) return error.BadConf;
+		const refs = try arena.alloc([]const u8, rv.array.items.len);
+		for (rv.array.items, 0..) |item, i| {
+			if (item != .string) return error.BadConf;
+			refs[i] = item.string;
+		}
+		out.refs = refs;
+	}
+	if (po.get("deny_delete")) |v| {
+		if (v != .bool) return error.BadConf;
+		out.deny_delete = v.bool;
+	}
+	if (po.get("deny_tags")) |v| {
+		if (v != .bool) return error.BadConf;
+		out.deny_tags = v.bool;
+	}
+	return out;
 }
 
 fn parseCaps(arena: std.mem.Allocator, go: std.json.ObjectMap) ParseError![]const []const u8 {
@@ -575,6 +640,27 @@ pub const test_conf_json =
 	\\  ]}]}
 ;
 
+// The v2 fixture: the fine-grained cap vocabulary plus a push-rule grant, on
+// the same fictional host. The conf version is 2 here for one reason only --
+// a grant carries `push`, which a pre-v2 reader would silently drop (see the
+// header). The GRANT vocabulary is otherwise the plugin's to gate, and rides
+// in verbatim from a version-2 policy document; a fine-caps-only conf stays at
+// version 1. Shared so the plugin units and the end-to-end suites pin one shape.
+pub const test_conf_v2_json =
+	\\{"version":2,"providers":[{
+	\\  "host":"git.example.com","plugin":"gitlab","scheme":"http","insecure":false,
+	\\  "cred_file":"/nonexistent/store/git-gitlab","cred_format":"raw","git_user":"oauth2",
+	\\  "grants":[
+	\\    {"id":"gg-v2a","scope":"project","repo":"grp/proj","project_id":"1234",
+	\\     "caps":["git-read","git-write","issues:read","issues:write","mr:read","mr:write",
+	\\             "mr:merge","pipelines:read","pipelines:write","repo:read","wiki:read","wiki:write"],
+	\\     "push":{"deny_delete":true,"deny_tags":true,"refs":["refs/heads/agent/*","refs/heads/release/**"]}},
+	\\    {"id":"gg-v2b","scope":"namespace","repo":"grp/sub/*","prefix":"/grp/sub/",
+	\\     "caps":["git-read","pipelines:read","repo:read","wiki:read"],
+	\\     "projects":[{"id":42,"path":"grp/sub/a"}]}
+	\\  ]}]}
+;
+
 fn testIo() std.Io.Threaded {
 	return .init(t.allocator, .{});
 }
@@ -599,12 +685,74 @@ test "parseGeneration: the fixture conf compiles; fields land typed" {
 	try t.expect(g.findEntry("api.example.com") == null);
 }
 
+test "parseGrants: the v2 push object lands typed; absent stays null" {
+	var threaded = testIo();
+	defer threaded.deinit();
+	const io = threaded.io();
+	const g = try parseGeneration(t.allocator, io, test_conf_v2_json, 1, .skip, null);
+	defer releaseGeneration(t.allocator, g);
+	const grants = g.entries[0].grants;
+	try t.expectEqual(@as(usize, 2), grants.len);
+	const push = grants[0].push.?;
+	try t.expect(push.deny_delete);
+	try t.expect(push.deny_tags);
+	try t.expectEqual(@as(usize, 2), push.refs.len);
+	try t.expectEqualStrings("refs/heads/agent/*", push.refs[0]);
+	try t.expectEqualStrings("refs/heads/release/**", push.refs[1]);
+	// A grant with no `push` key is unrestricted, not empty-restricted: the
+	// plugin's fast path keys on the null.
+	try t.expect(grants[1].push == null);
+
+	// A v1 document's grants carry no push key at all.
+	const v1 = try parseGeneration(t.allocator, io, test_conf_json, 1, .skip, null);
+	defer releaseGeneration(t.allocator, v1);
+	for (v1.entries[0].grants) |gr| try t.expect(gr.push == null);
+}
+
+test "parseGrants: a malformed push object fails the WHOLE parse (never a silently dropped restriction)" {
+	var threaded = testIo();
+	defer threaded.deinit();
+	const io = threaded.io();
+	// Every case keeps git-write in caps, so the refusal is parsePush's and not
+	// the plugin's "push without git-write" arm.
+	const cases = [_][]const u8{
+		// push is not an object
+		\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2","grants":[{"id":"g","scope":"instance","caps":["git-write"],"push":["refs/heads/x"]}]}]}
+		,
+		// refs is not an array
+		\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2","grants":[{"id":"g","scope":"instance","caps":["git-write"],"push":{"refs":"refs/heads/x"}}]}]}
+		,
+		// a refs element is not a string
+		\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2","grants":[{"id":"g","scope":"instance","caps":["git-write"],"push":{"refs":[7]}}]}]}
+		,
+		// a deny flag is not a boolean
+		\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2","grants":[{"id":"g","scope":"instance","caps":["git-write"],"push":{"deny_delete":"true"}}]}]}
+		,
+		\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2","grants":[{"id":"g","scope":"instance","caps":["git-write"],"push":{"deny_tags":1}}]}]}
+		,
+	};
+	for (cases) |json| {
+		try t.expectError(error.BadConf, parseGeneration(t.allocator, io, json, 1, .skip, null));
+	}
+	// An EMPTY push object is well-formed (no patterns, no denials): the plugin
+	// then compiles a rule set that restricts nothing.
+	const ok = try parseGeneration(t.allocator, io,
+		\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2","grants":[{"id":"g","scope":"instance","caps":["git-write"],"push":{}}]}]}
+	, 1, .skip, null);
+	defer releaseGeneration(t.allocator, ok);
+	const p = ok.entries[0].grants[0].push.?;
+	try t.expectEqual(@as(usize, 0), p.refs.len);
+	try t.expect(!p.deny_delete and !p.deny_tags);
+}
+
 test "parseGeneration: refusals fail the WHOLE parse, never a partial set" {
 	var threaded = testIo();
 	defer threaded.deinit();
 	const io = threaded.io();
-	// unknown version
-	try t.expectError(error.BadConf, parseGeneration(t.allocator, io, "{\"version\":2,\"providers\":[]}", 1, .skip, null));
+	// unknown version -- 1 and 2 are both live (conf_versions), 3 is the next
+	// unlanded one, and a reader too old for what it is handed must refuse the
+	// WHOLE file rather than enforce the subset it happens to understand.
+	try t.expectError(error.BadConf, parseGeneration(t.allocator, io, "{\"version\":3,\"providers\":[]}", 1, .skip, null));
 	// malformed JSON
 	try t.expectError(error.BadConf, parseGeneration(t.allocator, io, "{\"version\":1,", 1, .skip, null));
 	// unknown plugin name

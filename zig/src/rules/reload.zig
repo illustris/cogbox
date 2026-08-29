@@ -748,13 +748,60 @@ pub fn seedGitInjectSpecs(
 	};
 }
 
-/// The `providers[]` array of a VERSION-1 `.network.l7.authpolicy` document, or
-/// null when the section is absent / malformed / carries an unknown version.
-/// The version gate makes a document this binary is too new or too old to
-/// interpret DEAD TEXT rather than live policy (the delivery verb refuses an
-/// unknown version before writing, but a hand-edited or rolled-back config can
-/// still carry one -- fail closed here too). The literal 1 is the cross-repo
-/// schema version (l7/main.zig policy_doc_version; cogworx's renderer).
+/// The auth-policy document schema versions this binary interprets. DUPLICATED
+/// from l7/main.zig `policy_doc_versions` on purpose: the l7 verb module
+/// imports rules_module, so importing it back would close a module cycle. Keep
+/// the two lists in step -- the verb refuses an unknown version at delivery,
+/// this gate makes one that got in anyway dead text.
+const auth_policy_doc_versions = [_]i64{ 1, 2 };
+
+fn authPolicyVersionKnown(v: i64) bool {
+	for (auth_policy_doc_versions) |known| {
+		if (v == known) return true;
+	}
+	return false;
+}
+
+/// The rendered CONF's schema version -- INDEPENDENT of the policy DOCUMENT's
+/// version above. The document's version says what vocabulary cogworx sent;
+/// the conf's says what its READER must understand to enforce what this render
+/// wrote. This render runs in the AGENT image, authproxy/conf.zig runs in the
+/// ENFORCER image, and those two roll on independent tags -- so the conf
+/// version is the only whole-file fail-closed lever across that skew.
+///
+/// Base 1 is the shape every enforcer since the feature landed reads, and it
+/// stays byte-identical for every conf that needs nothing newer. It moves to 2
+/// for exactly ONE reason: some emitted grant carries `push` rules. A pre-v2
+/// `parseGrants` reads only the fields it knows, so an unknown `push` object
+/// would be silently DROPPED and a branch-restricted grant would relay every
+/// ref -- widening. Fine CAP NAMES need no bump: the plugin's `compile`
+/// already refuses an unknown cap and fails the whole conf. A dropped object
+/// is the one lossy case, so the version carries it and an old reader refuses
+/// the conf (empty policy, 403 `no-policy`) instead of enforcing less.
+const conf_version_base: i64 = 1;
+const conf_version_push: i64 = 2;
+
+/// Whether any grant in a policy-doc `grants[]` carries a `push` object -- the
+/// one field whose silent loss on an old reader would WIDEN the grant.
+fn grantsCarryPush(grants_v: std.json.Value) bool {
+	if (grants_v != .array) return false;
+	for (grants_v.array.items) |g| {
+		if (g != .object) continue;
+		if (g.object.get("push") != null) return true;
+	}
+	return false;
+}
+
+/// The `providers[]` array of a KNOWN-VERSION `.network.l7.authpolicy`
+/// document, or null when the section is absent / malformed / carries an
+/// unknown version. The version gate makes a document this binary is too new or
+/// too old to interpret DEAD TEXT rather than live policy (the delivery verb
+/// refuses an unknown version before writing, but a hand-edited or rolled-back
+/// config can still carry one -- fail closed here too). The accepted set is the
+/// cross-repo schema version list (l7/main.zig policy_doc_versions; cogworx's
+/// renderer): v2 adds fine caps and per-grant push rules, which ride into the
+/// conf inside the grants[] this render copies VERBATIM -- the vocabulary is
+/// the auth proxy plugin's to gate, not this render's.
 fn authPolicyProviders(network: std.json.Value) ?std.json.Array {
 	if (network != .object) return null;
 	const l7 = network.object.getPtr("l7") orelse return null;
@@ -762,7 +809,7 @@ fn authPolicyProviders(network: std.json.Value) ?std.json.Array {
 	const ap = l7.object.getPtr("authpolicy") orelse return null;
 	if (ap.* != .object) return null;
 	const v = ap.object.get("version") orelse return null;
-	if (v != .integer or v.integer != 1) return null;
+	if (v != .integer or !authPolicyVersionKnown(v.integer)) return null;
 	const p = ap.object.getPtr("providers") orelse return null;
 	if (p.* != .array) return null;
 	return p.array;
@@ -823,8 +870,8 @@ fn hostInLines(lines: []const u8, host: []const u8) bool {
 ///
 ///   1. the resolved secret is bound, its kind == gitlab_authproxy_kind, and
 ///      its audience is set;
-///   2. `.network.l7.authpolicy` (version 1) carries a provider entry whose
-///      `hosts[]` include that audience;
+///   2. `.network.l7.authpolicy` (version 1 or 2) carries a provider entry
+///      whose `hosts[]` include that audience;
 ///   3. an L7 rule NAMES the audience (hostNamedInRules) -- the mirror of
 ///      seedGitInjectSpecs' fail-closed gate: it covers the window before the
 ///      funnel lands and a control plane that withdrew the rules but left the
@@ -870,6 +917,9 @@ pub fn renderAuthProxyConf(
 	const arena = arena_inst.allocator();
 
 	var providers_arr = std.json.Array.init(arena);
+	// Raised to conf_version_push by the first emitted entry carrying push
+	// rules; a conf with none stays byte-identical to the pre-v2 render.
+	var conf_version: i64 = conf_version_base;
 
 	// Union of both stores' bound names, instance shadowing global -- the same
 	// walk (and the same shadow semantics) as seedGitInjectSpecs.
@@ -920,7 +970,11 @@ pub fn renderAuthProxyConf(
 		// An entry without them gets an empty array: the plugin then compiles
 		// zero grants and denies everything (fail closed), rather than the
 		// whole conf being refused for every host.
-		try el.put(arena, "grants", entry.get("grants") orelse .{ .array = std.json.Array.init(arena) });
+		const grants_v = entry.get("grants") orelse std.json.Value{ .array = std.json.Array.init(arena) };
+		// The ONE thing the render must notice about the grant vocabulary (see
+		// conf_version_push): a `push` object an old reader would drop.
+		if (grantsCarryPush(grants_v)) conf_version = conf_version_push;
+		try el.put(arena, "grants", grants_v);
 		try providers_arr.append(.{ .object = el });
 
 		// The addon's retarget set: one EMITTED host per line, nothing else.
@@ -936,7 +990,7 @@ pub fn renderAuthProxyConf(
 	};
 
 	var root: std.json.ObjectMap = .empty;
-	try root.put(arena, "version", .{ .integer = 1 });
+	try root.put(arena, "version", .{ .integer = conf_version });
 	try root.put(arena, "providers", .{ .array = providers_arr });
 	try config.writeJqTab(allocator, out, .{ .object = root });
 }
@@ -2090,6 +2144,22 @@ fn authNetFixture(
 	ver: []const u8,
 	doc_host: []const u8,
 ) !std.json.Parsed(std.json.Value) {
+	return authNetFixtureGrants(gpa, rule_host, insecure, ver, doc_host,
+		"[{\"id\":\"gg-1\",\"scope\":\"project\",\"repo\":\"grp/proj\"," ++
+			"\"project_id\":\"1234\",\"caps\":[\"git-read\",\"issues\"]}]");
+}
+
+/// authNetFixture with a caller-supplied `grants[]` payload: the v2 arm needs
+/// fine caps and a `push` object to show they ride into the conf VERBATIM (the
+/// render never interprets the grant vocabulary -- that is the plugin's job).
+fn authNetFixtureGrants(
+	gpa: std.mem.Allocator,
+	rule_host: []const u8,
+	insecure: bool,
+	ver: []const u8,
+	doc_host: []const u8,
+	grants_json: []const u8,
+) !std.json.Parsed(std.json.Value) {
 	var src: std.ArrayList(u8) = .empty;
 	defer src.deinit(gpa);
 	try src.appendSlice(gpa, "{\"l7\":{\"mode\":\"terminate\",\"rules\":[{\"allow\":\"");
@@ -2100,9 +2170,9 @@ fn authNetFixture(
 	try src.appendSlice(gpa, ver);
 	try src.appendSlice(gpa, ",\"providers\":[{\"provider\":\"GitLab\",\"plugin\":\"gitlab\",\"hosts\":[\"");
 	try src.appendSlice(gpa, doc_host);
-	try src.appendSlice(gpa, "\"],\"secret\":\"git-gitlab\",\"git_user\":\"oauth2\",\"scheme\":\"https\"," ++
-		"\"grants\":[{\"id\":\"gg-1\",\"scope\":\"project\",\"repo\":\"grp/proj\"," ++
-		"\"project_id\":\"1234\",\"caps\":[\"git-read\",\"issues\"]}]}]}}}");
+	try src.appendSlice(gpa, "\"],\"secret\":\"git-gitlab\",\"git_user\":\"oauth2\",\"scheme\":\"https\",\"grants\":");
+	try src.appendSlice(gpa, grants_json);
+	try src.appendSlice(gpa, "}]}}}");
 	return std.json.parseFromSlice(std.json.Value, gpa, src.items, .{});
 }
 
@@ -2223,8 +2293,9 @@ test "renderAuthProxyConf: each gate failing ALONE yields no element" {
 
 	// GATE 2, version arm: an unknown doc version is DEAD TEXT, not live
 	// policy (a rolled-back binary or a hand-edited config must fail closed).
+	// 3 is the next unlanded schema version; 1 and 2 are both live below.
 	{
-		var parsed = try authNetFixture(gpa, "git.example.com", false, "2", "git.example.com");
+		var parsed = try authNetFixture(gpa, "git.example.com", false, "3", "git.example.com");
 		defer parsed.deinit();
 		var r: AuthRender = .{};
 		defer r.deinit(gpa);
@@ -2247,6 +2318,86 @@ test "renderAuthProxyConf: each gate failing ALONE yields no element" {
 		try std.testing.expectEqualStrings("", r.auth_hosts.items);
 		try std.testing.expectEqualStrings("", r.inject_hosts.items);
 	}
+}
+
+test "renderAuthProxyConf: a VERSION-2 document renders, fine caps and push rules riding the grants[] verbatim; push rules raise the CONF version" {
+	// The two version numbers are independent: the DOCUMENT schema is 2 (fine
+	// caps + push rules), and the CONF version is decided by what its READER
+	// must understand -- here 2, because a grant carries `push` and a pre-v2
+	// reader would silently drop that object and relay every ref (the render
+	// and the reader ship in independently-rolled images). The render still
+	// does not learn the grant vocabulary: it copies grants[] across, and the
+	// plugin's `compile` fails closed on anything it does not understand.
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE", .{
+		.audience = "git.example.com",
+		.kind = secret_mod.gitlab_authproxy_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	var parsed = try authNetFixtureGrants(gpa, "git.example.com", false, "2", "git.example.com",
+		"[{\"id\":\"gg-2\",\"scope\":\"project\",\"repo\":\"grp/proj\",\"project_id\":\"1234\"," ++
+			"\"caps\":[\"git-read\",\"git-write\",\"mr:read\",\"mr:merge\",\"wiki:write\"]," ++
+			"\"push\":{\"deny_delete\":true,\"deny_tags\":true,\"refs\":[\"refs/heads/agent/*\"]}}]");
+	defer parsed.deinit();
+
+	var r: AuthRender = .{};
+	defer r.deinit(gpa);
+	try runAuthRender(gpa, io, parsed.value, glob_dir, "zig-inject-test-no-instance", &r);
+	const s = r.out.items;
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"host\": \"git.example.com\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"version\": 2") != null); // the CONF version, raised by `push`
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"mr:merge\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"wiki:write\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"deny_delete\": true") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"refs/heads/agent/*\"") != null);
+	try std.testing.expectEqualStrings("git.example.com\n", r.auth_hosts.items);
+}
+
+test "renderAuthProxyConf: a version-2 document WITHOUT push rules leaves the conf at version 1" {
+	// The other half of the version-bump contract: fine cap NAMES alone do not
+	// move the conf version, because an old reader's `compile` refuses an
+	// unknown cap and fails the whole conf by itself. Only a droppable object
+	// (`push`) needs the file-level lever -- so every fine-caps-only sandbox
+	// keeps the byte-identical version-1 conf an old enforcer still reads.
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+
+	try secret_store.add(gpa, io, glob_dir, "git-gitlab", "glpat-FAKE", .{
+		.audience = "git.example.com",
+		.kind = secret_mod.gitlab_authproxy_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+
+	var parsed = try authNetFixtureGrants(gpa, "git.example.com", false, "2", "git.example.com",
+		"[{\"id\":\"gg-3\",\"scope\":\"project\",\"repo\":\"grp/proj\",\"project_id\":\"1234\"," ++
+			"\"caps\":[\"git-read\",\"pipelines:read\"]}]");
+	defer parsed.deinit();
+
+	var r: AuthRender = .{};
+	defer r.deinit(gpa);
+	try runAuthRender(gpa, io, parsed.value, glob_dir, "zig-inject-test-no-instance", &r);
+	const s = r.out.items;
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"version\": 1") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"pipelines:read\"") != null);
 }
 
 test "renderAuthProxyConf: insecure is single-sourced from the rule scan (finding N2)" {
