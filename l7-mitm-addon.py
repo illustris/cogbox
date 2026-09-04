@@ -22,8 +22,9 @@ Every other host keeps the default verification (fail closed).
 
 SSRF/CIDR vetting is NOT repeated here; it stayed authoritative in the Zig
 proxy. Rules are read from the same l7-rules file (path in COGBOX_L7_RULES)
-and hot-reloaded on mtime change, so `cogbox l7 add/del` takes effect without
-restarting mitmproxy.
+and hot-reloaded by stat polling under the _PolledFile contract below, so
+`cogbox l7 add/del` takes effect without restarting mitmproxy -- and a poll that
+lands inside a render never installs torn or partial bytes.
 """
 
 import base64
@@ -78,9 +79,95 @@ def _is_methods_token(tk):
     return saw_letter
 
 
-class Rules:
+def _log(line):
+    """The single logging seam: mitmproxy's logger when we run inside it,
+    stderr otherwise (so importing the pure helpers -- tests -- still logs)."""
+    if ctx is not None:
+        try:
+            ctx.log.warn(line)
+            return
+        except Exception:
+            pass
+    sys.stderr.write(line + "\n")
+
+
+def _stat_key(path):
+    """Cache key for a polled runtime file: (mtime_ns, size). BOTH halves are
+    load-bearing -- a rewrite of the same length inside one timestamp tick moves
+    neither mtime nor ctime, but any real content change moves the size;
+    nanosecond mtime closes the converse (same size, new content). Mirrors the
+    Zig conf reader (authproxy/conf.zig)."""
+    st = os.stat(path)
+    return (st.st_mtime_ns, st.st_size)
+
+
+class _PolledFile:
+    """Shared reload bookkeeping for the three runtime files this addon polls
+    (l7-rules, l7-inject-conf.json, l7-auth-hosts). ONE contract, because they
+    are all written by the same renderer and read the same way:
+
+      1. key the cache on `_stat_key` -- (mtime_ns, size), never mtime alone;
+      2. RE-STAT after the read and discard it if the key moved: a torn file
+         often still parses (an empty or truncated rule list / JSON array is
+         valid syntax), so the key moving under the read is the only tell;
+      3. NEVER advance the cache key on a failed open/parse -- leave the
+         previous key so the next poll retries on settled bytes;
+      4. NEVER install a partial result, and mind that the two failure kinds
+         fall DIFFERENT ways. A failed/torn READ (the file is there, the bytes
+         are not usable): the rules and inject-conf readers keep the PREVIOUS
+         contents -- an empty rule set silently un-widens policy and an empty
+         spec set silently un-injects -- while AuthHosts keeps nothing, since
+         retargeting nothing is its closed direction. A failed STAT (the file
+         is gone / unreadable, i.e. there may BE no current contents): every
+         reader drops to the empty set and drops its cache key, and the
+         inject-conf reader additionally remembers which hosts the last good
+         conf named so the injection seam can 403 them (see conf_unavailable_for)
+         instead of forwarding the guest's placeholder as if it were real auth.
+
+    The renderer writes these files ATOMICALLY now (rules/reload.zig
+    writeRuntimeFile: sibling tmp, fsync, rename), which retires the torn read
+    on a matched pair of images -- and none of the above is thereby belt-and-
+    braces. The addon ships in the ENFORCER/agent image and the renderer in the
+    cogbox binary, which roll on independent tags, so this reader can be running
+    against an older writer that still truncates in place; and a multi-file
+    render is still not atomic across files, which is why the renderer pins the
+    write ORDER (see reload.writeWireFiles) and why these readers still have to
+    be told which way to fail. Same reasoning, and the same wording, as the Zig
+    reader's header in authproxy/conf.zig.
+
+    The inject conf's SECOND writer (cogbox-launch.sh merges the harness specs
+    into it at boot with `jq -s add` + `mv`) is not one of those reasons: a
+    rename within the runtime dir is atomic and cannot tear. What that writer
+    owns is CONTENT this reader cannot get anywhere else -- the harness cred_file
+    + refresh block for the provider host -- which is a contract on the RENDERER
+    (reload.writeL7Inject preserves the specs it did not author on every live
+    render), not on this reader.
+
+    Failures are logged ONCE per distinct cause -- these are polled on every
+    request, so a persistent failure must not become a log flood."""
+
     def __init__(self):
-        self.mtime = None
+        self.stat = None       # _stat_key of the last GOOD read
+        self._fail_key = None  # last distinct failure logged
+
+    def _fail(self, what, kind, effect, err=None):
+        """Log a reload failure ONCE per distinct cause. `effect` states what the
+        reader is serving meanwhile -- these lines are the only externally
+        visible sign of a torn render, so they have to say which way it failed."""
+        key = (kind, str(err))
+        if self._fail_key == key:
+            return
+        self._fail_key = key
+        _log("cogbox-l7: %s not reloaded (%s%s); %s"
+             % (what, kind, ": %s" % err if err is not None else "", effect))
+
+    def _ok(self):
+        self._fail_key = None
+
+
+class Rules(_PolledFile):
+    def __init__(self):
+        super().__init__()
         self.mode_terminate = False
         # list of (action, host_pattern, path_or_None, insecure_bool,
         #          methods_frozenset_or_None, exact_bool, service_or_None,
@@ -89,13 +176,17 @@ class Rules:
 
     def maybe_reload(self):
         try:
-            mtime = os.stat(RULES_PATH).st_mtime
-        except OSError:
-            self.rules, self.mode_terminate, self.mtime = [], False, None
+            key = _stat_key(RULES_PATH)
+        except OSError as e:
+            # Missing/unreadable path: the EMPTY rule set is this reader's
+            # fail-closed direction (evaluate() defaults to deny), and we DROP
+            # the key so the next poll re-stats once the render creates it.
+            self.rules, self.mode_terminate, self.stat = [], False, None
+            self._fail("l7-rules", "stat failed",
+                       "falling back to the empty, deny-all rule set", e)
             return
-        if mtime == self.mtime:
+        if key == self.stat:
             return
-        self.mtime = mtime
         rules, mode_t = [], False
         try:
             with open(RULES_PATH) as f:
@@ -148,9 +239,21 @@ class Rules:
                     if bad:
                         continue
                     rules.append((action, host, path, insecure, methods, exact, service, tag))
-        except OSError:
-            pass
-        self.rules, self.mode_terminate = rules, mode_t
+            key2 = _stat_key(RULES_PATH)
+        except OSError as e:
+            # A failed read installs NOTHING: not the partial list parsed so far
+            # and not the key. Previous rules stand; the next poll retries.
+            self._fail("l7-rules", "read failed", "keeping the previous rules", e)
+            return
+        if key2 != key:
+            # The file moved under the read -- the bytes we parsed are torn.
+            # Keep the previous rules and the previous key (a partial rule list
+            # is a silent policy change in EITHER direction).
+            self._fail("l7-rules", "changed under the read",
+                       "keeping the previous rules")
+            return
+        self.rules, self.mode_terminate, self.stat = rules, mode_t, key
+        self._ok()
 
 
 def host_match(pattern, host):
@@ -332,26 +435,20 @@ def host_insecure(rules, host):
 RULES = Rules()
 
 
-class AuthHosts:
+class AuthHosts(_PolledFile):
     """The set of hosts the per-sandbox auth proxy owns, read one-per-line from
-    COGBOX_L7_AUTH_HOSTS and hot-reloaded on change -- mirroring Rules.maybe_reload
-    with the render's two mandatory hardenings, because writeRuntimeFile
-    truncates-then-rewrites in place (NOT atomic):
-
-      1. key the cache on (mtime, SIZE), not mtime alone -- a truncate-then-
-         rewrite of the same length within one timestamp tick moves neither
-         mtime nor ctime, but it moves size for any real content change;
-      2. NEVER cache a failed read -- leave the previous mtime so the next poll
-         retries, and fall to the EMPTY set (never a partial one), so a torn
-         render can only ever un-retarget a host (fail closed to the legacy
-         path -> the provider 401s), never retarget against half a file.
+    COGBOX_L7_AUTH_HOSTS and hot-reloaded on change under the _PolledFile
+    contract: (mtime_ns, size) key, re-stat after the read, never cache a failed
+    read. This reader's fail direction is the EMPTY set (never a partial one),
+    so a torn render can only ever un-retarget a host (fail closed to the legacy
+    path -> the provider 401s), never retarget against half a file.
 
     An absent/empty path or a missing file yields the empty set: no host is
     retargeted, and every flow takes the unchanged legacy path."""
 
     def __init__(self, path):
+        super().__init__()
         self.path = path
-        self.stat = None  # (mtime, size)
         self.hosts = frozenset()
 
     def maybe_reload(self):
@@ -359,11 +456,12 @@ class AuthHosts:
             self.hosts, self.stat = frozenset(), None
             return
         try:
-            st = os.stat(self.path)
-            key = (st.st_mtime, st.st_size)
+            key = _stat_key(self.path)
         except OSError:
             # Missing/unreadable: empty set, and DROP the cache so the next poll
             # re-stats once the render creates the file (fail closed meanwhile).
+            # Not logged: an absent file is the NORMAL state for a sandbox with
+            # no migrated host, on every request.
             self.hosts, self.stat = frozenset(), None
             return
         if key == self.stat:
@@ -375,22 +473,29 @@ class AuthHosts:
                     if line and not line.startswith("#")
                 )
             # RE-STAT AFTER THE READ (the spec's mandatory hardening, mirrored
-            # by the Zig conf reader): writeRuntimeFile truncates then
-            # rewrites in place, so a read landing inside that window sees an
-            # empty or partial file. If (mtime, size) moved while we read, the
-            # bytes are torn -- keep the PREVIOUS set and the previous key
-            # (never a partial set, never a cache advance), and let the next
-            # poll retry on settled bytes.
-            st2 = os.stat(self.path)
-            key2 = (st2.st_mtime, st2.st_size)
-        except OSError:
+            # by the Zig conf reader). IMAGE SKEW is the one reason this file
+            # can tear: reload.writeL7Inject is its ONLY writer (the launcher's
+            # merge pass writes l7-inject-conf.json, never this), and it renames
+            # -- but the addon and the renderer roll on independent tags, so an
+            # older cogbox that still truncates and rewrites in place leaves a
+            # window in which a read sees an empty or partial file. If the key
+            # moved while we read, the bytes are torn -- keep the PREVIOUS set
+            # and the previous key (never a partial set, never a cache advance),
+            # and let the next poll retry on settled bytes.
+            key2 = _stat_key(self.path)
+        except OSError as e:
             # Do NOT advance the cache on a failed read: retry next poll, empty
             # set for now (never a partial one).
             self.hosts = frozenset()
+            self._fail("l7-auth-hosts", "read failed",
+                       "no host is retargeted meanwhile", e)
             return
         if key2 != key:
+            self._fail("l7-auth-hosts", "changed under the read",
+                       "keeping the previously retargeted hosts")
             return
         self.hosts, self.stat = hosts, key
+        self._ok()
 
     def contains(self, host):
         self.maybe_reload()
@@ -425,7 +530,7 @@ def strip_cogbox_headers(headers):
 # entry is a control-plane bug (the version gate should make them mutually
 # exclusive). Log it once per host per conf generation, keyed on the CredStore
 # conf mtime so a re-render re-arms it.
-_auth_conflict_logged = {}  # host -> conf generation (CredStore.conf_mtime)
+_auth_conflict_logged = {}  # host -> conf generation (CredStore.stat)
 
 
 # --- Host-side credential injection ---------------------------------------
@@ -676,14 +781,7 @@ CRED_LOCK_DIR = os.environ.get("COGBOX_L7_CRED_LOCK_DIR") or os.path.join(
 def _cred_log(msg):
     """Log a refresh event. NEVER pass a token here -- callers log only host
     names, field names and error classes."""
-    line = "cogbox-cred: " + msg
-    if ctx is not None:
-        try:
-            ctx.log.warn(line)
-            return
-        except Exception:
-            pass
-    sys.stderr.write(line + "\n")
+    _log("cogbox-cred: " + msg)
 
 
 def _http_post_json(url, payload, timeout, user_agent):
@@ -703,34 +801,61 @@ def _http_post_json(url, payload, timeout, user_agent):
         return json.loads(resp.read().decode())
 
 
-class CredStore:
+class CredStore(_PolledFile):
     """Maps a request host to the real token read from a host cred file,
-    hot-reloaded on mtime change -- mirroring Rules.maybe_reload(). So when the
+    hot-reloaded on change under the _PolledFile contract. So when the
     host-side refresh (ensure_fresh) or the host's own CLI rotates the on-disk
     access token, the next request picks it up with no addon restart. The
     refresh token is read only inside ensure_fresh, under the lock, and never
     leaves the host."""
 
     def __init__(self, path):
+        super().__init__()
         self.path = path
-        self.conf_mtime = None
         self.specs = {}  # host(lower) -> spec dict
-        self._file_cache = {}  # cred_file -> (mtime, parsed_json | None)
-        self._raw_cache = {}  # cred_file -> (mtime, first-non-empty-line | None)
+        # Hosts named by the last conf we successfully parsed. Kept separately
+        # from `specs` because it must survive the conf becoming unreadable:
+        # that is exactly when _enforce_and_inject has to know a host WAS
+        # injected-for, so it can fail closed instead of forwarding the guest's
+        # placeholder credential (see conf_unavailable_for).
+        self.known_hosts = frozenset()
+        # host(lower) -> the NON-SECRET half of that host's last good spec
+        # (style / stub_token / cookie_name / git_user): everything
+        # should_inject needs to tell "the guest is presenting the placeholder"
+        # from "the guest is presenting a real secondary credential", and
+        # nothing that could stamp anything (no cred_file, no token_path). It
+        # outlives the conf for the same reason known_hosts does -- deciding
+        # what to do while the conf is unreadable is precisely when it is needed.
+        self.known_stubs = {}
+        # True while `specs` is NOT confirmed by a successful read of the file
+        # as it stands now (missing / torn / unparseable).
+        self.conf_stale = False
+        self._file_cache = {}  # cred_file -> (_stat_key, parsed_json)
+        self._raw_cache = {}  # cred_file -> (_stat_key, first-non-empty-line|None)
         self._last_attempt = {}  # cred_file -> monotonic ts of last refresh attempt
 
     def _load_conf(self):
         if not self.path:
-            self.specs, self.conf_mtime = {}, None
+            # Injection is not configured at all: no specs, and nothing to fail
+            # closed about (the legacy end-to-end path is the intended one).
+            self.specs, self.stat = {}, None
+            self.known_hosts, self.known_stubs, self.conf_stale = frozenset(), {}, False
             return
         try:
-            mtime = os.stat(self.path).st_mtime
-        except OSError:
-            self.specs, self.conf_mtime = {}, None
+            key = _stat_key(self.path)
+        except OSError as e:
+            # Configured but not statable (deleted, EACCES, mid-teardown). Drop
+            # the specs AND the key, but keep `known_hosts`/`known_stubs` and mark
+            # the conf stale so the injection seam DENIES the requests it would
+            # have injected into, for the hosts the last good conf named, rather
+            # than forwarding the guest's stub upstream as if it were real auth.
+            self.specs, self.stat, self.conf_stale = {}, None, True
+            self._fail("l7-inject-conf.json", "stat failed",
+                       "denying the injectable requests to every host the last "
+                       "good conf named", e)
             return
-        if mtime == self.conf_mtime:
+        if key == self.stat:
             return
-        self.conf_mtime = mtime
         specs = {}
         try:
             with open(self.path) as f:
@@ -749,44 +874,134 @@ class CredStore:
                     or spec.get("style") in ("cookie", "basic")
                 ):
                     specs[host] = spec
-        except (OSError, ValueError):
-            specs = {}
+            key2 = _stat_key(self.path)
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            # Torn or unparseable read (TypeError/AttributeError: valid JSON of
+            # the wrong SHAPE -- not a list of objects -- which a truncated
+            # write cannot produce but a bad renderer can, and which used to
+            # escape into the request hook). A read landing inside a
+            # truncate-then-rewrite -- an older cogbox than this addon's image --
+            # sees an empty or half-written file,
+            # and an empty JSON array PARSES, which is why this must never
+            # install what it got. Keep the PREVIOUS specs and the PREVIOUS key
+            # (never {}, never the partial map built above) and retry next poll.
+            self.conf_stale = True
+            self._fail("l7-inject-conf.json", "read failed",
+                       "keeping the previous specs", e)
+            return
+        if key2 != key:
+            # The file moved under the read: same treatment as a parse failure.
+            self.conf_stale = True
+            self._fail("l7-inject-conf.json", "changed under the read",
+                       "keeping the previous specs")
+            return
         # A conf reload invalidates the cached credential READS too, not just the
-        # specs. Those caches are keyed on the cred file's mtime, and the change
-        # that makes a bound credential readable does NOT move it: the host grants
-        # the proxy gid group-read with a chmod (rules/credgrant.zig), and chmod
-        # moves ctime only. An atomic-rename rebind resets the file to 0600 and the
-        # re-render that re-grants it is a separate exec, so a request landing in
-        # that window caches (mtime, None) -- which without this flush stays
-        # cache-valid forever and makes every later request on that host 403 with
-        # "credential unavailable", with no self-heal. writeL7Inject applies the
-        # grant and rewrites this conf in the same pass, so the conf's mtime is a
-        # trigger that covers every grant transition -- including one that FAILED
-        # and only succeeded on a later render, which the host-side mtime bump
-        # cannot cover. Cheap: this costs at most one small re-read per cred file
-        # the conf names, on the next request that needs it, and the conf changes
-        # only when a render runs (a bind, a reload, an `l7 add/del`) -- never per
-        # request, so there is no re-read storm. `_last_attempt` is deliberately NOT
-        # cleared: it throttles refresh POSTs, and a render must not reset that.
+        # specs. Those caches are keyed on the cred file's (mtime_ns, size), and
+        # the change that makes a bound credential readable moves NEITHER: the
+        # host grants the proxy gid group-read with a chmod (rules/credgrant.zig),
+        # and chmod moves ctime only. The readers no longer cache a FAILED read at
+        # all (see _read_json), so a grant transition can no longer wedge a
+        # negative entry -- but a POSITIVE entry read before a rebind is still
+        # stale after one, and this flush is what retires it: writeL7Inject
+        # applies the grants and rewrites this conf in the same pass, so the
+        # conf's key is a trigger that covers every grant transition, including
+        # one that FAILED and only succeeded on a later render (which the
+        # host-side mtime bump cannot cover). Cheap: at most one small re-read per
+        # cred file the conf names, on the next request that needs it, and the
+        # conf changes only when a render runs (a bind, a reload, an `l7 add/del`)
+        # -- never per request, so there is no re-read storm. `_last_attempt` is
+        # deliberately NOT cleared: it throttles refresh POSTs, and a render must
+        # not reset that.
         self._file_cache.clear()
         self._raw_cache.clear()
-        self.specs = specs
+        self.specs, self.stat = specs, key
+        self.known_hosts, self.conf_stale = frozenset(specs), False
+        # Only the keys the spec actually carried, so `.get(k, default)` behaves
+        # here exactly as it does on the healthy path (a present-but-None style
+        # would defeat resolve_gitlab_style's "bearer" default).
+        self.known_stubs = {
+            h: {k: sp[k] for k in ("style", "stub_token", "cookie_name", "git_user")
+                if k in sp}
+            for h, sp in specs.items()
+        }
+        self._ok()
+
+    def conf_unavailable_for(self, host, headers=None, path="/"):
+        """True when injection IS configured, the conf as it stands now could
+        not be read (missing / torn / unparseable), `host` was named by the last
+        conf we did read, and THIS request is one the healthy path would have
+        injected into -- i.e. the credential it carries is the placeholder (or
+        it carries none) and we currently cannot know what to replace it with.
+        The caller must DENY.
+
+        Forwarding instead is the fail-OPEN direction and it is not harmless:
+        with no spec the guest's placeholder Bearer goes upstream as if it were
+        real auth, the provider 401s, and claude-code reads that as "your login
+        expired" and drops into a re-auth -- a transient render window surfacing
+        to the user as a lost credential. A 403 from us is visible and correct.
+
+        But only for those requests. The healthy path is surgical -- it replaces
+        a credential only when `should_inject` says the guest is presenting its
+        stubbed PRIMARY identity, and forwards a SECONDARY credential the guest
+        legitimately obtained through an already-injected call untouched (e.g.
+        claude-code Remote Control's per-session bridge creds). Denying those too
+        would turn a persistently unreadable conf (an EACCES after a permissions
+        regression, say -- `conf_stale` has no timeout and only a successful read
+        clears it) into a total outage for the host instead of the loss of
+        injection, so this asks the same question with the same inputs, off the
+        remembered non-secret half of the last good spec (`known_stubs`).
+
+        `headers` omitted (a caller that cannot answer the question) keeps the
+        conservative behaviour: deny every request to a known injected host.
+
+        A host that never had a spec is unaffected either way: it keeps the
+        legacy end-to-end path, where the guest's own credential is the real
+        one."""
+        if not self.path or not self.conf_stale:
+            return False
+        h = host.rstrip(".").lower()
+        if h not in self.known_hosts:
+            return False
+        if headers is None:
+            return True
+        stub = self.known_stubs.get(h)
+        if stub is None:
+            # Named by the last conf but with no remembered shape (a conf that
+            # parsed before this field existed): deny, as before.
+            return True
+        style, _prefix = resolve_gitlab_style(stub, path)
+        return should_inject(headers, style, stub.get("stub_token"),
+                             stub.get("cookie_name"))
 
     def _read_json(self, cred_file):
+        """The parsed JSON cred file, cached on `_stat_key` -- the same
+        (mtime_ns, size) key the polled wire files use, and for the same two
+        reasons: second-resolution mtime cannot see a rotation that lands in the
+        same second as the last read, and the render's grant pass only bumps the
+        mtime on a real 0600 -> 0640 transition (with the bind now staging that
+        grant, the steady state is `want == mode` and nothing bumps anything).
+
+        A FAILED read is never cached. Caching it under a key a later successful
+        read would not move is how a transient error (EACCES during the render's
+        revoke-then-regrant, EMFILE, ENOMEM) on a file whose mtime never changes
+        again turned into a permanent 403 `credential unavailable` for that host
+        with no self-heal. Re-opening a few-hundred-byte file per request on the
+        failing path is the cheap side of that trade."""
         try:
-            mtime = os.stat(cred_file).st_mtime
+            key = _stat_key(cred_file)
         except OSError:
             self._file_cache.pop(cred_file, None)
             return None
         cached = self._file_cache.get(cred_file)
-        if cached is not None and cached[0] == mtime:
+        if cached is not None and cached[0] == key:
             return cached[1]
         try:
             with open(cred_file) as f:
                 data = json.load(f)
         except (OSError, ValueError):
-            data = None
-        self._file_cache[cred_file] = (mtime, data)
+            self._file_cache.pop(cred_file, None)
+            return None
+        self._file_cache[cred_file] = (key, data)
         return data
 
     def spec_for(self, host):
@@ -804,15 +1019,16 @@ class CredStore:
 
     def _read_raw(self, cred_file):
         """First non-empty stripped line of a raw single-line cred file (a bare
-        bearer token or a session-cookie value), mtime-cached like _read_json.
-        Returns None (fail closed) if the file is missing/unreadable/blank."""
+        bearer token or a session-cookie value), cached exactly like _read_json
+        -- on `_stat_key`, and never on a failure. Returns None (fail closed) if
+        the file is missing/unreadable/blank."""
         try:
-            mtime = os.stat(cred_file).st_mtime
+            key = _stat_key(cred_file)
         except OSError:
             self._raw_cache.pop(cred_file, None)
             return None
         cached = self._raw_cache.get(cred_file)
-        if cached is not None and cached[0] == mtime:
+        if cached is not None and cached[0] == key:
             return cached[1]
         val = None
         try:
@@ -823,8 +1039,12 @@ class CredStore:
                         val = s
                         break
         except OSError:
-            val = None
-        self._raw_cache[cred_file] = (mtime, val)
+            # A read that FAILED is not an answer: drop any entry and let the
+            # next request retry (see _read_json). A file that is present but
+            # blank IS an answer -- None, cached under its own key.
+            self._raw_cache.pop(cred_file, None)
+            return None
+        self._raw_cache[cred_file] = (key, val)
         return val
 
     def token_for(self, spec):
@@ -1209,7 +1429,7 @@ def _enforce_and_inject(flow, path, query_service=None):
         # spec). We retarget regardless: the auth entry wins, the spec is
         # ignored, no token is stamped here.
         if CREDS.spec_for(host) is not None:
-            gen = CREDS.conf_mtime
+            gen = CREDS.stat
             if _auth_conflict_logged.get(host) != gen:
                 _auth_conflict_logged[host] = gen
                 _cred_log("CONFLICT host=%s has both an inject spec and an auth "
@@ -1224,6 +1444,16 @@ def _enforce_and_inject(flow, path, query_service=None):
     # Credential injection runs LAST, only on an allowed + host==SNI request,
     # so a denied/fronted request never gets a real token stamped on it.
     spec = CREDS.spec_for(host)
+    if spec is None and CREDS.conf_unavailable_for(host, flow.request.headers, path):
+        # This host IS injected-for, the conf naming its credential is currently
+        # unreadable, and this request is one the healthy path would have stamped
+        # (it carries the placeholder, or no credential at all). Fail closed:
+        # never forward the guest's placeholder Bearer as if it were real auth
+        # (see conf_unavailable_for). A request carrying a real SECONDARY
+        # credential falls through and is forwarded untouched, exactly as it
+        # would be with the conf readable.
+        _deny(flow, "inject conf unavailable")
+        return
     if spec is not None:
         # gitlab-oauth resolves basic-vs-bearer per request path; other styles
         # pass straight through.

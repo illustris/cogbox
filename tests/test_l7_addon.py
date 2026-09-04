@@ -1162,11 +1162,14 @@ check(not _ahr.contains("other.internal"), "AuthHosts: an unlisted host is not o
 os.remove(_ahp)
 check(not _ahr.contains(_ahost), "AuthHosts: a vanished file falls back to empty")
 
-# TORN WRITE (the re-stat-after-read hardening): writeRuntimeFile truncates
-# then rewrites in place, so a read can land between the two. Simulate it by
-# making the PRE-read os.stat of one reload report a different (mtime, size)
-# than the post-read one: the reader must keep its previous set AND its
-# previous key (no cache advance), so the next poll retries on settled bytes.
+# TORN WRITE (the re-stat-after-read hardening): IMAGE SKEW is the one reason
+# this file can tear -- reload.writeL7Inject is its only writer and it renames,
+# but an older cogbox than this addon's image still truncates and rewrites in
+# place (the two roll on independent tags), leaving a window a read can land
+# in. Simulate it by making the PRE-read os.stat of one reload report a
+# different (mtime, size) than the post-read one: the reader must keep its
+# previous set AND its previous key (no cache advance), so the next poll
+# retries on settled bytes.
 with open(_ahp, "w") as f:
     f.write(_ahost + "\n")
 os.utime(_ahp, (2100, 2100))
@@ -1306,6 +1309,271 @@ check(_leg.request.headers.get("authorization") == "Bearer " + _GTOK,
       "legacy path: a non-migrated host is injected here, exactly as before")
 check(_leg.request.headers.get("x-cogbox-host") is None,
       "legacy path: no reserved header is set on a non-migrated flow")
+
+
+# --- the polled-file contract: CredStore + Rules ----------------------------
+# The renderer publishes these files atomically now (writeRuntimeFile: sibling
+# tmp, fsync, rename), but the readers keep the torn-read hardening, because the
+# addon's image and the cogbox binary that renders roll on INDEPENDENT tags -- this
+# reader can be running against an older writer that still truncates in place.
+# (The inject conf's second writer, cogbox-launch.sh's merge, is NOT a reason: it
+# publishes with `mv`, which cannot tear. Its hazard is content, and it is the
+# renderer that answers for it -- see reload.writeL7Inject.) Neither reader may
+# install what it got from a torn read: the previous specs/rules stay live and
+# the cache key must NOT advance, or the torn state sticks until the next
+# unrelated render.
+_pd = tempfile.mkdtemp()
+_phost = "git.example.com"
+_pcred = os.path.join(_pd, "git-token")
+_write_raw(_pcred, "glpat-FAKEPOLLED\n", 1000)  # fictional owner token (OSS-clean)
+_pspec = {"host": _phost, "style": "gitlab-oauth", "cred_file": _pcred,
+          "cred_format": "raw", "git_user": "oauth2",
+          "stub_token": "glpat-cogbox-host-injected-placeholder"}  # gitleaks:allow
+_pconf = os.path.join(_pd, "inject.json")
+_write(_pconf, [_pspec], 1000)
+
+_pcs = m.CredStore(_pconf)
+check(_pcs.spec_for(_phost) is not None, "CredStore (torn): the settled conf loads")
+check(not _pcs.conf_stale, "CredStore (torn): a settled conf is not stale")
+_pkey = _pcs.stat
+
+# TORN READ: the renderer has truncated and not yet rewritten -- the poll sees an
+# EMPTY file (a size+mtime change, so the cache misses, and a parse failure).
+with open(_pconf, "w") as f:
+    f.write("")
+os.utime(_pconf, (1100, 1100))
+check(_pcs.spec_for(_phost) is not None,
+      "CredStore (torn): an empty file mid-write keeps the PREVIOUS specs (never {})")
+check(_pcs.stat == _pkey,
+      "CredStore (torn): a failed parse does NOT advance the cache key")
+check(_pcs.conf_stale,
+      "CredStore (torn): the conf is marked stale while it cannot be read")
+
+# ...and the settled rewrite that follows is picked up on the very next poll.
+_write(_pconf, [_pspec, dict(_pspec, host="api.example.com")], 1200)
+check(_pcs.spec_for("api.example.com") is not None,
+      "CredStore (torn): the next settled write is picked up")
+check(_pcs.stat != _pkey and not _pcs.conf_stale,
+      "CredStore (torn): a good read advances the key and clears the stale mark")
+
+# The renderer's provenance stamp (rules/reload.zig render_origin_field) rides in
+# the same spec objects: it tells a rendered spec from one the launcher merged in,
+# on the WRITE side only. This reader must ignore it like any unknown key -- if it
+# ever became load-bearing here, a spec would stop injecting the moment the two
+# images disagreed about the field.
+_write(_pconf, [dict(_pspec, origin="render")], 1300)
+check(_pcs.spec_for(_phost) is not None,
+      "CredStore: an unknown `origin` field (the renderer's provenance stamp) is ignored")
+check(_pcs.token_for(_pcs.spec_for(_phost)) == "glpat-FAKEPOLLED",
+      "CredStore: a stamped spec still resolves its credential")
+
+# Rules: a torn read still PARSES (a truncated rule list is valid syntax), so the
+# post-read stat is the only tell -- same simulation as the AuthHosts case above.
+_prules = os.path.join(_pd, "l7-rules")
+with open(_prules, "w") as f:
+    f.write("mode terminate\nallow git.example.com\n")
+os.utime(_prules, (2100, 2100))
+m.RULES_PATH = _prules
+_pr = m.Rules()
+_pr.maybe_reload()
+check(len(_pr.rules) == 1, "Rules (torn): the settled file loads")
+_prkey = _pr.stat
+with open(_prules, "w") as f:
+    f.write("mode terminate\nallow git.example.com\nallow api.example.com\n")
+os.utime(_prules, (2200, 2200))
+
+_real_stat2 = m.os.stat
+_pstat_calls = {"n": 0}
+
+
+def _torn_stat2(p, *a, **kw):
+    st = _real_stat2(p, *a, **kw)
+    if p == _prules:
+        _pstat_calls["n"] += 1
+        if _pstat_calls["n"] == 1:
+            # the pre-read stat: pretend a NEWER, larger version is on disk, so
+            # the post-read stat disagrees and the bytes we parsed are torn
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink,
+                                   st.st_uid, st.st_gid, st.st_size + 40,
+                                   st.st_atime, 2300, st.st_ctime))
+    return st
+
+
+m.os.stat = _torn_stat2
+try:
+    _pr.maybe_reload()
+finally:
+    m.os.stat = _real_stat2
+check(len(_pr.rules) == 1,
+      "Rules (torn): the PREVIOUS rule list stays live (never partial, never [])")
+check(_pr.stat == _prkey,
+      "Rules (torn): a read whose post-read stat disagrees does NOT advance the cache")
+_pr.maybe_reload()
+check(len(_pr.rules) == 2,
+      "Rules (torn): the next settled poll commits the new rules (the key never stuck)")
+
+
+# --- fail CLOSED when the inject conf is unreadable --------------------------
+# With no spec for a host the addon used to forward the guest's PLACEHOLDER
+# bearer upstream: the provider 401s and claude-code reads that as "log in
+# again". A host the last good conf named must get a 403 instead. (_deny needs
+# mitmproxy's http module; stub the one call it makes.)
+class _RespStub:
+    def __init__(self, status_code, content, headers):
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers
+
+
+class _HttpStub:
+    class Response:
+        @staticmethod
+        def make(status_code, content, headers):
+            return _RespStub(status_code, content, headers)
+
+
+with open(_prules, "w") as f:
+    f.write("mode terminate\nallow git.example.com\nallow other.example.com\n")
+os.utime(_prules, (2400, 2400))
+m.RULES = m.Rules()
+m.CREDS = _pcs
+m.AUTH_HOSTS = m.AuthHosts("")  # no retargeting on this path
+_STUB = "Bearer " + _pspec["stub_token"]
+_orig_http = m.http
+m.http = _HttpStub
+try:
+    # baseline: with a readable conf the placeholder is REPLACED by the real token
+    _fok = _GFlow(_phost, "GET", CIDict({"Host": _phost, "Authorization": _STUB}),
+                  sni=_phost)
+    m._enforce_and_inject(_fok, "/api/v4/projects/1234/issues")
+    check(_fok.response is None and _fok.request.headers.get("authorization")
+          == "Bearer glpat-FAKEPOLLED",
+          "fail-closed: a readable conf still injects the real token")
+
+    os.remove(_pconf)  # the conf goes away under a live proxy
+    _f403 = _GFlow(_phost, "GET", CIDict({"Host": _phost, "Authorization": _STUB}),
+                   sni=_phost)
+    m._enforce_and_inject(_f403, "/api/v4/projects/1234/issues")
+    check(_f403.response is not None and _f403.response.status_code == 403,
+          "fail-closed: an unreadable conf 403s a host the last good conf named")
+    check(b"inject conf unavailable" in _f403.response.content,
+          "fail-closed: the 403 names the cause")
+    check(_f403.request.headers.get("authorization") == _STUB,
+          "fail-closed: the guest's placeholder is NOT forwarded as real auth "
+          "(the request is denied before it leaves the proxy)")
+
+    # a host that was NEVER in any spec set is unaffected: legacy end-to-end.
+    _fleg = _GFlow("other.example.com", "GET",
+                   CIDict({"Host": "other.example.com",
+                           "Authorization": "Bearer GUEST-OWN"}), sni="other.example.com")
+    m._enforce_and_inject(_fleg, "/api/v4/projects/1234/issues")
+    check(_fleg.response is None,
+          "fail-closed: a host that never had a spec is not denied by a stale conf")
+    check(_fleg.request.headers.get("authorization") == "Bearer GUEST-OWN",
+          "fail-closed: that host's own credential is forwarded untouched")
+
+    # ...but the deny is exactly as SURGICAL as the healthy path. A request on an
+    # injected host carrying a REAL secondary credential (the one the guest
+    # legitimately obtained through an already-injected call) is one should_inject
+    # would have left alone, so a conf that cannot be read must cost injection --
+    # not the host. Otherwise a persistently unreadable conf (EACCES after a
+    # permissions regression: conf_stale has no timeout) is a total outage.
+    _fsec = _GFlow(_phost, "GET",
+                   CIDict({"Host": _phost,
+                           "Authorization": "Bearer bridge-cred-not-the-stub"}),
+                   sni=_phost)
+    m._enforce_and_inject(_fsec, "/api/v4/projects/1234/issues")
+    check(_fsec.response is None,
+          "fail-closed: an unreadable conf does NOT deny a request bearing a real "
+          "secondary credential")
+    check(_fsec.request.headers.get("authorization") == "Bearer bridge-cred-not-the-stub",
+          "fail-closed: that secondary credential is forwarded untouched")
+
+    # The remembered shape carries the gitlab per-path style resolution too: the
+    # question asked here is should_inject's, with should_inject's inputs, so on a
+    # git smart-HTTP path the stub is compared the BASIC way (a bearer-only
+    # comparison would forward the placeholder and 401 the user out of git).
+    _basic_stub = "Basic " + _b64.b64encode(_pspec["stub_token"].encode()).decode()
+    _fgit = _GFlow(_phost, "GET",
+                   CIDict({"Host": _phost, "Authorization": _basic_stub}), sni=_phost)
+    m._enforce_and_inject(_fgit, "/grp/repo.git/info/refs")
+    check(_fgit.response is not None and _fgit.response.status_code == 403,
+          "fail-closed: the BASIC-spelled placeholder on a git path is denied too")
+    # ...and a git-path request carrying NO credential is denied as well (that is
+    # a request the healthy path would have stamped).
+    _fbare = _GFlow(_phost, "GET", CIDict({"Host": _phost}), sni=_phost)
+    m._enforce_and_inject(_fbare, "/grp/repo.git/git-upload-pack")
+    check(_fbare.response is not None and _fbare.response.status_code == 403,
+          "fail-closed: an uncredentialed request to an injected host is denied")
+finally:
+    m.http = _orig_http
+
+
+# --- the credential-value readers never cache a FAILED read ------------------
+# _read_json/_read_raw used to store (mtime, None) on a transient open failure,
+# under a key a later successful read would not move: one EACCES (the render's
+# revoke-then-regrant window), EMFILE or ENOMEM on a file whose mtime then stays
+# put turned into a permanent 403 "credential unavailable" for that host with no
+# self-heal. They also keyed on second-resolution st_mtime, so a rotation landing
+# in the same second as the last read was invisible.
+_kd = tempfile.mkdtemp()
+_kraw = os.path.join(_kd, "raw-token")
+_write_raw(_kraw, "tok-first\n", 3000)
+_kspec = {"host": "api.example.com", "style": "bearer",
+          "cred_file": _kraw, "cred_format": "raw"}
+_kcs = m.CredStore("")  # injection not configured; the value readers are standalone
+check(_kcs.token_for(_kspec) == "tok-first", "cred cache: the settled value reads")
+
+# A rotation lands (new key), and the read that would pick it up fails.
+_write_raw(_kraw, "tok-second\n", 3100)
+
+
+def _boom_open(*a, **kw):
+    raise OSError(13, "Permission denied")
+
+
+_real_open = m.open if "open" in vars(m) else None
+m.open = _boom_open
+try:
+    check(_kcs.token_for(_kspec) is None,
+          "cred cache: a failed read fails closed (no value)")
+finally:
+    if _real_open is None:
+        del m.open
+    else:
+        m.open = _real_open
+check(_kcs.token_for(_kspec) == "tok-second",
+      "cred cache: the failure was NOT cached -- the next request re-reads and "
+      "self-heals to the rotated value")
+
+# Same for the JSON reader.
+_kjson = os.path.join(_kd, "creds.json")
+_write(_kjson, {"claudeAiOauth": {"accessToken": "OAT-A"}}, 3000)
+_kjspec = {"host": "api.anthropic.com", "style": "anthropic-oauth",
+           "cred_file": _kjson, "token_path": "claudeAiOauth.accessToken"}
+check(_kcs.token_for(_kjspec) == "OAT-A", "cred cache (json): the settled value reads")
+_write(_kjson, {"claudeAiOauth": {"accessToken": "OAT-B"}}, 3100)
+m.open = _boom_open
+try:
+    check(_kcs.token_for(_kjspec) is None, "cred cache (json): a failed read fails closed")
+finally:
+    if _real_open is None:
+        del m.open
+    else:
+        m.open = _real_open
+check(_kcs.token_for(_kjspec) == "OAT-B",
+      "cred cache (json): the failure was NOT cached -- the next request self-heals")
+
+# A file that is present but BLANK is an answer, not a failure: cached as None
+# under its own key, and re-read once the key moves.
+_kblank = os.path.join(_kd, "blank")
+_write_raw(_kblank, "\n", 3200)
+_kbspec = {"host": "api.example.com", "style": "bearer",
+           "cred_file": _kblank, "cred_format": "raw"}
+check(_kcs.token_for(_kbspec) is None, "cred cache: a blank cred file is None (fail closed)")
+_write_raw(_kblank, "tok-late\n", 3300)
+check(_kcs.token_for(_kbspec) == "tok-late",
+      "cred cache: a value written later is picked up on the next key change")
 
 
 if fails:

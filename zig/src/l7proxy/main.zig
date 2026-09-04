@@ -232,18 +232,192 @@ fn installSignals() void {
 	std.posix.sigaction(std.posix.SIG.USR1, &act, null);
 }
 
+/// A polled runtime file's cache key -- BOTH halves, for the reason every other
+/// reader of these files states (authproxy/conf.zig, l7-mitm-addon.py's
+/// `_PolledFile`): a truncate-then-rewrite of the same length inside one
+/// timestamp tick moves neither mtime nor ctime at second granularity but moves
+/// size, and the nanosecond mtime closes the same-size case.
+pub const FileKey = struct { mtime_ns: i128, size: u64 };
+
+/// `statx` on the OPEN fd (AT_EMPTY_PATH), not on the path: this file is the one
+/// the renderer must NOT rename, so the inode under the path cannot change
+/// underneath the two stats and keying on the fd removes the path-resolution
+/// TOCTOU the addon's path-based readers have to live with.
+fn statKeyOf(fd: c_int) ?FileKey {
+	var sx: std.os.linux.Statx = undefined;
+	const rc = std.os.linux.statx(fd, "", std.posix.AT.EMPTY_PATH, .{ .MTIME = true, .SIZE = true }, &sx);
+	if (rc != 0) return null;
+	return .{
+		.mtime_ns = @as(i128, sx.mtime.sec) * std.time.ns_per_s + @as(i128, sx.mtime.nsec),
+		.size = sx.size,
+	};
+}
+
+/// Read one runtime file the renderer writes TRUNCATE-IN-PLACE, with the polled
+/// reader's shape the addon and authproxy/conf.zig already use: stat -> read ->
+/// re-stat over (mtime_ns, size), and discard the read if the key moved.
+///
+/// `netfilter-rules` is the only such file. passt's seccomp-boxed shim holds an
+/// fd on it and a rename would strand the shim on the unlinked inode, so it
+/// cannot be published atomically (reload.writeRuntimeFileInPlace) -- and this
+/// proxy is its SECOND reader, opening by path, driven by a `reload_pending`
+/// flag its SIGHUP handler may have taken from an EARLIER render while a later,
+/// overlapping one is still inside that window. An empty CIDR set is deny-all
+/// egress (RuleSet.evaluate's default), so installing a torn read blackholes the
+/// guest until some later render signals again.
+///
+/// Returns null when the read must be DISCARDED: the caller keeps the set it
+/// already installed and re-raises `reload_pending`, so the next accept-loop
+/// iteration retries on settled bytes. That retry is not immediate: the loop's
+/// poll(..., 1000) bounds one iteration at ~1s, so a discard costs up to a second
+/// of the PREVIOUS set standing, and a settled narrowing-to-empty -- which needs
+/// two rounds, refuse then install -- up to ~1-2s. Fail-STATIC for that window is
+/// the trade, and it is the right one here: the alternative is deny-all egress.
+///
+/// Two discard conditions for a TEAR, and the second is the one the key alone
+/// misses. A reader that lands wholly inside the truncate -- after createFile
+/// emptied the file, before the writer's first flush -- sees a STABLE key of
+/// (t, 0) across both stats and reads zero bytes. So a zero-length read is
+/// discarded too while the caller says its current set came from a file that HAD
+/// content.
+///
+/// But only until the same empty is seen twice, which is what `settle` carries.
+/// An instance whose rules legitimately narrow to nothing renders an EMPTY
+/// netfilter-rules (renderRules emits nothing for an L4-only config with no
+/// rules left), and refusing that forever would pin the previous, WIDER set --
+/// the mirror image of the fail-open this reader exists to avoid, and worse,
+/// because it would never clear. So: the first empty read is discarded and its
+/// key remembered; if the very next read returns the same key, the file is
+/// settled-empty and the empty set is installed. A render cannot hold the same
+/// mtime_ns across two of our reads -- the whole in-place write is a truncate
+/// plus a few KB of writeAll -- so this cannot launder a tear.
+///
+/// One thing this reader does NOT defend, and the reason the "never installs
+/// torn or partial bytes" claim is scoped to a TEAR: a SETTLED file larger than
+/// the caller's buffer. readAllInto fills the 16 KiB loadRules gives this file
+/// (nf_buf) and stops, so what installs is a PREFIX of the render -- a
+/// pre-existing cap, not a tear, and one the key cannot tell from a whole read.
+/// The cap stays (16 KiB is ~500 CIDR rules, well past anything the renderer
+/// emits in the field) and the truncation is at least the NARROWING direction --
+/// an unrendered rule stops being allowed, deny-all being this file's default --
+/// but it is no longer SILENT: the first read that hits it is refused with a
+/// warning, and the prefix installs on the retry that finds the same key.
+/// Refusing it forever is the one thing that would be worse: it would pin the
+/// previous, WIDER set with nothing left to clear it, exactly the never-clearing
+/// fail-open the settled-empty rule above exists to avoid.
+pub fn readPolledInto(
+	rt: []const u8,
+	name: []const u8,
+	buf: []u8,
+	prev_had_content: bool,
+	settle: *?FileKey,
+) ?[]const u8 {
+	var path_buf: [4096]u8 = undefined;
+	const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ rt, name }) catch {
+		settle.* = null;
+		return buf[0..0];
+	};
+	const fd = @"open"(path.ptr, O_RDONLY, 0);
+	// A missing or unreadable file is NOT a tear: it is the honest empty state
+	// (deny-all), exactly as this reader treated it before the hardening.
+	if (fd < 0) {
+		settle.* = null;
+		return buf[0..0];
+	}
+	defer _ = c.close(fd);
+
+	const k1 = statKeyOf(fd) orelse return null;
+	const total = readAllInto(fd, buf);
+	const k2 = statKeyOf(fd) orelse return null;
+	if (k1.mtime_ns != k2.mtime_ns or k1.size != k2.size) return null;
+
+	// Settled, but bigger than the buffer: refuse once (loudly), install the
+	// prefix on the retry. `settle` carries the once-ness for the same reason it
+	// does for the empty read -- the key is stable, so nothing else can tell a
+	// first sighting from a retry -- and is deliberately LEFT set on the install
+	// so a permanently oversized file warns per render, not per poll.
+	if (total == buf.len and k1.size > total) {
+		if (settle.*) |s| {
+			if (s.mtime_ns == k1.mtime_ns and s.size == k1.size) return buf[0..total];
+		}
+		settle.* = k1;
+		// Suppressed under `zig build test` the way the auth proxy's pid lines
+		// are: the oversize path HAS a test (reload_test.zig), and a warning on
+		// stderr from a passing test is reported by the build runner as an
+		// unexpected write.
+		if (!@import("builtin").is_test) {
+			logLine("l7proxy: netfilter-rules is {d} bytes, over the {d}-byte read buffer; installing the first {d} on the next reload", .{ k1.size, buf.len, total });
+		}
+		return null;
+	}
+
+	if (total == 0 and prev_had_content) {
+		if (settle.*) |s| {
+			if (s.mtime_ns == k1.mtime_ns and s.size == k1.size) {
+				settle.* = null;
+				return buf[0..0];
+			}
+		}
+		settle.* = k1;
+		return null;
+	}
+	settle.* = null;
+	return buf[0..total];
+}
+
+/// readPolledInto's caller-side state for `netfilter-rules`: the byte count the
+/// installed CIDR set was parsed from (0 before the first install, and 0 again
+/// once a settled-empty file is installed), and the key of a read already refused
+/// for a reason the key alone cannot re-check on the retry -- a zero-length read,
+/// or one the 16 KiB buffer truncated. Guarded by `rules_lock` like the rulesets
+/// themselves -- socks5 mode runs TWO accept loops (one per front-door
+/// listener), so two loadRules calls can be in flight at once.
+var nf_installed_len: usize = 0;
+var nf_settle: ?FileKey = null;
+
+/// Re-read the three wire files this proxy owns. Every read opens BY PATH (not a
+/// held fd, unlike passt's seccomp-boxed shim in netfilter/main.zig), so for the
+/// two the renderer writes atomically -- l7-rules and l7-inject-hosts -- a reload
+/// resolves either the old inode or the new one and neither can be half-written.
+///
+/// `netfilter-rules` is the EXCEPTION: it is still written truncate-then-rewrite
+/// IN PLACE (reload.writeRuntimeFileInPlace), so it goes through readPolledInto
+/// instead -- a torn read leaves the previous CIDR set standing and re-raises
+/// `reload_pending`, which the accept loop consumes on its next iteration. Render
+/// serialisation is no longer what bounds this window.
+///
+/// The multi-file window survives regardless -- these are three separate files --
+/// which is why the renderer still pins its write order (reload.writeWireFiles).
 fn loadRules() void {
 	const rt = runtime_dir_buf[0..runtime_dir_len];
 	var nf_buf: [16384]u8 = undefined;
 	var l7_buf: [16384]u8 = undefined;
 	var inj_buf: [16384]u8 = undefined;
-	const nf = readFileInto(rt, "netfilter-rules", &nf_buf);
+
+	// Snapshot the polled reader's state, do the I/O outside the lock (the
+	// critical sections here are meant to stay memory-scan short), publish it
+	// back below. Two accept loops racing this is bounded: they read the SAME
+	// file, so the worst a lost update costs is one extra discard-and-retry.
+	lockRules();
+	const prev_had_content = nf_installed_len > 0;
+	var settle = nf_settle;
+	unlockRules();
+
+	const nf = readPolledInto(rt, "netfilter-rules", &nf_buf, prev_had_content, &settle);
 	const l7 = readFileInto(rt, "l7-rules", &l7_buf);
 	const inj = readFileInto(rt, "l7-inject-hosts", &inj_buf);
 
 	lockRules();
 	defer unlockRules();
-	cidr_rs = filter.parseRules(nf);
+	nf_settle = settle;
+	if (nf) |bytes| {
+		cidr_rs = filter.parseRules(bytes);
+		nf_installed_len = bytes.len;
+	} else {
+		// Raised AFTER the accept loop's swap consumed the flag, so it survives
+		// to the next iteration rather than being cleared by the caller.
+		reload_pending.store(true, .release);
+	}
 	filter.parseL7Rules(l7, &l7_rs);
 	filter.parseInjectHosts(inj, &inject_hosts);
 }
@@ -254,13 +428,17 @@ fn readFileInto(rt: []const u8, name: []const u8, buf: []u8) []const u8 {
 	const fd = @"open"(path.ptr, O_RDONLY, 0);
 	if (fd < 0) return buf[0..0];
 	defer _ = c.close(fd);
+	return buf[0..readAllInto(fd, buf)];
+}
+
+fn readAllInto(fd: c_int, buf: []u8) usize {
 	var total: usize = 0;
 	while (total < buf.len) {
 		const n = c.read(fd, @ptrCast(buf.ptr + total), buf.len - total);
 		if (n <= 0) break;
 		total += @intCast(n);
 	}
-	return buf[0..total];
+	return total;
 }
 
 // --- listener / accept ---

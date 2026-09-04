@@ -7,11 +7,13 @@
 const std = @import("std");
 const store = @import("store.zig");
 const main = @import("main.zig");
+const proxygid = @import("proxygid.zig");
 const t = std.testing;
 
 test {
 	std.testing.refAllDecls(main);
 	std.testing.refAllDecls(store);
+	std.testing.refAllDecls(proxygid);
 }
 
 test "validName accepts valid names, rejects traversal/charset/length" {
@@ -143,4 +145,248 @@ test "appendSecretJson emits bound and unbound shapes" {
 			out.items,
 		);
 	}
+}
+
+// --- staged L7-proxy read access (GCE uid split) ----------------------------
+//
+// On a deployment that sets COGBOX_PROXY_RUNAS the proxy reads bound credentials
+// through a GROUP grant that the inject render makes (rules/credgrant.zig). A
+// bind and its render are two separate control execs, so a credential used to
+// exist unreadable for ~an SSH round-trip and the addon answered 403 "credential
+// unavailable" in that window. These pin the write end of the fix: the group is
+// on the file before it is nameable, so the render's chmod is a no-op rather
+// than the moment of readability.
+
+/// The group owner, which `Io.File.Stat` does not carry.
+fn gidOf(path: []const u8) !store.Gid {
+	var buf: [std.fs.max_path_bytes]u8 = undefined;
+	const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
+	var sx: std.os.linux.Statx = undefined;
+	const rc = std.os.linux.statx(std.posix.AT.FDCWD, path_z, 0, .{ .GID = true }, &sx);
+	if (rc != 0) return error.StatxFailed;
+	return sx.gid;
+}
+
+fn modeOf(io: std.Io, path: []const u8) !std.posix.mode_t {
+	const st = try std.Io.Dir.cwd().statFile(io, path, .{});
+	return st.permissions.toMode() & 0o7777;
+}
+
+fn tmpStoreDir(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+	var rnd: [8]u8 = undefined;
+	io.random(&rnd);
+	var hexb: [16]u8 = undefined;
+	_ = std.fmt.bufPrint(&hexb, "{x}", .{&rnd}) catch unreachable;
+	return std.fmt.allocPrint(gpa, "zig-secret-store-{s}", .{hexb});
+}
+
+test "addForProxy stages the proxy group + 0640 on the value file, leaving the meta owner-only" {
+	const gpa = t.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(dir);
+	defer cwd.deleteTree(io, dir) catch {};
+
+	// The test process's own primary gid: the one group it may chown a file it
+	// owns to without privileges. It stands in for the proxy's gid.
+	const gid: store.Gid = @intCast(std.os.linux.getgid());
+
+	const outcome = try store.addForProxy(gpa, io, dir, "api-token", "tok-abc123", .{
+		.audience = "api.example.com",
+		.kind = "bearer",
+	}, gid);
+	try t.expect(outcome.proxy_readable);
+
+	const vpath = try std.fs.path.join(gpa, &.{ dir, "api-token" });
+	defer gpa.free(vpath);
+	// Exactly credgrant.grantedMode(0600): owner rw, group read, other nothing.
+	try t.expectEqual(@as(std.posix.mode_t, 0o640), try modeOf(io, vpath));
+	try t.expectEqual(gid, try gidOf(vpath));
+
+	// The proxy reads VALUES, never metadata, so the sidecar is not widened.
+	const mpath = try std.fs.path.join(gpa, &.{ dir, "api-token.meta" });
+	defer gpa.free(mpath);
+	try t.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, mpath));
+
+	// The widening happened on the temp path and the rename published it whole:
+	// the value is intact and no `.tmp` is left behind for listBound to trip on.
+	const f = try cwd.openFile(io, vpath, .{});
+	defer f.close(io);
+	var rbuf: [64]u8 = undefined;
+	var r = f.reader(io, &rbuf);
+	const got = try r.interface.allocRemaining(gpa, .limited(1 << 10));
+	defer gpa.free(got);
+	try t.expectEqualStrings("tok-abc123", got);
+
+	const tmp = try std.fs.path.join(gpa, &.{ dir, "api-token.tmp" });
+	defer gpa.free(tmp);
+	try t.expectError(error.FileNotFound, cwd.statFile(io, tmp, .{}));
+}
+
+test "addForProxy leaves the store owner-only with no proxy gid, and for a secret with no audience" {
+	const gpa = t.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(dir);
+	defer cwd.deleteTree(io, dir) catch {};
+
+	const gid: store.Gid = @intCast(std.os.linux.getgid());
+
+	// No uid split configured (container/k8s/local): byte-for-byte the old
+	// behavior, 0600 and nothing granted.
+	const unsplit = try store.addForProxy(gpa, io, dir, "app-session", "sess", .{
+		.audience = "app.example.com",
+		.kind = "cookie",
+	}, null);
+	try t.expect(!unsplit.proxy_readable);
+	const spath = try std.fs.path.join(gpa, &.{ dir, "app-session" });
+	defer gpa.free(spath);
+	try t.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, spath));
+
+	// A secret with no audience is not injectable at all (the renderer skips
+	// it), so there is no window to close and nothing is widened for it even
+	// where a proxy gid IS configured.
+	const no_aud = try store.addForProxy(gpa, io, dir, "api-token", "tok", .{
+		.audience = null,
+		.kind = "bearer",
+	}, gid);
+	try t.expect(!no_aud.proxy_readable);
+	const npath = try std.fs.path.join(gpa, &.{ dir, "api-token" });
+	defer gpa.free(npath);
+	try t.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, npath));
+
+	// The plain `add` wrapper every other caller uses is the no-gid case.
+	try store.add(gpa, io, dir, "git-example", "glpat-FAKE", .{ .audience = "git.example.com", .kind = "bearer" });
+	const gpath = try std.fs.path.join(gpa, &.{ dir, "git-example" });
+	defer gpa.free(gpath);
+	try t.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, gpath));
+}
+
+test "proxygid.fromEnv yields no gid without a COGBOX_PROXY_RUNAS spec" {
+	const gpa = t.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+
+	// No env at all (the container enforcer's render/bind path).
+	const none = try proxygid.fromEnv(gpa, io, null);
+	try t.expect(none.gid == null);
+	try t.expect(none.unresolved_group == null);
+
+	// An env that simply does not set the variable.
+	var env = std.process.Environ.Map.init(gpa);
+	defer env.deinit();
+	try env.put("PATH", "/usr/bin");
+	const unset = try proxygid.fromEnv(gpa, io, &env);
+	try t.expect(unset.gid == null);
+	try t.expect(unset.unresolved_group == null);
+
+	// A numeric spelling resolves without a name service, so this is the one
+	// arm that can assert a gid without depending on the host's /etc/group.
+	try env.put("COGBOX_PROXY_RUNAS", "998:998");
+	const numeric = try proxygid.fromEnv(gpa, io, &env);
+	try t.expectEqual(@as(?store.Gid, 998), numeric.gid);
+	try t.expect(numeric.unresolved_group == null);
+
+	// A name the group file does not define: no gid, but the caller is told
+	// which group so it can warn instead of silently behaving unsplit.
+	try env.put("COGBOX_PROXY_RUNAS", "cogbox-proxy:definitely-not-a-real-group-name");
+	const missing = try proxygid.fromEnv(gpa, io, &env);
+	try t.expect(missing.gid == null);
+	try t.expectEqualStrings("definitely-not-a-real-group-name", missing.unresolved_group.?);
+}
+
+test "secret add: COGBOX_PROXY_RUNAS reaches the store through dispatch, so the BIND itself lands 0640/proxy-gid" {
+	// The two tests above pin store.addForProxy with a gid handed straight in,
+	// and proxygid.fromEnv in isolation; neither covers the wiring BETWEEN them
+	// (`secret add` -> fromEnv -> addForProxy), which is the whole of this leg.
+	// Hard-coding the gid to null at the call site left both of them green.
+	const gpa = t.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(dir);
+	defer cwd.deleteTree(io, dir) catch {};
+
+	// The value arrives by --from-file so the test never touches stdin. It lives
+	// OUTSIDE the store dir: anything beside a value file there is store content.
+	const src_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(src_dir);
+	defer cwd.deleteTree(io, src_dir) catch {};
+	try cwd.createDirPath(io, src_dir);
+	const src = try std.fs.path.join(gpa, &.{ src_dir, "value" });
+	defer gpa.free(src);
+	{
+		const f = try cwd.createFile(io, src, .{ .truncate = true });
+		defer f.close(io);
+		var wbuf: [64]u8 = undefined;
+		var w = f.writer(io, &wbuf);
+		try w.interface.writeAll("tok-abc123\n");
+		try w.flush();
+	}
+
+	var env = std.process.Environ.Map.init(gpa);
+	defer env.deinit();
+	// The test process's own primary gid, spelled NUMERICALLY (the one gid it may
+	// chown to unprivileged, and the one spelling that needs no /etc/group).
+	const gid: store.Gid = @intCast(std.os.linux.getgid());
+	const spec = try std.fmt.allocPrint(gpa, "cogbox-proxy:{d}", .{gid});
+	defer gpa.free(spec);
+	try env.put("COGBOX_PROXY_RUNAS", spec);
+
+	// `secret add` ANNOUNCES on stdout, and under `zig build test` stdout is the
+	// build runner's message-protocol pipe: raw bytes there wedge the whole run
+	// (the runner waits for a message it can parse, the test binary waits for its
+	// next command, neither times out). Point fd 1 at /dev/null across the two
+	// dispatch calls -- every other test in this file drives the store directly,
+	// which is why this is the only one that needs it.
+	const devnull = try std.posix.openatZ(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+	defer _ = std.os.linux.close(devnull);
+	const saved_stdout: i32 = @intCast(std.os.linux.dup(1));
+	defer {
+		_ = std.os.linux.dup2(saved_stdout, 1);
+		_ = std.os.linux.close(saved_stdout);
+	}
+	_ = std.os.linux.dup2(devnull, 1);
+
+	try main.dispatch(gpa, io, dir, &.{ "add", "api-token", "--from-file", src, "--audience", "api.example.com", "--kind", "bearer" }, &env);
+
+	const vpath = try std.fs.path.join(gpa, &.{ dir, "api-token" });
+	defer gpa.free(vpath);
+	try t.expectEqual(@as(std.posix.mode_t, 0o640), try modeOf(io, vpath));
+	try t.expectEqual(gid, try gidOf(vpath));
+	// The trailing newline is trimmed and the value is intact -- the staged
+	// chown/chmod happened on the temp, so the rename published a whole file.
+	const f = try cwd.openFile(io, vpath, .{});
+	defer f.close(io);
+	var rbuf: [64]u8 = undefined;
+	var r = f.reader(io, &rbuf);
+	const got = try r.interface.allocRemaining(gpa, .limited(1 << 10));
+	defer gpa.free(got);
+	try t.expectEqualStrings("tok-abc123", got);
+	// The sidecar is never widened, on this path either.
+	const mpath = try std.fs.path.join(gpa, &.{ dir, "api-token.meta" });
+	defer gpa.free(mpath);
+	try t.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, mpath));
+
+	// No uid split configured (container/k8s/local, and every deployment before
+	// this feature): the same command binds owner-only, exactly as it always did.
+	var plain = std.process.Environ.Map.init(gpa);
+	defer plain.deinit();
+	try plain.put("PATH", "/usr/bin");
+	try main.dispatch(gpa, io, dir, &.{ "add", "app-session", "--from-file", src, "--audience", "app.example.com", "--kind", "cookie" }, &plain);
+	const spath = try std.fs.path.join(gpa, &.{ dir, "app-session" });
+	defer gpa.free(spath);
+	try t.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, spath));
 }

@@ -91,7 +91,11 @@ pub fn run(
 		try paths.globalSecretsDir(allocator, p);
 	defer allocator.free(secrets_dir);
 
-	try secret_module.dispatch(allocator, io, secrets_dir, rest.items);
+	// `env` reaches the store so a bind can stage the L7 proxy's read access
+	// (COGBOX_PROXY_RUNAS) into the same atomic write -- the same variable the
+	// re-render below resolves for its grant pass, so the two cannot name
+	// different identities.
+	try secret_module.dispatch(allocator, io, secrets_dir, rest.items, env);
 
 	// After a bind/remove that changes injectable state, re-render the named
 	// instance so a running proxy picks it up without a restart. Best-effort:
@@ -137,7 +141,10 @@ fn reRenderInstance(allocator: std.mem.Allocator, io: std.Io, env: *std.process.
 		return;
 	};
 
-	try rules_module.renderFiles(allocator, io, env, cfg_path, inst_runtime);
+	// A LIVE instance (the access() above proved it): its l7-inject-conf.json
+	// already carries the launcher's harness merge, so preserve what this render
+	// does not author -- see reload.writeL7Inject's two-writer contract.
+	try rules_module.renderFiles(allocator, io, env, cfg_path, inst_runtime, .preserve);
 	_ = rules_module.reload.maybeSignalL7proxy(allocator, io, inst_runtime) catch {};
 	// BOTH signals, for the same reason rules_module.maybeReload sends both: the
 	// render now SEEDS the control-plane inject specs, and netfilter-rules' L7

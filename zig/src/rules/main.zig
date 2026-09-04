@@ -85,6 +85,9 @@ pub fn dispatch(
 /// them, so re-rendering from the bare config would silently strip the funnel and
 /// the api.anthropic.com terminate-allow off a running VM -- killing Claude auth
 /// on the next `cogbox plugin add` / `rules add` until the instance restarted.
+/// And it publishes the inject/auth confs the seeded specs imply, through the
+/// same reload.writeWireFiles sequence the full render uses -- widening the rules
+/// without them is the fail-open state (see the call site).
 /// The seed reads only from the store; the config on disk (already saved by the
 /// caller) is untouched, and `net_val` is a local copy for exactly that reason.
 ///
@@ -103,8 +106,35 @@ pub fn maybeReload(allocator: std.mem.Allocator, io: std.Io, runtime_path: []con
 	defer dirs.deinit(allocator);
 	try seedManagedInjectSpecs(allocator, io, loaded, &net_val, dirs);
 
-	try reload.writeRuntimeRules(allocator, io, runtime_path, net_val, l7Base(loaded));
-	try reload.writeL7Rules(allocator, io, runtime_path, net_val);
+	// The SAME publish sequence renderFiles uses, for the same reason: this path
+	// seeds the managed inject specs and therefore WIDENS l7-rules (the seeded
+	// terminate-allow) and netfilter-rules (the funnel). Writing those two while
+	// leaving l7-inject-conf.json as it was is exactly the fail-OPEN state the
+	// ordering exists to prevent -- the proxy funnels and allows a host the addon
+	// has no spec for, so the guest's placeholder Bearer goes upstream, the
+	// provider 401s and claude-code drops into a re-auth. Reachable in the field:
+	// cogworx binds claude-oauth with a `secret add` that carries no `-n` (so no
+	// re-render) and the separate best-effort `secret reload -n <inst>` is skipped
+	// on a non-live instance and only logged on failure; the next `plugin add` on
+	// the VM/GCE backend then lands here with the store bound and the conf specless.
+	//
+	// Proxy gid: null, i.e. the confs are published but the store's group grants
+	// are NOT reconciled on this path -- this entry point has no env (15 call
+	// sites across `rules`, `remap`, `l7` and `plugin`, none of which carries
+	// one). That is deliberately the SAFE half: `Grants` with a null gid neither
+	// grants nor revokes, so the store's permissions are left exactly as the bind
+	// (secret/store.zig stages the group on the value file) and the last full
+	// render left them. A cred file this conf names but nothing has granted fails
+	// CLOSED in the addon (403 "credential unavailable"), never open.
+	//
+	// Foreign specs: PRESERVED. l7-inject-conf.json has a second writer on the
+	// VM/GCE path -- cogbox-launch.sh merges the HARNESS inject specs (the
+	// host-side cred file + refresh block for api.anthropic.com) on top of the
+	// boot render's output, and they exist nowhere this renderer can see. A live
+	// render that replaced the file would strip them while leaving l7-rules'
+	// terminate-allow and the :443 funnel standing, which is the very fail-open
+	// this path publishes the conf to close. See reload.writeL7Inject.
+	try reload.writeWireFiles(allocator, io, runtime_path, net_val, l7Base(loaded), dirs.global, dirs.instance, null, .preserve);
 	const sent = try reload.maybeSignalPasst(allocator, io, runtime_path);
 	_ = try reload.maybeSignalL7proxy(allocator, io, runtime_path);
 	if (sent) try announce(allocator, io, "Rules reloaded.", .{});
@@ -207,16 +237,25 @@ fn seedManagedInjectSpecs(
 	try reload.seedGitInjectSpecs(loaded.treeAllocator(), io, net_val, dirs.instance, dirs.global);
 }
 
-/// Boot-time render: write BOTH runtime files (netfilter-rules + l7-rules)
-/// from config.json. Backs the hidden `cogbox __render-rules <config>
-/// <runtime>` verb that the launcher calls before passt/the proxy start, so
-/// the boot path and hot-reload path share one renderer (no jq/Zig drift).
+/// Full render: write EVERY runtime wire file from config.json. Backs the hidden
+/// `cogbox __render-rules <config> <runtime>` verb that the launcher calls before
+/// passt/the proxy start, so the boot path and hot-reload path share one renderer
+/// (no jq/Zig drift), and the live re-render behind `secret add -n` / `secret
+/// reload` / `l7 authpolicy replace`.
+///
+/// `foreign` says which of those the caller is: `.replace` for the BOOT render
+/// (authoritative -- the launcher merges the harness inject specs back in right
+/// afterwards), `.preserve` for a render against a RUNNING instance, whose conf
+/// already carries that merge. reload.writeL7Inject documents the contract; a
+/// live `.replace` here is the round-1 regression this parameter exists to make
+/// un-writable by accident.
 pub fn renderFiles(
 	allocator: std.mem.Allocator,
 	io: std.Io,
 	env: *std.process.Environ.Map,
 	config_path: []const u8,
 	runtime_path: []const u8,
+	foreign: reload.ForeignSpecs,
 ) !void {
 	var loaded = try config.load(allocator, io, config_path);
 	defer loaded.deinit();
@@ -238,8 +277,6 @@ pub fn renderFiles(
 	// itself -- see seedManagedInjectSpecs.
 	try seedManagedInjectSpecs(allocator, io, &loaded, &net_val, dirs);
 
-	try reload.writeRuntimeRules(allocator, io, runtime_path, net_val, base);
-	try reload.writeL7Rules(allocator, io, runtime_path, net_val);
 	// A deployment that runs the L7 proxy on its OWN uid (COGBOX_PROXY_RUNAS: the
 	// GCE host image, whose nftables floor needs a distinct skuid for the proxy)
 	// has a reader that is not the store's owner, so the inject render also has to
@@ -248,7 +285,10 @@ pub fn renderFiles(
 	// `cogbox secret add -n <inst>` / `secret reload` come back through here, and
 	// a rebind is an atomic rename that resets the file's group anyway.
 	const proxy_gid = try reload.credgrant.proxyGidFromEnv(allocator, io, env);
-	try reload.writeL7Inject(allocator, io, runtime_path, net_val, dirs.global, dirs.instance, proxy_gid);
+	// ONE publish sequence, shared with maybeReload: netfilter-rules, then the
+	// four inject/auth files, then the WIDENING l7-rules last (reload.zig's
+	// writeWireFiles documents why the order is load-bearing, and a test pins it).
+	try reload.writeWireFiles(allocator, io, runtime_path, net_val, base, dirs.global, dirs.instance, proxy_gid, foreign);
 }
 
 fn cmdList(allocator: std.mem.Allocator, io: std.Io, rules_arr: std.json.Array) !void {
@@ -551,7 +591,7 @@ test "renderFiles: a VM-shaped render (NO secret-dir overrides) seeds the claude
 
 	var env = std.process.Environ.Map.init(gpa);
 	defer env.deinit();
-	try renderFiles(gpa, io, &env, cfg_path, rt);
+	try renderFiles(gpa, io, &env, cfg_path, rt, .replace);
 
 	// 1. l7-inject-conf.json NAMES the bound secret for the host, in the
 	//    anthropic-oauth style, over the shared guest stub sentinel.
@@ -594,7 +634,7 @@ test "renderFiles: a VM-shaped render with NOTHING bound leaves api.anthropic.co
 
 	var env = std.process.Environ.Map.init(gpa);
 	defer env.deinit();
-	try renderFiles(gpa, io, &env, cfg_path, rt);
+	try renderFiles(gpa, io, &env, cfg_path, rt, .replace);
 
 	// No spec, no inject entry, NO whole-host terminate-allow (the L4 deny-list
 	// keeps governing api.anthropic.com), and no funnel: an owner who never
@@ -640,7 +680,7 @@ test "renderFiles: a CONTAINER-shaped render (both secret-dir overrides, enforce
 	defer env.deinit();
 	try env.put("COGBOX_GLOBAL_SECRETS_DIR", priv_global);
 	try env.put("COGBOX_INSTANCE_SECRETS_DIR", priv_instance);
-	try renderFiles(gpa, io, &env, cfg_path, rt);
+	try renderFiles(gpa, io, &env, cfg_path, rt, .replace);
 
 	// Byte-exact render, so this test also pins the pre-existing container output:
 	// ONE spec, cred_file inside the enforcer-private store, plus the terminate
@@ -653,6 +693,11 @@ test "renderFiles: a CONTAINER-shaped render (both secret-dir overrides, enforce
 	const expected_conf = try std.fmt.allocPrint(gpa, "[\n" ++
 		"\t{{\n" ++
 		"\t\t\"host\": \"api.anthropic.com\",\n" ++
+		// The provenance stamp every RENDERED spec carries, so the next live
+		// render can tell its own elements from the ones the launcher merged in
+		// (reload.ForeignSpecs). Inert on the wire: both readers of this file
+		// look up named keys only.
+		"\t\t\"origin\": \"render\",\n" ++
 		"\t\t\"style\": \"anthropic-oauth\",\n" ++
 		"\t\t\"cred_file\": \"{s}/claude-oauth\",\n" ++
 		"\t\t\"cred_format\": \"raw\",\n" ++
@@ -714,11 +759,300 @@ test "maybeReload: a live-VM re-render (rule/plugin mutation) keeps the claude f
 	defer gpa.free(nf);
 	try std.testing.expect(std.mem.indexOf(u8, nf, "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:") != null);
 
+	// ...and the INJECT CONF the widened rules assume, from the same pass. This
+	// path used to write the funnel + terminate-allow and no conf at all, which is
+	// the fail-OPEN interleave: the proxy funnels and allows api.anthropic.com
+	// while the addon has no spec for it, so the guest's placeholder Bearer goes
+	// upstream, the provider 401s and claude-code drops into a re-auth. Reachable
+	// whenever a bind happened without a render (cogworx's `secret add` carries no
+	// `-n`) and the next `plugin add` on a live VM lands here.
+	const conf = try readRuntimeFile(gpa, io, root, "l7-inject-conf.json");
+	defer gpa.free(conf);
+	try std.testing.expect(std.mem.indexOf(u8, conf, "\"host\": \"api.anthropic.com\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, conf, "/claude-oauth") != null);
+	const inj_hosts = try readRuntimeFile(gpa, io, root, "l7-inject-hosts");
+	defer gpa.free(inj_hosts);
+	try std.testing.expectEqualStrings("api.anthropic.com\n", inj_hosts);
+	// The auth-proxy half of the same pass is published too (empty, but VALID:
+	// its reader caches a version-1 document instead of re-parsing a refusal).
+	const auth_conf = try readRuntimeFile(gpa, io, root, "l7-auth-conf.json");
+	defer gpa.free(auth_conf);
+	try std.testing.expect(std.mem.indexOf(u8, auth_conf, "\"version\": 1") != null);
+
 	// The config on disk is NOT rewritten: the seed is a render-time overlay, so a
 	// spec never becomes a persisted (and therefore un-revocable) config entry.
 	const on_disk = try readWholeFile(gpa, io, cfg_path);
 	defer gpa.free(on_disk);
 	try std.testing.expect(std.mem.indexOf(u8, on_disk, "inject") == null);
+}
+
+/// Point <rt>/passt.pid at a pid that cannot exist, so maybeReload runs (it fires
+/// only for an instance with a pidfile) while signalPidfile's kill(pid, 0) probe
+/// fails and nothing is signalled -- the assertions are on the rendered files.
+fn writeDeadPasstPid(gpa: std.mem.Allocator, io: std.Io, rt: []const u8) !void {
+	const pidf = try std.fs.path.join(gpa, &.{ rt, "passt.pid" });
+	defer gpa.free(pidf);
+	const f = try std.Io.Dir.cwd().createFile(io, pidf, .{ .truncate = true });
+	defer f.close(io);
+	var wbuf: [16]u8 = undefined;
+	var w = f.writer(io, &wbuf);
+	try w.interface.writeAll("2147483647\n");
+	try w.flush();
+}
+
+/// How many times `needle` occurs in `hay` (non-overlapping).
+fn countOccurrences(hay: []const u8, needle: []const u8) usize {
+	var n: usize = 0;
+	var i: usize = 0;
+	while (std.mem.indexOfPos(u8, hay, i, needle)) |at| : (i = at + needle.len) n += 1;
+	return n;
+}
+
+/// Write `body` into <rt>/<name>, standing in for a writer that is not this
+/// renderer (cogbox-launch.sh's `jq -s add` + `mv` merge).
+fn writeRuntimeFileRaw(gpa: std.mem.Allocator, io: std.Io, rt: []const u8, name: []const u8, body: []const u8) !void {
+	const path = try std.fs.path.join(gpa, &.{ rt, name });
+	defer gpa.free(path);
+	const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+	defer f.close(io);
+	var wbuf: [4096]u8 = undefined;
+	var w = f.writer(io, &wbuf);
+	try w.interface.writeAll(body);
+	try w.flush();
+}
+
+/// One HARNESS inject spec exactly as cogbox-launch.sh's gen_inject_conf emits it
+/// for claude-code: a host-side cred file with a token_path, the NESTED `refresh`
+/// object (the four optional TSV fields plus the `expires_at_unit` jq adds), the
+/// redaction stub, and NO `origin` -- the whole thing is projected from the
+/// launcher's shell state, so no render can reproduce any of it.
+///
+/// The refresh block matters more than the rest of the spec: it is what lets the
+/// addon do the OAuth refresh-token grant host-side for a harness whose token is
+/// EVICTED from the guest, so dropping it on a live render would leave the
+/// injection working only until the access token expired.
+const launcher_merged_conf =
+	\\[
+	\\  {"host":"api.anthropic.com","style":"anthropic-oauth",
+	\\   "cred_file":"/home/testuser/.claude/.credentials.json",
+	\\   "token_path":"claudeAiOauth.accessToken",
+	\\   "refresh":{"refresh_token_path":"claudeAiOauth.refreshToken",
+	\\              "expires_at_path":"claudeAiOauth.expiresAt",
+	\\              "token_url":"https://platform.claude.com/v1/oauth/token",
+	\\              "client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+	\\              "expires_at_unit":"ms"},
+	\\   "stub_token":"sk-ant-oat01-cogbox-host-injected-placeholder"}
+	\\]
+;
+
+/// The instance shape tests/test_script.py boots as the inject-auto case and the
+/// field's stock rules-mode sandbox: terminate mode, a whole-host allow, and the
+/// LEGACY BOOL `inject` (which carries no specs at all). Nothing here can produce
+/// an inject spec -- the launcher's merge is the only thing that puts one in the
+/// conf, which is precisely why a live render must not replace that file.
+const harness_only_network =
+	\\{"rules":[{"allow":"0.0.0.0/0","comment":"public internet"}],
+	\\ "l7":{"mode":"terminate","inject":true,"rules":[{"allow":"api.anthropic.com"}]}}
+;
+
+test "maybeReload: the HARNESS inject spec cogbox-launch.sh merged in survives a live re-render (two-writer contract)" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpInstanceLayout(gpa, io, harness_only_network);
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+	const cfg_path = try std.fs.path.join(gpa, &.{ root, "instances", "web", "config.json" });
+	defer gpa.free(cfg_path);
+	const rt = try std.fs.path.join(gpa, &.{ root, "rt" });
+	defer gpa.free(rt);
+	try writeDeadPasstPid(gpa, io, rt);
+	// Boot state: __render-rules wrote an EMPTY conf (nothing in config or the
+	// store names a spec), then the launcher merged the harness half on top.
+	try writeRuntimeFileRaw(gpa, io, rt, "l7-inject-conf.json", launcher_merged_conf);
+
+	// The routine live verb: `cogbox plugin add`, `rules add`, or cogworx's git
+	// reconcile `cogbox l7 replace`.
+	var loaded = try config.load(gpa, io, cfg_path);
+	defer loaded.deinit();
+	try maybeReload(gpa, io, rt, &loaded);
+
+	// The conf still names the harness credential. Replacing it here would leave
+	// the terminate-allow + funnel below standing for a host the addon has no spec
+	// for -- and a SUCCESSFUL read of a valid empty array is not stale, so none of
+	// the addon's fail-closed machinery fires: the guest's placeholder Bearer goes
+	// upstream, api.anthropic.com 401s, and claude-code reports an expired login.
+	const conf = try readRuntimeFile(gpa, io, root, "l7-inject-conf.json");
+	defer gpa.free(conf);
+	try std.testing.expect(std.mem.indexOf(u8, conf, "/home/testuser/.claude/.credentials.json") != null);
+	try std.testing.expect(std.mem.indexOf(u8, conf, "\"host\": \"api.anthropic.com\"") != null);
+	// Carried over verbatim: no `origin` stamp is invented for someone else's spec.
+	try std.testing.expect(std.mem.indexOf(u8, conf, "\"origin\"") == null);
+	// The NESTED refresh object survives the round-trip through std.json and the
+	// re-serialisation, keys and all. Losing it is the quiet half of this bug: the
+	// injection would keep working until the access token expired and only then
+	// start 401ing, with nothing in the conf to point at. Both a leaf key the
+	// launcher sourced from its TSV and one jq synthesises are asserted, because a
+	// reconstruct-from-known-fields regression would drop exactly the latter.
+	try std.testing.expect(std.mem.indexOf(u8, conf, "\"refresh_token_path\": \"claudeAiOauth.refreshToken\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, conf, "\"expires_at_unit\": \"ms\"") != null);
+
+	// IDEMPOTENT: a second live render must carry the same spec over ONCE, not
+	// append its own copy of what it just preserved. An accumulating conf would
+	// grow without bound across a session's plugin/rule edits, and the addon takes
+	// the LAST spec for a host -- so a duplicate is also a silent way for a stale
+	// copy to win over a fresh one.
+	try maybeReload(gpa, io, rt, &loaded);
+	const conf2 = try readRuntimeFile(gpa, io, root, "l7-inject-conf.json");
+	defer gpa.free(conf2);
+	try std.testing.expectEqual(@as(usize, 1), countOccurrences(conf2, "/home/testuser/.claude/.credentials.json"));
+	try std.testing.expectEqual(@as(usize, 1), countOccurrences(conf2, "\"refresh\""));
+
+	const l7 = try readRuntimeFile(gpa, io, root, "l7-rules");
+	defer gpa.free(l7);
+	try std.testing.expectEqualStrings("mode terminate\nallow api.anthropic.com\n", l7);
+
+	// A preserved spec is inert beyond the conf: its host does NOT join the
+	// plain-HTTP inject-routing list (the launcher keeps harness hosts out of it so
+	// the guest cannot force a cleartext send of the real token).
+	const inj_hosts = try readRuntimeFile(gpa, io, root, "l7-inject-hosts");
+	defer gpa.free(inj_hosts);
+	try std.testing.expectEqualStrings("", inj_hosts);
+}
+
+test "maybeReload: rendered specs are replaced (a withdrawn one goes) while the harness spec is preserved LAST" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpInstanceLayout(gpa, io, vm_default_network);
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+	const cfg_path = try std.fs.path.join(gpa, &.{ root, "instances", "web", "config.json" });
+	defer gpa.free(cfg_path);
+	const rt = try std.fs.path.join(gpa, &.{ root, "rt" });
+	defer gpa.free(rt);
+	const global_store = try std.fs.path.join(gpa, &.{ root, "secrets" });
+	defer gpa.free(global_store);
+	try bindClaudeOAuth(gpa, io, global_store);
+	try writeDeadPasstPid(gpa, io, rt);
+
+	// The conf as a live instance carries it: one spec a PREVIOUS render authored
+	// for a host nothing names any more (a git grant since revoked), plus the
+	// launcher's harness spec.
+	const before =
+		\\[
+		\\  {"host":"git.example.com","origin":"render","style":"gitlab-oauth",
+		\\   "cred_file":"/nonexistent/git-gitlab","cred_format":"raw","rules_tag":"git-grants"},
+		\\  {"host":"api.anthropic.com","style":"anthropic-oauth",
+		\\   "cred_file":"/home/testuser/.claude/.credentials.json",
+		\\   "token_path":"claudeAiOauth.accessToken"}
+		\\]
+	;
+	try writeRuntimeFileRaw(gpa, io, rt, "l7-inject-conf.json", before);
+
+	var loaded = try config.load(gpa, io, cfg_path);
+	defer loaded.deinit();
+	try maybeReload(gpa, io, rt, &loaded);
+
+	const conf = try readRuntimeFile(gpa, io, root, "l7-inject-conf.json");
+	defer gpa.free(conf);
+	// Withdrawal still works: an element THIS renderer stamped is re-rendered from
+	// config + store, so the revoked git spec is gone.
+	try std.testing.expect(std.mem.indexOf(u8, conf, "git.example.com") == null);
+	// The seeded claude spec (bound store secret) is rendered...
+	const rendered_at = std.mem.indexOf(u8, conf, "/claude-oauth") orelse return error.MissingRenderedSpec;
+	// ...and the harness spec is carried over AFTER it, so the addon's
+	// last-write-by-host resolution gives the harness spec the host -- the same
+	// precedence cogbox-launch.sh's `jq -s add` establishes at boot.
+	const foreign_at = std.mem.indexOf(u8, conf, "/home/testuser/.claude/.credentials.json") orelse return error.HarnessSpecDropped;
+	try std.testing.expect(foreign_at > rendered_at);
+}
+
+test "maybeReload: an UNSTAMPED spec naming a store path is re-rendered, not preserved (pre-stamp image skew)" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpInstanceLayout(gpa, io, vm_default_network);
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+	const cfg_path = try std.fs.path.join(gpa, &.{ root, "instances", "web", "config.json" });
+	defer gpa.free(cfg_path);
+	const rt = try std.fs.path.join(gpa, &.{ root, "rt" });
+	defer gpa.free(rt);
+	const global_store = try std.fs.path.join(gpa, &.{ root, "secrets" });
+	defer gpa.free(global_store);
+	try bindClaudeOAuth(gpa, io, global_store);
+	try writeDeadPasstPid(gpa, io, rt);
+
+	// The conf a cogbox OLDER than the provenance stamp left behind: a rendered
+	// spec with no `origin`, naming a store path, alongside the launcher's
+	// harness spec. Preserving the first would pin a stale spec on the host
+	// forever (appended last, it would even outrank the fresh render).
+	const before = try std.fmt.allocPrint(gpa,
+		\\[
+		\\  {{"host":"api.anthropic.com","style":"anthropic-oauth",
+		\\   "cred_file":"{s}/claude-oauth","cred_format":"raw","stub_token":"stale-render-stub"}},
+		\\  {{"host":"api.anthropic.com","style":"anthropic-oauth",
+		\\   "cred_file":"/home/testuser/.claude/.credentials.json",
+		\\   "token_path":"claudeAiOauth.accessToken"}}
+		\\]
+	, .{global_store});
+	defer gpa.free(before);
+	try writeRuntimeFileRaw(gpa, io, rt, "l7-inject-conf.json", before);
+
+	var loaded = try config.load(gpa, io, cfg_path);
+	defer loaded.deinit();
+	try maybeReload(gpa, io, rt, &loaded);
+
+	const conf = try readRuntimeFile(gpa, io, root, "l7-inject-conf.json");
+	defer gpa.free(conf);
+	// Only this renderer emits a cred_file inside the store, so the unstamped
+	// store-path spec is recognized as ours and re-rendered (the stale stub is
+	// gone, the current stub is back)...
+	try std.testing.expect(std.mem.indexOf(u8, conf, "stale-render-stub") == null);
+	try std.testing.expect(std.mem.indexOf(u8, conf, secret_mod.claude_stub_token) != null);
+	// ...while the launcher's host-side spec, which no render can reproduce, stays.
+	try std.testing.expect(std.mem.indexOf(u8, conf, "/home/testuser/.claude/.credentials.json") != null);
+}
+
+test "renderFiles(.replace): the BOOT render resets the conf, dropping the previous boot's merge" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpInstanceLayout(gpa, io, harness_only_network);
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+	const cfg_path = try std.fs.path.join(gpa, &.{ root, "instances", "web", "config.json" });
+	defer gpa.free(cfg_path);
+	const rt = try std.fs.path.join(gpa, &.{ root, "rt" });
+	defer gpa.free(rt);
+	// The runtime dir outlives a stop/start within a host session, so the previous
+	// boot's merged conf is sitting there.
+	try writeRuntimeFileRaw(gpa, io, rt, "l7-inject-conf.json", launcher_merged_conf);
+
+	var env = std.process.Environ.Map.init(gpa);
+	defer env.deinit();
+	try renderFiles(gpa, io, &env, cfg_path, rt, .replace);
+
+	// Gone -- and correctly so: cogbox-launch.sh re-merges the CURRENT harness half
+	// immediately after this call, so carrying the old one over would resurrect a
+	// spec for a harness the owner may have logged out of, whose cred file the
+	// addon would then fail closed on for the whole session.
+	const conf = try readRuntimeFile(gpa, io, root, "l7-inject-conf.json");
+	defer gpa.free(conf);
+	try std.testing.expectEqualStrings("[]\n", conf);
 }
 
 /// A bound secret with NOTHING in the config or the seeds naming it: the other
@@ -782,7 +1116,7 @@ test "renderFiles: a GCE-shaped render (COGBOX_PROXY_RUNAS set) makes the NAMED 
 	var env = std.process.Environ.Map.init(gpa);
 	defer env.deinit();
 	try env.put("COGBOX_PROXY_RUNAS", runas);
-	try renderFiles(gpa, io, &env, cfg_path, rt);
+	try renderFiles(gpa, io, &env, cfg_path, rt, .replace);
 
 	// The render named this file to a proxy that does NOT own it. Before this
 	// existed the store stayed 0600 root:root, the addon's open() raised OSError,
@@ -821,11 +1155,80 @@ test "renderFiles: a GCE-shaped render (COGBOX_PROXY_RUNAS set) makes the NAMED 
 	try secret_store.add(gpa, io, global_store, secret_mod.claude_oauth_secret, "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKE", .{});
 	// (Re-bound with NO audience: still present, so the host stays funnelled, but
 	// renderL7Inject's audience gate drops the spec -- nothing names the file.)
-	try renderFiles(gpa, io, &env, cfg_path, rt);
+	try renderFiles(gpa, io, &env, cfg_path, rt, .replace);
 	const conf2 = try readRuntimeFile(gpa, io, root, "l7-inject-conf.json");
 	defer gpa.free(conf2);
 	try std.testing.expect(std.mem.indexOf(u8, conf2, cred) == null);
 	try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOfPath(io, cred));
+}
+
+/// The mtime, which `Io.File.Stat` carries but `modeOfPath` throws away.
+fn mtimeOfPath(io: std.Io, path: []const u8) !i96 {
+	const st = try std.Io.Dir.cwd().statFile(io, path, .{});
+	return st.mtime.nanoseconds;
+}
+
+test "renderFiles: a GCE-shaped render over a STAGED bind is a permission no-op (mode and mtime both unmoved)" {
+	// store.addForProxy stages the proxy group + 0640 onto the value file inside
+	// the bind's own atomic write, and its doc claims that makes the render's
+	// chmod "a no-op (its `want == mode` short-circuit) rather than the moment of
+	// readability". This pins the claim, and the mtime half is the load-bearing
+	// one: the addon caches a cred file's VALUE keyed on the file's mtime, so a
+	// render that moved it would throw a good entry away on every unrelated `l7
+	// add` and look like a concurrent rotation to the addon's post-refresh
+	// clobber guard, which would then skip a legitimate refresh.
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpInstanceLayout(gpa, io, vm_default_network);
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+	const cfg_path = try std.fs.path.join(gpa, &.{ root, "instances", "web", "config.json" });
+	defer gpa.free(cfg_path);
+	const rt = try std.fs.path.join(gpa, &.{ root, "rt" });
+	defer gpa.free(rt);
+	const global_store = try std.fs.path.join(gpa, &.{ root, "secrets" });
+	defer gpa.free(global_store);
+
+	// The test process's own gid, standing in for cogbox-proxy's -- the one group
+	// a non-root test may chown its own files to.
+	const gid: std.Io.File.Gid = @intCast(std.os.linux.getgid());
+
+	// The bind cogworx issues on the GCE host image: `secret add` resolves
+	// COGBOX_PROXY_RUNAS and hands the gid straight to addForProxy, so the value
+	// file is group-readable the instant it is nameable.
+	const outcome = try secret_store.addForProxy(gpa, io, global_store, secret_mod.claude_oauth_secret, "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKE", .{
+		.audience = secret_mod.anthropic_api_host,
+		.kind = secret_mod.anthropic_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	}, gid);
+	try std.testing.expect(outcome.proxy_readable);
+
+	const cred = try std.fs.path.join(gpa, &.{ global_store, secret_mod.claude_oauth_secret });
+	defer gpa.free(cred);
+	try std.testing.expectEqual(@as(std.posix.mode_t, 0o640), try modeOfPath(io, cred));
+	const mode_before = try modeOfPath(io, cred);
+	const mtime_before = try mtimeOfPath(io, cred);
+
+	const runas = try std.fmt.allocPrint(gpa, "cogbox-proxy:{d}", .{gid});
+	defer gpa.free(runas);
+	var env = std.process.Environ.Map.init(gpa);
+	defer env.deinit();
+	try env.put("COGBOX_PROXY_RUNAS", runas);
+	try renderFiles(gpa, io, &env, cfg_path, rt, .replace);
+
+	// The render names this cred file (the seed fires: bound, audienced, kinded),
+	// so credgrant walks it -- and finds nothing to change.
+	const conf = try readRuntimeFile(gpa, io, root, "l7-inject-conf.json");
+	defer gpa.free(conf);
+	try std.testing.expect(std.mem.indexOf(u8, conf, cred) != null);
+	try std.testing.expectEqual(mode_before, try modeOfPath(io, cred));
+	try std.testing.expectEqual(gid, try gidOfPath(cred));
+	try std.testing.expectEqual(mtime_before, try mtimeOfPath(io, cred));
 }
 
 test "renderFiles: a CONTAINER-shaped render (no COGBOX_PROXY_RUNAS) touches no store permission at all" {
@@ -867,7 +1270,7 @@ test "renderFiles: a CONTAINER-shaped render (no COGBOX_PROXY_RUNAS) touches no 
 	defer env.deinit();
 	try env.put("COGBOX_GLOBAL_SECRETS_DIR", priv_global);
 	try env.put("COGBOX_INSTANCE_SECRETS_DIR", priv_instance);
-	try renderFiles(gpa, io, &env, cfg_path, rt);
+	try renderFiles(gpa, io, &env, cfg_path, rt, .replace);
 
 	// The render DID name the credential (so this is not vacuous -- the grant leg
 	// would have fired had a proxy gid been configured)...

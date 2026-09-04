@@ -14,6 +14,7 @@
 
 const std = @import("std");
 pub const store = @import("store.zig");
+pub const proxygid = @import("proxygid.zig");
 
 /// The secret `kind` that selects HOST-SIDE Bearer injection for a Claude
 /// `setup-token` (the per-user "Connect Claude" bind). It is admitted by the `--kind` allowlist below, and renderL7Inject
@@ -115,24 +116,29 @@ pub fn validKind(kind: []const u8) bool {
 		eql(kind, gitlab_authproxy_kind);
 }
 
+/// `env` is only consulted for COGBOX_PROXY_RUNAS (the L7 proxy's uid split, see
+/// proxygid.zig) so a bind can stage the proxy's read access into the same
+/// atomic write. Null -- and an env without that variable -- keeps the store
+/// exactly as it was: 0600, owner-only.
 pub fn dispatch(
 	allocator: std.mem.Allocator,
 	io: std.Io,
 	secrets_dir: []const u8,
 	argv: []const []const u8,
+	env: ?*const std.process.Environ.Map,
 ) !void {
 	if (argv.len == 0) {
 		return die(allocator, io, "usage: cogbox secret <add|ls|rm> ...", .{}, 64);
 	}
 	const sub = argv[0];
 	const rest = argv[1..];
-	if (eql(sub, "add")) return cmdAdd(allocator, io, secrets_dir, rest);
+	if (eql(sub, "add")) return cmdAdd(allocator, io, secrets_dir, rest, env);
 	if (eql(sub, "ls") or eql(sub, "list")) return cmdList(allocator, io, secrets_dir, rest);
 	if (eql(sub, "rm") or eql(sub, "del") or eql(sub, "delete")) return cmdRm(allocator, io, secrets_dir, rest);
 	return die(allocator, io, "unknown subcommand '{s}' (expected add|ls|rm)", .{sub}, 64);
 }
 
-fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, argv: []const []const u8) !void {
+fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, argv: []const []const u8, env: ?*const std.process.Environ.Map) !void {
 	var name: ?[]const u8 = null;
 	var from_file: ?[]const u8 = null;
 	var from_stdin = false;
@@ -193,9 +199,27 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 		.tier = "durable",
 		.bound_at = bound_at,
 	};
-	store.add(allocator, io, secrets_dir, nm, value, meta) catch |err| {
+	// The L7 proxy's gid, where the deployment runs a uid split. Staged onto the
+	// value file inside the same atomic write so the credential is readable by
+	// the proxy the instant it lands, instead of only after the SEPARATE inject
+	// render that follows this bind (rules/credgrant.zig) -- the window in which
+	// the addon answered 403 "credential unavailable". A group the deployment
+	// names but /etc/group does not define is reported, not fatal: the bind is
+	// still correct and the render warns about the same thing.
+	const runas = try proxygid.fromEnv(allocator, io, env);
+	if (runas.unresolved_group) |g| {
+		try warnLine(allocator, io, "COGBOX_PROXY_RUNAS names group '{s}', which /etc/group does not define; the L7 proxy will not be able to read bound credentials.", .{g});
+	}
+
+	const outcome = store.addForProxy(allocator, io, secrets_dir, nm, value, meta, runas.gid) catch |err| {
 		return die(allocator, io, "failed to bind secret '{s}': {s}", .{ nm, @errorName(err) }, 73);
 	};
+	// Loud on the failure path only: a staged grant that did NOT land leaves the
+	// pre-existing behavior (unreadable until the next render grants it), which
+	// is recoverable but would otherwise be invisible.
+	if (runas.gid != null and audience != null and !outcome.proxy_readable) {
+		try warnLine(allocator, io, "bound '{s}', but could not stage the L7 proxy's read access on it; it stays unreadable until the next inject render grants it.", .{nm});
+	}
 
 	if (audience) |aud| {
 		try announce(allocator, io, "Bound secret '{s}' (kind={s}, audience={s}).", .{ nm, kind, aud });
@@ -378,6 +402,12 @@ fn announce(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, 
 	const msg = try std.fmt.allocPrint(allocator, fmt ++ "\n", args);
 	defer allocator.free(msg);
 	try writeStdout(io, msg);
+}
+
+fn warnLine(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args: anytype) !void {
+	const msg = try std.fmt.allocPrint(allocator, "cogbox secret: warning: " ++ fmt ++ "\n", args);
+	defer allocator.free(msg);
+	try writeStderr(io, msg);
 }
 
 fn die(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args: anytype, code: u8) noreturn {

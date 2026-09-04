@@ -20,6 +20,9 @@
 // its load/save IO to integration coverage).
 
 const std = @import("std");
+const proxygid = @import("proxygid.zig");
+
+pub const Gid = proxygid.Gid;
 
 // --- pure layer ------------------------------------------------------------
 
@@ -118,10 +121,25 @@ fn metaPath(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) ![]
 }
 
 /// Atomically write `bytes` to `path` with mode 0600 (.tmp + rename).
-fn writeFile0600(allocator: std.mem.Allocator, io: std.Io, path: []const u8, bytes: []const u8) !void {
+///
+/// `group`, when set, is the L7 proxy's gid (see proxygid.zig): the temp file is
+/// chowned to it and widened to 0640 BEFORE the rename, so the file is
+/// group-readable from the very first instant it is observable at `path`.
+/// Returns whether that grant is in place -- false both when no group was asked
+/// for and when applying it failed (in which case the file keeps its 0600 and
+/// the caller warns; the next inject render's credgrant pass still grants it, so
+/// this degrades to the pre-existing behavior rather than to a broken bind).
+///
+/// The widening happens on the TEMP path, never on the live one: at no point is
+/// a file both reachable at `path` and readable by a group it should not be.
+/// Ordering inside mirrors credgrant.grantFile -- chown first, then chmod, so a
+/// chmod that outlived a failed chown cannot publish group-read to whatever
+/// group the file happened to carry.
+fn writeFile0600(allocator: std.mem.Allocator, io: std.Io, path: []const u8, bytes: []const u8, group: ?Gid) !bool {
 	const cwd = std.Io.Dir.cwd();
 	const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
 	defer allocator.free(tmp);
+	var granted = false;
 	{
 		const f = try cwd.createFile(io, tmp, .{ .truncate = true, .permissions = std.Io.File.Permissions.fromMode(0o600) });
 		defer f.close(io);
@@ -130,8 +148,19 @@ fn writeFile0600(allocator: std.mem.Allocator, io: std.Io, path: []const u8, byt
 		try w.interface.writeAll(bytes);
 		try w.flush();
 		try f.sync(io);
+		if (group) |gid| granted = stageGroupRead(io, f, gid);
 	}
 	try cwd.rename(tmp, cwd, path, io);
+	return granted;
+}
+
+/// chown+chmod the still-unpublished temp file so `gid` may read it: 0600 ->
+/// 0640, exactly the transition credgrant.grantedMode makes. Best effort by
+/// design (see writeFile0600); returns false if either half did not land.
+fn stageGroupRead(io: std.Io, f: std.Io.File, gid: Gid) bool {
+	f.setOwner(io, null, gid) catch return false;
+	f.setPermissions(io, .fromMode(0o640)) catch return false;
+	return true;
 }
 
 fn readAll(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
@@ -146,19 +175,82 @@ fn readAll(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
 /// Bind `name` to `value` (0600) plus its `meta` sidecar, under `dir`
 /// (created 0700-ish if absent). Overwrites atomically (rotation-safe).
 pub fn add(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, value: []const u8, meta: Meta) !void {
+	_ = try addForProxy(allocator, io, dir, name, value, meta, null);
+}
+
+/// What a bind did about the L7 proxy's read access, so the caller can say so.
+pub const AddOutcome = struct {
+	/// A proxy gid was configured AND the value file landed group-readable by
+	/// it. False both when no gid was configured (container/k8s/local: nothing
+	/// to do) and when the chown/chmod failed (the render's credgrant pass is
+	/// then the only thing that can grant it -- worth a warning).
+	proxy_readable: bool = false,
+};
+
+/// `add`, but staging the L7 proxy's read access as part of the same atomic
+/// write when `proxy_gid` is set.
+///
+/// WHY. On a deployment with a uid split (COGBOX_PROXY_RUNAS, i.e. the GCE host
+/// image) the store is written by the control uid at 0600 and read by the
+/// proxy's uid, which gets its read access from a group grant made by the inject
+/// RENDER (rules/credgrant.zig). A bind and its render are two separate control
+/// execs, so between them the credential existed but was unreadable: the addon
+/// fail-closed with 403 "credential unavailable" for roughly an SSH round-trip.
+/// Staging the group on the temp file closes that window -- the file is readable
+/// the instant it is nameable -- and makes the render's chmod a no-op (its
+/// `want == mode` short-circuit) rather than the moment of readability. That
+/// no-op is pinned end to end by rules/main.zig's "a GCE-shaped render over a
+/// STAGED bind is a permission no-op": the render leaves both the mode AND the
+/// mtime where the bind put them, which matters because the addon caches the
+/// credential's value keyed on that mtime.
+///
+/// Only a credential with an AUDIENCE is staged: a secret with no audience is
+/// not injectable at all (the renderer skips it), so there is no window to close
+/// and no reason to widen it. The `.meta` sidecar is never widened -- the proxy
+/// reads values, not metadata.
+///
+/// SCOPE, precisely: this gate is WIDER than the set credgrant grants, which is
+/// "exactly the value files the conf being written names". It has to be -- the
+/// bind cogworx actually issues is a GLOBAL `cogbox secret add` with no `-n`, so
+/// at this point there is no instance and no conf to check the audience against.
+/// The render remains the authority in the sense that its revoke pass takes
+/// group-read back off any value file the conf it writes does not name -- but it
+/// is NOT prompt: `secret add` re-renders only when given `-n`, that re-render
+/// returns early for an instance with no live runtime dir, and the GCE control
+/// plane's follow-up `secret reload` is skipped for a non-live instance and only
+/// logged when it fails. So an audience-bearing value that no current conf names
+/// can stay 0640 (proxy-group read; still owner-write, never world-readable)
+/// until that instance's next render -- at boot, at the latest -- rather than for
+/// "roughly an SSH round-trip". That is the price of closing the 403 window; the
+/// narrowing, if it is ever wanted, is to stage only for audiences the instance's
+/// own conf names, which is computable on the `-n` path and not on this one.
+/// Documented in docs/network-filtering.md's "At bind time, too" bullet.
+pub fn addForProxy(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	dir: []const u8,
+	name: []const u8,
+	value: []const u8,
+	meta: Meta,
+	proxy_gid: ?Gid,
+) !AddOutcome {
 	if (!validName(name)) return error.InvalidName;
 	const cwd = std.Io.Dir.cwd();
 	try cwd.createDirPath(io, dir);
 
+	const stage_gid: ?Gid = if (meta.audience == null) null else proxy_gid;
+
 	const vpath = try std.fs.path.join(allocator, &.{ dir, name });
 	defer allocator.free(vpath);
-	try writeFile0600(allocator, io, vpath, value);
+	const granted = try writeFile0600(allocator, io, vpath, value, stage_gid);
 
 	const mpath = try metaPath(allocator, dir, name);
 	defer allocator.free(mpath);
 	const mjson = try buildMeta(allocator, meta);
 	defer allocator.free(mjson);
-	try writeFile0600(allocator, io, mpath, mjson);
+	_ = try writeFile0600(allocator, io, mpath, mjson, null);
+
+	return .{ .proxy_readable = granted };
 }
 
 /// Remove a bound secret + its meta. Returns true if the value file existed.
