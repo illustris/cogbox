@@ -5,6 +5,7 @@
 // without dropping the other layer.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const rule = @import("rule.zig");
 const config = @import("config.zig");
 const filter = @import("filter");
@@ -448,7 +449,25 @@ pub fn renderL7Inject(
 	var arena_inst = std.heap.ArenaAllocator.init(allocator);
 	defer arena_inst.deinit();
 	const arena = arena_inst.allocator();
+	const arr = try buildInjectArray(allocator, arena, io, network, global_secrets_dir, instance_secrets_dir, hosts_out, grants);
+	try config.writeJqTab(allocator, out, .{ .array = arr });
+}
 
+/// The rendered inject specs as a JSON array (arena-owned), split out of
+/// renderL7Inject so writeL7Inject can APPEND the specs it did not author
+/// before serializing (see ForeignSpecs). Everything renderL7Inject documents
+/// -- the resolve/audience gates, the kind-forced styles, the grants note and
+/// the hosts_out mirror -- happens here.
+fn buildInjectArray(
+	allocator: std.mem.Allocator,
+	arena: std.mem.Allocator,
+	io: std.Io,
+	network: std.json.Value,
+	global_secrets_dir: []const u8,
+	instance_secrets_dir: []const u8,
+	hosts_out: *std.ArrayList(u8),
+	grants: ?*credgrant.Grants,
+) !std.json.Array {
 	var arr = std.json.Array.init(arena);
 	if (injectSpecs(network)) |specs| {
 		for (specs.items) |spec| {
@@ -477,6 +496,9 @@ pub fn renderL7Inject(
 
 			var el: std.json.ObjectMap = .empty;
 			try el.put(arena, "host", .{ .string = host });
+			// Stamp it as OURS, so the next render knows which elements it owns
+			// and which belong to the file's other writer (see ForeignSpecs).
+			try el.put(arena, render_origin_field, .{ .string = render_origin });
 			try el.put(arena, "style", .{ .string = style });
 			try el.put(arena, "cred_file", .{ .string = resolved.value_path });
 			// The proxy that will open that file may not be the uid that owns it
@@ -524,8 +546,17 @@ pub fn renderL7Inject(
 			try hosts_out.append(allocator, '\n');
 		}
 	}
-	try config.writeJqTab(allocator, out, .{ .array = arr });
+	return arr;
 }
+
+/// The field every spec THIS renderer emits carries, and the value it carries.
+/// It is what tells a rendered spec from a FOREIGN one on the next render (see
+/// ForeignSpecs / readForeignInjectSpecs): the render owns and replaces every
+/// element stamped with it, and carries every other element over untouched.
+/// Unknown fields are ignored by both readers of this file (the mitm addon's
+/// CredStore._load_conf reads named keys only), so the stamp is inert on the wire.
+pub const render_origin_field = "origin";
+pub const render_origin = "render";
 
 /// Whether a VALUE FILE EXISTS for the reserved per-user `claude-oauth` secret in
 /// this instance's store (instance store shadowing global -- the same precedence
@@ -1014,7 +1045,9 @@ pub fn writeRuntimeRules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: 
 	var out: std.ArrayList(u8) = .empty;
 	defer out.deinit(allocator);
 	try renderRules(allocator, network, l7_base, &out);
-	try writeRuntimeFile(allocator, io, runtime_dir, "netfilter-rules", out.items);
+	// In-place, NOT atomic: passt's shim holds an fd on this path (see
+	// writeRuntimeFileInPlace).
+	try writeRuntimeFileInPlace(allocator, io, runtime_dir, "netfilter-rules", out.items);
 }
 
 /// Write `<runtime>/l7-rules` (the host-side proxy's rule file).
@@ -1023,6 +1056,108 @@ pub fn writeL7Rules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []con
 	defer out.deinit(allocator);
 	try renderL7(allocator, network, &out);
 	try writeRuntimeFile(allocator, io, runtime_dir, "l7-rules", out.items);
+}
+
+/// Whether a render REPLACES l7-inject-conf.json wholesale or PRESERVES the
+/// specs it did not author. See the two-writer contract on writeL7Inject: the
+/// boot render is the authoritative reset, every live render must carry the
+/// launcher's harness half over or it un-injects a host whose terminate-allow
+/// and funnel it leaves standing.
+pub const ForeignSpecs = enum { replace, preserve };
+
+/// What the BOOT render (`cogbox __render-rules`, cli/main.zig) passes, pinned
+/// here rather than spelled at the call site. It is the only `.replace` caller
+/// in the tree, and flipping it to `.preserve` is silent: the render still
+/// succeeds, the wire files still look right, and the only symptom is a spec
+/// from the PREVIOUS boot outliving the credential it names -- a stale cred_file
+/// the addon opens and 403s on, or worse, one whose path has been re-used. The
+/// constant plus the test that pins it makes that flip fail the gate.
+pub const boot_foreign_specs: ForeignSpecs = .replace;
+
+/// The elements of the CURRENT l7-inject-conf.json that this renderer did not
+/// author: every array element that is an object without `origin: "render"`,
+/// minus any whose `cred_file` points INTO the secret store. Arena-owned (the
+/// values alias `arena`, not the file buffer).
+///
+/// The store-path exclusion is the image-skew guard. A conf written by a cogbox
+/// that predates the stamp carries rendered specs with no `origin`, and without
+/// this they would be preserved forever -- never replaced, never withdrawn, and
+/// (appended last) WINNING their host over the freshly rendered spec. Only this
+/// renderer ever emits a cred_file inside the store; the launcher's harness specs
+/// name a host-side path, so the two are separable without the stamp. It is a
+/// belt for one upgrade window -- the next boot render resets the file anyway --
+/// and it costs nothing in steady state.
+///
+/// Every failure yields the EMPTY set with a warning, never an error: a render
+/// that refused to publish because the file it was replacing was unreadable
+/// would leave policy half-applied, which is the worse half of the trade. The
+/// cost of the empty set is the same clobber this exists to avoid, so it is
+/// LOUD -- and a missing file is not a failure at all (the first render into a
+/// fresh runtime dir).
+fn readForeignInjectSpecs(
+	arena: std.mem.Allocator,
+	io: std.Io,
+	runtime_dir: []const u8,
+	global_secrets_dir: []const u8,
+	instance_secrets_dir: []const u8,
+) ![]const std.json.Value {
+	const path = try std.fs.path.join(arena, &.{ runtime_dir, "l7-inject-conf.json" });
+	const cwd = std.Io.Dir.cwd();
+	const file = cwd.openFile(io, path, .{}) catch |err| switch (err) {
+		error.FileNotFound => return &.{},
+		else => {
+			warnForeign(io, path, @errorName(err));
+			return &.{};
+		},
+	};
+	defer file.close(io);
+	var read_buf: [8192]u8 = undefined;
+	var reader = file.reader(io, &read_buf);
+	const buf = reader.interface.allocRemaining(arena, .limited(1 << 20)) catch |err| {
+		if (err == error.OutOfMemory) return error.OutOfMemory;
+		warnForeign(io, path, @errorName(err));
+		return &.{};
+	};
+	// alloc_always: the parsed values outlive `buf` only because they are copied
+	// into the arena here -- they are appended to the array this render writes.
+	const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, buf, .{ .allocate = .alloc_always }) catch |err| {
+		if (err == error.OutOfMemory) return error.OutOfMemory;
+		warnForeign(io, path, @errorName(err));
+		return &.{};
+	};
+	if (parsed != .array) {
+		warnForeign(io, path, "not a JSON array");
+		return &.{};
+	}
+	var keep: std.ArrayList(std.json.Value) = .empty;
+	for (parsed.array.items) |el| {
+		if (el != .object) continue; // junk element: the addon ignores it too
+		if (strField(el.object, render_origin_field)) |o| {
+			if (std.mem.eql(u8, o, render_origin)) continue; // ours; re-rendered above
+		}
+		if (strField(el.object, "cred_file")) |cf| {
+			// Unstamped, but it names a store path -- so it IS ours, from a cogbox
+			// older than the stamp (see the header).
+			if (underDir(cf, instance_secrets_dir) or underDir(cf, global_secrets_dir)) continue;
+		}
+		try keep.append(arena, el);
+	}
+	return keep.items;
+}
+
+/// `path` is `dir` itself or something beneath it. Plain prefix work on the
+/// strings the render itself produced (both sides come from the same
+/// resolveSecretDirs join), so no symlink resolution is implied or needed.
+fn underDir(path: []const u8, dir: []const u8) bool {
+	if (dir.len == 0) return false;
+	if (!std.mem.startsWith(u8, path, dir)) return false;
+	return path.len == dir.len or path[dir.len] == '/';
+}
+
+fn warnForeign(io: std.Io, path: []const u8, why: []const u8) void {
+	// credgrant's warner: stderr (never stdout -- a render runs inside the
+	// launcher and inside control-channel execs), once per call, silent under test.
+	credgrant.warn(io, "could not carry over the inject specs {s} holds that this render did not author (the launcher's harness half); they are dropped until the next boot render: {s}", .{ path, why });
 }
 
 /// Write `<runtime>/l7-inject-conf.json` (the mitmproxy addon's
@@ -1040,6 +1175,50 @@ pub fn writeL7Rules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []con
 /// are the same uid (container, k8s, local -- an exact no-op there). When set,
 /// this reconciles the store's permissions so that gid can read EXACTLY the cred
 /// files the confs being written name, and nothing else in the store.
+///
+/// TWO-WRITER CONTRACT (l7-inject-conf.json only). On the VM/GCE path this file
+/// has a SECOND writer: after the boot render, cogbox-launch.sh reads it back,
+/// appends the HARNESS specs from gen_inject_conf (host cred_file + OAuth refresh
+/// block + stub_token, gated on INJECT_ACTIVE) and republishes the union with
+/// `jq -s add` + `mv`, harness LAST so it wins a host collision at the addon
+/// (CredStore._load_conf is last-write-by-host). Those specs are projected from
+/// the launcher's shell state, NOT from config.json or the secret store, so this
+/// renderer cannot reproduce them -- and a render that simply replaced the file
+/// would drop them, leaving l7-rules' terminate-allow and the :443 funnel standing
+/// for a host the addon then has no spec for: the guest's redacted placeholder
+/// Bearer goes upstream, the provider 401s and claude-code reads that as an
+/// expired login. `foreign` is how a caller says which side of that it is on:
+///
+///   * `.replace` -- the BOOT render (`__render-rules`), which is the
+///     authoritative reset: the launcher merges the current harness half back on
+///     top immediately afterwards, and a stale spec carried over from the
+///     previous boot (a harness the owner has since logged out of) would outlive
+///     the credential it names and 403 that host for the whole session.
+///   * `.preserve` -- every LIVE render (rules/plugin/l7 hot reload, `secret
+///     reload -n`, `l7 authpolicy replace`): keep every element this renderer did
+///     not author, appended AFTER the rendered ones so the launcher's precedence
+///     is reproduced exactly. Elements it did author (`origin: "render"`) are
+///     replaced wholesale, so dropping a plugin spec or unbinding a secret still
+///     withdraws the injection on the next render.
+///
+/// (An element with no stamp whose cred_file points into the secret store is
+/// treated as OURS anyway: only this renderer emits one, so that is a conf
+/// written by a cogbox older than the stamp -- see readForeignInjectSpecs.)
+///
+/// A preserved spec is carried over VERBATIM and is otherwise inert here: its
+/// host is NOT added to l7-inject-hosts (the launcher deliberately keeps harness
+/// hosts out of the plain-HTTP inject-routing list, so the guest cannot force a
+/// cleartext send of the real token), it seeds no terminate-allow (a stale conf
+/// must never widen l7-rules), and it is NOT noted in `grants` -- only a store
+/// path this render resolved can ever be granted, never a cred_file that arrived
+/// from another writer.
+///
+/// The other three files have one writer and are always fully re-rendered. The
+/// exception worth knowing: under the operator override COGBOX_L7_INJECT_CONF the
+/// launcher computes l7-inject-hosts from the override conf, which a later render
+/// resets to the config-rendered set. That is fail-closed (plain-HTTP egress to an
+/// override host stops being routed through the injector; HTTPS is unaffected) and
+/// the override's own conf, at its own path, is never touched.
 pub fn writeL7Inject(
 	allocator: std.mem.Allocator,
 	io: std.Io,
@@ -1048,6 +1227,7 @@ pub fn writeL7Inject(
 	global_secrets_dir: []const u8,
 	instance_secrets_dir: []const u8,
 	proxy_gid: ?credgrant.Gid,
+	foreign: ForeignSpecs,
 ) !void {
 	var out: std.ArrayList(u8) = .empty;
 	defer out.deinit(allocator);
@@ -1059,7 +1239,16 @@ pub fn writeL7Inject(
 	defer auth_hosts.deinit(allocator);
 	var grants = credgrant.Grants.init(allocator, proxy_gid);
 	defer grants.deinit();
-	try renderL7Inject(allocator, io, network, global_secrets_dir, instance_secrets_dir, &out, &hosts, &grants);
+	var arena_inst = std.heap.ArenaAllocator.init(allocator);
+	defer arena_inst.deinit();
+	const arena = arena_inst.allocator();
+	var arr = try buildInjectArray(allocator, arena, io, network, global_secrets_dir, instance_secrets_dir, &hosts, &grants);
+	if (foreign == .preserve) {
+		// Read the file we are about to replace, keep what we did not author, and
+		// append it LAST -- the launcher's own precedence (see the contract above).
+		for (try readForeignInjectSpecs(arena, io, runtime_dir, global_secrets_dir, instance_secrets_dir)) |spec| try arr.append(spec);
+	}
+	try config.writeJqTab(allocator, &out, .{ .array = arr });
 	// The auth-proxy conf renders inside the SAME Grants transaction, and it
 	// must: grants.apply below revokes group-read on every bound value file
 	// and re-grants only the ones noted in THIS pass, so rendering the auth
@@ -1076,7 +1265,7 @@ pub fn writeL7Inject(
 	// just took away.
 	try grants.apply(io, &.{ instance_secrets_dir, global_secrets_dir });
 	// The four wire files, written in l7_inject_write_order (see the constant
-	// for why the order is load-bearing and how a test pins it).
+	// for why the order still holds as belt and how a test pins it).
 	const files = [l7_inject_write_order.len][]const u8{ out.items, auth_out.items, hosts.items, auth_hosts.items };
 	for (l7_inject_write_order, files) |name, bytes| {
 		try writeRuntimeFile(allocator, io, runtime_dir, name, bytes);
@@ -1085,11 +1274,16 @@ pub fn writeL7Inject(
 
 /// The ORDER writeL7Inject writes its four wire files in -- a single pinned
 /// list (asserted by a test) rather than four calls whose sequence nothing
-/// checks. Renders are NOT atomic (writeRuntimeFile truncates in place), so
-/// each conf must land before the hosts file that routes traffic to its
-/// consumer, and l7-auth-hosts must land LAST: a torn state is then always
-/// the fail-closed one -- hosts ahead of conf can only 403 (the auth proxy
-/// has no entry yet), never retarget-and-stamp against a stale conf.
+/// checks. Each conf lands before the hosts file that routes traffic to its
+/// consumer, and l7-auth-hosts lands LAST: an interleaved state is then always
+/// the fail-closed one -- hosts ahead of conf can only 403 (the auth proxy has
+/// no entry yet), never retarget-and-stamp against a stale conf.
+///
+/// Since writeRuntimeFile became atomic (tmp + rename) this ordering is BELT,
+/// not load-bearing: no reader can see a half-written file any more, so the only
+/// window left is the multi-file one -- a reader that catches file N of the four
+/// updated and N+1 not. The order keeps that window on the deny side, and it is
+/// free, so it stays pinned and tested.
 pub const l7_inject_write_order = [_][]const u8{
 	"l7-inject-conf.json",
 	"l7-auth-conf.json",
@@ -1097,7 +1291,153 @@ pub const l7_inject_write_order = [_][]const u8{
 	"l7-auth-hosts",
 };
 
+/// Publish ALL of an instance's wire files, in the ONE order every render uses.
+/// Both render paths go through here -- the boot/full render (rules.renderFiles,
+/// behind `cogbox __render-rules` and the `secret` re-render) and the hot-reload
+/// render (rules.maybeReload, behind `rules add`, `remap`, `l7 add/del` and
+/// `plugin add` on a live instance) -- so the sequence cannot drift between them,
+/// and neither can widen policy without publishing the conf that policy assumes.
+///
+/// The order is `wire_write_order` and it is load-bearing. Each file is written
+/// atomically now, so no reader can see a half-written one; what survives is the
+/// MULTI-FILE window -- a reader that catches file N updated and N+1 not -- and
+/// this order keeps that window on the fail-CLOSED side:
+///
+///   * netfilter-rules first: it is the funnel (which hosts reach the L7 proxy
+///     at all), and a host funnelled with no rule yet is denied by the proxy;
+///   * then the four inject/auth files, in l7_inject_write_order;
+///   * l7-rules LAST, because it is the WIDENING file: it carries the
+///     terminate-allow that lets a host through. Published after the conf that
+///     names that host's credential, an interleaved reader sees "conf in place,
+///     rules not yet widened" (deny) rather than "rules widened, conf still the
+///     old one" -- the latter is the fail-OPEN state where the proxy funnels a
+///     host the injector has no spec for and the guest's placeholder Bearer goes
+///     upstream (a 401 that claude-code reads as "your login expired").
+///
+/// The order is chosen for the WIDENING direction, and it is not symmetric: it
+/// costs latency on the narrowing one. The mitm addon re-reads l7-rules on every
+/// request, so a render that REMOVES an allow (a git-grant revocation, say) used
+/// to reach that reader as soon as l7-rules landed; now it lands only after the
+/// inject pass has enumerated both stores, run the grant reconciliation over
+/// every bound value file and fsynced four files. The old, wider rule stays
+/// enforceable at the addon for that span. The trade is deliberate -- a widening
+/// interleave forwards a real placeholder credential upstream, a narrowing one
+/// keeps a stale allow for the tail of one render -- and the exposure is bounded
+/// by the l7proxy, which reloads only on the SIGHUP the caller sends after ALL
+/// six writes. If the narrowing side ever matters, the shape is to write l7-rules
+/// twice: the intersection of old and new first, the full new set last.
+///
+/// `foreign` is passed straight to writeL7Inject; see the two-writer contract
+/// there for why a live render must not publish that file from config alone.
+pub fn writeWireFiles(
+	allocator: std.mem.Allocator,
+	io: std.Io,
+	runtime_dir: []const u8,
+	network: std.json.Value,
+	l7_base: u16,
+	global_secrets_dir: []const u8,
+	instance_secrets_dir: []const u8,
+	proxy_gid: ?credgrant.Gid,
+	foreign: ForeignSpecs,
+) !void {
+	try writeRuntimeRules(allocator, io, runtime_dir, network, l7_base);
+	try writeL7Inject(allocator, io, runtime_dir, network, global_secrets_dir, instance_secrets_dir, proxy_gid, foreign);
+	try writeL7Rules(allocator, io, runtime_dir, network);
+}
+
+/// The full published sequence, as data, so a test can pin it (see the test on
+/// writeWireFiles: it renders into a tmp dir with the write trace armed and
+/// asserts this exact list, so reordering the calls above fails the gate).
+pub const wire_write_order = [_][]const u8{"netfilter-rules"} ++ l7_inject_write_order ++ [_][]const u8{"l7-rules"};
+
+/// Write `<runtime>/<name>` ATOMICALLY: a sibling `<name>.tmp-<pid>` is created,
+/// filled, fsynced and renamed over the destination, so every state a reader can
+/// observe at `<name>` is either the whole previous render or the whole new one.
+/// A truncate-in-place write let a reader that happened to open between the
+/// truncate and the writeAll see an EMPTY file -- and the mitm addon's cred store
+/// caches whatever it parses keyed on mtime, so one such read stuck an empty spec
+/// set in front of the credential injector until the NEXT render bumped the mtime
+/// (fail-open: the guest's placeholder Bearer went upstream and claude-code was
+/// told to re-auth). Same shape as secret/store.zig and rules/config.zig.
+///
+/// Mode: the destination's mode is carried onto the tmp file before the rename,
+/// so an overwrite preserves whatever mode the file already had exactly as the
+/// old truncate-in-place write did; a first write keeps the plain createFile
+/// (0o666 & ~umask) behaviour. Stale `<name>.tmp-*` siblings left behind by a
+/// killed render are swept on the way in -- nothing else in the runtime dir uses
+/// that suffix, and the readers all ignore unknown names -- but only once their
+/// owning pid is gone AND they are too old to belong to a render that is still
+/// running: the temp name is unique per render, and a CONCURRENT render's temp
+/// must survive this sweep (see sweepStaleTmps).
+///
+/// NOT for `netfilter-rules`: see writeRuntimeFileInPlace.
 fn writeRuntimeFile(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, name: []const u8, bytes: []const u8) !void {
+	const path = try std.fs.path.join(allocator, &.{ runtime_dir, name });
+	defer allocator.free(path);
+
+	const cwd = std.Io.Dir.cwd();
+	sweepStaleTmps(allocator, io, runtime_dir, name);
+
+	const tmp_path = try tmpPathFor(allocator, io, path);
+	defer allocator.free(tmp_path);
+
+	// A render that dies between here and the rename must not leave the tmp
+	// behind for the next one to inherit; the sweep above is the belt for a
+	// render that dies harder than a defer can catch (SIGKILL).
+	errdefer cwd.deleteFile(io, tmp_path) catch {};
+
+	const keep_mode: ?std.posix.mode_t = blk: {
+		const existing = cwd.openFile(io, path, .{}) catch break :blk null;
+		defer existing.close(io);
+		const st = existing.stat(io) catch break :blk null;
+		break :blk st.permissions.toMode();
+	};
+
+	{
+		const f = try cwd.createFile(io, tmp_path, .{ .truncate = true });
+		defer f.close(io);
+		var write_buf: [4096]u8 = undefined;
+		var writer = f.writer(io, &write_buf);
+		try writer.interface.writeAll(bytes);
+		try writer.flush();
+		if (keep_mode) |m| try f.setPermissions(io, .fromMode(m));
+		// Cheap here (these files are a few KB) and it is what makes the rename
+		// a real barrier rather than an ordering hint to the page cache.
+		try f.sync(io);
+	}
+
+	try cwd.rename(tmp_path, cwd, path, io);
+	noteWrite(name);
+}
+
+/// The one wire file that must keep its INODE across a render: passt's
+/// LD_PRELOAD shim (netfilter/main.zig init) opens NETFILTER_RULES once, before
+/// seccomp is applied, and every SIGUSR1 reload afterwards is lseek+read on that
+/// held fd -- it cannot open() again. Renaming a new file over the path would
+/// leave the shim reading the unlinked old inode forever, so a rule NARROWING
+/// would silently never reach the guest. So this one stays truncate-in-place.
+///
+/// This file has a SECOND reader for which the tear IS reachable: the L7 proxy
+/// re-opens `netfilter-rules` BY PATH in loadRules (l7proxy/main.zig), driven by a
+/// `reload_pending` flag its SIGHUP handler sets, and it can consume a flag an
+/// EARLIER render raised while a later, overlapping render is inside the
+/// truncate-then-writeAll window below. passt's shim is the reason the inode has
+/// to stay put, so the cheap fix (tmp + rename) is not available here -- so that
+/// reader carries the fix instead: l7proxy's `readPolledInto` re-stats after the
+/// read, keeps the previously installed CIDR set when the key moved (or when the
+/// read came back empty and the last one had content), and re-raises its own
+/// reload flag so the next accept-loop iteration retries on settled bytes. Render
+/// SERIALISATION is no longer what bounds the window.
+///
+/// For the shim itself the window is not reachable in the same way: it re-reads
+/// only when the render signals it, which happens after the write returns, and it
+/// never caches a parse keyed on mtime.
+///
+/// `pub` only so l7proxy's reload_test.zig can hammer THIS writer -- the torn
+/// read it defends against is a property of the two halves together, and a test
+/// that re-created the write here would stop testing the moment this one
+/// changed. Production callers go through writeRuntimeRules.
+pub fn writeRuntimeFileInPlace(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, name: []const u8, bytes: []const u8) !void {
 	const path = try std.fs.path.join(allocator, &.{ runtime_dir, name });
 	defer allocator.free(path);
 
@@ -1108,6 +1448,119 @@ fn writeRuntimeFile(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []con
 	var writer = f.writer(io, &write_buf);
 	try writer.interface.writeAll(bytes);
 	try writer.flush();
+	noteWrite(name);
+}
+
+/// A write-temp path that is unique per RENDER, not merely per process: pid plus
+/// eight random bytes. Two renders of the same file (two independent control
+/// legs -- a reconciler `__render-rules` and a `secret reload -n <inst>` exec --
+/// take no lock in the guest) must never pick the same temp, or one would write
+/// into the other's file and the loser would publish the winner's half-written
+/// bytes under its own name. Same idiom as the store's tmp dirs.
+fn tmpPathFor(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+	var rnd: [8]u8 = undefined;
+	io.random(&rnd);
+	var hexb: [16]u8 = undefined;
+	_ = std.fmt.bufPrint(&hexb, "{x}", .{&rnd}) catch unreachable;
+	return std.fmt.allocPrint(allocator, "{s}.tmp-{d}-{s}", .{ path, std.os.linux.getpid(), hexb });
+}
+
+/// How old a `<name>.tmp-*` has to be before the sweep will consider deleting it.
+/// Every write here is a few KB between createFile and rename (microseconds, plus
+/// one fsync), so a temp this old cannot belong to a render that is still running
+/// -- as long as the clock has not moved. See sweepStaleTmps for why that caveat
+/// is why age is only HALF the test.
+const stale_tmp_age_ns: i128 = 60 * std.time.ns_per_s;
+
+/// The pid a `<name>.tmp-<pid>-<hex>` entry was written by (tmpPathFor's format),
+/// or null when the suffix is not that shape -- a foreign file that merely shares
+/// the prefix. `rest` is everything after `<name>.tmp-`.
+fn tmpOwnerPid(rest: []const u8) ?std.posix.pid_t {
+	const dash = std.mem.indexOfScalar(u8, rest, '-') orelse return null;
+	return std.fmt.parseInt(std.posix.pid_t, rest[0..dash], 10) catch null;
+}
+
+/// Whether `pid` still names a process. `kill(pid, 0)` distinguishes the three
+/// answers we need: ESRCH is gone, EPERM is alive-but-not-ours (a render by
+/// another uid on the same runtime dir), success is alive. Anything that is not
+/// specifically "no such process" is treated as ALIVE -- the conservative half,
+/// since sparing a dead temp costs one stale file and reaping a live one aborts
+/// a render.
+fn pidIsLive(pid: std.posix.pid_t) bool {
+	if (pid <= 0) return false;
+	const sig_zero: std.posix.SIG = @enumFromInt(0);
+	std.posix.kill(pid, sig_zero) catch |err| return err != error.ProcessNotFound;
+	return true;
+}
+
+/// Remove `<runtime>/<name>.tmp-*` left over from a render that was killed
+/// mid-write -- and ONLY those. Deleting a temp a render is about to rename is
+/// not the benign outcome an earlier version of this comment claimed: it aborts a
+/// multi-file render PARTWAY THROUGH (netfilter-rules and the inject confs
+/// already published, l7-rules not), and on the boot path it fails the launch.
+///
+/// So an entry is reaped only when BOTH halves hold: its pid component names no
+/// live process AND it is older than `stale_tmp_age_ns`. Age alone was not enough
+/// because it is wall-clock: these boxes get their time from the host and a
+/// forward STEP (an NTP correction after a resume, or a GCE guest whose clock was
+/// behind at boot) ages every live temp past the threshold at once, and the very
+/// next render would then delete the temp of a render running beside it. Liveness
+/// alone is not enough either -- pids are recycled, so a long-dead render's temp
+/// can collide with some unrelated live process and never be swept -- which is
+/// why the age check stays as the secondary condition rather than being replaced.
+///
+/// Best effort by design otherwise: a sweep failure must never fail the render,
+/// and the caller's own temp is unique (tmpPathFor) so it can never be the entry
+/// swept here -- its pid is this process, which is live by construction.
+fn sweepStaleTmps(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, name: []const u8) void {
+	const prefix = std.fmt.allocPrint(allocator, "{s}.tmp-", .{name}) catch return;
+	defer allocator.free(prefix);
+
+	const now: i128 = std.Io.Clock.now(.real, io).nanoseconds;
+	const cwd = std.Io.Dir.cwd();
+	var d = cwd.openDir(io, runtime_dir, .{ .iterate = true }) catch return;
+	defer d.close(io);
+	var iter = d.iterate();
+	while (iter.next(io) catch return) |entry| {
+		if (entry.kind != .file) continue;
+		if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+		// A name this sweep did not write gets no pid gate -- there is no render
+		// to protect -- but it still has to be aged out, as before.
+		if (tmpOwnerPid(entry.name[prefix.len..])) |pid| {
+			if (pidIsLive(pid)) continue;
+		}
+		const st = d.statFile(io, entry.name, .{}) catch continue;
+		if (now - @as(i128, st.mtime.nanoseconds) < stale_tmp_age_ns) continue;
+		d.deleteFile(io, entry.name) catch {};
+	}
+}
+
+/// Test-only observation seam for the ORDER the wire files are published in.
+/// The order is load-bearing (see writeWireFiles and l7_inject_write_order): an
+/// interleaved reader must always catch the fail-CLOSED state, and nothing else
+/// can observe a sequence of renames after the fact. Compiled out entirely
+/// outside `zig build test` -- `builtin.is_test` is comptime-known, so a release
+/// build has neither the branch nor the global.
+pub const WriteTrace = struct {
+	names: [16][]const u8 = undefined,
+	len: usize = 0,
+
+	pub fn push(self: *WriteTrace, name: []const u8) void {
+		if (self.len >= self.names.len) return;
+		self.names[self.len] = name;
+		self.len += 1;
+	}
+
+	pub fn items(self: *const WriteTrace) []const []const u8 {
+		return self.names[0..self.len];
+	}
+};
+
+pub var write_trace: ?*WriteTrace = null;
+
+fn noteWrite(name: []const u8) void {
+	if (!builtin.is_test) return;
+	if (write_trace) |t| t.push(name);
 }
 
 /// If <runtime>/passt.pid exists and the process is alive, send SIGUSR1.
@@ -2462,6 +2915,16 @@ test "renderAuthProxyConf: the N1 inject-hosts append dedupes against spec-emitt
 	try std.testing.expectEqualStrings("git.example.com\n", r.auth_hosts.items);
 }
 
+test "boot_foreign_specs: the boot render REPLACES, so a stale spec cannot outlive its credential" {
+	// cli/main.zig's `__render-rules` reads this constant rather than spelling
+	// `.replace` inline. Flipping it is otherwise silent -- the render succeeds
+	// and the wire files still look right -- and the symptom shows up a boot
+	// later, as a preserved spec naming a credential that no longer exists.
+	// cogbox-launch.sh merges the CURRENT harness half back on top immediately
+	// after this render, so nothing is lost by resetting the file.
+	try std.testing.expectEqual(ForeignSpecs.replace, boot_foreign_specs);
+}
+
 test "writeL7Inject: the wire-file write order is pinned -- each conf before its hosts file, l7-auth-hosts LAST" {
 	// The order is data (l7_inject_write_order) and writeL7Inject iterates it,
 	// so asserting the list IS asserting the sequence. Conf-before-hosts for
@@ -2506,7 +2969,7 @@ test "writeL7Inject: one pass writes all four wire files; empty auth state rende
 	{
 		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, "{\"l7\":{\"mode\":\"terminate\",\"rules\":[]}}", .{});
 		defer parsed.deinit();
-		try writeL7Inject(gpa, io, rt_dir, parsed.value, glob_dir, "zig-inject-test-no-instance", null);
+		try writeL7Inject(gpa, io, rt_dir, parsed.value, glob_dir, "zig-inject-test-no-instance", null, .replace);
 		const conf = try readFile(gpa, io, rt_dir, "l7-auth-conf.json");
 		defer gpa.free(conf);
 		try std.testing.expect(std.mem.indexOf(u8, conf, "\"version\": 1") != null);
@@ -2526,7 +2989,7 @@ test "writeL7Inject: one pass writes all four wire files; empty auth state rende
 	{
 		var parsed = try authNetFixture(gpa, "git.example.com", false, "1", "git.example.com");
 		defer parsed.deinit();
-		try writeL7Inject(gpa, io, rt_dir, parsed.value, glob_dir, "zig-inject-test-no-instance", null);
+		try writeL7Inject(gpa, io, rt_dir, parsed.value, glob_dir, "zig-inject-test-no-instance", null, .replace);
 		const conf = try readFile(gpa, io, rt_dir, "l7-auth-conf.json");
 		defer gpa.free(conf);
 		try std.testing.expect(std.mem.indexOf(u8, conf, "\"host\": \"git.example.com\"") != null);
@@ -2543,4 +3006,369 @@ test "writeL7Inject: one pass writes all four wire files; empty auth state rende
 		defer gpa.free(ic);
 		try std.testing.expect(std.mem.indexOf(u8, ic, "git.example.com") == null);
 	}
+}
+
+// --- writeRuntimeFile atomicity -------------------------------------------
+
+/// Shared state for the observer thread below. `stop` is the writer telling the
+/// reader it is finished; `torn` is the reader telling the writer it saw a state
+/// that was neither payload -- i.e. a partial file, the bug this whole change
+/// exists to close.
+const ObserveState = struct {
+	path: []const u8,
+	a: []const u8,
+	b: []const u8,
+	stop: std.atomic.Value(bool) = .init(false),
+	torn: std.atomic.Value(bool) = .init(false),
+	/// Set once the reader has classified its first observation. The writer waits
+	/// for it before starting, so the run cannot degenerate into "the writer
+	/// finished before the thread was ever scheduled" -- which passes while
+	/// asserting nothing.
+	ready: std.atomic.Value(bool) = .init(false),
+	seen: std.atomic.Value(u32) = .init(0),
+	missing: std.atomic.Value(u32) = .init(0),
+};
+
+/// Read the path over and over with the plainest possible reader (open by path,
+/// read to EOF -- the shape every consumer of these wire files uses) and classify
+/// each observation. Deliberately does NOT go through std.Io: it stands in for
+/// the mitmproxy addon and the L7 proxy, neither of which shares this process's
+/// io.
+fn observeRuntimeFile(st: *ObserveState) void {
+	var path_buf: [4096]u8 = undefined;
+	const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{st.path}) catch return;
+	var buf: [1 << 20]u8 = undefined;
+	while (!st.stop.load(.acquire)) {
+		const fd = std.posix.openatZ(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDONLY }, 0) catch {
+			// The rename never unlinks the destination, so the path is never
+			// absent. Count it rather than swallow it.
+			_ = st.missing.fetchAdd(1, .monotonic);
+			continue;
+		};
+		defer _ = std.os.linux.close(fd);
+		var total: usize = 0;
+		while (total < buf.len) {
+			const n = std.posix.read(fd, buf[total..]) catch break;
+			if (n == 0) break;
+			total += n;
+		}
+		const got = buf[0..total];
+		if (!std.mem.eql(u8, got, st.a) and !std.mem.eql(u8, got, st.b)) {
+			st.torn.store(true, .release);
+			return;
+		}
+		_ = st.seen.fetchAdd(1, .monotonic);
+		st.ready.store(true, .release);
+	}
+}
+
+test "writeRuntimeFile: a render is atomic -- no reader ever observes a partial file" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const rt_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(rt_dir);
+	defer cwd.deleteTree(io, rt_dir) catch {};
+
+	// Two payloads of the SAME length, so neither a length check nor a content
+	// check alone can pass a torn read off as settled. Big enough (192 KiB) to
+	// span many writer-buffer flushes: under the truncate-in-place write this
+	// replaced, a reader landed inside that span within the first few renders.
+	const size = 192 * 1024;
+	const a = try gpa.alloc(u8, size);
+	defer gpa.free(a);
+	@memset(a, 'a');
+	const b = try gpa.alloc(u8, size);
+	defer gpa.free(b);
+	@memset(b, 'b');
+
+	const name = "l7-inject-conf.json";
+	const path = try std.fs.path.join(gpa, &.{ rt_dir, name });
+	defer gpa.free(path);
+
+	// A tmp left behind by a render that was killed mid-write must not survive
+	// the next one, or they accumulate in the runtime dir forever. Aged past
+	// stale_tmp_age_ns AND owned by a pid that cannot exist, because a YOUNG tmp
+	// and a LIVE-pid tmp are both deliberately spared (either may belong to a
+	// render running right now -- see the sweep test below).
+	const stale = try std.fmt.allocPrint(gpa, "{s}.tmp-{d}-deadbeef", .{ path, @as(std.posix.pid_t, std.math.maxInt(std.posix.pid_t)) });
+	defer gpa.free(stale);
+	{
+		const f = try cwd.createFile(io, stale, .{ .truncate = true });
+		defer f.close(io);
+		try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = 1_000_000_000 } } });
+	}
+
+	try writeRuntimeFile(gpa, io, rt_dir, name, a);
+	try std.testing.expectError(error.FileNotFound, cwd.access(io, stale, .{}));
+
+	var st: ObserveState = .{ .path = path, .a = a, .b = b };
+	const th = try std.Thread.spawn(.{}, observeRuntimeFile, .{&st});
+
+	var spins: usize = 0;
+	while (!st.ready.load(.acquire) and spins < 100_000_000) : (spins += 1) {}
+	try std.testing.expect(st.ready.load(.acquire));
+	const seen_before = st.seen.load(.monotonic);
+
+	// Alternate the two payloads under the reader. Every intermediate state the
+	// reader can name has to be exactly one of them.
+	var i: usize = 0;
+	while (i < 200) : (i += 1) {
+		try writeRuntimeFile(gpa, io, rt_dir, name, if (i % 2 == 0) b else a);
+		if (st.torn.load(.acquire)) break;
+	}
+	st.stop.store(true, .release);
+	th.join();
+
+	try std.testing.expect(!st.torn.load(.acquire));
+	try std.testing.expectEqual(@as(u32, 0), st.missing.load(.monotonic));
+	// The observations that matter are the ones taken WHILE the writer ran.
+	try std.testing.expect(st.seen.load(.monotonic) > seen_before);
+
+	// The settled content round-trips (the last render wrote `a`), and no tmp is
+	// left behind.
+	{
+		const f = try cwd.openFile(io, path, .{});
+		defer f.close(io);
+		var rbuf: [4096]u8 = undefined;
+		var rd = f.reader(io, &rbuf);
+		const got = try rd.interface.allocRemaining(gpa, .limited(1 << 20));
+		defer gpa.free(got);
+		try std.testing.expectEqualSlices(u8, a, got);
+	}
+	var d = try cwd.openDir(io, rt_dir, .{ .iterate = true });
+	defer d.close(io);
+	var iter = d.iterate();
+	while (try iter.next(io)) |entry| {
+		try std.testing.expect(std.mem.indexOf(u8, entry.name, ".tmp-") == null);
+	}
+}
+
+test "writeRuntimeFile: an overwrite keeps the mode the destination already had" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const rt_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(rt_dir);
+	defer cwd.deleteTree(io, rt_dir) catch {};
+
+	const name = "l7-auth-conf.json";
+	const path = try std.fs.path.join(gpa, &.{ rt_dir, name });
+	defer gpa.free(path);
+
+	try writeRuntimeFile(gpa, io, rt_dir, name, "one\n");
+	{
+		const f = try cwd.openFile(io, path, .{ .mode = .read_write });
+		defer f.close(io);
+		try f.setPermissions(io, .fromMode(0o640));
+	}
+
+	// The rename replaces the inode, so without carrying the mode across, the
+	// second render would silently reset the file's permissions to the umask
+	// default -- which for a conf naming credential paths is not cosmetic.
+	try writeRuntimeFile(gpa, io, rt_dir, name, "two\n");
+	const f = try cwd.openFile(io, path, .{});
+	defer f.close(io);
+	const stat = try f.stat(io);
+	try std.testing.expectEqual(@as(std.posix.mode_t, 0o640), stat.permissions.toMode() & 0o777);
+}
+
+test "sweepStaleTmps: reaps only a tmp that is BOTH dead-pid and aged; a live pid survives a clock step" {
+	// The sweep's whole risk is deleting a temp that a render running right now
+	// is about to rename: that render then fails with ENOENT partway through the
+	// six-file sequence (netfilter-rules + the inject confs already published,
+	// l7-rules not) and, on the boot path, fails the launch. Two independent
+	// control legs DO render the same runtime dir with no lock between them
+	// (`__render-rules` and a `secret reload -n <inst>` exec), so this is the
+	// property that keeps them from breaking each other.
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const rt_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(rt_dir);
+	defer cwd.deleteTree(io, rt_dir) catch {};
+
+	const name = "l7-rules";
+	const path = try std.fs.path.join(gpa, &.{ rt_dir, name });
+	defer gpa.free(path);
+
+	// A pid that cannot name a process: above every reachable `pid_max`
+	// (2^22 at its largest), so `kill(pid, 0)` is ESRCH on any kernel.
+	const dead_pid: std.posix.pid_t = std.math.maxInt(std.posix.pid_t);
+	// A pid that certainly IS live: this test process.
+	const live_pid: std.posix.pid_t = @intCast(std.os.linux.getpid());
+	const aged_ns: i128 = 1_000_000_000; // 2001-09-09, far past stale_tmp_age_ns
+
+	// (1) Someone else's LIVE temp, YOUNG: the plain concurrent-render case.
+	const live_young = try std.fmt.allocPrint(gpa, "{s}.tmp-{d}-0badc0de", .{ path, live_pid });
+	defer gpa.free(live_young);
+	{
+		const f = try cwd.createFile(io, live_young, .{ .truncate = true });
+		defer f.close(io);
+		var wbuf: [16]u8 = undefined;
+		var w = f.writer(io, &wbuf);
+		try w.interface.writeAll("mid-render\n");
+		try w.flush();
+	}
+
+	// (2) The same live render's temp, but AGED -- which is what a forward
+	// wall-clock STEP does to every live temp at once (an NTP correction after a
+	// resume, a GCE guest whose clock was behind at boot). Under an age-only
+	// sweep this is deleted and that render dies on its rename; the pid gate is
+	// the whole reason it survives.
+	const live_aged = try std.fmt.allocPrint(gpa, "{s}.tmp-{d}-c10cc10c", .{ path, live_pid });
+	defer gpa.free(live_aged);
+	{
+		const f = try cwd.createFile(io, live_aged, .{ .truncate = true });
+		defer f.close(io);
+		try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = aged_ns } } });
+	}
+
+	// (3) A dead render's temp that is still YOUNG. Spared by the age half: pids
+	// are recycled, so liveness alone would be a licence to delete a temp whose
+	// owner is simply not this pid.
+	const dead_young = try std.fmt.allocPrint(gpa, "{s}.tmp-{d}-beefbeef", .{ path, dead_pid });
+	defer gpa.free(dead_young);
+	{
+		const f = try cwd.createFile(io, dead_young, .{ .truncate = true });
+		defer f.close(io);
+	}
+
+	// (4) The only reapable shape: SIGKILLed long ago AND aged out.
+	const dead_aged = try std.fmt.allocPrint(gpa, "{s}.tmp-{d}-f00dface", .{ path, dead_pid });
+	defer gpa.free(dead_aged);
+	{
+		const f = try cwd.createFile(io, dead_aged, .{ .truncate = true });
+		defer f.close(io);
+		try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = aged_ns } } });
+	}
+
+	// (5) A foreign file that merely shares the prefix: no parseable pid, so no
+	// render to protect -- it is aged out exactly as before.
+	const foreign = try std.fmt.allocPrint(gpa, "{s}.tmp-scratch", .{path});
+	defer gpa.free(foreign);
+	{
+		const f = try cwd.createFile(io, foreign, .{ .truncate = true });
+		defer f.close(io);
+		try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = aged_ns } } });
+	}
+
+	try writeRuntimeFile(gpa, io, rt_dir, name, "mode terminate\n");
+
+	try cwd.access(io, live_young, .{});
+	try cwd.access(io, live_aged, .{});
+	try cwd.access(io, dead_young, .{});
+	try std.testing.expectError(error.FileNotFound, cwd.access(io, dead_aged, .{}));
+	try std.testing.expectError(error.FileNotFound, cwd.access(io, foreign, .{}));
+
+	// The live temp's bytes are its own: the render that swept around it wrote
+	// into a temp of its own name and published that one.
+	const f = try cwd.openFile(io, live_young, .{});
+	defer f.close(io);
+	var rbuf: [64]u8 = undefined;
+	var rd = f.reader(io, &rbuf);
+	const got = try rd.interface.allocRemaining(gpa, .limited(1 << 10));
+	defer gpa.free(got);
+	try std.testing.expectEqualStrings("mid-render\n", got);
+}
+
+/// The inode of a path, which `Io.File.Stat` does not surface.
+fn inodeOf(path: []const u8) !u64 {
+	var buf: [std.fs.max_path_bytes]u8 = undefined;
+	const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
+	var sx: std.os.linux.Statx = undefined;
+	const rc = std.os.linux.statx(std.posix.AT.FDCWD, path_z, 0, .{ .INO = true }, &sx);
+	if (rc != 0) return error.StatxFailed;
+	return sx.ino;
+}
+
+test "writeRuntimeRules keeps netfilter-rules' INODE; writeRuntimeFile replaces it" {
+	// netfilter-rules is the ONE wire file that may not be renamed over: passt's
+	// LD_PRELOAD shim opens it once before seccomp (netfilter/main.zig) and every
+	// SIGUSR1 reload afterwards is lseek+read on that HELD fd. Rename the path and
+	// the shim reads the unlinked old inode forever -- so a rule NARROWING would
+	// silently never reach the guest, the quietest possible fail-open. Nothing
+	// else in the suite would fail if someone unified the two write paths, so this
+	// test is the guard: same inode across renders here, a NEW inode there.
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const rt_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(rt_dir);
+	defer cwd.deleteTree(io, rt_dir) catch {};
+
+	const wide_src = "{\"l7\":{\"mode\":\"passthrough\",\"rules\":[{\"allow\":\"a.example.com\"},{\"allow\":\"b.example.com\"}]}}";
+	var wide = try std.json.parseFromSlice(std.json.Value, gpa, wide_src, .{});
+	defer wide.deinit();
+	const narrow_src = "{\"l7\":{\"mode\":\"passthrough\",\"rules\":[{\"allow\":\"a.example.com\"}]}}";
+	var narrow = try std.json.parseFromSlice(std.json.Value, gpa, narrow_src, .{});
+	defer narrow.deinit();
+
+	const nf_path = try std.fs.path.join(gpa, &.{ rt_dir, "netfilter-rules" });
+	defer gpa.free(nf_path);
+
+	try writeRuntimeRules(gpa, io, rt_dir, wide.value, filter.l7_default_base);
+	const ino1 = try inodeOf(nf_path);
+	// The NARROWING render is the one that must reach a shim holding the fd.
+	try writeRuntimeRules(gpa, io, rt_dir, narrow.value, filter.l7_default_base);
+	const ino2 = try inodeOf(nf_path);
+	try std.testing.expectEqual(ino1, ino2);
+
+	// ...and the atomic path is the opposite by construction: every render
+	// publishes a NEW inode, which is exactly why it may not be used above.
+	const l7_path = try std.fs.path.join(gpa, &.{ rt_dir, "l7-rules" });
+	defer gpa.free(l7_path);
+	try writeRuntimeFile(gpa, io, rt_dir, "l7-rules", "mode terminate\n");
+	const lino1 = try inodeOf(l7_path);
+	try writeRuntimeFile(gpa, io, rt_dir, "l7-rules", "mode passthrough\n");
+	const lino2 = try inodeOf(l7_path);
+	try std.testing.expect(lino1 != lino2);
+}
+
+test "writeWireFiles: the publish order is pinned -- funnel first, confs next, l7-rules LAST" {
+	// The order is the whole fail-closed story of a multi-file render (see
+	// writeWireFiles), and before this test nothing in the suite failed if the
+	// widening file moved back in front of the conf it widens for.
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const rt_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(rt_dir);
+	defer cwd.deleteTree(io, rt_dir) catch {};
+
+	const src = "{\"l7\":{\"mode\":\"terminate\",\"rules\":[{\"allow\":\"api.example.com\"}]}}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var trace: WriteTrace = .{};
+	write_trace = &trace;
+	defer write_trace = null;
+	try writeWireFiles(gpa, io, rt_dir, parsed.value, filter.l7_default_base, glob_dir, "zig-inject-test-no-instance", null, .replace);
+
+	try std.testing.expectEqual(wire_write_order.len, trace.items().len);
+	for (wire_write_order, trace.items()) |want, got| {
+		try std.testing.expectEqualStrings(want, got);
+	}
+	// Spelled out, so the list itself cannot be reordered silently either.
+	try std.testing.expectEqualStrings("netfilter-rules", wire_write_order[0]);
+	try std.testing.expectEqualStrings("l7-inject-conf.json", wire_write_order[1]);
+	try std.testing.expectEqualStrings("l7-rules", wire_write_order[wire_write_order.len - 1]);
 }

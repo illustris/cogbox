@@ -189,7 +189,18 @@ pub fn main(init: std.process.Init) !void {
 	}
 	if (std.mem.eql(u8, verb, "__render-rules")) {
 		if (rest.len < 2) util.die(allocator, io, null, exit_codes.usage, "__render-rules requires <config> <runtime>", .{});
-		return rules_module.renderFiles(allocator, io, env, rest[0], rest[1]);
+		// The launcher/enforcer render, and the only `.replace` caller. On the VM
+		// path it is the BOOT render: cogbox-launch.sh runs it before the proxies
+		// start and then merges the harness inject specs on top of what it wrote,
+		// so this is the authoritative reset -- carrying the PREVIOUS boot's merge
+		// over would outlive the credentials it names (the runtime dir survives a
+		// stop/start within a host session). On the container path (cogbox-enforce.sh
+		// at start, plus cogworx's courier reconcile on a live enforcer) this
+		// renderer is the file's ONLY writer, so there is nothing to preserve.
+		// The choice is PINNED in the renderer (reload.boot_foreign_specs) with a
+		// test on its value, so flipping the boot render to `.preserve` fails the
+		// gate instead of silently carrying a dead spec into the next boot.
+		return rules_module.renderFiles(allocator, io, env, rest[0], rest[1], rules_module.reload.boot_foreign_specs);
 	}
 	if (std.mem.eql(u8, verb, "__claude-stub")) return claude_stub_verb.run(allocator, io, rest);
 	if (std.mem.eql(u8, verb, "console")) return attach_verb.run(allocator, io, &p, rest, attach.Target.console);

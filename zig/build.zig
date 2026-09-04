@@ -160,6 +160,10 @@ pub fn build(b: *std.Build) void {
 		.link_libc = true,
 	});
 	l7proxy_test_mod.addImport("filter", filter_mod);
+	// reload_test.zig hammers the RENDERER's truncate-in-place writer against this
+	// proxy's polled reader -- the torn-read contract on netfilter-rules only
+	// exists between the two, so the test needs both halves. Test module only.
+	l7proxy_test_mod.addImport("rules_module", rules_mod);
 	const l7proxy_tests = b.addTest(.{
 		.root_module = l7proxy_test_mod,
 	});

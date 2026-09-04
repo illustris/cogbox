@@ -55,7 +55,9 @@ const std = @import("std");
 const secret_mod = @import("secret_module");
 const secret_store = secret_mod.store;
 
-pub const Gid = std.Io.File.Gid;
+const proxygid = secret_mod.proxygid;
+
+pub const Gid = proxygid.Gid;
 const Mode = std.posix.mode_t;
 
 /// Owner bits kept, group set to read-only, other bits cleared: 0600 -> 0640.
@@ -77,46 +79,14 @@ fn searchableMode(mode: Mode) Mode {
 	return mode | 0o010;
 }
 
-/// The group half of a `COGBOX_PROXY_RUNAS` value, byte-for-byte as
-/// cogbox-launch.sh's `${COGBOX_PROXY_RUNAS#*:}` reads it when it builds the
-/// `setpriv --regid` argument: everything after the FIRST colon, or the whole
-/// string when there is no colon (the documented `user` spelling, where the
-/// group has the same name as the user). Null for an unset/empty spec, and for a
-/// trailing-colon spec (`user:`) -- setpriv would reject that too, and guessing a
-/// group for it could only guess wrong. Pure.
-pub fn runasGroup(spec: []const u8) ?[]const u8 {
-	if (spec.len == 0) return null;
-	const colon = std.mem.indexOfScalar(u8, spec, ':') orelse return spec;
-	const group = spec[colon + 1 ..];
-	return if (group.len == 0) null else group;
-}
-
-/// Resolve a group NAME or a numeric gid against `group_file` (/etc/group's
-/// format: `name:passwd:gid:members`). A numeric spelling is taken as the gid
-/// itself, so a deployment can name the group either way -- and so a caller that
-/// has no name service still works. Null when the name is not in the file.
-pub fn lookupGidIn(allocator: std.mem.Allocator, io: std.Io, group_file: []const u8, group: []const u8) !?Gid {
-	if (std.fmt.parseInt(Gid, group, 10)) |gid| return gid else |_| {}
-
-	const cwd = std.Io.Dir.cwd();
-	const file = cwd.openFile(io, group_file, .{}) catch return null;
-	defer file.close(io);
-	var read_buf: [16384]u8 = undefined;
-	var reader = file.reader(io, &read_buf);
-	const data = reader.interface.allocRemaining(allocator, .limited(1 << 20)) catch return null;
-	defer allocator.free(data);
-
-	var lines = std.mem.splitScalar(u8, data, '\n');
-	while (lines.next()) |line| {
-		var cols = std.mem.splitScalar(u8, line, ':');
-		const name = cols.next() orelse continue;
-		if (!std.mem.eql(u8, name, group)) continue;
-		_ = cols.next() orelse continue; // password field
-		const gid_str = cols.next() orelse continue;
-		return std.fmt.parseInt(Gid, gid_str, 10) catch null;
-	}
-	return null;
-}
+// The COGBOX_PROXY_RUNAS parse + /etc/group lookup live in the SECRET module
+// (secret/proxygid.zig), because `secret add` needs the same answer to stage the
+// grant onto the value file it writes and the module graph only allows
+// rules -> secret. Re-exported here so this file stays the one place a reader
+// looks for "who may read a bound credential", and so the two ends are provably
+// one implementation rather than two that agree today.
+pub const runasGroup = proxygid.runasGroup;
+pub const lookupGidIn = proxygid.lookupGidIn;
 
 /// The gid the L7 proxy runs under, from `COGBOX_PROXY_RUNAS`, or null when the
 /// deployment runs no uid split (container, k8s, local -- none of them set it, so
@@ -124,18 +94,15 @@ pub fn lookupGidIn(allocator: std.mem.Allocator, io: std.Io, group_file: []const
 /// launcher hands `setpriv`, so the identity that must read the credential and
 /// the identity the proxy actually becomes are one value, not two that can drift.
 pub fn proxyGidFromEnv(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) !?Gid {
-	const e = env orelse return null;
-	const spec = e.get("COGBOX_PROXY_RUNAS") orelse return null;
-	const group = runasGroup(spec) orelse return null;
-	const gid = try lookupGidIn(allocator, io, "/etc/group", group);
-	if (gid == null) {
+	const runas = try proxygid.fromEnv(allocator, io, env);
+	if (runas.unresolved_group) |group| {
 		// LOUD, not fatal. Fatal here would abort the render that also writes
 		// netfilter-rules and l7-rules (the floor), which is a far worse failure
 		// than an un-stamped credential -- and the credential path still fails
 		// CLOSED on its own (the addon denies with "credential unavailable").
 		warn(io, "COGBOX_PROXY_RUNAS names group '{s}', which /etc/group does not define; the L7 proxy will not be able to read bound credentials", .{group});
 	}
-	return gid;
+	return runas.gid;
 }
 
 /// The set of store credential files this render's inject conf names, plus the
@@ -322,7 +289,10 @@ fn grantSearch(io: std.Io, dir_path: []const u8, gid: Gid) void {
 	};
 }
 
-fn warn(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+/// pub because the render's other half (reload.zig's foreign-spec carry-over)
+/// warns the same way, for the same reasons -- one warner, one stream, one
+/// under-test rule.
+pub fn warn(io: std.Io, comptime fmt: []const u8, args: anytype) void {
 	emit(io, "cogbox: warning: " ++ fmt ++ "\n", args);
 }
 

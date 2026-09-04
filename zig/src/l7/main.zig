@@ -501,7 +501,9 @@ fn cmdPolicy(
 		try announce(allocator, io, "Instance is not running; the policy renders at its next start.", .{});
 		return;
 	};
-	try rules_module.renderFiles(allocator, io, env, args.config_path, args.runtime_path);
+	// Live instance (the access() above proved it) -> preserve the inject specs
+	// the launcher merged in at boot (reload.writeL7Inject's two-writer contract).
+	try rules_module.renderFiles(allocator, io, env, args.config_path, args.runtime_path, .preserve);
 	_ = reload.maybeSignalL7proxy(allocator, io, args.runtime_path) catch {};
 	_ = reload.maybeSignalPasst(allocator, io, args.runtime_path) catch {};
 }

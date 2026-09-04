@@ -1,11 +1,14 @@
 // l7-auth-conf.json -> typed entries, plus the credential-file reader.
 //
-// The write side (rules/reload.zig renderAuthProxyConf) is NOT atomic
-// (writeRuntimeFile is createFile(truncate)+writeAll+flush), so the reader is
-// Rules.maybe_reload's shape with the spec's mandatory hardenings (addendum
-// F.1): stat -> read -> re-stat over BOTH (mtime, size); never cache a failed
-// parse (the next poll retries); on any failure fall to the EMPTY entry set,
-// never a partial one -- every host then refuses with `no policy`.
+// The write side (rules/reload.zig renderAuthProxyConf) is now atomic --
+// writeRuntimeFile writes a sibling tmp and renames it over the path -- but the
+// reader keeps every hardening it was given, because they are what covers the
+// case the rename does not: an ENFORCER image running ahead of an AGENT image
+// that still truncates in place (the two roll on independent tags), and any
+// other writer of this path. So: stat -> read -> re-stat over BOTH (mtime,
+// size); never cache a failed parse (the next poll retries); on any failure fall
+// to the EMPTY entry set, never a partial one -- every host then refuses with
+// `no policy`. Rules.maybe_reload's shape plus addendum F.1.
 //
 // Generations are arena-owned and refcounted: a worker that picked one up sees
 // a coherent policy for its whole request even while a new conf swaps in; the
@@ -382,8 +385,10 @@ pub const Store = struct {
 	}
 
 	/// stat -> read -> re-stat over (mtime, size) -- BOTH, because a truncate-
-	/// then-rewrite of the same length within one timestamp tick is exactly
-	/// what the non-atomic writer produces (addendum F.1 step 3).
+	/// then-rewrite of the same length within one timestamp tick is exactly what
+	/// a writer that does NOT rename produces (addendum F.1 step 3): the current
+	/// renderer does rename, but this reader also has to survive an agent image
+	/// older than this one -- see the header.
 	///
 	/// Returns whether the store now holds a generation PARSED FROM THE FILE
 	/// (true also when the cached one is still current). False means the
