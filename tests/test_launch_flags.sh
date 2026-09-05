@@ -170,14 +170,90 @@ else
 	missing=0
 	while IFS= read -r ln; do
 		window=$(sed -n "${ln},$((ln + 2))p" "$LAUNCH")
-		for tok in PASST_RUNAS_ARGS PASST_DNS_ARGS PASST_FWD_PREFIX; do
+		for tok in PASST_RUNAS_ARGS PASST_DNS_ARGS PASST_FWD_PREFIX PASST_MOSH_ARGS; do
 			case "$window" in
 				*"$tok"*) ;;
 				*) bad "passt invocation at line $ln does not carry $tok"; missing=1 ;;
 			esac
 		done
 	done < <(grep -n 'passt --foreground' "$LAUNCH" | cut -d: -f1)
-	[ "$missing" -eq 0 ] && ok "both passt invocations carry the uid / guest-DNS / bind knobs"
+	[ "$missing" -eq 0 ] && ok "both passt invocations carry the uid / guest-DNS / bind / mosh knobs"
+	# Neither invocation may pin passt's outbound source address: the netfilter
+	# shim's mosh reply exemption (zig/src/netfilter) tells passt's inbound
+	# reply sockets apart from guest-originated UDP by the latter binding the
+	# WILDCARD address, and `--outbound-addr`/`-o` would make every outbound
+	# socket bind a specific one -- widening the exemption to all guest UDP.
+	oa=0
+	while IFS= read -r ln; do
+		window=$(sed -n "${ln},$((ln + 2))p" "$LAUNCH")
+		case "$window" in
+			*'--outbound-addr'*|*' -o '*) bad "passt invocation at line $ln pins an outbound address; the shim's mosh reply exemption would then match guest-originated UDP too"; oa=1 ;;
+		esac
+	done < <(grep -n 'passt --foreground' "$LAUNCH" | cut -d: -f1)
+	[ "$oa" -eq 0 ] && ok "no passt invocation passes --outbound-addr / -o"
+fi
+
+# --- 5a. the mosh UDP forward: composed like -t, refused unless <lo>-<hi> ---
+#
+# The `-u` must take the SAME bind prefix as the two -t forwards, or with
+# COGBOX_PASST_BIND_FORWARDS the SSH/HTTP forwards would bind the VM address
+# while the mosh range bound every address. Static for the composition (the
+# spelling is the mechanism); BEHAVIOURAL for the validation, by extracting
+# the PASST_MOSH_ARGS block and running it with a stub `die` -- --init-only
+# returns before the knob block, so run_init cannot reach it.
+grep -qF -- '-u "${PASST_FWD_PREFIX}${COGBOX_MOSH_UDP_FORWARD}"' "$LAUNCH" \
+	&& ok "the mosh -u forward composes the same bind prefix as the -t forwards" \
+	|| bad "the mosh -u forward does not use \${PASST_FWD_PREFIX}; with COGBOX_PASST_BIND_FORWARDS it would bind every address"
+mosh_src=$(sed -n '/^PASST_MOSH_ARGS=()$/,/^fi$/p' "$LAUNCH")
+if [ -z "$mosh_src" ]; then
+	bad "could not find the PASST_MOSH_ARGS construction in the launcher"
+else
+	# $1 = COGBOX_MOSH_UDP_FORWARD ("" = unset), $2 = PASST_FWD_PREFIX; prints
+	# the resulting args one per line, exits with die's code on refusal
+	run_mosh_block() {
+		local fwd="$1" prefix="$2"
+		( die() { echo "cogbox-launch: error: $*" >&2; exit "${2:-70}"; }
+		  PASST_FWD_PREFIX="$prefix"
+		  if [ -n "$fwd" ]; then export COGBOX_MOSH_UDP_FORWARD="$fwd"; else unset COGBOX_MOSH_UDP_FORWARD; fi
+		  eval "$mosh_src"
+		  printf '%s\n' "${PASST_MOSH_ARGS[@]+"${PASST_MOSH_ARGS[@]}"}" )
+	}
+	# unset: expands to NOTHING (the byte-identity guarantee for every
+	# launch that does not set the knob)
+	out=$(run_mosh_block "" "" 2>&1); rc=$?
+	[ "$rc" = 0 ] && [ -z "$out" ] \
+		&& ok "unset COGBOX_MOSH_UDP_FORWARD adds no passt argv" \
+		|| bad "unset COGBOX_MOSH_UDP_FORWARD changed the argv (rc=$rc out='$out')"
+	# set, no bind prefix: bare -u lo-hi
+	out=$(run_mosh_block "60000-60031" "" 2>&1); rc=$?
+	[ "$rc" = 0 ] && [ "$out" = "$(printf -- '-u\n60000-60031')" ] \
+		&& ok "COGBOX_MOSH_UDP_FORWARD=60000-60031 renders -u 60000-60031" \
+		|| bad "COGBOX_MOSH_UDP_FORWARD=60000-60031 rendered rc=$rc '$out'"
+	# the bounds are inclusive: 1-65535 and a single port lo-lo render
+	for goodv in 1-65535 60000-60000; do
+		out=$(run_mosh_block "$goodv" "" 2>&1); rc=$?
+		[ "$rc" = 0 ] && [ "$out" = "$(printf -- '-u\n%s' "$goodv")" ] \
+			&& ok "COGBOX_MOSH_UDP_FORWARD=$goodv renders -u $goodv" \
+			|| bad "COGBOX_MOSH_UDP_FORWARD=$goodv rendered rc=$rc '$out'"
+	done
+	# set, with the bind prefix: -u <bind>/lo-hi, the address-scoped passt form
+	out=$(run_mosh_block "60000-60031" "10.0.0.5/" 2>&1); rc=$?
+	[ "$rc" = 0 ] && [ "$out" = "$(printf -- '-u\n10.0.0.5/60000-60031')" ] \
+		&& ok "the -u forward takes the bind prefix (-u 10.0.0.5/60000-60031)" \
+		|| bad "the -u forward with a bind prefix rendered rc=$rc '$out'"
+	# malformed spellings are refused with exit 64 and the usage text, never
+	# handed to passt: the mosh-server colon form, a bare port, a stray letter,
+	# a dangling or doubled dash; and well-formed ranges the shim's
+	# parsePortRange would refuse (lo > hi, port 0, > 65535, > 5 digits), which
+	# passt might otherwise accept while the reply exemption stayed OFF
+	for badv in 60000:60031 60000 6000a-60031 -60031 60000- 1-2-3 60031-60000 0-5 1-70000 60000-000060031; do
+		out=$(run_mosh_block "$badv" "" 2>&1); rc=$?
+		if [ "$rc" = 64 ] && grep -qF 'must be <lo>-<hi>' <<<"$out"; then
+			ok "COGBOX_MOSH_UDP_FORWARD='$badv' is refused with exit 64"
+		else
+			bad "COGBOX_MOSH_UDP_FORWARD='$badv' was not refused (rc=$rc out='$out')"
+		fi
+	done
 fi
 
 # --- 5b. guest DNS is FORWARDED to the host, never handed over raw ----------

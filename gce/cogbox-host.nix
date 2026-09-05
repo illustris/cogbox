@@ -341,6 +341,28 @@ in
 			default = 8080;
 			description = "cogbox's default guest HTTP forward port (cogbox-launch.sh `.httpPort // 8080`).";
 		};
+		moshUDPPort = lib.mkOption {
+			type = lib.types.port;
+			default = (import ../mosh-udp-range.nix).port;
+			description = ''
+				First guest mosh UDP port passt forwards (`-u`, via
+				COGBOX_MOSH_UDP_FORWARD). mosh-server binds a port in this
+				range inside the guest; the cogworx gateway injects the same
+				range into the exec, so the default comes from the repo's
+				single source of truth (mosh-udp-range.nix).
+			'';
+		};
+		moshUDPPortRange = lib.mkOption {
+			type = lib.types.ints.positive;
+			default = (import ../mosh-udp-range.nix).count;
+			description = ''
+				Width of the guest mosh UDP range (last port = moshUDPPort +
+				moshUDPPortRange - 1). Mirrors cogworx's
+				COGWORX_MOSH_SANDBOX_UDP_PORTS: a narrower forward than the
+				range the gateway injects would leave sessions on the missing
+				ports unreachable.
+			'';
+		};
 		hostResolver = lib.mkOption {
 			type = lib.types.str;
 			default = "127.0.0.53";
@@ -859,6 +881,16 @@ in
 					("That resolver NXDOMAINs split-horizon internal names and returns EMPTY answers for public names a peering zone shadows, and the guest resolves through the host's forwarder, so every sandbox created from this image comes up healthy resolving neither -- with nothing failing loudly.")
 					("Set cogworx.gce.vpcResolver to a full recursive resolver that serves both kinds of name, or set cogworx.gce.allowMetadataResolver = true to affirm that the VPC resolver is the intended upstream for this image.")
 				];
+			}
+			{
+				# The mosh forward range must fit in the UDP port space. supervisor.nix
+				# renders COGBOX_MOSH_UDP_FORWARD = "${moshUDPPort}-${moshUDPPort +
+				# moshUDPPortRange - 1}"; cogbox-launch.sh validates `lo <= hi <= 65535`
+				# and dies 64 otherwise, so without this an out-of-range option pair
+				# builds a fine image whose every sandbox launch loops on exit 64 at
+				# VM boot -- visible only on the serial console. Catch it at eval.
+				assertion = cfg.moshUDPPort + cfg.moshUDPPortRange - 1 <= 65535;
+				message = "cogworx.gce.moshUDPPort + moshUDPPortRange - 1 must be <= 65535 (got ${toString cfg.moshUDPPort} + ${toString cfg.moshUDPPortRange} - 1 = ${toString (cfg.moshUDPPort + cfg.moshUDPPortRange - 1)}); cogbox-launch.sh would reject the rendered COGBOX_MOSH_UDP_FORWARD with exit 64 at every VM boot.";
 			}
 		];
 

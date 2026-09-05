@@ -308,6 +308,7 @@ variables -- see [Internals](docs/internals.md#host-side-path-overrides).
 | Harness overlay (shared) | 128 MB ext4 image, per-harness subdirs |
 | SSH | 127.0.0.1:2222 -> 22 |
 | HTTP | 127.0.0.1:8080 -> 8080 (guest 8080 is reserved for the `app-relay` plugin) |
+| Mosh UDP | off. `COGBOX_MOSH_UDP_FORWARD=lo-hi` adds a `passt -u` forward for that guest range, composed with the bind prefix exactly like the two TCP forwards; the GCE host sets `60000-60031` from `mosh-udp-range.nix`. The guest carries only `mosh-server`, and a session needs the cogworx gateway's UDP relay -- see [network filtering](docs/network-filtering.md#the-mosh-reply-socket-exemption) |
 | Network | rules (private/bogon denied, public allowed) |
 | Docker | enabled |
 | Storage profile | `workstation` (see below) |
@@ -504,7 +505,7 @@ the guest's stage 1 cannot boot without.
 The read-only harness lower is identical in both profiles -- that is the
 security property, and the hosted case loses nothing by keeping it.
 
-Pre-installed tools: core — `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`, `nixfs`; search/files — `ripgrep`, `fd`, `bat`, `sd`; data wrangling — `yq-go`, `duckdb`, `miller`, `dasel`, `gron`, `datamash`, `jo`; HTTP/DNS/web — `xh`, `websocat`, `dnsutils`, `htmlq`, `pup`; shell glue — `moreutils` (plus `xargs -P` for parallelism).
+Pre-installed tools: core — `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`, `nixfs`; search/files — `ripgrep`, `fd`, `bat`, `sd`; data wrangling — `yq-go`, `duckdb`, `miller`, `dasel`, `gron`, `datamash`, `jo`; HTTP/DNS/web — `xh`, `websocat`, `dnsutils`, `htmlq`, `pup`; shell glue — `moreutils` (plus `xargs -P` for parallelism); remote shell - `mosh-server` (server half only, for cogworx's mosh relay; the guest admits UDP 60000-60031 per `mosh-udp-range.nix`).
 Harness binaries (with launchers): `claude-code` (`c`), `hermes-agent`
 (`h`), `opencode` (`oc`), and `pi` (`p`) on `x86_64-linux` and
 `aarch64-linux` (sourced from `numtide/llm-agents.nix`). `codex` (`cx`)
@@ -686,6 +687,24 @@ their own `nixosSystem`. The `gce-image-control-ca` flake check asserts both
 halves: that the default bakes no CA, and that the override reaches sshd's
 `TrustedUserCAKeys` file.
 
+The host also forwards the guest's mosh UDP range. `cogworx.gce.moshUDPPort`
+and `cogworx.gce.moshUDPPortRange` (defaults from `mosh-udp-range.nix`: 60000
+and 32, so 60000-60031) render `COGBOX_MOSH_UDP_FORWARD=60000-60031` into the
+supervisor's environment; the launcher turns that into `passt -u
+<VM_IP>/60000-60031` on the same line as the two `-t` forwards (the bind
+prefix composes the same way), and the L4 shim reads the SAME variable to
+exempt passt's inbound reply sockets for that range from the `rules`-mode deny
+([the mosh reply-socket exemption](docs/network-filtering.md#the-mosh-reply-socket-exemption)),
+so the forward and the exemption cannot name different ranges. The floor is
+untouched: `gce/floor.nix` is OUTPUT-only and the reply sockets target the
+control plane's relay, which none of its three rules name. A pair whose last
+port would exceed 65535 fails the eval with an assertion, because the launcher
+would otherwise refuse the rendered value with exit 64 on every VM boot and
+the failure would only show on the serial console. The `gce-image-mosh-forward`
+flake check pins the rendered variable to the range file, that the hosted
+guest has `/sw/bin/mosh-server` and no mosh client, and that the baked
+launcher renders the `-u` forward with the bind prefix.
+
 ### The DNS upstream, and why the metadata server is not resolved
 
 `cogworx.gce.vpcResolver` is the single upstream systemd-resolved forwards to,
@@ -809,3 +828,10 @@ explicitly.
   handled internally by passt (ARP, DHCP, gateway ping responses) is not
   subject to user rules. See
   [enforcement internals](docs/network-filtering.md#enforcement-internals).
+- mosh works only through the cogworx gateway's UDP relay. The guest carries
+  the server half only (`mosh-server`, no client), and the sandbox-side range
+  it may bind (`mosh-udp-range.nix`, 60000-60031) is admitted by the guest
+  firewall on the VM target, by the container floor's reply-leg rule, and on
+  GCE by passt's `-u` forward -- but nothing forwards UDP into a workstation
+  `nix run .` VM or a `--network none` one, so `mosh` against a local cogbox
+  does not connect; use `cogbox ssh`.

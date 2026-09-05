@@ -131,17 +131,48 @@ table inet cogbox_divert {
 #   - udp/53 to ANY ip  -> a DNS-tunnel/exfil channel (now: allow ONLY the resolver);
 #   - ICMP              -> direct egress via unprivileged ping sockets (now: dropped);
 #   - SCTP/DCCP/other   -> direct egress on a non-tcp/udp L4 (now: dropped).
-# Allowlist = lo + all TCP + udp/53-to-resolver. IPv6 has no legitimate egress, so
-# reject it explicitly (faster app feedback than a silent policy drop). Everything
-# else (other UDP, ICMP, SCTP, udp/53 to a non-resolver) falls to policy drop. ALL
-# forwarded traffic is dropped too (belt-and-suspenders -- the agent holds no
-# NET_ADMIN to make a tap, but keep the FORWARD drop regardless).
+# Allowlist = lo + all TCP + udp/53-to-resolver + the mosh REPLY leg (below). IPv6
+# has no legitimate egress, so reject it explicitly (faster app feedback than a
+# silent policy drop). Everything else (other UDP, ICMP, SCTP, udp/53 to a
+# non-resolver) falls to policy drop. ALL forwarded traffic is dropped too
+# (belt-and-suspenders -- the agent holds no NET_ADMIN to make a tap, but keep the
+# FORWARD drop regardless).
 table inet cogbox_floor {
+  # mosh seed-marking, PREROUTING. The reply-leg accept below fires ONLY for a
+  # flow whose seeding datagram we saw ARRIVE on a real interface (iif != lo) at
+  # udp/60000-60031. That is the whole basis of the reply rule's soundness: it
+  # must NOT depend on the pod being unable to forge such a seed itself. Without
+  # this mark, a pod that ever held CAP_NET_RAW could open IP_HDRINCL, send one
+  # spoofed datagram src A:P -> podIP:60005 which routes via lo (accepted by
+  # `oif "lo"`), seed a conntrack entry, and then egress freely from sport 60005
+  # to A:P as `ct direction reply` -- the exact sport-keyed hole the reply rule
+  # is meant not to be. A lo-injected seed traverses prerouting with iif="lo"
+  # and so never gets the mark, so its "reply" leg fails the `ct mark` test
+  # below and falls to policy drop. Range mirrors mosh-udp-range.nix. (ct state
+  # is settled by the conntrack hook at priority -200, before this -150 mangle
+  # hook, so `ct state new` is available here.)
+  chain prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+    iif != "lo" udp dport 60000-60031 ct state new ct mark set 0x6d
+  }
   chain output {
     type filter hook output priority mangle; policy drop;
     meta nfproto ipv6 reject
     oif "lo" accept
     meta l4proto tcp accept$DNS_ALLOW
+    # mosh reply leg ONLY. mosh-server binds udp 60000-60031 in the pod (range
+    # mirrors mosh-udp-range.nix; the cogworx gateway injects it into the exec)
+    # and answers the client datagrams the gateway relays in. The pod never
+    # ORIGINATES these flows: a datagram is admitted only when it belongs to a
+    # conntrack entry (a) in the reply direction AND (b) that was seeded from a
+    # real interface (ct mark 0x6d, set by the prerouting chain above). Both
+    # halves matter: (a) keeps a pod-originated sport-60000-60031 datagram (ct
+    # direction original) on the drop path, and (b) makes the rule hold even if
+    # the pod could spoof a lo-injected seed with a raw socket (it never gets
+    # the mark). Who may LEGITIMATELY seed one is bounded outside the pod by the
+    # per-instance NetworkPolicy (the cogworxd gateway pod). This is not a UDP
+    # egress hole keyed on a source port.
+    udp sport 60000-60031 ct state established ct direction reply ct mark 0x6d counter accept
   }
   chain forward { type filter hook forward priority filter; policy drop; }
 }

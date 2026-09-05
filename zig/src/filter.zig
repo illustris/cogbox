@@ -321,10 +321,11 @@ fn normalizeMapped(addr: IpAddr) IpAddr {
 	};
 }
 
-/// Exact address equality, v4-mapped-v6 normalized on both sides. Used only by
-/// the `dns_host` exception, which must match ONE address rather than a prefix:
-/// a prefix there would be a loopback carve-out, not a socket carve-out.
-fn addrEquals(a: IpAddr, b: IpAddr) bool {
+/// Exact address equality, v4-mapped-v6 normalized on both sides. Used by the
+/// `dns_host` exception, which must match ONE address rather than a prefix (a
+/// prefix there would be a loopback carve-out, not a socket carve-out), and by
+/// `replySendAllowed` for the same one-socket reason.
+pub fn addrEquals(a: IpAddr, b: IpAddr) bool {
 	return switch (normalizeMapped(a)) {
 		.ipv4 => |x| switch (normalizeMapped(b)) {
 			.ipv4 => |y| std.mem.eql(u8, &x, &y),
@@ -346,6 +347,96 @@ pub fn isLoopback(addr: IpAddr) bool {
 		.ipv4 => |ip| ip[0] == 127,
 		.ipv6 => |ip| std.mem.eql(u8, &ip, &ipv6_loopback),
 	};
+}
+
+// --- passt inbound-flow reply sockets (the mosh UDP forward) ---
+//
+// Pure helpers behind the shim's ONE exemption from the default deny. passt
+// serves a datagram arriving at a `-u <addr>/lo-hi` listener by opening a
+// per-flow socket bound to the datagram's destination (PKTINFO dst, i.e. the
+// listener's own address and port) and connect()ing it to the sender; the
+// guest's replies then leave through sendmmsg() on that socket with the
+// sender as explicit msg_name. Under the default deny that connect() fails
+// ("Couldn't connect flow socket"), so an inbound UDP forward is dead unless
+// the shim can tell such a socket apart from one the guest opened.
+
+/// One endpoint (address + port). The shim records a connected UDP socket's
+/// peer in this shape and compares send destinations against it.
+pub const Endpoint = struct {
+	addr: IpAddr,
+	port: u16,
+};
+
+/// A closed port interval, as carried by `COGBOX_MOSH_UDP_FORWARD=lo-hi`.
+pub const PortRange = struct {
+	lo: u16,
+	hi: u16,
+
+	pub fn contains(self: PortRange, p: u16) bool {
+		return p >= self.lo and p <= self.hi;
+	}
+};
+
+/// Parse exactly `<digits>-<digits>`, each 1..65535, lo <= hi. Every other
+/// shape (empty, `lo:hi`, spaces, a bare port, a sign, zero, > 65535) is
+/// null: a malformed knob leaves the exemption OFF rather than guessing.
+pub fn parsePortRange(s: []const u8) ?PortRange {
+	const dash = std.mem.indexOfScalar(u8, s, '-') orelse return null;
+	const lo = parseStrictPort(s[0..dash]) orelse return null;
+	const hi = parseStrictPort(s[dash + 1 ..]) orelse return null;
+	if (lo > hi) return null;
+	return .{ .lo = lo, .hi = hi };
+}
+
+/// Decimal digits only (std.fmt.parseInt would also take a sign and `_`
+/// separators), 1..65535.
+fn parseStrictPort(s: []const u8) ?u16 {
+	if (s.len == 0 or s.len > 5) return null;
+	for (s) |ch| {
+		if (ch < '0' or ch > '9') return null;
+	}
+	const v = std.fmt.parseInt(u32, s, 10) catch return null;
+	if (v == 0 or v > 65535) return null;
+	return @intCast(v);
+}
+
+/// True iff `addr:port` -- the LOCAL address of a socket, as getsockname()
+/// reports it at connect() time -- is one of passt's inbound-flow reply
+/// sockets for the forward: the port sits inside `range` AND the address is
+/// a specific, non-loopback unicast address (v4-mapped v6 judged as v4).
+///
+/// The address half is what keeps guest-originated traffic out: passt binds
+/// a guest-originated UDP flow to the UNSPECIFIED address with the guest's
+/// source port preserved (fwd_nat_from_tap sets oaddr = addr_out, which stays
+/// unspecified because the launcher never passes -o/--outbound-addr, and
+/// oport = the guest sport; sock_l4 then bind()s exactly that), so a guest
+/// picking a source port inside the range still fails here. Only the socket
+/// passt opens for a datagram that ARRIVED at a `-u` listener carries that
+/// listener's address (udp_flow_from_sock -> flow_initiate_sa with the
+/// PKTINFO destination). The port check lives here so a caller cannot forget
+/// it.
+pub fn isForwardReplyLocal(addr: IpAddr, port: u16, range: PortRange) bool {
+	if (!range.contains(port)) return false;
+	if (isLoopback(addr)) return false;
+	return switch (normalizeMapped(addr)) {
+		// not 0.0.0.0, not multicast/reserved/broadcast (224.0.0.0/3)
+		.ipv4 => |ip| !std.mem.eql(u8, &ip, &[4]u8{ 0, 0, 0, 0 }) and ip[0] < 224,
+		// not ::, not multicast (ff00::/8)
+		.ipv6 => |ip| !std.mem.eql(u8, &ip, &([_]u8{0} ** 16)) and ip[0] != 0xff,
+	};
+}
+
+/// Pure decision behind the shim's send-path half of the exemption. `exempt`
+/// is what connect() recorded via isForwardReplyLocal and `peer` the address
+/// it was connected to. A NULL destination sends to the connected peer by
+/// definition; an explicit destination is exempt only when it IS that peer
+/// (v4-mapped normalized). Anything else falls back to the ruleset walk, so
+/// an exempt fd cannot be steered at a third party.
+pub fn replySendAllowed(exempt: bool, peer: ?Endpoint, dest: ?Endpoint) bool {
+	if (!exempt) return false;
+	const p = peer orelse return false;
+	const d = dest orelse return true;
+	return d.port == p.port and addrEquals(d.addr, p.addr);
 }
 
 // The L7 proxy's NON-OVERRIDABLE hard floor: addresses it must never dial no
@@ -1304,6 +1395,85 @@ test "parseIpv6 :: forms" {
 	try std.testing.expect(parseIpv6("2001:::1") == null);
 	try std.testing.expect(parseIpv6("xyz") == null);
 	try std.testing.expect(parseIpv6("::ffff:1.2.3.4") == null); // embedded v4 not supported
+}
+
+// --- mosh reply-socket exemption helpers ---
+
+test "parsePortRange accepts exactly lo-hi" {
+	const r = parsePortRange("60000-60031").?;
+	try std.testing.expectEqual(@as(u16, 60000), r.lo);
+	try std.testing.expectEqual(@as(u16, 60031), r.hi);
+	try std.testing.expect(r.contains(60000));
+	try std.testing.expect(r.contains(60031));
+	try std.testing.expect(!r.contains(59999));
+	try std.testing.expect(!r.contains(60032));
+	const full = parsePortRange("1-65535").?;
+	try std.testing.expectEqual(@as(u16, 1), full.lo);
+	try std.testing.expectEqual(@as(u16, 65535), full.hi);
+	const one = parsePortRange("7-7").?;
+	try std.testing.expectEqual(@as(u16, 7), one.lo);
+	try std.testing.expectEqual(@as(u16, 7), one.hi);
+}
+
+test "parsePortRange rejects every other shape" {
+	const bad = [_][]const u8{
+		"",        "60000", "60000:60031", "60031-60000", "0-5",
+		"1-70000", "a-b",   " 1-2",        "1-2 ",        "1-2-3",
+		"-5",      "5-",    "+1-2",        "1_0-20",      "60000-60031\n",
+	};
+	for (bad) |s| {
+		try std.testing.expect(parsePortRange(s) == null);
+	}
+}
+
+test "isForwardReplyLocal needs a specific non-loopback unicast address in range" {
+	const range = PortRange{ .lo = 60000, .hi = 60031 };
+	// guest-originated flows: wildcard bind with the guest sport preserved
+	try std.testing.expect(!isForwardReplyLocal(.{ .ipv4 = .{ 0, 0, 0, 0 } }, 60005, range));
+	try std.testing.expect(!isForwardReplyLocal(.{ .ipv6 = [_]u8{0} ** 16 }, 60005, range));
+	// loopback
+	try std.testing.expect(!isForwardReplyLocal(.{ .ipv4 = .{ 127, 0, 0, 1 } }, 60005, range));
+	try std.testing.expect(!isForwardReplyLocal(.{ .ipv6 = ipv6_loopback }, 60005, range));
+	// the -u listener address, inside and just outside the range
+	const vm = IpAddr{ .ipv4 = .{ 10, 1, 2, 3 } };
+	try std.testing.expect(isForwardReplyLocal(vm, 60005, range));
+	try std.testing.expect(isForwardReplyLocal(vm, 60000, range));
+	try std.testing.expect(isForwardReplyLocal(vm, 60031, range));
+	try std.testing.expect(!isForwardReplyLocal(vm, 59999, range));
+	try std.testing.expect(!isForwardReplyLocal(vm, 60032, range));
+	try std.testing.expect(!isForwardReplyLocal(vm, 0, range));
+	// v4-mapped v6 is unwrapped and judged as v4
+	const mapped = ipv4_mapped_prefix ++ [4]u8{ 10, 1, 2, 3 };
+	try std.testing.expect(isForwardReplyLocal(.{ .ipv6 = mapped }, 60005, range));
+	const mapped_lo = ipv4_mapped_prefix ++ [4]u8{ 127, 0, 0, 1 };
+	try std.testing.expect(!isForwardReplyLocal(.{ .ipv6 = mapped_lo }, 60005, range));
+	const mapped_any = ipv4_mapped_prefix ++ [4]u8{ 0, 0, 0, 0 };
+	try std.testing.expect(!isForwardReplyLocal(.{ .ipv6 = mapped_any }, 60005, range));
+	// global v6 unicast
+	const v6 = IpAddr{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+	try std.testing.expect(isForwardReplyLocal(v6, 60005, range));
+	try std.testing.expect(!isForwardReplyLocal(v6, 60032, range));
+	// multicast / broadcast are not unicast
+	try std.testing.expect(!isForwardReplyLocal(.{ .ipv4 = .{ 224, 0, 0, 1 } }, 60005, range));
+	try std.testing.expect(!isForwardReplyLocal(.{ .ipv4 = .{ 255, 255, 255, 255 } }, 60005, range));
+	try std.testing.expect(!isForwardReplyLocal(.{ .ipv6 = [_]u8{0xff} ++ [_]u8{0} ** 15 }, 60005, range));
+}
+
+test "replySendAllowed exempts only the recorded peer" {
+	const peer = Endpoint{ .addr = .{ .ipv4 = .{ 10, 9, 8, 7 } }, .port = 41000 };
+	const peer_mapped = Endpoint{ .addr = .{ .ipv6 = ipv4_mapped_prefix ++ [4]u8{ 10, 9, 8, 7 } }, .port = 41000 };
+	// exempt fd: implicit peer, the peer itself, the peer's v4-mapped spelling
+	try std.testing.expect(replySendAllowed(true, peer, null));
+	try std.testing.expect(replySendAllowed(true, peer, peer));
+	try std.testing.expect(replySendAllowed(true, peer, peer_mapped));
+	// exempt fd steered elsewhere: port or address differs -> ruleset walk
+	try std.testing.expect(!replySendAllowed(true, peer, .{ .addr = peer.addr, .port = 41001 }));
+	try std.testing.expect(!replySendAllowed(true, peer, .{ .addr = .{ .ipv4 = .{ 10, 9, 8, 6 } }, .port = 41000 }));
+	// not exempt: never, whatever the destination
+	try std.testing.expect(!replySendAllowed(false, peer, null));
+	try std.testing.expect(!replySendAllowed(false, peer, peer));
+	// exempt but no recorded peer (cannot happen; fail closed anyway)
+	try std.testing.expect(!replySendAllowed(true, null, null));
 }
 
 test "parseLine accepts port-less IPv6 CIDR" {

@@ -32,6 +32,11 @@ extern "c" fn @"open"(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern "c" fn lseek(fd: c_int, offset: c_long, whence: c_int) c_long;
 
+// getsockname is not intercepted; the shim calls it itself (see
+// isForwardReplySocket) and passt's seccomp profile already carries it
+// (udp_flow.c `#syscalls getsockname`, unprofiled so in every profile).
+extern "c" fn getsockname(fd: c_int, addr: *c.struct_sockaddr, len: *c.socklen_t) c_int;
+
 // SOCK_* flag bits from <sys/socket.h>. The type argument to socket(2) can
 // include SOCK_NONBLOCK / SOCK_CLOEXEC ORed in; the actual type lives in
 // the low 8 bits.
@@ -57,6 +62,11 @@ var reload_pending = std.atomic.Value(bool).init(false);
 // Rules file descriptor -- opened during lazy init (after passt's
 // close_open_files but before seccomp), kept open for lseek+read reloads.
 var rules_fd: c_int = -1;
+
+// COGBOX_MOSH_UDP_FORWARD=lo-hi, read once in init(). Null (unset or
+// malformed) means the reply-socket exemption below is OFF and every
+// connect/send decision is exactly what it was before the knob existed.
+var reply_range: ?filter.PortRange = null;
 
 // --- Real libc function pointers ---
 
@@ -100,6 +110,12 @@ const FdEntry = struct {
 	proto: filter.Proto = .any,
 	peer_addr: ?filter.IpAddr = null,
 	peer_port: u16 = 0,
+	// passt inbound-flow reply socket: bound to a specific forward
+	// address:port inside `reply_range` and connect()ed to the datagram's
+	// sender (peer_addr:peer_port). Sends to THAT peer bypass the rule
+	// walk; any other destination is still evaluated. Reset by socket()
+	// (trackSocket rewrites the entry) and close() (untrackFd).
+	reply_exempt: bool = false,
 };
 
 var fd_table: [max_tracked_fds]?FdEntry = [_]?FdEntry{null} ** max_tracked_fds;
@@ -152,6 +168,41 @@ fn setFdPeer(fd: c_int, addr: filter.IpAddr, port: u16) void {
 	}
 }
 
+fn markReplyExempt(fd: c_int) void {
+	if (fd < 0 or @as(usize, @intCast(fd)) >= max_tracked_fds) return;
+	if (fd_table[@intCast(fd)]) |*e| e.reply_exempt = true;
+}
+
+fn clearReplyExempt(fd: c_int) void {
+	if (fd < 0 or @as(usize, @intCast(fd)) >= max_tracked_fds) return;
+	if (fd_table[@intCast(fd)]) |*e| e.reply_exempt = false;
+}
+
+/// Send-path half of the reply-socket exemption: true iff `fd` was marked by
+/// connect() and `dest` (the explicit sendto/sendmsg destination, or null for
+/// a connected send) is the peer recorded there. Pure logic in
+/// filter.replySendAllowed (tested); this only does the table lookup.
+fn replyExemptTo(fd: c_int, dest: ?AddrInfo) bool {
+	if (fd < 0 or @as(usize, @intCast(fd)) >= max_tracked_fds) return false;
+	const e = fd_table[@intCast(fd)] orelse return false;
+	if (!e.reply_exempt) return false;
+	return filter.replySendAllowed(true, fdPeer(fd), dest);
+}
+
+/// Connect-path half: is `fd` one of passt's inbound-flow reply sockets?
+/// Judged on the socket's LOCAL address as bound BEFORE connect() -- passt
+/// bind()s every flow socket first (sock_l4), and a guest-originated flow
+/// is bound to the unspecified address with the guest sport, which
+/// isForwardReplyLocal rejects. Must run before real connect: an implicit
+/// bind after connect would report the route's source address instead.
+fn isForwardReplySocket(fd: c_int, range: filter.PortRange) bool {
+	var sa: c.struct_sockaddr_storage = std.mem.zeroes(c.struct_sockaddr_storage);
+	var len: c.socklen_t = @sizeOf(c.struct_sockaddr_storage);
+	if (getsockname(fd, @ptrCast(&sa), &len) != 0) return false;
+	const local = extractAddr(@ptrCast(&sa)) orelse return false;
+	return filter.isForwardReplyLocal(local.addr, local.port, range);
+}
+
 fn resolve(comptime name: [*:0]const u8) *anyopaque {
 	return c.dlsym(RTLD_NEXT, name) orelse @panic("netfilter: dlsym failed");
 }
@@ -198,6 +249,13 @@ fn init() void {
 		}
 	}
 
+	// Mosh UDP forward range (see isForwardReplySocket). Read once here,
+	// pre-seccomp like everything else in init; a malformed value leaves
+	// the exemption off (the launcher already refuses that shape with 64).
+	if (c.getenv("COGBOX_MOSH_UDP_FORWARD")) |p| {
+		reply_range = filter.parsePortRange(std.mem.span(p));
+	}
+
 	loadRules();
 	initialized = true;
 }
@@ -232,10 +290,9 @@ fn checkReload() void {
 
 // --- Address extraction ---
 
-const AddrInfo = struct {
-	addr: filter.IpAddr,
-	port: u16,
-};
+// Same shape as filter.Endpoint; aliased so the reply-socket peer can be
+// handed to filter.replySendAllowed without a copy.
+const AddrInfo = filter.Endpoint;
 
 fn extractAddr(sa: *const c.struct_sockaddr) ?AddrInfo {
 	if (sa.sa_family == c.AF_INET) {
@@ -318,6 +375,42 @@ export fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) 
 		}
 	}
 
+	// The ONE exemption from the default deny: passt's per-flow reply
+	// socket for a datagram that arrived at a `-u <addr>/lo-hi` listener
+	// (udp_flow_from_sock -> flow_initiate_sa: PKTINFO dst = the listener
+	// address; udp_flow_sock: bind that, connect the sender). Keyed on the
+	// socket's LOCAL address being a specific non-loopback address with a
+	// port in COGBOX_MOSH_UDP_FORWARD. A guest-originated UDP flow never
+	// passes: passt binds it to the UNSPECIFIED address with the guest's
+	// source port (fwd_nat_from_tap + sock_l4; -o/--outbound-addr is never
+	// passed), so even a guest sport inside the range fails the address
+	// half. The peer is recorded so the send wrappers can exempt exactly
+	// that destination and nothing else. A loopback peer is not exempted:
+	// the loopback deny stays whole, and passt itself refuses non-unicast
+	// senders, so only a host-local process could ever seed one.
+	if (proto == .udp) {
+		if (reply_range) |range| {
+			// Only exempt a fd the table can actually mark: for fd >=
+			// max_tracked_fds setFdPeer/markReplyExempt are no-ops, so an
+			// exempt return here would admit the connect but then deny every
+			// reply datagram one-by-one in sendmmsg. Falling through to the
+			// ordinary deny path instead fails once, cleanly, at connect.
+			const trackable = fd >= 0 and @as(usize, @intCast(fd)) < max_tracked_fds;
+			if (trackable and !filter.isLoopback(info.addr) and isForwardReplySocket(fd, range)) {
+				setFdPeer(fd, info.addr, info.port);
+				markReplyExempt(fd);
+				return real_connect.?(fd, addr, len);
+			}
+		}
+	}
+
+	// A UDP connect that did not re-qualify above drops any earlier
+	// exemption on the fd BEFORE the rule walk, whatever its outcome: a
+	// denied re-connect leaves the kernel association (and so the peer the
+	// exemption was granted for) untouched, but the mark expressed an intent
+	// this connect no longer has, so it must not survive the denial either.
+	if (proto == .udp) clearReplyExempt(fd);
+
 	// CIDR check against the ORIGINAL destination (no remap matched).
 	if (ruleset.evaluate(proto, info.addr, info.port) == .deny) {
 		denyErrno();
@@ -326,9 +419,7 @@ export fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) 
 
 	// Track connected-UDP peer for subsequent sendto/sendmsg with NULL
 	// dest_addr (typical glibc resolver pattern).
-	if (proto == .udp) {
-		setFdPeer(fd, info.addr, info.port);
-	}
+	if (proto == .udp) setFdPeer(fd, info.addr, info.port);
 
 	return real_connect.?(fd, addr, len);
 }
@@ -384,13 +475,18 @@ export fn sendto(fd: c_int, buf: ?*const anyopaque, len: usize, flags: c_int, de
 
 	const proto = fdProto(fd);
 
+	// Reply-socket exemption (see connect): the destination is worked out
+	// FIRST, and only a send to the recorded peer skips the rule walk.
 	if (dest_addr) |a| {
 		if (extractAddr(a)) |info| {
+			if (replyExemptTo(fd, info)) return real_sendto.?(fd, buf, len, flags, dest_addr, addrlen);
 			if (ruleset.evaluate(proto, info.addr, info.port) == .deny) {
 				denyErrno();
 				return -1;
 			}
 		}
+	} else if (replyExemptTo(fd, null)) {
+		return real_sendto.?(fd, buf, len, flags, dest_addr, addrlen);
 	} else if (fdPeer(fd)) |peer| {
 		// Connected UDP / TCP send with implicit peer.
 		if (ruleset.evaluate(proto, peer.addr, peer.port) == .deny) {
@@ -411,11 +507,14 @@ export fn sendmsg(fd: c_int, msg: ?*const c.struct_msghdr, flags: c_int) callcon
 		if (m.msg_name) |name| {
 			const sa: *const c.struct_sockaddr = @ptrCast(@alignCast(name));
 			if (extractAddr(sa)) |info| {
+				if (replyExemptTo(fd, info)) return real_sendmsg.?(fd, msg, flags);
 				if (ruleset.evaluate(proto, info.addr, info.port) == .deny) {
 					denyErrno();
 					return -1;
 				}
 			}
+		} else if (replyExemptTo(fd, null)) {
+			return real_sendmsg.?(fd, msg, flags);
 		} else if (fdPeer(fd)) |peer| {
 			if (ruleset.evaluate(proto, peer.addr, peer.port) == .deny) {
 				denyErrno();
@@ -432,16 +531,23 @@ export fn sendmmsg(fd: c_int, msgvec: ?[*]c.struct_mmsghdr, vlen: c_uint, flags:
 
 	const proto = fdProto(fd);
 
+	// vec[0]-only inspection, as before. passt's reply path
+	// (udp_tap_handler) sets the same to_sa on every entry, so for an
+	// exempt fd the first entry naming the recorded peer is the whole
+	// batch naming it.
 	if (msgvec) |vec| {
 		if (vlen > 0) {
 			if (vec[0].msg_hdr.msg_name) |name| {
 				const sa: *const c.struct_sockaddr = @ptrCast(@alignCast(name));
 				if (extractAddr(sa)) |info| {
+					if (replyExemptTo(fd, info)) return real_sendmmsg.?(fd, msgvec, vlen, flags);
 					if (ruleset.evaluate(proto, info.addr, info.port) == .deny) {
 						denyErrno();
 						return -1;
 					}
 				}
+			} else if (replyExemptTo(fd, null)) {
+				return real_sendmmsg.?(fd, msgvec, vlen, flags);
 			} else if (fdPeer(fd)) |peer| {
 				if (ruleset.evaluate(proto, peer.addr, peer.port) == .deny) {
 					denyErrno();
