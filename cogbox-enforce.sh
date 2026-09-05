@@ -79,6 +79,17 @@ export COGBOX_L7_FUNNEL_ALL="${COGBOX_L7_FUNNEL_ALL:-1}"
 # deny) and continue; cogworx reconciles (courier config -> __render-rules ->
 # SIGHUP) right after the enforcer is Ready. A present config is rendered now so a
 # restart re-enforces immediately without waiting on cogworx.
+#
+# SINGLE-WRITER CONTRACT: this renderer is the ONLY writer of
+# $RUNTIME/l7-inject-conf.json on the container path -- there is no
+# gen_inject_conf half here (that lives in cogbox-launch.sh, VM path only), and
+# `cogbox secret reload` renders into paths.instanceRuntime, not this pod's
+# /run/cogbox-rt. That is why __render-rules (reload.boot_foreign_specs =
+# .replace) is correct here. If a harness merge -- or any second writer of that
+# file -- is ever added on this path, every LIVE re-render must switch to
+# renderFiles(..., .preserve); a live .replace beside a second writer strips its
+# specs while leaving l7-rules' terminate-allow and the :443 funnel standing.
+# See docs/network-filtering.md, "Where the two-writer contract actually applies".
 if [ -f "$CONFIG" ]; then
 	@cogbox@ __render-rules "$CONFIG" "$RUNTIME" || die "render of $CONFIG failed"
 else

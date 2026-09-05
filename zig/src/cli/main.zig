@@ -196,7 +196,12 @@ pub fn main(init: std.process.Init) !void {
 		// over would outlive the credentials it names (the runtime dir survives a
 		// stop/start within a host session). On the container path (cogbox-enforce.sh
 		// at start, plus cogworx's courier reconcile on a live enforcer) this
-		// renderer is the file's ONLY writer, so there is nothing to preserve.
+		// renderer is the file's ONLY writer, so there is nothing to preserve:
+		// cogbox-enforce.sh has no gen_inject_conf half, and `secret reload`
+		// renders into paths.instanceRuntime, not the enforcer's /run/cogbox-rt.
+		// If a SECOND writer of l7-inject-conf.json is ever added on that path,
+		// its live re-render must go through renderFiles(.., .preserve) -- never
+		// this verb.
 		// The choice is PINNED in the renderer (reload.boot_foreign_specs) with a
 		// test on its value, so flipping the boot render to `.preserve` fails the
 		// gate instead of silently carrying a dead spec into the next boot.
