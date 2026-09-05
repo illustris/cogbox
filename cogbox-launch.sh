@@ -2074,9 +2074,18 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	# block near the config reads), so an unconfigured host runs the argv it
 	# ran before they existed. Guest DNS is a floor concern in BOTH modes, so
 	# the same pieces are applied to the full-mode invocation below.
+	# `-4` (--ipv4-only), also in both modes: no cogbox host has IPv6 egress
+	# (GCE VPC is IPv4; the container floor drops IPv6), and passt since the
+	# 2026_07 release, finding no host IPv6 interface to template, runs IPv6
+	# in "local mode" and STILL sends router advertisements -- the guest then
+	# gained `default via fe80::1`, dialled dual-stack names (NTP pool, ...)
+	# over IPv6 first and fast-failed every one ("Couldn't connect flow
+	# socket ... Network is unreachable", 10-12 per boot) before falling back
+	# to IPv4. IPv4-only turns RA/NDP/DHCPv6 off in one flag; every other
+	# argv piece (-t/-u binds, --dns-forward/--dns-host) is an IPv4 literal.
 	NETFILTER_RULES="$RUNTIME/netfilter-rules" \
 	LD_PRELOAD="@netfilter@" \
-	passt --foreground --socket "$PASST_SOCK" \
+	passt --foreground --socket "$PASST_SOCK" -4 \
 		"${PASST_RUNAS_ARGS[@]}" "${PASST_DNS_ARGS[@]}" \
 		-t "${PASST_FWD_PREFIX}${SSH_PORT}:22" -t "${PASST_FWD_PREFIX}${HTTP_PORT}:8080" "${PASST_MOSH_ARGS[@]}" &
 	PASST_PID=$!
@@ -2105,8 +2114,10 @@ elif [ "$NETWORK_MODE" != "none" ]; then
 	# Full mode: unrestricted passt. This is the mode with NO L4 filter, so
 	# whatever the host's own packet filter expresses about the guest is the
 	# only floor -- which is exactly why the uid and guest-DNS knobs must be
-	# applied here too, not only in rules mode.
-	passt --foreground --socket "$PASST_SOCK" \
+	# applied here too, not only in rules mode. Likewise `-4`: the RA-induced
+	# IPv6-first fast-fail (see the rules-mode comment) is a passt property,
+	# not a filter one.
+	passt --foreground --socket "$PASST_SOCK" -4 \
 		"${PASST_RUNAS_ARGS[@]}" "${PASST_DNS_ARGS[@]}" \
 		-t "${PASST_FWD_PREFIX}${SSH_PORT}:22" -t "${PASST_FWD_PREFIX}${HTTP_PORT}:8080" "${PASST_MOSH_ARGS[@]}" &
 	PASST_PID=$!

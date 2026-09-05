@@ -178,6 +178,20 @@ else
 		done
 	done < <(grep -n 'passt --foreground' "$LAUNCH" | cut -d: -f1)
 	[ "$missing" -eq 0 ] && ok "both passt invocations carry the uid / guest-DNS / bind / mosh knobs"
+	# Both must run passt IPv4-only. No host has IPv6 egress, and passt (since
+	# 2026_07) with no host IPv6 interface to template still sends router
+	# advertisements: the guest gets `default via fe80::1`, dials dual-stack
+	# names over IPv6 first and fast-fails each before falling back to IPv4.
+	# `-4` is the one flag that disables RA/NDP/DHCPv6 together.
+	v4=0
+	while IFS= read -r ln; do
+		window=$(sed -n "${ln},$((ln + 2))p" "$LAUNCH")
+		case "$window" in
+			*' -4 '*|*'--ipv4-only'*) ;;
+			*) bad "passt invocation at line $ln is not IPv4-only (-4); the guest would pick up a router advertisement and dial IPv6 first"; v4=1 ;;
+		esac
+	done < <(grep -n 'passt --foreground' "$LAUNCH" | cut -d: -f1)
+	[ "$v4" -eq 0 ] && ok "both passt invocations run IPv4-only (-4)"
 	# Neither invocation may pin passt's outbound source address: the netfilter
 	# shim's mosh reply exemption (zig/src/netfilter) tells passt's inbound
 	# reply sockets apart from guest-originated UDP by the latter binding the
