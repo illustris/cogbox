@@ -1349,9 +1349,19 @@ serve(80, handle_http)
     assert "host=vhost-a.test" in hits, hits
     assert "vhost-b.test" not in hits, f"sibling reached origin! log={hits!r}"
 
-    # Direct-IP / no-SNI HTTPS -> denied (proxy can't identify a vhost).
+    # Direct-IP / no-SNI HTTPS -> the no-SNI arm defers to L4; 203.0.113.0/24
+    # is L4-denied above, so it drops (proxy logs no-sni-not-l4-allowed). The
+    # drop comes from rawL4Allowed, NOT from classification: lifting that L4
+    # deny would make this request succeed.
+    wlog = "/run/user/1000/cogbox-work/cogbox.log"
+    before = int(machine.succeed(f"wc -l < {wlog}").strip())
     rc, out = gcurl("https://203.0.113.5/")
-    assert rc != 0, f"direct-IP no-SNI should be blocked, got rc={rc}"
+    assert rc != 0, f"direct-IP no-SNI should be L4-dropped, got rc={rc}"
+    machine.wait_until_succeeds(
+        f"tail -n +{before + 1} {wlog} | grep -q no-sni-not-l4-allowed", timeout=10
+    )
+    new = machine.succeed(f"tail -n +{before + 1} {wlog}")
+    assert "no-sni-not-l4-allowed" in new, f"no-SNI drop not attributed to the L4 gate: {new!r}"
 
     # SSRF canary: an allowed name that resolves (host-side) to the cloud
     # metadata IP MUST be refused by the proxy's non-overridable SSRF floor.

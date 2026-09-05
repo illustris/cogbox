@@ -369,6 +369,71 @@ test "funnel-all: plain socks5 (no funnel) drops even an L4-allowed unclassifiab
 	try t.expect(!main.rawL4Eligible(.socks5, false)); // ...but it's never routed there.
 }
 
+// --- no-SNI TLS (HTTPS to an IP literal) -> L4-gated splice on every front door ---
+//
+// RFC 6066 forbids IP literals in server_name, so HTTPS to a bare IP is a
+// well-formed ClientHello with NO SNI. The worker's .no_sni arm splices it to its
+// orig dst iff rawL4Allowed passes -- regardless of accept mode or FUNNEL_ALL --
+// because there is no vhost for an L7 rule to apply to. There is no worker-level
+// socket harness (worker() needs a SOCKS5 handshake + a live upstream), so the
+// arm's wiring is proven by the exhaustive switch over Classified (a missing
+// .no_sni arm is a compile error) plus the classification + gate tests below,
+// exactly as the funnel-all tests prove theirs.
+
+test "classify: a well-formed ClientHello with no SNI is .no_sni (not .deny)" {
+	var raw: [1200]u8 = undefined;
+	const hello = buildHello(&raw, "", false);
+	var oh: [256]u8 = undefined;
+	var op: [2048]u8 = undefined;
+	var os: [256]u8 = undefined;
+	const cl = classifyBytes(hello, &oh, &op, &os);
+	try t.expect(cl == .no_sni);
+}
+
+test "no-sni: an L4-allowed orig dst splices, a non-allowed one drops, on plain socks5" {
+	const orig = main.Orig{ .addr = .{ .ipv4 = .{ 198, 51, 100, 10 } }, .port = 443 };
+	const allow_rs = filter.parseRules("allow tcp 198.51.100.0/24:443\ndeny 0.0.0.0/0");
+	try t.expect(main.rawL4Allowed(&allow_rs, orig)); // gate passes -> spliced
+	// Eligibility is NOT consulted for .no_sni: the plain-socks5 VM front door,
+	// where .deny is hard-dropped, still L4-gates a no-SNI hello.
+	try t.expect(!main.rawL4Eligible(.socks5, false));
+	// default-deny instance -> dropped (logged no-sni-not-l4-allowed).
+	const deny_rs = filter.parseRules("");
+	try t.expect(!main.rawL4Allowed(&deny_rs, orig));
+	// wrong port under the same allow -> dropped.
+	try t.expect(!main.rawL4Allowed(&allow_rs, .{ .addr = orig.addr, .port = 8443 }));
+}
+
+test "no-sni: the hard floor still bounds it under allow-all" {
+	const rs = filter.parseRules("hard-deny 198.51.100.7/32\nallow 0.0.0.0/0");
+	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 198, 51, 100, 7 } }, .port = 443 }));
+	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 127, 0, 0, 1 } }, .port = 443 }));
+	try t.expect(!main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 169, 254, 169, 254 } }, .port = 443 }));
+	try t.expect(main.rawL4Allowed(&rs, .{ .addr = .{ .ipv4 = .{ 198, 51, 100, 8 } }, .port = 443 }));
+}
+
+test "classify: malformed TLS is still .deny (never .no_sni)" {
+	var oh: [256]u8 = undefined;
+	var op: [2048]u8 = undefined;
+	var os: [256]u8 = undefined;
+	// Handshake type 2 (ServerHello) inside a client-side record: not a ClientHello.
+	const cl = classifyBytes(&[_]u8{ 0x16, 0x03, 0x01, 0x00, 0x05, 0x02, 0x00, 0x00, 0x01, 0x00 }, &oh, &op, &os);
+	try t.expect(cl == .deny);
+
+	// A truncated valid hello: .need_more until the SHUT_WR EOF -> peekClassify deny.
+	var raw: [1200]u8 = undefined;
+	const hello = buildHello(&raw, "app.example.com", false);
+	const cl2 = classifyBytes(hello[0 .. hello.len - 4], &oh, &op, &os);
+	try t.expect(cl2 == .deny);
+
+	// An ECH hello with NO outer SNI is well-formed but must stay .deny: its
+	// encrypted inner name could be an L7-denied vhost on the orig IP, which
+	// the L4-only no-SNI splice could never see.
+	const ech_hello = buildHello(&raw, "", true);
+	const cl3 = classifyBytes(ech_hello, &oh, &op, &os);
+	try t.expect(cl3 == .deny);
+}
+
 test "classify: an ECH ClientHello is still refused on the splice tier" {
 	var raw: [1200]u8 = undefined;
 	const hello = buildHello(&raw, "app.example.com", true); // GREASE/real ECH present
