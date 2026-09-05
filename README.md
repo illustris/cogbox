@@ -193,7 +193,9 @@ cogbox monitor                      # QEMU monitor ((qemu) prompt)
 The default `rules` mode gives the sandbox working public internet while
 blocking LAN, link-local, and cloud-metadata ranges. On top of that, L7
 rules whitelist individual vhosts behind shared IPs, with TLS termination
-for `Host`/path enforcement. Rule edits hot-reload into a running VM.
+for `Host`/path enforcement. HTTPS to a bare IP (no SNI, e.g. an appliance
+with no DNS name) has no vhost to check and follows the L4 rule for that IP
+instead. Rule edits hot-reload into a running VM.
 
 ```sh
 cogbox rules add allow 192.168.1.50/32 --at 8    # open one LAN host (position matters)

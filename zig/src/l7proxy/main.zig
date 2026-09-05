@@ -135,6 +135,8 @@ var accept_mode: AcceptMode = .socks5;
 // the agent pod's in-pod shim funnels EVERY diverted port over one SOCKS5 hop,
 // so the socks5 front door now sees non-HTTP/TLS flows too. Default false keeps
 // the VM/launch socks5 path byte-identical (a .deny is hard-dropped there).
+// A well-formed no-SNI ClientHello (.no_sni) is not governed by this flag: it is
+// L4-gated on every front door (see worker).
 var funnel_all: bool = false;
 
 // COGBOX_L7_LISTEN_ADDR (host-order IPv4): the front-door listener bind address.
@@ -495,6 +497,7 @@ pub const Orig = struct { addr: filter.IpAddr, port: u16 };
 pub const Classified = union(enum) {
 	tls: tls.Sni, // SNI + whether an ECH extension accompanied it
 	http: http.Parsed,
+	no_sni, // well-formed TLS ClientHello with no cleartext SNI (HTTPS to an IP literal): no vhost to evaluate, L4-gated splice only
 	deny,
 };
 
@@ -554,10 +557,25 @@ fn worker(client_fd: c_int) void {
 			// floor + CIDR gate (rawL4Splice). Plain socks5 (VM/launch, no funnel)
 			// hard-drops here -- byte-identical to the original proxy.
 			if (rawL4Eligible(accept_mode, funnel_all)) {
-				rawL4Splice(client_fd, orig, buf[0..buffered]);
+				rawL4Splice(client_fd, orig, buf[0..buffered], "rawl4-deny");
 			} else {
 				logReject(orig, "?", "unclassifiable-or-no-sni");
 			}
+			return;
+		},
+		.no_sni => {
+			// A well-formed ClientHello with no cleartext SNI: HTTPS to an IP literal
+			// (RFC 6066 forbids IP literals in server_name), e.g. an appliance with no
+			// DNS name. There is no vhost to evaluate, so no L7 rule -- allow or deny
+			// by name -- can apply. Splice it to its orig dst iff that dst clears the
+			// raw-L4 gate (hard floor + the instance L4 CIDR policy), on EVERY front
+			// door and independent of COGBOX_L7_FUNNEL_ALL: this is exactly what the
+			// guest may already do to that IP on any non-funneled port, so it is no
+			// wider than L4 itself. A malformed hello (.deny) never reaches this arm,
+			// nor does an ECH hello with no outer SNI (tls.zig keeps it .deny, so it
+			// takes the .deny arm above, not this one: its encrypted inner name
+			// could be an L7-denied vhost on this IP).
+			rawL4Splice(client_fd, orig, buf[0..buffered], "no-sni-not-l4-allowed");
 			return;
 		},
 		.tls => |s| {
@@ -903,6 +921,7 @@ pub fn peekClassify(
 			switch (tls.extractSni(buf[0..n], out_sni)) {
 				.sni => |s| return .{ .tls = s },
 				.need_more => if (n >= buf.len) return .deny,
+				.no_sni => return .no_sni,
 				.deny => return .deny,
 			}
 		} else if (isHttpStart(buf[0])) {
@@ -1011,6 +1030,7 @@ fn connectVetted(ai: *c.struct_addrinfo, port: u16) ?c_int {
 /// the redirect front door, OR for the socks5 front door when COGBOX_L7_FUNNEL_ALL
 /// is set (the separate-pod enforcer, whose shim funnels every port over socks5).
 /// FALSE for plain socks5 (the VM/launch path) -> hard drop, byte-identical.
+/// Applies to the .deny arm only; a .no_sni hello is L4-gated regardless.
 pub fn rawL4Eligible(mode: AcceptMode, funnel: bool) bool {
 	return mode == .redirect or funnel;
 }
@@ -1030,16 +1050,22 @@ pub fn rawL4Allowed(rs: *const filter.RuleSet, orig: Orig) bool {
 	return rs.evaluate(.tcp, orig.addr, orig.port) != .deny;
 }
 
-/// Splice a non-HTTP/TLS redirect flow straight to its original destination. The
-/// dst is the kernel-recovered orig (NO name -> no re-resolve; never a
-/// guest-supplied value). Connects only after rawL4Allowed clears both gates;
-/// otherwise it logs and drops.
-fn rawL4Splice(client_fd: c_int, orig: Orig, buffered: []const u8) void {
+/// Splice a flow that carries no routable name (an unclassifiable non-HTTP/TLS
+/// .deny flow, or a well-formed TLS ClientHello with no SNI) straight to its
+/// original destination, from either front door. In redirect mode the dst is
+/// the kernel-recovered orig; in socks5 mode it is the CONNECT target the shim
+/// sent, which a hostile guest can forge -- so rawL4Allowed is re-checked here
+/// under the rules lock and is the only thing that authorizes the dial. NO
+/// name -> no re-resolve. Connects only after rawL4Allowed clears both gates;
+/// otherwise it logs and drops. deny_reason names the arm in the reject line
+/// (`rawl4-deny` for an unclassifiable flow, `no-sni-not-l4-allowed` for a
+/// no-SNI hello).
+fn rawL4Splice(client_fd: c_int, orig: Orig, buffered: []const u8, deny_reason: []const u8) void {
 	lockRules();
 	const allowed = rawL4Allowed(&cidr_rs, orig);
 	unlockRules();
 	if (!allowed) {
-		logReject(orig, "?", "rawl4-deny");
+		logReject(orig, "?", deny_reason);
 		return;
 	}
 
