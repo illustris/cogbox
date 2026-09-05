@@ -518,6 +518,14 @@ in
 		systemd.services.google-startup-scripts.wantedBy = lib.mkForce [ ];
 		systemd.services.google-shutdown-scripts.wantedBy = lib.mkForce [ ];
 
+		# The host journal must survive a reboot: it is the only record of a
+		# supervisor run once the VM has bounced, and supervisor.nix deliberately
+		# keeps its units journal-only. nixpkgs used to render Storage=persistent
+		# by default; its RFC 42 journald migration (337890d5, 2026-08-25) dropped
+		# that, and systemd's `auto` only goes persistent if /var/log/journal
+		# already exists -- which a freshly baked boot disk has no reason to.
+		services.journald.settings.Journal.Storage = "persistent";
+
 		# --- The cogbox host half ------------------------------------------
 		#
 		# Dragging in the cogbox package drags in the microvm runner, the guest

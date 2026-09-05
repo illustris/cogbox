@@ -869,9 +869,9 @@
 					# A guest journal that survives reboot -- the reason repeated
 					# "the sandbox is full" reports went undiagnosed, since the journal
 					# lived on the tmpfs root and every restart destroyed the evidence.
-					# This is a MOUNT and nothing else: journald already runs
-					# Storage=persistent (the nixpkgs default; cogbox configures
-					# journald nowhere). systemd-journal-flush.service carries
+					# This is a MOUNT and nothing else: Storage=persistent is pinned
+					# in the journald block below (nixpkgs dropped its own default in
+					# 2026-08). systemd-journal-flush.service carries
 					# RequiresMountsFor=/var/log/journal of its own; the explicit
 					# before= is the gce/state-disk.nix house idiom and costs nothing.
 					"/var/log/journal" = {
@@ -3976,14 +3976,23 @@
 				# from the 100 MiB the 10% default gives. The percentage defaults
 				# self-scale with `mem` and are already the right answer there.
 				#
-				# Joined from a list rather than written as an indented '' block: Nix
-				# strips only SPACE indentation and this file is tab-indented, so a ''
-				# block emits tab-prefixed directives into journald.conf and leans on
-				# systemd's parser stripping them.
-				services.journald.extraConfig = lib.mkIf poolEnabled (lib.concatStringsSep "\n" [
-					"SystemMaxUse=512M"
-					"SystemKeepFree=1G"
-				]);
+				# Typed settings rather than a free-text extraConfig block: nixpkgs
+				# removed services.journald.extraConfig when it migrated the module
+				# to RFC 42-style settings (337890d5, 2026-08-25) and now renders the
+				# [Journal] section from this attrset itself.
+				#
+				# Storage=persistent is pinned here because that same migration
+				# dropped nixpkgs' own `persistent` default, leaving systemd's `auto`
+				# -- which only goes persistent when /var/log/journal ALREADY exists
+				# at flush time, and nothing creates it on the root-tmpfs profiles
+				# (systemd's tmpfiles.d only adjusts the directory, never makes it).
+				# The pool bind above relies on the journal being persistent to have
+				# anything to receive; every profile ran persistent before the bump.
+				services.journald.settings.Journal = {
+					Storage = "persistent";
+					SystemMaxUse = lib.mkIf poolEnabled "512M";
+					SystemKeepFree = lib.mkIf poolEnabled "1G";
+				};
 
 				# Bounds for the jobs on the pool's boot path that this change does not
 				# author. `nofail` on the pool line bounds FAILURE; only a timeout bounds
