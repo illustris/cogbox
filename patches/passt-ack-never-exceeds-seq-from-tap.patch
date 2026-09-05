@@ -1,0 +1,50 @@
+tcp: never acknowledge to the tap beyond what the tap has sent
+
+cogbox runs passt under an LD_PRELOAD shim (zig/src/netfilter/main.zig,
+doRemappedConnect) that, for a remapped TCP flow, drives a 13-byte SOCKS5
+CONNECT handshake (zig/src/socks5/main.zig, handshake) on passt's own flow
+socket inside connect(), before passt writes the first guest byte to it.
+The peer acks those 13 bytes like any other, so tcpi_bytes_acked on that
+socket overstates the guest's data by 13 for the life of the flow.
+
+passt 2026_07_16's tcp_update_seqack_wnd() (the bandwidth-delay
+heuristic taken when the kernel reports tcpi_bytes_acked and
+tcpi_delivery_rate, the flow is not LOCAL, closing or low-RTT, and the
+sndbuf is not far above the bandwidth * delay product) derives the ACK
+it sends the guest as tcpi_bytes_acked + seq_init_from_tap, i.e. 13
+past the guest's snd_nxt.
+The guest (Linux) treats an ACK for unsent data as invalid and discards
+the segment, and passt's never-backwards guard right below then pins the
+bad value, so every later ACK is discarded too: the guest's TLS handshake
+stalls until its retransmit timer gives up. Observed on the terminate
+tier as ~25% of HTTPS connections hanging whenever the ClientHello
+exceeds one MSS (a stock TLS 1.3 hello with post-quantum key shares).
+2025_09_19's variant of the heuristic never took this branch with the
+~87 KB default sndbuf; the 2026_07_16 one does.
+
+Clamp the derived ACK to seq_from_tap before the never-backwards guard.
+seq_ack_to_tap <= seq_from_tap already holds from connection setup
+(tcp_conn_from_tap / tcp_conn_from_sock_finish set them equal), so the guard
+cannot re-raise it above the clamp. For an unmodified socket the clamp
+is a no-op: the kernel cannot have acked more than passt wrote.
+
+Upstream candidate for passt-dev: the same overstatement arises for any
+wrapper or proxy that speaks on the flow socket before passt does.
+
+--- a/tcp.c
++++ b/tcp.c
+@@ -1189,6 +1189,14 @@
+ 		                       conn->seq_init_from_tap;
+ 	}
+ 
++	/* Never acknowledge beyond what the guest has sent: bytes the peer acked
++	 * that did not come from the tap (e.g. a proxy handshake written on this
++	 * socket by a wrapper) would otherwise produce an ACK for unsent data,
++	 * which the guest discards along with every later segment.
++	 */
++	if (SEQ_GT(conn->seq_ack_to_tap, conn->seq_from_tap))
++		conn->seq_ack_to_tap = conn->seq_from_tap;
++
+ 	/* It's occasionally possible for us to go from using the fallback above
+ 	 * to the tcpi_bytes_acked method.  In that case, we must be careful not
+ 	 * to let our ACKed sequence go backwards.

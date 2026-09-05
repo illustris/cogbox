@@ -4492,6 +4492,19 @@
 				# Allow rt_sigreturn so LD_PRELOAD signal handlers work
 				# under passt's seccomp filter (needed for SIGUSR1 rule reload)
 				makeFlags = (old.makeFlags or []) ++ [ "EXTRA_SYSCALLS=rt_sigreturn" ];
+				# Clamp the ACK passt sends the guest to the bytes the guest
+				# actually sent. The L4 shim (zig/src/netfilter/main.zig
+				# doRemappedConnect) speaks a 13-byte SOCKS5 handshake
+				# (zig/src/socks5/main.zig handshake) on passt's own flow socket
+				# inside connect(), so the peer acks 13 bytes passt never saw
+				# from the tap; passt >= 2026_07_16 derives its guest-facing ACK
+				# from tcpi_bytes_acked and would ack 13 bytes past the guest's
+				# snd_nxt, which the guest discards -- with every later ACK, since
+				# passt never moves it backwards. Symptom: terminate-tier TLS
+				# stalls, ~25% of connections with a >1-MSS ClientHello. The
+				# passt-cc-patched check keeps this override loud across nixpkgs
+				# bumps. To be submitted upstream to passt-dev.
+				patches = (old.patches or []) ++ [ ./patches/passt-ack-never-exceeds-seq-from-tap.patch ];
 			});
 			cogbox = mkCogbox runner;
 			default = cogbox;
@@ -5497,6 +5510,30 @@
 			} ''
 				export HOME=$TMPDIR
 				bash ${./tests/test_enforce.sh} ${./cogbox-enforce.sh}
+				touch $out
+			'';
+
+			# The passt-cc override is the only thing standing between the L4
+			# shim's in-band SOCKS5 prefix and passt's bytes_acked-derived ACK
+			# (patches/passt-ack-never-exceeds-seq-from-tap.patch). A nixpkgs bump
+			# that changes tcp.c around the hunk fails the passt-cc build itself;
+			# this check covers the quieter failure modes -- the patch list being
+			# dropped from the override, or a future upstream tcp.c that applies
+			# the hunk somewhere the clamp no longer runs -- by asserting the
+			# clamp is present in the patched source that passt-cc compiles.
+			passt-cc-patched = assert lib.assertMsg
+				(lib.any (p: lib.hasSuffix "passt-ack-never-exceeds-seq-from-tap.patch" (toString p))
+					self.packages.${system}.passt-cc.patches)
+				"passt-cc must carry patches/passt-ack-never-exceeds-seq-from-tap.patch";
+			pkgs.runCommand "cogbox-passt-cc-patched" {
+				src = pkgs.applyPatches {
+					name = "passt-cc-patched-src";
+					src = self.packages.${system}.passt-cc.src;
+					patches = self.packages.${system}.passt-cc.patches;
+				};
+			} ''
+				grep -q 'Never acknowledge beyond what the guest has sent' $src/tcp.c
+				grep -q 'SEQ_GT(conn->seq_ack_to_tap, conn->seq_from_tap)' $src/tcp.c
 				touch $out
 			'';
 
