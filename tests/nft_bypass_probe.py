@@ -56,6 +56,18 @@ UDP53_BAD = "198.51.100.20"  # udp/53 to a NON-resolver (must drop)
 ICMP_DST = "198.51.100.30"  # icmp echo target (must drop)
 RAW_DST = "198.51.100.40"  # raw non-tcp/udp L4 target (must drop)
 V6_DST = "fd00:dead:beef::10"  # any IPv6 dst (must drop)
+# mosh: the peer plays the cogworxd gateway relay. MOSH_PEER:40000 seeds a flow INTO
+# the main netns at 10.0.0.1:MOSH_PORT (a stand-in mosh-server echo listener there),
+# whose reply must pass the floor's ct-direction-reply exception; MOSH_PEER:9999 is
+# the positive-control sink for a POD-originated datagram from the same source-port
+# range, which must still drop. 60005/60006 sit inside 60000-60031 = the range in
+# mosh-udp-range.nix (port + count - 1), the same literal the floor script carries.
+MOSH_PEER = "198.51.100.50"
+MOSH_PORT = 60005  # the in-pod "mosh-server" port (peer-initiated flow, reply allowed)
+MOSH_ORIG_SPORT = 60006  # pod-originated probe source port (must drop, in-range or not)
+MOSH_SPOOF_SPORT = 60007  # in-range sport the raw-spoof egress reuses (must still drop)
+MOSH_LOCAL = "10.0.0.1"  # the main-netns veth0 addr (a LOCAL dst -> routes via lo)
+MOSH_PROBE = b"cogbox-mosh-probe"
 
 SCTP_PROTO = 132  # IPPROTO_SCTP -- a representative non-tcp/udp IPv4 L4
 SO_ORIGINAL_DST = 80  # getsockopt(SOL_IP, ...) -> the pre-REDIRECT tuple
@@ -75,10 +87,14 @@ M_UDP_OTHER = "udp_other"  # udp/9999 leaked off-box
 M_UDP53_BAD = "udp53_bad"  # udp/53-to-non-resolver leaked off-box
 M_RAW_DROP = "raw_drop"  # proto-132 leaked off-box
 M_V6_UDP = "v6_udp"  # ipv6 udp leaked off-box
+M_MOSH_ORIG = "mosh_orig_leak"  # a pod-ORIGINATED sport-60006 udp datagram leaked off-box
+M_MOSH_REPLY = "mosh_reply"  # the in-pod :60005 echo reached the peer (reply leg admitted)
+M_MOSH_GO = "mosh_go"  # client->server control: fire the peer-initiated mosh flow now
 
 _lock = threading.Lock()
 shim_hits = []  # (ip, port) recovered from SO_ORIGINAL_DST per redirected conn
 raw_ctl_seen = []  # loopback proto-132 control packets (main-netns raw listener)
+_mosh_echo_sock = None  # the in-pod :MOSH_PORT echo socket, reused by the third-party probe
 
 
 # --- marker helpers ----------------------------------------------------------
@@ -153,6 +169,56 @@ def _serve_udp(family, ip, port, marker):
 	threading.Thread(target=loop, daemon=True).start()
 
 
+def _mosh_peer_client():
+	"""Peer-netns stand-in for the cogworxd gateway relay: once the client says go,
+	send one datagram from MOSH_PEER:40000 to the in-pod :MOSH_PORT echo and mark
+	M_MOSH_REPLY if anything comes back. The flow is seeded from OUTSIDE the main
+	netns, so the echo's datagram is `ct direction reply` there -- the one UDP shape
+	the floor admits from sport 60000-60031."""
+	s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+	s.bind((MOSH_PEER, 40000))
+	s.settimeout(0.2)
+
+	def loop():
+		if not _wait_marker(M_MOSH_GO, timeout=120.0, interval=0.1):
+			return
+		end = time.time() + 3.0
+		while time.time() < end:
+			try:
+				s.sendto(MOSH_PROBE, ("10.0.0.1", MOSH_PORT))
+				data, _ = s.recvfrom(2048)
+			except OSError:
+				continue
+			if data == MOSH_PROBE:
+				_touch(M_MOSH_REPLY)
+				return
+
+	threading.Thread(target=loop, daemon=True).start()
+
+
+def _serve_udp_echo(ip, port):
+	"""Main-netns stand-in for mosh-server: echo every datagram to its sender.
+	The socket is stashed in _mosh_echo_sock so the third-party probe can reuse
+	the same in-range sport (now carrying an established peer-seeded flow) to try
+	to reach a DIFFERENT peer."""
+	global _mosh_echo_sock
+	s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+	s.bind((ip, port))
+	_mosh_echo_sock = s
+
+	def loop():
+		while True:
+			try:
+				data, peer = s.recvfrom(2048)
+				s.sendto(data, peer)
+			except OSError:
+				return
+
+	threading.Thread(target=loop, daemon=True).start()
+
+
 def _serve_raw(sink):
 	s = socket.socket(socket.AF_INET, socket.SOCK_RAW, SCTP_PROTO)
 
@@ -187,6 +253,41 @@ def _raw_send(ip, payload):
 	s = socket.socket(socket.AF_INET, socket.SOCK_RAW, SCTP_PROTO)
 	try:
 		s.sendto(payload, (ip, 0))
+	except OSError:
+		pass
+	finally:
+		s.close()
+
+
+def _ip_checksum(data):
+	if len(data) % 2:
+		data += b"\x00"
+	total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+	total = (total >> 16) + (total & 0xFFFF)
+	total += total >> 16
+	return (~total) & 0xFFFF
+
+
+def _raw_send_udp(dst_ip, dst_port, src_ip, src_port, payload=MOSH_PROBE):
+	"""Send ONE UDP datagram with a SPOOFED source via an IP_HDRINCL raw socket
+	(needs CAP_NET_RAW; the VM test runs as root). This is finding-1's attack
+	primitive: a datagram src<A> -> <local>:<in-range> routes via lo and, absent
+	the prerouting mark, seeds a conntrack entry whose reply tuple <local>:<port>
+	-> <A> a pod-originated egress can then ride. The UDP checksum is left 0
+	(optional on IPv4)."""
+	saddr = socket.inet_aton(src_ip)
+	daddr = socket.inet_aton(dst_ip)
+	udp_len = 8 + len(payload)
+	udp = struct.pack("!HHHH", src_port, dst_port, udp_len, 0) + payload
+	total_len = 20 + udp_len
+	ip = struct.pack(
+		"!BBHHHBBH4s4s",
+		0x45, 0, total_len, 0, 0, 64, socket.IPPROTO_UDP, 0, saddr, daddr,
+	)
+	ip = ip[:10] + struct.pack("!H", _ip_checksum(ip)) + ip[12:]
+	s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+	try:
+		s.sendto(ip + udp, (dst_ip, 0))
 	except OSError:
 		pass
 	finally:
@@ -309,6 +410,69 @@ def probe_ipv6_udp_dropped():
 	return not _wait_marker(M_V6_UDP, timeout=1.0)
 
 
+# --- probes: MOSH (reply leg admitted, origin leg still closed) ----------------
+def probe_mosh_origin_dropped():
+	# A POD-originated datagram whose SOURCE port sits inside the mosh range is
+	# `ct direction original`, so the reply-only exception must not match it: the
+	# peer's :9999 sink (a bound positive control) must never see it. This is the
+	# check that the exception is not a sport-keyed UDP egress hole.
+	s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	try:
+		s.bind(("", MOSH_ORIG_SPORT))
+		s.sendto(MOSH_PROBE, (MOSH_PEER, 9999))
+	except OSError:
+		pass
+	finally:
+		s.close()
+	return not _wait_marker(M_MOSH_ORIG, timeout=1.0)
+
+
+def probe_mosh_reply_allowed():
+	# The peer (standing in for the gateway relay) seeds a flow INTO :MOSH_PORT; the
+	# in-pod echo's answer is the reply leg and must reach it. Without the floor's
+	# exception this datagram (udp, oif=veth0, not port 53) falls to policy drop.
+	_touch(M_MOSH_GO)
+	return _wait_marker(M_MOSH_REPLY, timeout=4.0)
+
+
+def probe_mosh_established_no_third_party():
+	# Runs AFTER probe_mosh_reply_allowed, so :MOSH_PORT now carries an established,
+	# marked, peer-seeded flow. The pod reuses that SAME in-range sport to reach a
+	# DIFFERENT peer/port: that is a fresh flow (ct direction original, unmarked),
+	# so neither `ct direction reply` nor `ct mark 0x6d` matches and it must drop.
+	# Guards against a future loosening of the reply rule to a bare `ct state
+	# established`, which would pass both other mosh probes yet leak here.
+	if _mosh_echo_sock is not None:
+		try:
+			_mosh_echo_sock.sendto(MOSH_PROBE, (MOSH_PEER, 9999))
+		except OSError:
+			pass
+	return not _wait_marker(M_MOSH_ORIG, timeout=1.0)
+
+
+def probe_mosh_raw_spoof_seed_dropped():
+	# Finding-1's CAP_NET_RAW vector, proved closed by the prerouting mark. Forge a
+	# lo-injected seed src MOSH_PEER:9999 -> MOSH_LOCAL:MOSH_SPOOF_SPORT (a local
+	# dst, so it routes via lo and `oif "lo"` waves it through), which absent the
+	# mark would leave a conntrack entry whose reply tuple an in-range-sport egress
+	# can ride. Then send from that sport to MOSH_PEER:9999. Because the seed came
+	# in on lo it never got ct mark 0x6d, so the reply rule refuses the egress and
+	# the MOSH_PEER:9999 sink (M_MOSH_ORIG) must stay silent. (If the forged seed
+	# fails to register a conntrack entry the egress simply drops as a cold
+	# original datagram -- still no marker, never a false failure.)
+	_raw_send_udp(MOSH_LOCAL, MOSH_SPOOF_SPORT, MOSH_PEER, 9999)
+	time.sleep(0.2)
+	s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	try:
+		s.bind(("", MOSH_SPOOF_SPORT))
+		s.sendto(MOSH_PROBE, (MOSH_PEER, 9999))
+	except OSError:
+		pass
+	finally:
+		s.close()
+	return not _wait_marker(M_MOSH_ORIG, timeout=1.0)
+
+
 CHECKS = [
 	("FORCED-THROUGH  tcp literal-IP  -> shim w/ orig dst", probe_forced_tcp_literal),
 	("FORCED-THROUGH  tcp by-name      -> shim w/ orig dst", probe_forced_tcp_name),
@@ -322,6 +486,10 @@ CHECKS = [
 	("CLOSED          raw proto-132 -> dropped", probe_raw_l4_dropped),
 	("CLOSED          ipv6 tcp -> dropped", probe_ipv6_tcp_dropped),
 	("CLOSED          ipv6 udp -> dropped", probe_ipv6_udp_dropped),
+	("CLOSED          udp sport 60006 pod-originated -> dropped", probe_mosh_origin_dropped),
+	("ALLOWED         udp reply from :60005 to peer-initiated flow", probe_mosh_reply_allowed),
+	("CLOSED          udp :60005 established-sport -> third party dropped", probe_mosh_established_no_third_party),
+	("CLOSED          udp raw-spoof lo seed -> in-range egress dropped", probe_mosh_raw_spoof_seed_dropped),
 ]
 
 
@@ -345,6 +513,10 @@ def serve():
 	_serve_udp(socket.AF_INET, UDP_OTHER, 9999, M_UDP_OTHER)
 	_serve_udp(socket.AF_INET, UDP53_BAD, 53, M_UDP53_BAD)
 	_serve_udp(socket.AF_INET6, V6_DST, 53, M_V6_UDP)
+	# mosh: the sink for a pod-originated in-range-sport datagram (positive control,
+	# must stay unmarked) + the gateway-relay stand-in that seeds the reply-leg flow.
+	_serve_udp(socket.AF_INET, MOSH_PEER, 9999, M_MOSH_ORIG)
+	_mosh_peer_client()
 	# Raw proto-132 drop target.
 	_serve_raw(_raw_sink)
 	time.sleep(0.3)
@@ -364,6 +536,9 @@ def main():
 			raw_ctl_seen.append(data)
 
 	_serve_raw(_ctl_sink)
+	# mosh-server stand-in: an echo on the in-range port, bound BEFORE READY so the
+	# peer's seeding datagram never races the listener.
+	_serve_udp_echo("0.0.0.0", MOSH_PORT)
 	if not _wait_marker(READY, timeout=15.0):
 		print("FAIL  peer listener server never signalled READY")
 		print("LEAK-DETECTED")

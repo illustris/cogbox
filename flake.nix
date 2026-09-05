@@ -2702,6 +2702,33 @@
 				services.openssh.hostKeys = lib.mkIf (isContainer || isVm) [
 					{ type = "ed25519"; path = if isContainer then "${stateRoot}/ssh/ssh_host_ed25519_key" else "/var/lib/cogbox/ssh/ssh_host_ed25519_key"; }
 				];
+				# mosh: admit the sandbox-side UDP range mosh-server binds. This
+				# flake sets no other networking.firewall option, so on the VM
+				# target the NixOS default (iptables) firewall is enabled and its
+				# allow-list is just sshd's port (services.openssh.openFirewall) --
+				# hence this range must be added explicitly, or the mosh-server a
+				# client just started is unreachable and the client dies with
+				# "Did not find mosh server startup message" after 60 s. On the
+				# container target the firewall unit is condition-skipped
+				# (nixpkgs firewall-iptables.nix: ConditionCapability=CAP_NET_ADMIN,
+				# and the pod holds none), so the option is inert there and the
+				# per-instance NetworkPolicy + the nft-init floor are the controls.
+				# The range comes from mosh-udp-range.nix, which the cogworx
+				# gateway mirrors (it injects `-p lo:hi` into the exec).
+				#
+				# NOTE (tracked for the stage mosh E2E, not settled here): with the
+				# firewall enabled the VM guest INPUT chain also gates the passt
+				# `-t <VM_IP>/8080:8080` HTTP forward the GCE app proxy uses, yet
+				# nothing opens guest :8080. Either that forward is already dropped
+				# on GCE (a pre-existing app-proxy gap to fix separately by opening
+				# the httpPort here) or the guest firewall is not runtime-effective
+				# for tap-delivered traffic (in which case this UDP rule is a no-op
+				# belt to the NetworkPolicy/nft controls). The stage E2E should
+				# capture `iptables -S nixos-fw` in the hosted guest and check
+				# :8080 end-to-end so we resolve which, and act on it, out of band.
+				networking.firewall.allowedUDPPortRanges = let r = import ./mosh-udp-range.nix; in [
+					{ from = r.port; to = r.port + r.count - 1; }
+				];
 
 				environment.systemPackages = with pkgs; [
 					git
@@ -2715,6 +2742,17 @@
 					# CA into root's NSS db with it (so Chromium/Playwright trust the
 					# terminate tier); also handy for inspecting that trust.
 					nss.tools
+					# mosh-server only (the client is never run in-guest); utempter
+					# off (no /run/wrappers helper in the guest, and utmp records
+					# are irrelevant). Ungated: both the vm and container targets
+					# are cluster-launched, and the sshd exec channel's PATH is
+					# /run/current-system/sw/bin, which cogbox.packages cannot
+					# reach on the container. The cogworx SSH gateway rewrites
+					# the client's `mosh-server new ...` exec (injecting the
+					# mosh-udp-range.nix port range) and relays the UDP session;
+					# the guest side only has to admit the range (firewall
+					# below, NetworkPolicy + nft floor on the container).
+					(mosh.override { withClient = false; withUtempter = false; })
 
 					# Generic CLI toolkit, broadly useful to any in-guest agent or
 					# task. Grouped by purpose; jq/curl/git are above.
@@ -5040,6 +5078,12 @@
 			gceWorkstationCogbox = self.packages.x86_64-linux.cogbox;
 			gceHostedRunner = self.nixosConfigurations."cogbox-x86_64-hosted".config.microvm.declaredRunner;
 			gceWorkstationRunner = self.nixosConfigurations.cogbox-x86_64.config.microvm.declaredRunner;
+			# The mosh seam, for gce-image-mosh-forward: the range the HOST tells
+			# passt to forward (the supervisor env the launcher reads) and the
+			# GUEST toplevel that must carry mosh-server on the sshd exec PATH.
+			gceHostedToplevel = self.nixosConfigurations."cogbox-x86_64-hosted".config.system.build.toplevel;
+			gceMoshForward = gceCfg.systemd.services.cogworx-supervisor.environment.COGBOX_MOSH_UDP_FORWARD;
+			gceMoshRange = import ./mosh-udp-range.nix;
 			gceHostedVolumeDevices = map (v: v.image)
 				(lib.filter (v: !v.autoCreate)
 					self.nixosConfigurations."cogbox-x86_64-hosted".config.microvm.volumes);
@@ -8470,6 +8514,39 @@
 			# is visible and named -- otherwise this is the stuck-in-Booting mode with a
 			# tidier cause. The second half of this check asserts those legs against
 			# the realized units.
+			# The GCE half of the mosh contract, pinned where both ends meet: the
+			# supervisor's COGBOX_MOSH_UDP_FORWARD (what passt forwards and what
+			# the shim exempts) must spell exactly the range mosh-udp-range.nix
+			# declares -- the same range cogworx injects into every mosh-server
+			# exec -- and the hosted GUEST must actually have mosh-server where
+			# sshd's exec channel looks (/run/current-system/sw/bin), or the
+			# forward points at a port nothing will ever bind. The launcher the
+			# image bakes must also still carry the -u wiring, so an edit that
+			# drops it from the shipped script (not only the repo copy the
+			# launch-flag-tests read) fails here.
+			gce-image-mosh-forward = pkgs.runCommand "gce-image-mosh-forward" { } ''
+				fails=0
+				want='${toString gceMoshRange.port}-${toString (gceMoshRange.port + gceMoshRange.count - 1)}'
+				if [ '${gceMoshForward}' != "$want" ]; then
+					echo "FAIL: cogworx-supervisor exports COGBOX_MOSH_UDP_FORWARD='${gceMoshForward}', mosh-udp-range.nix says $want; passt would forward a range the gateway does not inject" >&2
+					fails=$((fails + 1))
+				fi
+				if [ ! -x '${gceHostedToplevel}/sw/bin/mosh-server' ]; then
+					echo "FAIL: the hosted guest toplevel has no /sw/bin/mosh-server; the relayed exec would fail with command not found" >&2
+					fails=$((fails + 1))
+				fi
+				if [ -e '${gceHostedToplevel}/sw/bin/mosh' ] || [ -e '${gceHostedToplevel}/sw/bin/mosh-client' ]; then
+					echo "FAIL: the hosted guest carries the mosh CLIENT; withClient = false was meant to keep it out" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF -- '-u "''${PASST_FWD_PREFIX}''${COGBOX_MOSH_UDP_FORWARD}"' '${gceHostedCogbox}/libexec/cogbox-launch.sh'; then
+					echo "FAIL: the baked hosted launcher does not render the mosh -u forward with the bind prefix" >&2
+					fails=$((fails + 1))
+				fi
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
 			gce-image-hosted-guest-profile = pkgs.runCommand "gce-image-hosted-guest-profile" { } ''
 				fails=0
 

@@ -1340,6 +1340,21 @@ BIND_ADDR=$(jq -r '.bindAddr // "127.0.0.1"' "$ACTIVE_CONFIG")
 #                      instead of every address. Opt-in because the k8s and
 #                      local backends leave `.bindAddr` at 127.0.0.1 and depend
 #                      on the forwards being reachable at the pod/host address.
+# COGBOX_MOSH_UDP_FORWARD  <lo>-<hi>: also forward this guest UDP port range
+#                      through passt (`-u`), for mosh. mosh-server binds a
+#                      port in this range inside the guest (the cogworx
+#                      gateway injects `-p lo:hi` into the exec) and the
+#                      gateway relays the client's datagrams to the host
+#                      address, so the forward must exist for the session to
+#                      reach the guest at all. Digits only, dash-separated;
+#                      anything else is a usage error (exit 64). Composes with
+#                      COGBOX_PASST_BIND_FORWARDS exactly like the -t forwards
+#                      (`-u <bind>/lo-hi`). The LD_PRELOAD netfilter shim reads
+#                      the SAME variable to exempt passt's inbound reply
+#                      sockets (docs/network-filtering.md), so the two never
+#                      name different ranges. Unset => no -u and the passt argv
+#                      is byte-identical to before the knob existed. `none`
+#                      mode (SLIRP) ignores it: mosh is unsupported there.
 PASST_RUNAS_ARGS=()
 [ -n "${COGBOX_PASST_RUNAS:-}" ] && PASST_RUNAS_ARGS=(--runas "$COGBOX_PASST_RUNAS")
 PASST_DNS_ARGS=()
@@ -1352,6 +1367,32 @@ fi
 # on the target passt build before relying on this knob.
 PASST_FWD_PREFIX=""
 [ -n "${COGBOX_PASST_BIND_FORWARDS:-}" ] && PASST_FWD_PREFIX="${BIND_ADDR}/"
+# mosh UDP forward. Validated to <digits>-<digits> so a stray colon (the
+# mosh-server `-p lo:hi` spelling) or a bare port can never reach passt, whose
+# own parse error would only surface as a boot-loop; the passt(1) range form
+# is `-u lo-hi`, and the bind prefix composes as for -t. Never add
+# `--outbound-addr`/`-o` here: the shim's reply exemption keys on
+# guest-originated UDP binding the unspecified address.
+PASST_MOSH_ARGS=()
+if [ -n "${COGBOX_MOSH_UDP_FORWARD:-}" ]; then
+	case "$COGBOX_MOSH_UDP_FORWARD" in
+		# reject first (non-digit, leading/trailing/doubled dash), then require
+		# exactly one dash so a bare port is refused too
+		*[!0-9-]*|-*|*-|*-*-*|'') die "COGBOX_MOSH_UDP_FORWARD must be <lo>-<hi> (digits), got '$COGBOX_MOSH_UDP_FORWARD'" 64 ;;
+		*-*) ;;
+		*) die "COGBOX_MOSH_UDP_FORWARD must be <lo>-<hi> (digits), got '$COGBOX_MOSH_UDP_FORWARD'" 64 ;;
+	esac
+	# same bounds as the shim's parsePortRange (zig/src/filter.zig): 1 <= lo <=
+	# hi <= 65535, so a range the shim would silently refuse never reaches passt
+	mosh_lo="${COGBOX_MOSH_UDP_FORWARD%-*}"
+	mosh_hi="${COGBOX_MOSH_UDP_FORWARD#*-}"
+	if [ "${#mosh_lo}" -gt 5 ] || [ "${#mosh_hi}" -gt 5 ] \
+		|| [ "$mosh_lo" -lt 1 ] || [ "$mosh_hi" -gt 65535 ] || [ "$mosh_lo" -gt "$mosh_hi" ]; then
+		die "COGBOX_MOSH_UDP_FORWARD must be <lo>-<hi> with 1 <= lo <= hi <= 65535, got '$COGBOX_MOSH_UDP_FORWARD'" 64
+	fi
+	unset mosh_lo mosh_hi
+	PASST_MOSH_ARGS=(-u "${PASST_FWD_PREFIX}${COGBOX_MOSH_UDP_FORWARD}")
+fi
 # Run a host-half helper under the proxy uid when one is configured. Expands to
 # nothing when it is not, so the command line is unchanged.
 # Accepts `user` (group of the same name) or `user:group`.
@@ -2029,7 +2070,7 @@ launch_vm() {
 
 if [ "$NETWORK_MODE" = "rules" ]; then
 	# Rules mode: passt with LD_PRELOAD netfilter. The RUNAS / guest-DNS /
-	# forward-prefix pieces expand to NOTHING unless their knob is set (see the
+	# forward-prefix / mosh-forward pieces expand to NOTHING unless their knob is set (see the
 	# block near the config reads), so an unconfigured host runs the argv it
 	# ran before they existed. Guest DNS is a floor concern in BOTH modes, so
 	# the same pieces are applied to the full-mode invocation below.
@@ -2037,7 +2078,7 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	LD_PRELOAD="@netfilter@" \
 	passt --foreground --socket "$PASST_SOCK" \
 		"${PASST_RUNAS_ARGS[@]}" "${PASST_DNS_ARGS[@]}" \
-		-t "${PASST_FWD_PREFIX}${SSH_PORT}:22" -t "${PASST_FWD_PREFIX}${HTTP_PORT}:8080" &
+		-t "${PASST_FWD_PREFIX}${SSH_PORT}:22" -t "${PASST_FWD_PREFIX}${HTTP_PORT}:8080" "${PASST_MOSH_ARGS[@]}" &
 	PASST_PID=$!
 	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt
@@ -2067,7 +2108,7 @@ elif [ "$NETWORK_MODE" != "none" ]; then
 	# applied here too, not only in rules mode.
 	passt --foreground --socket "$PASST_SOCK" \
 		"${PASST_RUNAS_ARGS[@]}" "${PASST_DNS_ARGS[@]}" \
-		-t "${PASST_FWD_PREFIX}${SSH_PORT}:22" -t "${PASST_FWD_PREFIX}${HTTP_PORT}:8080" &
+		-t "${PASST_FWD_PREFIX}${SSH_PORT}:22" -t "${PASST_FWD_PREFIX}${HTTP_PORT}:8080" "${PASST_MOSH_ARGS[@]}" &
 	PASST_PID=$!
 	echo "$PASST_PID" > "$RUNTIME/passt.pid"
 	wait_for_passt

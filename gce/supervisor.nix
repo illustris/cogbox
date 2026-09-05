@@ -119,6 +119,15 @@ in
 				# and k8s backends leave bindAddr at loopback and depend on the
 				# forwards being reachable at the pod address.
 				COGBOX_PASST_BIND_FORWARDS = "1";
+				# mosh: also forward the guest's mosh UDP range. With
+				# COGBOX_PASST_BIND_FORWARDS=1 passt renders `-u <VM_IP>/60000-60031`
+				# (the -t forwards take the same prefix). The LD_PRELOAD shim reads
+				# the SAME variable to exempt passt's inbound reply sockets for
+				# this range from the rules-mode deny (docs/network-filtering.md),
+				# so the forward and the exemption cannot drift apart. No floor
+				# change: gce/floor.nix is OUTPUT-only and the reply sockets
+				# target the cogworxd relay, which none of its rules name.
+				COGBOX_MOSH_UDP_FORWARD = "${toString cfg.moshUDPPort}-${toString (cfg.moshUDPPort + cfg.moshUDPPortRange - 1)}";
 				# The loopback socket passt re-emits the guest's intercepted DNS
 				# queries to (`--dns-host`), which is also what supervise.sh
 				# hands `cogbox init --dns-host` so the L4 shim admits that one

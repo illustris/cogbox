@@ -22,6 +22,7 @@ HITDIR = "/run/cbxprobe"
 PEER_V4 = [
     "10.96.0.10", "10.96.12.34", "192.0.2.10", "192.0.2.20", "192.0.2.30",
     "198.51.100.10", "198.51.100.20", "198.51.100.30", "198.51.100.40",
+    "198.51.100.50",
 ]
 PEER_V6 = ["fd00:dead:beef::10"]
 # Routes that send each probe dst off-box (oif=veth0) via the peer next-hop.
@@ -90,6 +91,23 @@ machine.fail(
     "nft list chain inet cogbox_floor output "
     "| grep -E '^[[:space:]]*udp dport 53 accept$'"
 )
+# 4b. The mosh REPLY-leg exception is present and is exactly the reply-only,
+#     seed-marked shape: established + ct direction reply + ct mark 0x6d, so only a
+#     flow whose seed we saw arrive on a real interface (marked by the prerouting
+#     chain, NOT a lo-injected raw-socket spoof) gets its answers out. The
+#     60000-60031 literal is pinned to mosh-udp-range.nix (port + count - 1); a
+#     drift in either breaks every mosh session, so keep the spellings in step.
+machine.succeed(
+    "nft list chain inet cogbox_floor output "
+    "| grep -F 'udp sport 60000-60031 ct state established ct direction reply ct mark 0x0000006d counter'"
+)
+# 4c. ...and its seed-marking half exists in prerouting and is iif-guarded: a seed
+#     that arrives on lo (the raw-socket spoof path) must NOT be marked, so the
+#     rule's soundness does not silently depend on the pod lacking CAP_NET_RAW.
+machine.succeed(
+    "nft list chain inet cogbox_floor prerouting "
+    "| grep -F 'iif != \"lo\" udp dport 60000-60031 ct state new ct mark set 0x0000006d'"
+)
 
 # 5. Run the in-guest probe harness: it asserts every egress path against the off-box
 #    dsts and exits non-zero (with a PASS/FAIL report) on any leak.
@@ -114,3 +132,8 @@ machine.succeed(
     "nft list chain inet cogbox_floor output "
     "| grep -F 'ip daddr 10.96.0.10 udp dport 53 accept'"
 )
+# ...and carries NO mosh exception, on EITHER half: the fallback floor is
+# deny-all-but-DNS, so a misconfigured nft-init must not leave the mosh reply leg
+# open nor even the seed-marking prerouting chain that arms it.
+machine.fail("nft list chain inet cogbox_floor output | grep -F 'udp sport 60000-60031'")
+machine.fail("nft list chain inet cogbox_floor prerouting")
