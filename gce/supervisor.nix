@@ -39,7 +39,9 @@ let
 	supervise = pkgs.runCommand "cogworx-supervise" { } ''
 		mkdir -p $out/bin
 		install -m0755 ${./supervise.sh} $out/bin/cogworx-supervise
+		install -m0755 ${./stop-supervisor.sh} $out/bin/cogworx-stop-supervisor
 		patchShebangs $out/bin/cogworx-supervise
+		patchShebangs $out/bin/cogworx-stop-supervisor
 	'';
 
 	# Level-held readiness: this covers the crash paths the poll loop cannot
@@ -145,7 +147,14 @@ in
 			serviceConfig = {
 				Type = "simple";
 				ExecStart = "${supervise}/bin/cogworx-supervise";
+				ExecStop = "${supervise}/bin/cogworx-stop-supervisor ${cfg.cogboxPackage}/bin/cogbox";
 				ExecStopPost = "${stopPost}/bin/cogworx-supervisor-stop";
+				# ExecStop owns the entire graceful window. Only AFTER it returns
+				# (or times out) may systemd kill the remaining service cgroup.
+				KillMode = "control-group";
+				KillSignal = "SIGKILL";
+				TimeoutStopFailureMode = "kill";
+				TimeoutStopSec = "75s";
 				Restart = "always";
 				# FLAT, and deliberately so. The obvious way to stop a permanently
 				# broken box that restarts without bound (the failure mode
