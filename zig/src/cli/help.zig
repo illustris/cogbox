@@ -178,11 +178,14 @@ pub const STOP =
     \\
     \\Options:
     \\  -n, --name NAME       Instance name (default: "default")
-    \\  --force               After 10s of SIGTERM with no exit, send SIGKILL
+    \\  --force               Skip guest grace; ask the launcher to terminate QEMU
     \\  -h, --help            Show this help and exit
     \\
-    \\Idempotent: if the instance isn't running (no PID file, or the process is
-    \\already dead), stop prints "instance 'NAME' is not running" and exits 0.
+    \\Idempotent when no launch is recorded. A retained launch consumes its
+    \\matching stop result; failed, missing or changed outcomes remain errors.
+    \\Normal stop allows up to 45s for orderly guest shutdown, then uses bounded
+    \\forced termination with a data-loss warning. Total wait is at most 65s.
+    \\An older launcher receives TERM only; its shutdown cannot be verified.
     \\
 ;
 

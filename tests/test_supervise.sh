@@ -272,6 +272,25 @@ BASE_ATTRS=(
 
 rc=$(run_boot normal "${BASE_ATTRS[@]}")
 md="$ROOT/normal/md"
+[ "$(cat "$ROOT/normal/run/cogworx-supervisor-instance" 2>/dev/null)" = demo ] \
+	|| bad "normal start did not capture the exact shutdown identity"
+[ "$(stat -c %a "$ROOT/normal/run/cogworx-supervisor-instance" 2>/dev/null)" = 600 ] \
+	|| bad "shutdown identity was not private"
+
+# A surviving previous QEMU holds the lifetime flock. Neither its runtime nor
+# the inode protecting it may be removed by a supervisor restart.
+mkdir -p "$ROOT/locked/run/cogbox-demo"
+printf 'preserved\n' > "$ROOT/locked/run/cogbox-demo/sentinel"
+exec 8> "$ROOT/locked/run/cogbox-demo.lock"
+flock -x 8
+lock_inode=$(stat -c %i "$ROOT/locked/run/cogbox-demo.lock")
+locked_rc=$(run_boot locked "${BASE_ATTRS[@]}" 8>&-)
+[ "$locked_rc" != 0 ] || bad "supervisor accepted an owned runtime"
+[ "$(evcount "$ROOT/locked/md" 'cogbox start')" = 0 ] || bad "supervisor launched over an owned runtime"
+[ "$(cat "$ROOT/locked/run/cogbox-demo/sentinel")" = preserved ] || bad "supervisor deleted live runtime contents"
+[ "$(stat -c %i "$ROOT/locked/run/cogbox-demo.lock")" = "$lock_inode" ] || bad "supervisor replaced the lifetime lock inode"
+exec 8>&-
+ok "owned runtime contents and lifetime lock survive supervisor restart"
 
 # The supervisor exits non-zero once the sandbox is gone, so Restart=always
 # re-runs the whole sequence rather than leaving a half-torn-down instance.

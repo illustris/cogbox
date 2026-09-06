@@ -4416,10 +4416,12 @@
 				# L7 terminate-tier enforcement addon for mitmproxy.
 				cp ${./l7-mitm-addon.py} $out/libexec/l7-mitm-addon.py
 				cp ${./cogbox-launch.sh} $out/libexec/cogbox-launch.sh
+				cp ${./cogbox-shutdown.sh} $out/libexec/cogbox-shutdown.sh
 				chmod +w $out/libexec/cogbox-launch.sh
 				substituteInPlace $out/libexec/cogbox-launch.sh \
 					--replace-fail "@runtimeDir@" "${runtimeDir}" \
 					--replace-fail "@runner@" "${runner'}" \
+					--replace-fail "@shutdown@" "$out/libexec/cogbox-shutdown.sh" \
 					--replace-fail "@netfilter@" "$out/lib/libnetfilter.so" \
 					--replace-fail "@cogbox@" "$out/bin/cogbox" \
 					--replace-fail "@harnesses@" "${harnessNames}" \
@@ -5496,6 +5498,13 @@
 				touch $out
 			'';
 
+			shutdown-tests = pkgs.runCommand "cogbox-shutdown-tests" {
+				nativeBuildInputs = with pkgs; [ bash coreutils python3 util-linux ];
+			} ''
+				python3 ${./tests/test_shutdown.py} ${./cogbox-shutdown.sh} ${./cogbox-launch.sh} ${self.packages.${system}.cogbox-tools}/bin/cogbox
+				touch $out
+			'';
+
 			# cogbox-nft-divert.sh feeds its ruleset through UNQUOTED heredocs (the
 			# shell must expand the divert port / enforcer carve-out / DNS allow
 			# rules inside them), so any backtick or $( in an nft COMMENT there is
@@ -6014,6 +6023,18 @@
 				esac
 				if ! grep -q '^ExecStopPost=.' "$sup"; then
 					echo "FAIL: supervisor has no ExecStopPost; readiness would latch across the crash paths the poll loop cannot see" >&2
+					fails=$((fails + 1))
+				fi
+				# ExecStop, not the cgroup TERM, owns guest grace. Assert the
+				# realized unit so module merging cannot silently remove it.
+				for setting in 'KillMode=control-group' 'KillSignal=SIGKILL' 'TimeoutStopFailureMode=kill' 'TimeoutStopSec=75s' 'Restart=always' 'StandardOutput=journal' 'StandardError=journal'; do
+					if ! grep -qx "$setting" "$sup"; then
+						echo "FAIL: supervisor missing shutdown contract $setting" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				if ! grep -q '^ExecStop=.*/bin/cogworx-stop-supervisor /nix/store/.*/bin/cogbox$' "$sup"; then
+					echo 'FAIL: supervisor lacks exact trusted synchronous stop command' >&2
 					fails=$((fails + 1))
 				fi
 
@@ -9297,10 +9318,23 @@
 			# The supervisor's orderings and refusals, none of which are visible in
 			# the unit file. See tests/test_supervise.sh for what each case guards.
 			gce-supervise-tests = pkgs.runCommand "gce-supervise-tests" {
-				nativeBuildInputs = with pkgs; [ bash coreutils gawk gnugrep ];
+				nativeBuildInputs = with pkgs; [ bash coreutils gawk gnugrep util-linux ];
 			} ''
 				export HOME=$TMPDIR
 				bash ${./tests/test_supervise.sh} ${./gce/supervise.sh}
+				bash ${./tests/test_stop_supervisor.sh} ${./gce/stop-supervisor.sh} ${./gce/supervise.sh}
+				# The Nix sandbox has no /run/current-system. Replace only the
+				# trusted tool root; both executions must stop at the explicit GO
+				# guard, before any root/systemd check or transient-unit action.
+				substitute ${./tests/test_shutdown_systemd.sh} guarded-fixture.sh \
+					--replace-fail 'export PATH=/run/current-system/sw/bin' 'export PATH=${pkgs.coreutils}/bin'
+				for inherited_path in "" /nonexistent; do
+					rc=0
+					env -u COGBOX_SHUTDOWN_FIXTURE_GO PATH="$inherited_path" ${pkgs.bash}/bin/bash guarded-fixture.sh --run > guard.log 2>&1 || rc=$?
+					[ "$rc" -eq 1 ]
+					grep -qx 'FAIL: explicit stage-only GO required' guard.log
+					echo "ok - systemd fixture reaches GO guard with inherited PATH='$inherited_path'"
+				done
 				touch $out
 			'';
 

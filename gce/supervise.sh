@@ -24,7 +24,7 @@
 #   d2  maintenance short-circuit: initialized, but the sandbox guest is
 #       deliberately never started
 #   c   stage the gateway SSH CA + principal before the guest boots
-#   e   wipe the stale runtime dir and lock
+#   e   clear stale runtime under the instance lock, keeping its inode
 #   f   cogbox start --no-ssh
 #   g   (moved out) the cogbox.log tail lives in cogworx-cogbox-log.service
 #   h   publish readiness once the GUEST's host key file appears
@@ -60,6 +60,11 @@ VM_HOSTKEY_PUB="$STATE_DIR/sshd/ssh_host_ed25519_key.pub"
 POLL_INTERVAL="${COGWORX_POLL_INTERVAL:-5}"
 READY_TIMEOUT="${COGWORX_READY_TIMEOUT:-300}"
 HOSTKEY_TIMEOUT="${COGWORX_HOSTKEY_TIMEOUT:-60}"
+STOP_INSTANCE="${XDG_RUNTIME_DIR:-/run}/cogworx-supervisor-instance"
+STOPPING="${XDG_RUNTIME_DIR:-/run}/cogworx-supervisor-stopping"
+# This unit has one supervisor run at a time. No old identity may survive a
+# failed/maintenance/resolver boot and accidentally stop a different guest.
+rm -f "$STOP_INSTANCE" "$STOPPING"
 
 # Classified serial writer. Everything else in this script -- and every child
 # it spawns -- writes to the journal.
@@ -236,6 +241,8 @@ fi
 # --- instance shape, all from metadata --------------------------------------
 INSTANCE="$(md_get cogworx-instance)"
 [ -n "$INSTANCE" ] || fatal "no cogworx-instance in instance metadata"
+[[ "$INSTANCE" =~ ^[a-zA-Z][a-zA-Z0-9-]{0,63}$ ]] && [ "$INSTANCE" != default ] \
+	|| fatal "invalid instance name in metadata"
 VCPU="$(md_get cogworx-vcpu)"
 MEMMB="$(md_get cogworx-mem-mb)"
 NETWORK="$(md_get cogworx-network)"
@@ -519,12 +526,16 @@ if [ -n "${COGBOX_PROXY_RUNAS:-}" ]; then
 	chmod 0750 "$_icd/l7-ca" 2>/dev/null || true
 fi
 
-# --- (e) wipe the stale runtime dir and lock --------------------------------
+# --- (e) clear stale runtime under the instance lock ------------------------
 #
 # Still required despite /run being a tmpfs on a full VM: a live pidfile with a
 # recycled pid false-trips cogbox's "already running" guard and exits 75.
 RT="$XDG_RUNTIME_DIR/cogbox-$INSTANCE"
-rm -rf "$RT" "$RT.lock"
+exec {runtime_lock}> "$RT.lock" || fatal "cannot open instance lifetime lock"
+flock -n "$runtime_lock" || fatal "previous guest still owns its runtime; refusing to replace live storage paths"
+rm -rf "$RT"
+exec {runtime_lock}>&-
+# Never unlink the lock inode: an unconfirmed surviving QEMU inherits it.
 
 # --- (e2) the guest's block volumes must exist before the launch ------------
 #
@@ -564,7 +575,16 @@ emit "starting sandbox $INSTANCE"
 start_args=(start --no-ssh -y -n "$INSTANCE")
 [ -n "$VCPU" ] && start_args+=(--vcpu "$VCPU")
 [ -n "$MEMMB" ] && start_args+=(--mem "$MEMMB")
-if ! cogbox "${start_args[@]}"; then
+start_sandbox() {
+	# The close on cogbox's fd prevents its daemon/QEMU from inheriting this
+	# short admission lock. ExecStop either observes a completed admission or
+	# reports a bounded startup failure before systemd's final cgroup cleanup.
+	flock -x 9 || return 1
+	[ ! -e "$STOPPING" ] || return 1
+	(umask 077; printf '%s\n' "$INSTANCE" > "$STOP_INSTANCE") || return 1
+	cogbox "${start_args[@]}" 9>&-
+}
+if ! start_sandbox 9> "${XDG_RUNTIME_DIR:-/run}/cogworx-supervisor-start.lock"; then
 	emit "sandbox start failed"
 	ga_del cogworx/ready || true
 	backoff_sleep
