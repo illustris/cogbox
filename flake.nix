@@ -5496,6 +5496,25 @@
 				touch $out
 			'';
 
+			# cogbox-nft-divert.sh feeds its ruleset through UNQUOTED heredocs (the
+			# shell must expand the divert port / enforcer carve-out / DNS allow
+			# rules inside them), so any backtick or $( in an nft COMMENT there is
+			# command-substituted by the shell: the ruleset loads intact but the
+			# sidecar's stderr fills with "oif: command not found" noise that reads
+			# like a broken floor (field, 9/05). tests/test_nft_divert.sh pins the
+			# heredoc bodies shell-inert, runs the script against a stub nft on
+			# both the normal and the fail-closed path, and -- when the sandbox
+			# lets nft -c dry-run in a fresh netns -- re-parses the captured
+			# programs with the real nft (it skips loudly otherwise; the KVM
+			# nft-floor-bypass check remains the authoritative parse proof).
+			nft-divert-tests = pkgs.runCommand "cogbox-nft-divert-tests" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gawk gnugrep gnused nftables util-linux ];
+			} ''
+				export HOME=$TMPDIR
+				bash ${./tests/test_nft_divert.sh} ${./cogbox-nft-divert.sh}
+				touch $out
+			'';
+
 			# cogbox-enforce.sh's FIRST-EVER test. Everything in that supervisor
 			# is an ordering or a refusal invisible in the unit file or the pod
 			# spec, so a flake check over the manifest cannot reach any of it. By
