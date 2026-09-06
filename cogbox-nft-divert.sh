@@ -144,13 +144,16 @@ table inet cogbox_floor {
   # must NOT depend on the pod being unable to forge such a seed itself. Without
   # this mark, a pod that ever held CAP_NET_RAW could open IP_HDRINCL, send one
   # spoofed datagram src A:P -> podIP:60005 which routes via lo (accepted by
-  # `oif "lo"`), seed a conntrack entry, and then egress freely from sport 60005
-  # to A:P as `ct direction reply` -- the exact sport-keyed hole the reply rule
-  # is meant not to be. A lo-injected seed traverses prerouting with iif="lo"
-  # and so never gets the mark, so its "reply" leg fails the `ct mark` test
-  # below and falls to policy drop. Range mirrors mosh-udp-range.nix. (ct state
-  # is settled by the conntrack hook at priority -200, before this -150 mangle
-  # hook, so `ct state new` is available here.)
+  # the lo accept rule), seed a conntrack entry, and then egress freely from
+  # sport 60005 to A:P as a conntrack reply -- the exact sport-keyed hole the
+  # reply rule is meant not to be. A lo-injected seed traverses prerouting with
+  # iif="lo" and so never gets the mark, so its "reply" leg fails the ct-mark
+  # test below and falls to policy drop. Range mirrors mosh-udp-range.nix. (ct
+  # state is settled by the conntrack hook at priority -200, before this -150
+  # mangle hook, so the ct-state-new match is available here.)
+  # NOTE: this program is an UNQUOTED heredoc (the shell expands the vars in it),
+  # so comments here must carry no backtick or dollar-paren -- the shell would
+  # command-substitute them (tests/test_nft_divert.sh pins this).
   chain prerouting {
     type filter hook prerouting priority mangle; policy accept;
     iif != "lo" udp dport 60000-60031 ct state new ct mark set 0x6d
