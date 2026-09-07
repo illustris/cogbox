@@ -36,7 +36,7 @@ fn parseRecord(data: []const u8, result: bool) !Record {
     const outcome = words.next();
     if (result) {
         const o = outcome orelse return error.InvalidRecord;
-        if (!std.mem.eql(u8, o, "graceful") and !std.mem.eql(u8, o, "forced") and
+        if (!std.mem.eql(u8, o, "graceful") and !std.mem.eql(u8, o, "unverified") and !std.mem.eql(u8, o, "forced") and
             !std.mem.eql(u8, o, "already-stopped") and !std.mem.eql(u8, o, "failed")) return error.InvalidRecord;
     } else if (outcome != null) return error.InvalidRecord;
     if (words.next() != null) return error.InvalidRecord;
@@ -95,7 +95,10 @@ pub fn run(
         else => return err,
     };
     if (identity) |id| {
-        if (id.pid != pid or id.start != start) return error.ChangedLaunch;
+        // A retained completed run may outlive its PID. Never signal the
+        // unrelated replacement; only its matching terminal record can make
+        // this an idempotent completed stop. Missing/failed records still fail.
+        if (id.start != start) return reportCompleted(allocator, io, result_path, identity);
     }
     // A pidfd ensures the final signal cannot hit a reused PID between the
     // starttime check and delivery. This is Linux-only, like the VM launcher.
@@ -108,7 +111,7 @@ pub fn run(
         error.FileNotFound, error.ProcessExited => return reportCompleted(allocator, io, result_path, identity),
         else => return err,
     };
-    if (verified != start) return error.ChangedLaunch;
+    if (verified != start) return reportCompleted(allocator, io, result_path, identity);
     const signal = if (force and identity != null) std.posix.SIG.USR1 else std.posix.SIG.TERM;
     const sent = linux.errno(linux.pidfd_send_signal(pidfd, signal, null, 0));
     if (sent == .SRCH) return reportCompleted(allocator, io, result_path, identity);
@@ -124,7 +127,7 @@ pub fn run(
             else => return err,
         };
         if (current) |value| {
-            if (value != start) return error.ChangedLaunch;
+            if (value != start) return reportCompleted(allocator, io, result_path, identity);
             continue;
         }
         return reportCompleted(allocator, io, result_path, identity);
@@ -145,8 +148,9 @@ fn reportCompleted(allocator: std.mem.Allocator, io: std.Io, result_path: []cons
         if (std.mem.eql(u8, outcome, "failed")) return error.ShutdownUnconfirmed;
         if (std.mem.eql(u8, outcome, "forced")) {
             try util.writeStdout(io, "instance stopped with forced termination; recent writes might have been lost\n");
-        } else if (std.mem.eql(u8, outcome, "graceful")) {
-            try util.writeStdout(io, "instance stopped: orderly request completed without forced fallback\n");
+        } else if (std.mem.eql(u8, outcome, "graceful") or std.mem.eql(u8, outcome, "unverified")) {
+            // Old graceful records used the same insufficient exit-zero proof.
+            try util.writeStdout(io, "instance stopped; clean guest shutdown could not be verified, recent writes might have been lost\n");
         } else {
             try util.writeStdout(io, "instance stopped: no live guest required shutdown\n");
         }
@@ -202,6 +206,32 @@ fn processStart(allocator: std.mem.Allocator, io: std.Io, pid: std.posix.pid_t) 
     return parseProcessStart(data);
 }
 
+// Start readiness must belong to the newly forked launcher and its live child,
+// not merely to a retained qemu.pid. Shared with start; never signals a PID.
+pub fn ownsReadyChild(allocator: std.mem.Allocator, io: std.Io, runtime: []const u8, launcher: std.posix.pid_t) bool {
+    const launch_path = std.fs.path.join(allocator, &.{ runtime, "launch" }) catch return false;
+    defer allocator.free(launch_path);
+    const data = readSmall(allocator, io, launch_path, 192) catch return false;
+    defer allocator.free(data);
+    const record = parseRecord(data, false) catch return false;
+    if (record.identity.pid != launcher) return false;
+    const start = processStart(allocator, io, launcher) catch return false;
+    if (record.identity.start != start) return false;
+    const pid_path = std.fs.path.join(allocator, &.{ runtime, "qemu.pid" }) catch return false;
+    defer allocator.free(pid_path);
+    const pid = readPid(allocator, io, pid_path) catch return false;
+    const stat_path = std.fmt.allocPrint(allocator, "/proc/{d}/stat", .{pid}) catch return false;
+    defer allocator.free(stat_path);
+    const stat = readSmall(allocator, io, stat_path, 4096) catch return false;
+    defer allocator.free(stat);
+    _ = parseProcessStart(stat) catch return false;
+    const end = std.mem.lastIndexOf(u8, stat, ") ") orelse return false;
+    var words = std.mem.tokenizeScalar(u8, stat[end + 2 ..], ' ');
+    _ = words.next();
+    const parent = std.fmt.parseInt(std.posix.pid_t, words.next() orelse return false, 10) catch return false;
+    return parent == launcher;
+}
+
 fn parseProcessStart(data: []const u8) !u64 {
     const end = std.mem.lastIndexOf(u8, data, ") ") orelse return error.InvalidProcess;
     var words = std.mem.tokenizeScalar(u8, data[end + 2 ..], ' ');
@@ -216,6 +246,9 @@ test "shutdown records fence run PID starttime and fixed outcomes" {
     const a = try parseRecord("v1 01234567-1234-1234-1234-123456789abc 42 99\n", false);
     const b = try parseRecord("v1 01234567-1234-1234-1234-123456789abc 42 99 forced\n", true);
     try std.testing.expect(a.identity.same(b.identity));
+    const unverified = try parseRecord("v1 01234567-1234-1234-1234-123456789abc 42 99 unverified\n", true);
+    try std.testing.expect(a.identity.same(unverified.identity));
+    try std.testing.expectEqualStrings("unverified", unverified.outcome.?);
     try std.testing.expectError(error.InvalidRecord, parseRecord("v1 bad 42 99 graceful", true));
     try std.testing.expectError(error.InvalidRecord, parseRecord("v1 01234567-1234-1234-1234-123456789abc 0 99", false));
     try std.testing.expectError(error.InvalidRecord, parseRecord("v1 01234567-1234-1234-1234-123456789abc 42 99 unknown", true));

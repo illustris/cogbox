@@ -182,7 +182,11 @@ cogbox_stop_child() {
 					cogbox_reap_child "$QEMU_PID" || { STOP_OUTCOME=failed; return 1; }
 					qemu_rc=$COGBOX_REAP_STATUS
 					if [ "$qemu_rc" -eq 0 ]; then
-						STOP_OUTCOME=graceful
+						# Exit zero is not a guest shutdown witness: panic=-1
+						# plus -no-reboot can produce the same successful QEMU
+						# exit as an orderly reboot. Preserve stop availability
+						# without claiming that the guest flushed its files.
+						STOP_OUTCOME=unverified
 						return 0
 					fi
 					echo "cogbox-launch: guest exited unsuccessfully during shutdown (status $qemu_rc)" >&2

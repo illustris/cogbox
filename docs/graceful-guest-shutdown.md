@@ -6,9 +6,9 @@ Repair ordinary VM stop/restart by draining the inner NixOS guest before killing
 QEMU. Keep this runtime-only: no control-plane lifecycle, authorization, provider
 API, disk-layout, container-native, plugin, or dependency-pin changes.
 
-The launcher currently responds to TERM by sending QEMU TERM, waiting about five
+Before this change the launcher responded to TERM by sending QEMU TERM, waiting about five
 seconds, then sending KILL. This does not shut down the guest operating system.
-The GCE supervisor has no synchronous `ExecStop`, so stopping the outer host can
+The GCE supervisor had no synchronous `ExecStop`, so stopping the outer host could
 signal its whole service cgroup before the guest has flushed buffered writes.
 The observed loss of recent unsynced edits, absent guest shutdown journal, and
 successful explicitly synced control are consistent with that mechanism; they
@@ -22,6 +22,15 @@ guest. Reuse the helper belonging to the launcher's actual `RUNNER_DIR`; do not
 substitute an SSH command, add a guest agent, or depend on generic ACPI defaults.
 The helper has no deadline, emits raw QMP replies, and returns success when its
 socket is absent. Those are caller-side obligations, not completion proof.
+
+The runner also keeps `panic=-1`: Linux immediately reboots after a panic. With
+`-no-reboot`, an unclean panic and an orderly reboot can both end QEMU with exit
+zero. This launcher has no guest shutdown witness or panic-notification device.
+It therefore reports confirmed termination as **unverified**, not graceful.
+A QMP `query-status` preflight would only sample the current emulator state; it
+cannot reject an unreported panic or one after the query. A `guest-reset` event
+is ambiguous too. Keep the existing panic/automatic-recovery policy unchanged;
+`panic=0` would instead leave an unreported panic running indefinitely.
 
 ## Runtime shutdown contract
 
@@ -41,12 +50,11 @@ Normal TERM/INT requests one orderly attempt:
    Bound the attempt to 45 seconds, including a bounded helper termination tail.
    No request-controlled command, executable lookup, or new credential is used.
 3. Helper success alone is insufficient. Independently confirm and reap the
-   owned QEMU child. Only successful helper execution, a successful child exit,
-   and no fallback qualify as completion through the graceful path. Missing
-   socket/helper, errors, timeout, unknown exit, and generic `status=stopped`
-   must never become graceful success. In particular, `guest-panicked` and
-   `internal-error` are not orderly shutdown acknowledgments.
-4. If orderly completion cannot be established, retain the existing ability to
+   owned QEMU child. Successful helper execution, a successful child exit,
+   and no fallback qualify only as `unverified` termination. No current path
+   claims graceful completion, and neither a zero exit nor a generic QMP state
+   is a guest-filesystem shutdown acknowledgment.
+4. If termination through the orderly attempt cannot be established, retain the existing ability to
    stop an unhealthy VM: a classified forced fallback sends the owned child
    TERM for at most five seconds, then KILL with at most five seconds to confirm
    exit. Reap the child before deleting anything it can still use.
@@ -55,8 +63,9 @@ Normal TERM/INT requests one orderly attempt:
    beneath a surviving QEMU. Kernel-uninterruptible I/O cannot be made safe by
    pretending a signal delivery was successful termination.
 6. After confirmed child termination, stop/reap owned supporting processes and
-   perform the existing scoped cleanup. Preserve diagnostic logs on forced or
-   failed shutdown. Do not change persistent guest/user data.
+   perform the existing scoped cleanup and remove active `pid` and `qemu.pid`
+   hints. Preserve the run/result and diagnostic logs, including unexpected
+   zero/nonzero guest exits. Do not change persistent guest/user data.
 
 Repeated normal stop signals must not issue repeated Ctrl-Alt-Delete events or
 reenter cleanup. A force request during an orderly attempt must cancel/reap the
@@ -67,7 +76,9 @@ the cleanup guard or kill only the launcher.
 
 Keep normal stop's bounded fallback behavior, but make it visible:
 
-- Graceful-path completion: exit success, classified completion message.
+- Unverified termination: exit success with a warning that clean guest shutdown
+  could not be verified and recent writes might have been lost. Retained legacy
+  `graceful` records are accepted but rendered with the same conservative warning.
 - Confirmed forced termination: exit success with an explicit warning that the
   graceful request failed or was skipped and recent writes might have been lost.
   This preserves stop/restart availability without claiming graceful completion.
@@ -93,10 +104,14 @@ Use a small runtime-only outcome protocol, not a job engine:
   Records contain no executable paths, guest output, credentials, or user data.
   Linux process starttime validates the captured PID; a pidfd binds signal
   delivery to that process rather than a subsequently reused PID.
-- Retain the runtime directory after a requested stop so callers can read the
+- Retain the runtime directory after a requested stop or unexpected guest exit so callers can read the
   outcome; continue removing the existing transient sources and mirrors only
   after QEMU exits. The next start already removes the old runtime while holding
   the single-starter flock. Do not introduce a persistent history or new GC.
+- Admission trusts the held lifetime flock, not stale PID hints. CLI readiness
+  requires the new launch identity and its live QEMU child, not mere existence
+  of `qemu.pid`. A reused unrelated PID is never signalled when consuming a
+  completed run's matching terminal result.
 - Concurrent stop callers may consume the same immutable terminal result.
   Reading a result must not delete it. A new launch's identifier cannot satisfy
   an old stop. If the next start removes/replaces the runtime before a caller
@@ -160,6 +175,10 @@ children and helper stubs: healthy delayed completion, helper absent/nonzero/
 stalled, socket missing, helper success while QEMU survives, already exited child,
 nonzero child exit, TERM-resistant child, forced stop, force during graceful wait,
 duplicate callers/signals, stale/different run outcomes, and missing outcomes.
+Run the actual CLI and full launcher through start, stop, and the next start
+using hermetic external runner/helper substitutes. Cover both nonzero crashes
+and panic-equivalent zero exits, retained PID reuse, stale readiness, and a held
+lifetime lock. These integration cases must not copy launcher lifecycle wiring.
 Assert ordering: guest request before QEMU signals; QEMU gone before supporting
 processes or runtime sources disappear; forced/failure diagnostics survive.
 Use short test-only deadlines without exposing a caller-controlled production
@@ -169,7 +188,7 @@ Add a realized-unit check for exact ExecStop/env, finite aggregate deadlines,
 preserved mount/network ordering, restart policy and output classes. Add a
 systemd behavioral fixture that stops the service with live child processes and
 proves they are not signaled while the synchronous graceful helper is waiting.
-Cover successful, failed and timed-out stop commands, main-process exit during
+Cover successful, failed and timed-out stop commands, main-process exit one during
 the wait, and startup/maintenance with no guest. Run real-process, CLI and
 supervisor tests locally. A local host without KVM cannot run a NixOS VM test;
 execute the systemd fixture on the authorized disposable stage candidate and
@@ -192,7 +211,7 @@ tracked and untracked markers without sync/fsync, capture exact bytes/hashes,
 sizes, mtimes, inodes and HEAD, then immediately use ordinary Restart. Repeat
 with ordinary Stop, wait for provider termination, then Start. Require unchanged
 data and disk/image identity, a new guest boot ID, actual orderly guest shutdown
-journal evidence, classified no-fallback runtime completion, and no repository
+journal evidence, conservative `unverified` runtime completion, and no repository
 worker replay. Exercise force/unhealthy behavior only on the second disposable
 candidate using the actual changed runtime seam. Never call a forced result a
 graceful pass.
@@ -205,3 +224,8 @@ shutdown window can still lose recent writes. Those cases remain classified
 fallback/failure paths, not claimed graceful durability. Existing pinned images
 do not gain the fix on a normal restart; any later migration requires a separate
 explicitly authorized image-update workflow.
+
+An affirmative shutdown witness and a panic-aware guest/host protocol are
+deliberately deferred. Existing healthy guest journal and data-preservation
+tests support those individual shutdowns; they do not turn the runtime's
+exit-zero heuristic into a universal clean-shutdown guarantee.

@@ -184,7 +184,7 @@ wait "$QEMU_PID"
 
     def test_orderly_socket_closure_precedes_child_exit(self):
         self.launch()
-        self.assertEqual(self.stop(), "graceful")
+        self.assertEqual(self.stop(), "unverified")
         self.assertFalse((self.runtime / "qemu-term").exists())
         self.assertFalse((self.runtime / "aux-before-qemu").exists())
         self.assertEqual((self.runtime / "requests").read_text(), "request\n")
@@ -264,7 +264,7 @@ wait "$QEMU_PID"
         return dict(os.environ, XDG_RUNTIME_DIR=str(self.root / "run"), XDG_CONFIG_HOME=str(self.root / "config"))
 
     @unittest.skipUnless(CLI, "actual CLI supplied by Nix check")
-    def test_cli_graceful_and_concurrent_callers(self):
+    def test_cli_unverified_and_concurrent_callers(self):
         self.launch()
         env = dict(os.environ, XDG_RUNTIME_DIR=str(self.root / "run"), XDG_CONFIG_HOME=str(self.root / "config"))
         callers = [subprocess.Popen([CLI, "stop", "-n", "demo"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
@@ -272,7 +272,7 @@ wait "$QEMU_PID"
             for caller in callers:
                 out, err = caller.communicate(timeout=5)
                 self.assertEqual(caller.returncode, 0, err + (self.root / "log").read_text() + repr(list(self.runtime.iterdir())))
-                self.assertIn("without forced fallback", out, (self.root / "log").read_text())
+                self.assertIn("clean guest shutdown could not be verified", out, (self.root / "log").read_text())
         finally:
             for caller in callers:
                 if caller.poll() is None:
@@ -299,7 +299,7 @@ wait "$QEMU_PID"
     @unittest.skipUnless(CLI, "actual CLI supplied by Nix check")
     def test_cli_retained_failed_missing_and_changed_results_refuse_restart(self):
         self.launch()
-        self.assertEqual(self.stop(), "graceful")
+        self.assertEqual(self.stop(), "unverified")
         result = self.runtime / "stop-result"
         identity = (self.runtime / "launch").read_text().strip()
         for value in (identity + " failed\n", identity.replace("v1 ", "v1 a", 1) + " graceful\n", None):
