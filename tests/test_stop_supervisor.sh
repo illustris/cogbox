@@ -13,7 +13,7 @@ printf '#!%s\n' "$(command -v bash)" > "$stub"
 cat >> "$stub" <<'STUB'
 printf '%s\n' "$*" >> "$STOP_EVENTS"
 sleep 0.1
-echo 'instance stopped: orderly request completed without forced fallback'
+echo 'instance stopped; clean guest shutdown could not be verified, recent writes might have been lost'
 exit "${STOP_EXIT:-0}"
 STUB
 chmod +x "$stub"
@@ -28,7 +28,7 @@ echo 'ok - no guest is an explicit safe no-op'
 printf 'demo\n' > "$record"
 bash "$stop_script" "$stub" > "$work/normal"
 [ "$(< "$STOP_EVENTS")" = 'stop --name demo' ]
-grep -q 'without forced fallback' "$work/normal"
+grep -q 'clean guest shutdown could not be verified' "$work/normal"
 echo 'ok - exact captured instance and synchronous classified output'
 
 for invalid in default '../demo' '-n other' 'demo; echo injected'; do

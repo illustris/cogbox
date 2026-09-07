@@ -5505,6 +5505,13 @@
 				touch $out
 			'';
 
+			shutdown-lifecycle-tests = pkgs.runCommand "cogbox-shutdown-lifecycle-tests" {
+				nativeBuildInputs = with pkgs; [ bash coreutils python3 util-linux jq gnugrep gnused diffutils ];
+			} ''
+				python3 ${./tests/test_shutdown_lifecycle.py} ${./cogbox-launch.sh} ${./cogbox-shutdown.sh} ${self.packages.${system}.cogbox-tools}/bin/cogbox
+				touch $out
+			'';
+
 			# cogbox-nft-divert.sh feeds its ruleset through UNQUOTED heredocs (the
 			# shell must expand the divert port / enforcer carve-out / DNS allow
 			# rules inside them), so any backtick or $( in an nft COMMENT there is

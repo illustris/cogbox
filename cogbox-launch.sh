@@ -1475,9 +1475,8 @@ if ! @flock@ -n "$LOCK_FD"; then
 fi
 
 if [ -e "$RUNTIME" ]; then
-	if [ -f "$RUNTIME/pid" ] && kill -0 "$(cat "$RUNTIME/pid")" 2>/dev/null; then
-		die "instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is already running (PID $(cat "$RUNTIME/pid"))." 75
-	fi
+	# The lifetime flock, inherited by the VM and helpers, is authoritative.
+	# Retained PID hints may name a zombie or a reused, unrelated process.
 	rm -rf "$RUNTIME"
 fi
 mkdir -p "$RUNTIME"
@@ -1598,6 +1597,14 @@ cogbox_cleanup() {
 		cogbox_stop_result || true
 		return
 	fi
+	# Publish no active-process hints after confirmed child-first cleanup.
+	# Keep the run identity/result instead: PID reuse must neither signal an
+	# unrelated process nor make the next start consume old QEMU readiness.
+	if ! rm -f "$RUNTIME/pid" "$RUNTIME/qemu.pid"; then
+		STOP_OUTCOME=failed
+		cogbox_stop_result || true
+		return
+	fi
 	# Dynamic 9p sources and their manifest may contain caller path bytes. QEMU
 	# is dead before these are removed; retained failed-launch runtimes keep only
 	# diagnostics, never stale grants for a later launch.
@@ -1608,23 +1615,26 @@ cogbox_cleanup() {
 	# tidy it rather than leave it under the data root until the next boot.
 	rm -rf "$BASE_DATA/mirrors/${EFFECTIVE_NAME}"
 	rmdir "$BASE_DATA/mirrors" 2>/dev/null
-	# Requested stops retain the fenced result and diagnostics for all callers.
-	# Only an unrequested clean guest exit removes runtime. Failed starts retain
-	# the log that `cogbox start` tells the user to inspect. The next start clears
-	# old runtime under the lifetime flock, so no persistent history accumulates.
+	# Retain the fenced result for requested stops AND unexpected guest exits.
+	# A guest panic can exit QEMU zero, so even an unrequested zero exit carries
+	# no clean-shutdown proof. The next start clears this bounded history under
+	# the lifetime flock; failed starts retain the log shown by `cogbox start`.
 	if [ "$STOP_REQUESTED" -eq 1 ]; then
 		echo "cogbox-launch: shutdown outcome=$STOP_OUTCOME"
 		cogbox_stop_result || echo "cogbox-launch: cannot persist shutdown outcome" >&2
-	elif [ "$rc" -eq 0 ]; then
-		rm -rf "$RUNTIME"
 	elif [ -n "$QEMU_PID" ]; then
 		# QEMU had launched, so the start itself succeeded -- this is the VM
 		# dying later (a crash, an external SIGKILL, a guest fault). Keep the
 		# dir: cogbox.log/console.log are the post-mortem for that exit.
+		STOP_OUTCOME=unverified
+		cogbox_stop_result || echo "cogbox-launch: cannot persist shutdown outcome" >&2
 		echo "cogbox-launch: VM terminated unexpectedly (status $rc); keeping runtime dir for diagnosis: $RUNTIME/cogbox.log" >&2
+	elif [ "$rc" -eq 0 ]; then
+		rm -rf "$RUNTIME"
 	else
 		# Failed before QEMU ever launched (passt/L7/persist) -- the "VM did not
 		# come up" case; keep the log the start error points the user at.
+		cogbox_stop_result || echo "cogbox-launch: cannot persist shutdown outcome" >&2
 		echo "cogbox-launch: start failed (status $rc); keeping runtime dir for diagnosis: $RUNTIME/cogbox.log" >&2
 	fi
 	# Leave $LOCK in place: it is an flock target, not a pid file. Our held

@@ -80,7 +80,9 @@ fixture_role() {
             event main-ready
             while [[ ! -f $case_dir/exit-request ]]; do sleep 0.02; done
             event main-exit
-            exit 0
+            # The real supervisor returns one when its guest disappears while
+            # synchronous ExecStop is still awaiting the launcher's outcome.
+            exit 1
             ;;
         child)
             trap 'event child-term; exit 91' TERM
@@ -246,6 +248,8 @@ for case_name in success main-exit failed-stop hung-stop no-guest bounded-post; 
             if [[ $case_name == main-exit ]]; then
                 ordered stop-enter main-exit
                 ordered main-exit stop-wait-proved
+                property_is ExecMainCode 1
+                property_is ExecMainStatus 1
             fi
             if [[ $case_name == bounded-post ]]; then
                 ordered post-cgroup-gone post-deadline

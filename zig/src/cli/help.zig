@@ -185,6 +185,8 @@ pub const STOP =
     \\matching stop result; failed, missing or changed outcomes remain errors.
     \\Normal stop allows up to 45s for orderly guest shutdown, then uses bounded
     \\forced termination with a data-loss warning. Total wait is at most 65s.
+    \\Even without fallback, clean guest shutdown cannot be verified; a warning
+    \\is reported. Confirmed termination still permits an ordinary restart.
     \\An older launcher receives TERM only; its shutdown cannot be verified.
     \\
 ;
