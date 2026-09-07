@@ -85,6 +85,31 @@ Keep normal stop's bounded fallback behavior, but make it visible:
 - Child still running, changed launch, or inability to confirm termination:
   return a nonzero error. Do not proceed with `cogbox restart`.
 - Already stopped/no guest: idempotent success, explicitly not a graceful claim.
+- Guest ended on its own (`exited`): the launcher saw QEMU end with NO stop
+  request -- an in-guest reboot/poweroff or a panic (both exit zero under
+  `-no-reboot`), a crash, an external kill. A later stop reports "was not
+  running (guest exited on its own)" and exits 0; it stopped nothing and claims
+  nothing. This is deliberately a different token from `unverified`, which
+  only ever records a stop this caller requested.
+- Start failed before QEMU (`start-failed`): the launcher died in the port
+  probe, passt, the L7 stack or persistence. A later stop reports "not running
+  (start failed; see cogbox.log)" and exits 0, so `restart` is not blocked by a
+  guest that never existed. The generic `failed` stays an error: it means a
+  child's termination could not be confirmed.
+
+Handler ordering inside the launcher: the shutdown functions, the EXIT/TERM
+traps and the run identity (`launch`, written atomically) are installed right
+after the runtime directory exists -- BEFORE the host-port probe. The legacy
+`pid` marker alone stays after the probe, because `cogbox ssh` reads it and
+then requires `ssh-endpoint`, which the probe's result determines. A stop that
+lands during the probe is therefore fenced (via the identity's pid), honored
+and recorded, instead of TERMing a handler-less shell. CLI liveness checks
+(`start`, `stop`-adjacent verbs, `delete`, `list`, `status`, `console`,
+`monitor`, `ssh`, the plugin restart hint) all consult the lifetime flock, not
+the `pid` file; `ssh` additionally reports "still starting" while the lock is
+held but `pid` is not yet published. Start readiness requires `qemu.start`
+(the child's starttime, persisted before `qemu.pid`) to match a live,
+launcher-parented `/proc/<pid>/stat`; a zombie or reused PID is never ready.
 
 `stop --force` requests the launcher's bounded hard-stop lane without waiting
 45 seconds. It must not retain the current orphan-prone behavior of KILLing only
@@ -142,13 +167,33 @@ clears stale runtime, and acquire that lock before removing those paths.
 
 Keep `KillMode=control-group` (the default), not `none` or an unbounded exception.
 Systemd must run the stop command to completion before signaling the remaining
-cgroup; merely sending the request and returning is insufficient. Set
-`KillSignal=SIGKILL` for leftovers AFTER the synchronous command, and
-`TimeoutStopFailureMode=kill` for command timeout. The graceful window is owned
-by ExecStop; do not accidentally grant another full unit timeout to leftover
-processes afterward. Preserve the existing ordering after the state mount,
-floor, resolver and network so their reverse stop order keeps guest storage and
+cgroup; merely sending the request and returning is insufficient. Leave
+`KillSignal` at its SIGTERM default -- do NOT set `KillSignal=SIGKILL`. A
+requested stop is covered by ExecStop, but when the supervisor's main process
+exits nonzero on its own (every `supervise.sh` exit is nonzero, including the
+ordinary in-guest reboot on leg (j)) systemd SKIPS ExecStop and goes straight
+to signaling the cgroup: that TERM, caught by the launcher's trap, is the only
+grace a still-live QEMU gets there. SIGKILL in that position killed a live
+guest with zero grace; the realized-unit check asserts the ABSENCE of any
+`KillSignal=` line. Set `TimeoutStopFailureMode=kill` for command timeout.
+`FinalKillSignal`/`SendSIGKILL` stay at their defaults (SIGKILL once
+`TimeoutStopSec` expires) as the backstop. Consequence to accept: after a
+FAILED or timed-out ExecStop the leftover phase gets its own `TimeoutStopSec`
+of TERM grace before that final kill, so the aggregate worst case is roughly
+two unit timeouts plus post-stop -- the same policy as before this work, not a
+regression. Preserve the existing ordering after the state mount, floor,
+resolver and network so their reverse stop order keeps guest storage and
 supporting services available.
+
+Cost of the SIGTERM default on the in-guest `poweroff` path: the microvm
+machine type does not exit QEMU on a guest power-off (it lingers halted, see
+`status.zig`), so `supervise.sh` leg (j) fires with a LIVE QEMU. The cgroup
+TERM then reaches the launcher's trap, which sets a stop request and runs the
+full orderly lane -- Ctrl-Alt-Delete against an already-halted guest, up to the
+45-second grace -- before TERM/KILL fallback. A halted guest is
+indistinguishable from a draining one, so this is correct, and it stays inside
+`TimeoutStopSec=75s`; it only makes a `poweroff` restart slower than a `reboot`
+(`-no-reboot` exits QEMU, so `reboot` is unaffected).
 
 Retain `Restart=always` for ordinary guest exits/reboots. During a systemd stop
 transaction, automatic restart is suppressed by systemd itself; do not manually
@@ -158,12 +203,15 @@ guest starts until the stop transaction is complete.
 
 Set `TimeoutStopSec=75s`; the synchronous command must honor its own 65-second
 bound. Keep the existing best-effort ten-second `ExecStopPost` readiness removal.
-For killable processes the 75-second command backstop plus ten-second post-stop
-leg leaves margin inside the standard provider's 120-second shutdown window.
-`TimeoutStopSec` is not itself an aggregate bound: the explicit final-kill policy
-above prevents its reuse as another graceful-wait interval. Test the realized
-aggregate, including helper termination, auxiliary cleanup, failed/hung ExecStop,
-unit fallback, and post-stop time; an individual timeout assertion is not enough.
+On the normal path (ExecStop completes) the 75-second command backstop plus the
+ten-second post-stop leg fits inside GCE's default 90-second host shutdown
+window (unverified against the provider; Spot/preemptible windows are shorter).
+`TimeoutStopSec` is not itself an aggregate bound: a failed or hung ExecStop
+hands leftovers a second `TimeoutStopSec` of TERM grace (see above), which can
+exceed that window; kernel-uninterruptible I/O exceeds any window. Test the
+realized aggregate, including helper termination, auxiliary cleanup, failed/hung
+ExecStop, unit fallback, and post-stop time; an individual timeout assertion is
+not enough.
 Kernel-uninterruptible tasks remain a failure case, not a promised finite reap.
 Keep classified lifecycle output journal-only; never stream raw QMP replies or
 runtime logs to the provider serial channel.
@@ -189,7 +237,9 @@ preserved mount/network ordering, restart policy and output classes. Add a
 systemd behavioral fixture that stops the service with live child processes and
 proves they are not signaled while the synchronous graceful helper is waiting.
 Cover successful, failed and timed-out stop commands, main-process exit one during
-the wait, and startup/maintenance with no guest. Run real-process, CLI and
+the wait, main-process exit one with NO stop job (the in-guest reboot path: no
+ExecStop, leftovers TERMed promptly, ExecStopPost, automatic restart), and
+startup/maintenance with no guest. Run real-process, CLI and
 supervisor tests locally. A local host without KVM cannot run a NixOS VM test;
 execute the systemd fixture on the authorized disposable stage candidate and
 capture actual unit/journal ordering and aggregate elapsed time. Do not mutate

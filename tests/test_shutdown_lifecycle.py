@@ -75,10 +75,22 @@ class Lifecycle(unittest.TestCase):
         for old, new in substitutions.items():
             source = source.replace(old, new)
         self.executable(self.script, source)
+        # The launcher's port probe resolves `timeout` through the inherited
+        # PATH. This shim marks probe entry and parks the probe while hold-probe
+        # exists, then becomes the real timeout -- the only way to hold the
+        # launcher inside the (millisecond) loopback probe deterministically.
+        self.hold_probe = self.root / "hold-probe"
+        self.probe_entered = self.root / "probe-entered"
+        (self.root / "bin").mkdir()
+        self.executable(self.root / "bin" / "timeout", f"#!{self.bash}\n"
+                        f"touch {Q(str(self.probe_entered))}\n"
+                        f"while [ -e {Q(str(self.hold_probe))} ]; do sleep .01; done\n"
+                        f"exec {Q(shutil.which('timeout'))} \"$@\"\n")
         self.env = dict(os.environ, HOME=str(self.root), XDG_RUNTIME_DIR=str(self.runtime.parent),
                         XDG_CONFIG_HOME=str(self.root / "config"),
                         COGBOX_DATA=str(self.root / "data"),
-                        COGBOX_LAUNCH_SCRIPT=str(self.script))
+                        COGBOX_LAUNCH_SCRIPT=str(self.script),
+                        PATH=str(self.root / "bin") + os.pathsep + os.environ["PATH"])
         self.env.pop("SUDO_USER", None)
 
     @staticmethod
@@ -174,7 +186,10 @@ class Lifecycle(unittest.TestCase):
             with self.subTest(mode=mode):
                 before = self.start()
                 (self.runtime / mode).touch()
-                self.assertEqual(self.ended(before), "unverified")
+                # Unrequested end: distinct from a requested stop's `unverified`.
+                self.assertEqual(self.ended(before), "exited")
+                stopped = self.cli("stop")
+                self.assertIn("exited on its own", stopped.stdout)
                 self.cli("restart", "--no-ssh")
                 self.wait_for(lambda: (self.runtime / "fake-qemu-ready").exists())
                 after = (self.runtime / "launch").read_text().split()
@@ -226,6 +241,90 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual((self.runtime / "launch").read_text().split(), before)
         self.cli("stop")
         self.ended(before)
+
+    def test_stop_during_port_probe(self):
+        # The shutdown handlers and run identity must exist BEFORE the port
+        # probe, while the legacy pid marker follows it (cogbox ssh needs the
+        # ssh-endpoint written just before pid). A stop that lands inside the
+        # probe must be honored, recorded against this launch, and exit 0.
+        self.cli("init", "--no-auto-keys", "--yes", "--network", "none")
+        self.hold_probe.touch()
+        starter = subprocess.Popen([str(CLI), "start", "-n", "demo", "--no-ssh"], env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.children.append(starter)
+        try:
+            self.wait_for(self.probe_entered.exists)
+            # The ordering proof: identity published, pid not yet.
+            self.assertTrue((self.runtime / "launch").exists(), "launch identity missing during the port probe")
+            self.assertFalse((self.runtime / "pid").exists(), "pid published before the port probe finished")
+            identity = (self.runtime / "launch").read_text().split()
+            self.assertEqual(len(identity), 4)
+            # delete consults the lifetime flock, not the (absent) pid file: it
+            # must refuse to remove a launch that is still starting.
+            kept = [d for d in (self.root / "config", self.root / "data", self.runtime) if d.exists()]
+            self.assertIn(self.runtime, kept)
+            self.cli("delete", "-y", ok=False)
+            for d in kept:
+                self.assertTrue(d.exists(), f"delete removed {d} from under a starting launch")
+            self.assertFalse(self.lock_free(), "delete released the lifetime lock")
+            stopper = subprocess.Popen([str(CLI), "stop", "-n", "demo"], env=self.env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.children.append(stopper)
+            # Let the stop caller fence the launcher and deliver TERM while the
+            # probe is still parked; bash defers the trap until the command
+            # substitution around the probe returns.
+            time.sleep(.3)
+        finally:
+            self.hold_probe.unlink()
+        out, err = stopper.communicate(timeout=8)
+        self.assertEqual(stopper.returncode, 0, out + err)
+        starter.communicate(timeout=8)
+        self.assertNotEqual(starter.returncode, 0)
+        self.wait_for(lambda: (self.runtime / "stop-result").exists())
+        result = (self.runtime / "stop-result").read_text().split()
+        self.assertEqual(result[:4], identity)
+        # No QEMU was ever launched, so the launcher records already-stopped;
+        # `unverified` is tolerated only if the deferred trap ran after launch.
+        self.assertIn(result[-1], ("already-stopped", "unverified"))
+        self.assertFalse((self.runtime / "pid").exists())
+        self.wait_for(lambda: self.lock_free())
+
+    def test_start_failed_before_qemu_does_not_block_restart(self):
+        # A launcher that dies AFTER the run identity exists but BEFORE QEMU
+        # (here: an --add-dir that vanishes while the port probe is parked, so
+        # the staging realpath check fails) must record `start-failed`, which
+        # `stop` reports as not running and `restart` sails past. The generic
+        # `failed` would make every pre-QEMU start failure un-restartable.
+        self.cli("init", "--no-auto-keys", "--yes", "--network", "none")
+        extra = self.root / "extra"
+        extra.mkdir()
+        self.hold_probe.touch()
+        starter = subprocess.Popen([str(CLI), "start", "-n", "demo", "--no-ssh", "--add-dir", str(extra)],
+                                   env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.children.append(starter)
+        try:
+            self.wait_for(self.probe_entered.exists)
+            extra.rmdir()
+        finally:
+            self.hold_probe.unlink()
+        out, err = starter.communicate(timeout=8)
+        self.assertNotEqual(starter.returncode, 0, out + err)
+        self.wait_for(lambda: (self.runtime / "stop-result").exists())
+        result = (self.runtime / "stop-result").read_text().split()
+        self.assertEqual(result[:4], (self.runtime / "launch").read_text().split())
+        self.assertEqual(result[-1], "start-failed")
+        self.assertFalse((self.runtime / "qemu.pid").exists())
+        self.wait_for(lambda: self.lock_free())
+        stopped = self.cli("stop")
+        self.assertIn("start failed; see cogbox.log", stopped.stdout)
+        # restart = stop + start: the retained record must not block the start.
+        restarted = self.cli("restart", "--no-ssh")
+        self.assertIn("start failed; see cogbox.log", restarted.stdout)
+        self.wait_for(lambda: (self.runtime / "fake-qemu-ready").exists())
+        identity = (self.runtime / "launch").read_text().split()
+        self.assertNotEqual(identity[1], result[1])
+        self.cli("stop")
+        self.ended(identity)
 
     def test_stale_qemu_hint_cannot_report_new_start_ready(self):
         self.cli("init", "--no-auto-keys", "--yes", "--network", "none")

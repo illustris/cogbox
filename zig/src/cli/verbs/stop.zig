@@ -37,7 +37,8 @@ fn parseRecord(data: []const u8, result: bool) !Record {
     if (result) {
         const o = outcome orelse return error.InvalidRecord;
         if (!std.mem.eql(u8, o, "graceful") and !std.mem.eql(u8, o, "unverified") and !std.mem.eql(u8, o, "forced") and
-            !std.mem.eql(u8, o, "already-stopped") and !std.mem.eql(u8, o, "failed")) return error.InvalidRecord;
+            !std.mem.eql(u8, o, "already-stopped") and !std.mem.eql(u8, o, "failed") and
+            !std.mem.eql(u8, o, "exited") and !std.mem.eql(u8, o, "start-failed")) return error.InvalidRecord;
     } else if (outcome != null) return error.InvalidRecord;
     if (words.next() != null) return error.InvalidRecord;
     return .{ .identity = .{ .nonce = nonce[0..36].*, .pid = pid, .start = start }, .outcome = outcome };
@@ -146,7 +147,13 @@ fn reportCompleted(allocator: std.mem.Allocator, io: std.Io, result_path: []cons
         if (!record.identity.same(expected)) return error.ChangedLaunch;
         const outcome = record.outcome.?;
         if (std.mem.eql(u8, outcome, "failed")) return error.ShutdownUnconfirmed;
-        if (std.mem.eql(u8, outcome, "forced")) {
+        if (std.mem.eql(u8, outcome, "exited")) {
+            // The launcher recorded an UNREQUESTED end (reboot/poweroff/panic/
+            // crash); this caller stopped nothing. Idempotent success, no claim.
+            try util.writeStdout(io, "instance was not running (guest exited on its own)\n");
+        } else if (std.mem.eql(u8, outcome, "start-failed")) {
+            try util.writeStdout(io, "instance is not running (start failed; see cogbox.log)\n");
+        } else if (std.mem.eql(u8, outcome, "forced")) {
             try util.writeStdout(io, "instance stopped with forced termination; recent writes might have been lost\n");
         } else if (std.mem.eql(u8, outcome, "graceful") or std.mem.eql(u8, outcome, "unverified")) {
             // Old graceful records used the same insufficient exit-zero proof.
@@ -208,6 +215,8 @@ fn processStart(allocator: std.mem.Allocator, io: std.Io, pid: std.posix.pid_t) 
 
 // Start readiness must belong to the newly forked launcher and its live child,
 // not merely to a retained qemu.pid. Shared with start; never signals a PID.
+// The launcher persists the child's starttime (qemu.start) BEFORE qemu.pid, so
+// a pid without a starttime, a zombie, or a reused PID is never readiness.
 pub fn ownsReadyChild(allocator: std.mem.Allocator, io: std.Io, runtime: []const u8, launcher: std.posix.pid_t) bool {
     const launch_path = std.fs.path.join(allocator, &.{ runtime, "launch" }) catch return false;
     defer allocator.free(launch_path);
@@ -217,6 +226,11 @@ pub fn ownsReadyChild(allocator: std.mem.Allocator, io: std.Io, runtime: []const
     if (record.identity.pid != launcher) return false;
     const start = processStart(allocator, io, launcher) catch return false;
     if (record.identity.start != start) return false;
+    const start_path = std.fs.path.join(allocator, &.{ runtime, "qemu.start" }) catch return false;
+    defer allocator.free(start_path);
+    const start_data = readSmall(allocator, io, start_path, 64) catch return false;
+    defer allocator.free(start_data);
+    const expected_start = std.fmt.parseInt(u64, std.mem.trim(u8, start_data, " \t\r\n"), 10) catch return false;
     const pid_path = std.fs.path.join(allocator, &.{ runtime, "qemu.pid" }) catch return false;
     defer allocator.free(pid_path);
     const pid = readPid(allocator, io, pid_path) catch return false;
@@ -224,12 +238,25 @@ pub fn ownsReadyChild(allocator: std.mem.Allocator, io: std.Io, runtime: []const
     defer allocator.free(stat_path);
     const stat = readSmall(allocator, io, stat_path, 4096) catch return false;
     defer allocator.free(stat);
-    _ = parseProcessStart(stat) catch return false;
+    return childProof(stat, launcher, expected_start);
+}
+
+// Proof that a /proc/<pid>/stat line describes the QEMU child THIS launcher
+// forked and still owns: not a zombie/dead entry, parented by the launcher,
+// and started when the launcher recorded it (so a reused PID cannot match).
+// Comm may contain spaces and parentheses; fields follow the LAST ") ".
+pub fn childProof(stat: []const u8, launcher: std.posix.pid_t, expected_start: u64) bool {
     const end = std.mem.lastIndexOf(u8, stat, ") ") orelse return false;
     var words = std.mem.tokenizeScalar(u8, stat[end + 2 ..], ' ');
-    _ = words.next();
+    const state = words.next() orelse return false;
+    if (std.mem.eql(u8, state, "Z") or std.mem.eql(u8, state, "X")) return false;
     const parent = std.fmt.parseInt(std.posix.pid_t, words.next() orelse return false, 10) catch return false;
-    return parent == launcher;
+    if (parent != launcher) return false;
+    // state and ppid consumed; starttime is the 20th field after the comm.
+    var i: usize = 2;
+    while (i < 19) : (i += 1) _ = words.next() orelse return false;
+    const start = std.fmt.parseInt(u64, words.next() orelse return false, 10) catch return false;
+    return start == expected_start;
 }
 
 fn parseProcessStart(data: []const u8) !u64 {
@@ -249,6 +276,12 @@ test "shutdown records fence run PID starttime and fixed outcomes" {
     const unverified = try parseRecord("v1 01234567-1234-1234-1234-123456789abc 42 99 unverified\n", true);
     try std.testing.expect(a.identity.same(unverified.identity));
     try std.testing.expectEqualStrings("unverified", unverified.outcome.?);
+    // Unrequested ends and pre-QEMU start failures are distinct from a stop
+    // this caller completed; both must parse so the CLI can render them.
+    const exited = try parseRecord("v1 01234567-1234-1234-1234-123456789abc 42 99 exited\n", true);
+    try std.testing.expectEqualStrings("exited", exited.outcome.?);
+    const start_failed = try parseRecord("v1 01234567-1234-1234-1234-123456789abc 42 99 start-failed\n", true);
+    try std.testing.expectEqualStrings("start-failed", start_failed.outcome.?);
     try std.testing.expectError(error.InvalidRecord, parseRecord("v1 bad 42 99 graceful", true));
     try std.testing.expectError(error.InvalidRecord, parseRecord("v1 01234567-1234-1234-1234-123456789abc 0 99", false));
     try std.testing.expectError(error.InvalidRecord, parseRecord("v1 01234567-1234-1234-1234-123456789abc 42 99 unknown", true));
@@ -265,4 +298,18 @@ test "process start parser handles parentheses and rejects zombies" {
     try std.testing.expectEqual(@as(u64, 123), try parseProcessStart("42 (a ) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123 999"));
     try std.testing.expectError(error.ProcessExited, parseProcessStart("42 (a) Z 1"));
     try std.testing.expectError(error.InvalidProcess, parseProcessStart("invalid"));
+}
+
+test "child proof requires a live starttime-matched child of the launcher" {
+    // ppid 7, starttime 123; comm carries a space and a nested parenthesis.
+    const live = "42 (qemu (a ) vm) S 7 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123 999";
+    try std.testing.expect(childProof(live, 7, 123));
+    // A zombie QEMU keeps its ppid and starttime but is not a running guest.
+    try std.testing.expect(!childProof("42 (qemu (a ) vm) Z 7 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123 999", 7, 123));
+    try std.testing.expect(!childProof("42 (qemu) X 7 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123 999", 7, 123));
+    // Somebody else's child, or a reused PID with a different starttime.
+    try std.testing.expect(!childProof(live, 8, 123));
+    try std.testing.expect(!childProof(live, 7, 124));
+    try std.testing.expect(!childProof("42 (qemu) S 7", 7, 123));
+    try std.testing.expect(!childProof("invalid", 7, 123));
 }

@@ -79,7 +79,7 @@ pub fn run(
 
     const inst_runtime = try paths.instanceRuntime(allocator, p, opts.name);
     defer allocator.free(inst_runtime);
-    if (try isRunning(allocator, io, inst_runtime)) {
+    if (try util.instanceRunning(allocator, io, inst_runtime)) {
         util.die(allocator, io, "start", exit_codes.tempfail, "instance is already running. Use 'cogbox stop' first, 'cogbox restart', or attach with 'cogbox console'.", .{});
     }
 
@@ -314,22 +314,4 @@ fn logTail(allocator: std.mem.Allocator, io: std.Io, path: []const u8) []const u
         }
     }
     return trimmed[idx..];
-}
-
-fn isRunning(allocator: std.mem.Allocator, io: std.Io, runtime: []const u8) !bool {
-    // The kernel-held lifetime lock covers the launcher AND surviving children.
-    // A PID file alone cannot distinguish a dead launch from unrelated PID reuse.
-    const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{runtime});
-    defer allocator.free(lock_path);
-    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    defer file.close(io);
-    const linux = std.os.linux;
-    return switch (linux.errno(linux.flock(file.handle, 2 | 4))) { // LOCK_EX | LOCK_NB
-        .SUCCESS => false,
-        .AGAIN => true,
-        else => error.CannotInspectLaunchLock,
-    };
 }

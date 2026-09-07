@@ -42,9 +42,7 @@ pub fn run(
 	const inst_runtime = try paths.instanceRuntime(allocator, p, name);
 	defer allocator.free(inst_runtime);
 
-	const pid_path = try std.fs.path.join(allocator, &.{ inst_runtime, "pid" });
-	defer allocator.free(pid_path);
-	if (!isRunning(allocator, io, pid_path)) {
+	if (!util.instanceRunningConservative(allocator, io, inst_runtime)) {
 		const eff = name orelse "default";
 		const hint_name: []const u8 = if (name) |n|
 			try std.fmt.allocPrint(allocator, " --name {s}", .{n})
@@ -92,19 +90,4 @@ fn nameFlag(parsed: *const parse.Parsed, allocator: std.mem.Allocator, io: std.I
 		return n;
 	}
 	return null;
-}
-
-fn isRunning(allocator: std.mem.Allocator, io: std.Io, pid_path: []const u8) bool {
-	const cwd = std.Io.Dir.cwd();
-	const file = cwd.openFile(io, pid_path, .{}) catch return false;
-	defer file.close(io);
-	var buf: [64]u8 = undefined;
-	var reader = file.reader(io, &buf);
-	const data = reader.interface.allocRemaining(allocator, .limited(64)) catch return false;
-	defer allocator.free(data);
-	const trimmed = std.mem.trim(u8, data, " \t\r\n");
-	const pid = std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch return false;
-	const sig_zero: std.posix.SIG = @enumFromInt(0);
-	std.posix.kill(pid, sig_zero) catch return false;
-	return true;
 }

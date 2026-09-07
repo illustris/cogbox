@@ -1,8 +1,10 @@
 // `cogbox status` - report whether a single instance is running.
 // Exit codes: 0 running, 3 stopped, 64 unknown instance.
 //
-// Liveness is a two-step check. First the daemon PID (<runtime>/pid, the bash
-// launch script) must be alive. That alone is NOT sufficient: on a
+// Liveness is a two-step check. First the launch's lifetime flock
+// (<runtime>.lock, held by the bash launch script and inherited by QEMU) must
+// be held -- util.instanceRunning; the pid file is only a best-effort hint for
+// the report line. That alone is NOT sufficient: on a
 // guest-initiated power-off (`poweroff`, `shutdown -h now`, `systemctl
 // poweroff`) the QEMU `microvm` machine type does NOT exit the QEMU process --
 // it halts the guest but lingers -- so the daemon's `wait` never returns and
@@ -71,12 +73,13 @@ pub fn run(
 		util.die(allocator, io, "status", exit_codes.usage, "no such instance: \"{s}\"", .{eff});
 	};
 
-	// Try to read pid + check liveness.
+	// Liveness is the lifetime flock; pid (published after the launcher's port
+	// probe) is read best-effort for the report line only.
 	const pid_path = try std.fs.path.join(allocator, &.{ inst_runtime, "pid" });
 	defer allocator.free(pid_path);
 
 	const pid = readPid(allocator, io, pid_path) catch null;
-	const alive = if (pid) |p_| livenessCheck(p_) else false;
+	const alive = util.instanceRunningConservative(allocator, io, inst_runtime);
 
 	if (!alive) {
 		try util.writeStdout(io, "stopped\n");
@@ -129,9 +132,11 @@ pub fn run(
 
 	const net_label = networkLabel(obj);
 
+	var pid_buf: [16]u8 = undefined;
+	const pid_text: []const u8 = if (pid) |v| (std.fmt.bufPrint(&pid_buf, "{d}", .{v}) catch "?") else "?";
 	try util.say(allocator, io,
-		"running pid={d} ssh={s}:{s} http={s}:{d} net={s}",
-		.{ pid.?, if (ssh_host.len > 0) ssh_host else bind_addr, ssh_port, bind_addr, http_port, net_label },
+		"running pid={s} ssh={s}:{s} http={s}:{d} net={s}",
+		.{ pid_text, if (ssh_host.len > 0) ssh_host else bind_addr, ssh_port, bind_addr, http_port, net_label },
 	);
 }
 
@@ -153,12 +158,6 @@ fn readPid(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.posi
 	defer allocator.free(text);
 	const trimmed = std.mem.trim(u8, text, " \t\r\n");
 	return std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch return error.InvalidPid;
-}
-
-fn livenessCheck(pid: std.posix.pid_t) bool {
-	const sig_zero: std.posix.SIG = @enumFromInt(0);
-	std.posix.kill(pid, sig_zero) catch return false;
-	return true;
 }
 
 /// Map a QEMU QMP `query-status` run-state string to cogbox's stopped verdict.

@@ -56,8 +56,9 @@ pub fn run(
 		return;
 	}
 
-	// Never delete out from under a live VM.
-	if (isRunning(allocator, io, runtime_dir)) {
+	// Never delete out from under a live VM. The lifetime flock, not the pid
+	// hint, is the verdict (util.instanceRunning); an uninspectable lock refuses.
+	if (util.instanceRunningConservative(allocator, io, runtime_dir)) {
 		// die() exits immediately, so leaking this small format is fine.
 		const hint = if (name) |n|
 			std.fmt.allocPrint(allocator, " -n {s}", .{n}) catch ""
@@ -111,25 +112,6 @@ fn nameFlag(parsed: *const parse.Parsed, allocator: std.mem.Allocator, io: std.I
 
 fn exists(io: std.Io, cwd: std.Io.Dir, path: []const u8) bool {
 	cwd.access(io, path, .{}) catch return false;
-	return true;
-}
-
-/// True if the instance's daemon is alive (pid file present and the process
-/// answers signal 0). Mirrors the check in start.zig / list.zig.
-fn isRunning(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8) bool {
-	const pid_path = std.fs.path.join(allocator, &.{ runtime_dir, "pid" }) catch return false;
-	defer allocator.free(pid_path);
-	const cwd = std.Io.Dir.cwd();
-	const file = cwd.openFile(io, pid_path, .{}) catch return false;
-	defer file.close(io);
-	var buf: [64]u8 = undefined;
-	var reader = file.reader(io, &buf);
-	const data = reader.interface.allocRemaining(allocator, .limited(64)) catch return false;
-	defer allocator.free(data);
-	const trimmed = std.mem.trim(u8, data, " \t\r\n");
-	const pid = std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch return false;
-	const sig_zero: std.posix.SIG = @enumFromInt(0);
-	std.posix.kill(pid, sig_zero) catch return false;
 	return true;
 }
 

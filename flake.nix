@@ -6034,12 +6034,21 @@
 				fi
 				# ExecStop, not the cgroup TERM, owns guest grace. Assert the
 				# realized unit so module merging cannot silently remove it.
-				for setting in 'KillMode=control-group' 'KillSignal=SIGKILL' 'TimeoutStopFailureMode=kill' 'TimeoutStopSec=75s' 'Restart=always' 'StandardOutput=journal' 'StandardError=journal'; do
+				for setting in 'KillMode=control-group' 'TimeoutStopFailureMode=kill' 'TimeoutStopSec=75s' 'Restart=always' 'StandardOutput=journal' 'StandardError=journal'; do
 					if ! grep -qx "$setting" "$sup"; then
 						echo "FAIL: supervisor missing shutdown contract $setting" >&2
 						fails=$((fails + 1))
 					fi
 				done
+				# KillSignal must stay at its SIGTERM default. A spontaneous nonzero
+				# main exit (supervise.sh leg (j): an in-guest reboot) SKIPS ExecStop,
+				# so the cgroup signal is the launcher's only chance to drain the
+				# guest; any override here (SIGKILL shipped once) kills a live guest
+				# with zero grace. Assert the ABSENCE of a KillSignal= line.
+				if grep -q '^KillSignal=' "$sup"; then
+					echo "FAIL: supervisor overrides KillSignal ($(grep '^KillSignal=' "$sup")); a self-exiting main skips ExecStop and the cgroup signal must stay SIGTERM" >&2
+					fails=$((fails + 1))
+				fi
 				if ! grep -q '^ExecStop=.*/bin/cogworx-stop-supervisor /nix/store/.*/bin/cogbox$' "$sup"; then
 					echo 'FAIL: supervisor lacks exact trusted synchronous stop command' >&2
 					fails=$((fails + 1))
@@ -9335,6 +9344,12 @@
 				# guard, before any root/systemd check or transient-unit action.
 				substitute ${./tests/test_shutdown_systemd.sh} guarded-fixture.sh \
 					--replace-fail 'export PATH=/run/current-system/sw/bin' 'export PATH=${pkgs.coreutils}/bin'
+				# The fixture BODY only ever runs on the stage candidate, so CI must at
+				# least parse it: a syntax slip past the GO guard would otherwise surface
+				# for the first time as root on a sandbox host.
+				${pkgs.bash}/bin/bash -n ${./tests/test_shutdown_systemd.sh}
+				${pkgs.bash}/bin/bash -n guarded-fixture.sh
+				echo "ok - systemd fixture parses"
 				for inherited_path in "" /nonexistent; do
 					rc=0
 					env -u COGBOX_SHUTDOWN_FIXTURE_GO PATH="$inherited_path" ${pkgs.bash}/bin/bash guarded-fixture.sh --run > guard.log 2>&1 || rc=$?

@@ -63,7 +63,7 @@ fixture_role() {
     local role=$1 root=$2 case_name=$3
     [[ $root =~ ^/run/cogbox-shutdown-fixture\.[A-Za-z0-9]+$ && -d $root && ! -L $root ]] || die 'invalid fixture directory'
     [[ $(stat -c '%u:%a' "$root") == 0:700 ]] || die 'unsafe fixture directory'
-    case "$case_name" in success|main-exit|failed-stop|hung-stop|no-guest|bounded-post) ;; *) die 'invalid case';; esac
+    case "$case_name" in success|main-exit|main-exit-unrequested|failed-stop|hung-stop|no-guest|bounded-post) ;; *) die 'invalid case';; esac
     case_dir=$root/$case_name
     [[ -d $case_dir && ! -L $case_dir && -f $root/authorized ]] || die 'missing fixture authorization record'
     [[ $(<"$root/authorized") == "$COGBOX_SHUTDOWN_FIXTURE_BOOT_ID" ]] || die 'stale fixture authorization'
@@ -80,8 +80,10 @@ fixture_role() {
             event main-ready
             while [[ ! -f $case_dir/exit-request ]]; do sleep 0.02; done
             event main-exit
-            # The real supervisor returns one when its guest disappears while
-            # synchronous ExecStop is still awaiting the launcher's outcome.
+            # The real supervisor returns one when its guest disappears: while
+            # synchronous ExecStop is still awaiting the launcher's outcome
+            # (main-exit) or, far more often, with no stop job at all -- an
+            # in-guest reboot (main-exit-unrequested).
             exit 1
             ;;
         child)
@@ -105,6 +107,10 @@ fixture_role() {
                     : >"$case_dir/exit-request"
                     wait_event main-exit
                     ;;
+                # Only the runner's explicit teardown stop reaches here (the case
+                # asserted no ExecStop ran for the spontaneous exit); main has
+                # legitimately started twice, so skip the single-start check.
+                main-exit-unrequested) exit 0 ;;
             esac
             sleep 0.8
             live_pid_file "$case_dir/child.pid" || die 'child was killed while synchronous ExecStop waited'
@@ -195,7 +201,7 @@ property_is() {
 }
 
 printf 'Testing only transient units prefixed cogbox-shutdown-fixture-%s-\n' "$fixture_tag"
-for case_name in success main-exit failed-stop hung-stop no-guest bounded-post; do
+for case_name in success main-exit main-exit-unrequested failed-stop hung-stop no-guest bounded-post; do
     case_dir=$fixture_root/$case_name
     mkdir -m 700 "$case_dir"
     : >"$case_dir/events"
@@ -205,8 +211,7 @@ for case_name in success main-exit failed-stop hung-stop no-guest bounded-post; 
     systemd-run --quiet --unit="$unit" \
         --property=Type=simple \
         --property=Restart=always --property=RestartSec=100ms \
-        --property=KillMode=control-group --property=KillSignal=SIGKILL \
-        --property=FinalKillSignal=SIGKILL --property=SendSIGKILL=yes \
+        --property=KillMode=control-group \
         --property=TimeoutStopFailureMode=kill --property=TimeoutStopSec=3s \
         --property=StandardOutput=journal --property=StandardError=journal \
         --property="ExecStop=/run/current-system/sw/bin/bash $script_path --fixture-role stop $fixture_root $case_name" \
@@ -217,13 +222,57 @@ for case_name in success main-exit failed-stop hung-stop no-guest bounded-post; 
         /run/current-system/sw/bin/bash "$script_path" --fixture-role main "$fixture_root" "$case_name"
     wait_event main-ready
     property_is KillMode control-group
-    property_is KillSignal 9
+    # KillSignal is deliberately the SIGTERM default (gce/supervisor.nix): a
+    # self-exiting main skips ExecStop, so the cgroup signal is the launcher's
+    # only grace. FinalKillSignal/SendSIGKILL defaults remain the backstop.
+    property_is KillSignal 15
     property_is FinalKillSignal 9
     property_is SendSIGKILL yes
     property_is TimeoutStopFailureMode kill
     property_is TimeoutStopUSec 3s
     property_is Restart always
     systemctl show "$unit" --property=ExecStart,ExecStop,ExecStopPost,KillMode,KillSignal,FinalKillSignal,TimeoutStopFailureMode,TimeoutStopUSec,Restart >"$case_dir/realized-unit.txt"
+    if [[ $case_name == main-exit-unrequested ]]; then
+        # No stop job. Main exits 1 on its own, exactly as supervise.sh leg (j)
+        # does after an in-guest reboot. systemd SKIPS ExecStop here, so the
+        # leftover child (the launcher/QEMU in production) gets only the
+        # cgroup KillSignal -- which must therefore be TERM, delivered promptly,
+        # never a SIGKILL and never a 3s wait for the final kill. ExecStopPost
+        # still runs, then Restart=always brings main back.
+        start_ms=$(monotonic_ms)
+        : >"$case_dir/exit-request"
+        wait_event main-exit
+        # Park the restart: the replacement main must find no exit request,
+        # or the fixture would restart-loop for the rest of the run.
+        rm -f "$case_dir/exit-request"
+        wait_event post-end
+        has_event child-term || die 'unrequested main exit did not TERM the leftover child (KillSignal is not the SIGTERM default)'
+        ! has_event stop-enter || die 'ExecStop ran for a spontaneous main exit'
+        ordered main-exit child-term
+        ordered child-term post-enter
+        ordered post-enter post-cgroup-gone
+        ordered post-cgroup-gone post-end
+        # The post role itself died if child.pid was still live at post-enter,
+        # so post-end proves the leftover was gone (not re-checked here: the
+        # replacement main rewrites child.pid 100ms later).
+        (( $(event_time post-enter) - $(event_time main-exit) < 1000 )) || die 'leftover child was not gone within 1s of the main exit; it waited for the final kill'
+        elapsed_ms=$(( $(monotonic_ms) - start_ms ))
+        deadline=$(( $(monotonic_ms) + 1800 ))
+        while [[ $(grep -c '^main-start|' "$case_dir/events") -lt 2 ]]; do
+            (( $(monotonic_ms) < deadline )) || die 'Restart=always did not bring main back after its unrequested exit'
+            sleep 0.02
+        done
+        systemctl is-active --quiet "$unit" || die 'fixture is not active after the automatic restart'
+        # Explicit teardown: this appends ONE stop-enter (and stop.pid) to the
+        # retained events, deterministically AFTER the no-stop-job assertion
+        # above, so the events file is complete when the case reports PASS
+        # instead of being mutated later by the EXIT cleanup's stop.
+        timeout --kill-after=1s 8s systemctl stop "$unit" >"$case_dir/stop.stdout" 2>"$case_dir/stop.stderr" || die 'teardown stop of the restarted fixture failed'
+        ! systemctl is-active --quiet "$unit" || die 'fixture remained active after teardown stop'
+        journalctl --no-pager --unit="$unit" --output=short-monotonic >"$case_dir/journal.txt"
+        printf 'PASS case=%s elapsed_ms=%s stop_rc=n/a main_starts=2 leftover_child_termed=yes\n' "$case_name" "$elapsed_ms"
+        continue
+    fi
     start_ms=$(monotonic_ms)
     stop_rc=0
     timeout --kill-after=1s 8s systemctl stop "$unit" >"$case_dir/stop.stdout" 2>"$case_dir/stop.stderr" || stop_rc=$?
@@ -234,7 +283,19 @@ for case_name in success main-exit failed-stop hung-stop no-guest bounded-post; 
     ordered post-enter post-cgroup-gone
     ordered post-cgroup-gone post-end
     [[ $(grep -c '^main-start|' "$case_dir/events") == 1 ]] || die "$case_name restarted during stop"
-    ! grep -Eq '^(main-term|child-term|child-int|stop-term)\|' "$case_dir/events" || die "$case_name received a soft signal instead of final SIGKILL"
+    # KillSignal stays the SIGTERM default (see main-exit-unrequested), so
+    # leftovers legitimately receive TERM -- but only AFTER the synchronous
+    # stop command has finished, never while it is still waiting.
+    for soft in main-term child-term child-int stop-term; do
+        has_event "$soft" || continue
+        ordered stop-enter "$soft"
+        case "$case_name" in
+            success|main-exit|bounded-post) ordered stop-exit "$soft" ;;
+            failed-stop) ordered stop-failure "$soft" ;;
+            hung-stop) ordered stop-hanging "$soft" ;;
+            no-guest) ordered stop-no-guest "$soft" ;;
+        esac
+    done
     for pid_file in main.pid child.pid stop.pid; do
         ! live_pid_file "$case_dir/$pid_file" || die "$case_name still has a live $pid_file"
     done
@@ -286,4 +347,4 @@ for case_name in success main-exit failed-stop hung-stop no-guest bounded-post; 
     journalctl --no-pager --unit="$unit" --output=short-monotonic >"$case_dir/journal.txt"
     printf 'PASS case=%s elapsed_ms=%s stop_rc=%s main_starts=1 all_owned_processes_gone=yes\n' "$case_name" "$elapsed_ms" "$stop_rc"
 done
-printf 'PASS: all six realized-systemd cases; no installed host services changed\n'
+printf 'PASS: all seven realized-systemd cases; no installed host services changed\n'

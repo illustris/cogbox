@@ -75,7 +75,7 @@ pub fn run(
 		else
 			try std.fmt.allocPrint(allocator, "{s}-{s}", .{ p.base_runtime, name });
 		defer allocator.free(inst_runtime);
-		const running = isRunning(allocator, io, inst_runtime);
+		const running = util.instanceRunningConservative(allocator, io, inst_runtime);
 
 		if (json_out) {
 			if (!first) try util.writeStdout(io, ",\n");
@@ -129,21 +129,4 @@ fn networkLabel(obj: std.json.ObjectMap) []const u8 {
 		},
 		else => return "rules",
 	}
-}
-
-fn isRunning(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8) bool {
-	const pid_path = std.fs.path.join(allocator, &.{ runtime_dir, "pid" }) catch return false;
-	defer allocator.free(pid_path);
-	const cwd = std.Io.Dir.cwd();
-	const file = cwd.openFile(io, pid_path, .{}) catch return false;
-	defer file.close(io);
-	var buf: [64]u8 = undefined;
-	var reader = file.reader(io, &buf);
-	const data = reader.interface.allocRemaining(allocator, .limited(64)) catch return false;
-	defer allocator.free(data);
-	const trimmed = std.mem.trim(u8, data, " \t\r\n");
-	const pid = std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch return false;
-	const sig_zero: std.posix.SIG = @enumFromInt(0);
-	std.posix.kill(pid, sig_zero) catch return false;
-	return true;
 }

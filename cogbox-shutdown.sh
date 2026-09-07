@@ -92,12 +92,17 @@ cogbox_stop_init() {
 	IFS= read -r nonce < /proc/sys/kernel/random/uuid || return 1
 	start=$(cogbox_process_start "$$") || return 1
 	STOP_ID="v1 $nonce $$ $start"
-	(umask 077; printf '%s\n' "$STOP_ID" > "$RUNTIME/launch") || return 1
+	# Atomic like stop-result: a stop caller racing this write must see either
+	# no identity yet or the whole line, never a truncated one.
+	(umask 077; printf '%s\n' "$STOP_ID" > "$RUNTIME/launch.tmp") &&
+		mv -f "$RUNTIME/launch.tmp" "$RUNTIME/launch" || { rm -f "$RUNTIME/launch.tmp"; return 1; }
 }
 
 cogbox_stop_result() {
 	# Called only after cleanup, before the launcher exits. Retain this small
 	# per-run record until the next start replaces runtime under the flock.
+	# No identity, no record: never persist a malformed line.
+	[ -n "$STOP_ID" ] || return 1
 	(umask 077; printf '%s %s\n' "$STOP_ID" "$STOP_OUTCOME" > "$RUNTIME/stop-result.tmp") &&
 		mv -f "$RUNTIME/stop-result.tmp" "$RUNTIME/stop-result"
 }

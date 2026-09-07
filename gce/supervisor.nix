@@ -149,10 +149,16 @@ in
 				ExecStart = "${supervise}/bin/cogworx-supervise";
 				ExecStop = "${supervise}/bin/cogworx-stop-supervisor ${cfg.cogboxPackage}/bin/cogbox";
 				ExecStopPost = "${stopPost}/bin/cogworx-supervisor-stop";
-				# ExecStop owns the entire graceful window. Only AFTER it returns
-				# (or times out) may systemd kill the remaining service cgroup.
+				# ExecStop owns the graceful window on a REQUESTED stop. Only AFTER
+				# it returns (or times out) may systemd signal the remaining service
+				# cgroup. KillSignal deliberately stays at its SIGTERM default: when
+				# the main process exits nonzero on its own (supervise.sh leg (j),
+				# an in-guest reboot included) systemd SKIPS ExecStop, and the
+				# cgroup signal is then the ONLY grace a still-live QEMU gets -- the
+				# launcher's TERM trap drains the guest; SIGKILL there cut a live
+				# guest with zero grace. FinalKillSignal/SendSIGKILL defaults
+				# (SIGKILL once TimeoutStopSec expires) remain the backstop.
 				KillMode = "control-group";
-				KillSignal = "SIGKILL";
 				TimeoutStopFailureMode = "kill";
 				TimeoutStopSec = "75s";
 				Restart = "always";
