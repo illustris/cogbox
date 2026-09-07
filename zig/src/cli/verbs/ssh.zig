@@ -50,7 +50,7 @@ pub fn run(
 
 	const pid_path = try std.fs.path.join(allocator, &.{ inst_runtime, "pid" });
 	defer allocator.free(pid_path);
-	if (!isRunning(allocator, io, pid_path)) {
+	if (!util.instanceRunningConservative(allocator, io, inst_runtime)) {
 		const eff = name orelse "default";
 		const hint_name: []const u8 = if (name) |n|
 			try std.fmt.allocPrint(allocator, " --name {s}", .{n})
@@ -65,6 +65,14 @@ pub fn run(
 		);
 		std.process.exit(exit_codes.software);
 	}
+	// The lifetime lock proves a live launch, but the launcher publishes pid
+	// (and, just before it, ssh-endpoint) only after its port probe. A launch
+	// caught in that window is starting, not broken -- say so instead of the
+	// misleading "older cogbox" endpoint error below.
+	const pid = readPid(allocator, io, pid_path) orelse {
+		const eff = name orelse "default";
+		util.die(allocator, io, "ssh", exit_codes.tempfail, "instance \"{s}\" is still starting; retry shortly.", .{eff});
+	};
 
 	const endpoint = readEndpoint(allocator, io, inst_runtime) catch |err| switch (err) {
 		error.Missing => util.die(allocator, io, "ssh", exit_codes.software, "missing {s}/ssh-endpoint (instance launched by an older cogbox?). Restart the instance to repopulate it.", .{inst_runtime}),
@@ -83,10 +91,6 @@ pub fn run(
 				util.die(allocator, io, "ssh", exit_codes.dataerr, "--wait-timeout must be an integer number of seconds (1-86400)", .{})) * 1000
 		else
 			180_000;
-
-		// isRunning above already confirmed the pid file; re-read it for the wait.
-		const pid = readPid(allocator, io, pid_path) orelse
-			util.die(allocator, io, "ssh", exit_codes.software, "could not read instance pid from {s}.", .{pid_path});
 
 		if (!waitForSshOrDeath(io, pid, endpoint.host, endpoint.port, wait_ms)) {
 			if (pidAlive(pid)) {
@@ -367,11 +371,6 @@ fn pidAlive(pid: c_int) bool {
 	const sig_zero: std.posix.SIG = @enumFromInt(0);
 	std.posix.kill(@intCast(pid), sig_zero) catch return false;
 	return true;
-}
-
-fn isRunning(allocator: std.mem.Allocator, io: std.Io, pid_path: []const u8) bool {
-	const pid = readPid(allocator, io, pid_path) orelse return false;
-	return pidAlive(pid);
 }
 
 // --- sshd readiness probe -------------------------------------------------

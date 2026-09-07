@@ -1463,14 +1463,16 @@ fi
 # We hold an exclusive flock on $LOCK for this daemon's ENTIRE lifetime: the
 # fd stays open through the final `wait "$QEMU_PID"`, so the kernel keeps the
 # lock until the daemon (and the QEMU/passt it spawned, which inherit the fd)
-# is gone. flock -n fails immediately for any concurrent or already-running
-# starter -> exit 75. This is race-free where the old pid-file dance was not:
+# is gone. flock fails for any concurrent or already-running starter -> exit
+# 75; the 0.2s wait only absorbs the momentary LOCK_EX a CLI liveness probe
+# (instanceRunning) takes and drops, so a probe cannot fail a genuine start.
+# This is race-free where the old pid-file dance was not:
 # the kernel arbitrates the single winner atomically, and a crashed start
 # releases the lock automatically (fd closed on death) with no stale-pid
 # bookkeeping to get wrong.
 LOCK="${RUNTIME}.lock"
 exec {LOCK_FD}>"$LOCK" || die "cannot open start lock $LOCK" 70
-if ! @flock@ -n "$LOCK_FD"; then
+if ! @flock@ -w 0.2 "$LOCK_FD"; then
 	die "instance${INSTANCE_NAME:+ \"$INSTANCE_NAME\"} is already running or starting." 75
 fi
 
@@ -1489,6 +1491,101 @@ mkdir -p "$RUNTIME"
 if [ ! -t 1 ]; then
 	exec >>"$RUNTIME/cogbox.log" 2>&1
 fi
+
+# Shutdown handlers + run identity BEFORE the port probe below: a stop request
+# that lands while the probe is scanning must be honored and recorded, not
+# TERM a handler-less shell that leaves no outcome and no cleanup.
+PASST_PID=""
+L7PROXY_PID=""
+L7MITM_PID=""
+L7AUTH_PID=""
+QEMU_PID=""
+CLEANED=0
+# Packaged, trusted shutdown functions; shared with real-process tests.
+source @shutdown@
+cogbox_cleanup() {
+	# Capture the status that triggered the EXIT trap BEFORE any command below
+	# overwrites $? -- it tells us whether the start succeeded.
+	local rc=$?
+	[ "$CLEANED" -eq 1 ] && return
+	CLEANED=1
+	# Coalesce repeated normal requests before any child wait. Otherwise a
+	# second TERM can interrupt Bash wait and masquerade as a child failure.
+	# USR1 remains available to shorten an in-progress graceful attempt.
+	trap '' TERM INT
+	if ! cogbox_stop_child; then
+		echo "cogbox-launch: shutdown failed; child termination unconfirmed, retaining runtime" >&2
+		cogbox_stop_result || true
+		return
+	fi
+	if ! cogbox_stop_aux "$PASST_PID" "$L7PROXY_PID" "$L7MITM_PID" "$L7AUTH_PID"; then
+		STOP_OUTCOME=failed
+		echo "cogbox-launch: supporting process termination unconfirmed; retaining runtime" >&2
+		cogbox_stop_result || true
+		return
+	fi
+	# Publish no active-process hints after confirmed child-first cleanup.
+	# Keep the run identity/result instead: PID reuse must neither signal an
+	# unrelated process nor make the next start consume old QEMU readiness.
+	if ! rm -f "$RUNTIME/pid" "$RUNTIME/qemu.pid" "$RUNTIME/qemu.start"; then
+		STOP_OUTCOME=failed
+		cogbox_stop_result || true
+		return
+	fi
+	# Dynamic 9p sources and their manifest may contain caller path bytes. QEMU
+	# is dead before these are removed; retained failed-launch runtimes keep only
+	# diagnostics, never stale grants for a later launch.
+	rm -rf "$RUNTIME/additional-dirs"
+	rm -f "$RUNTIME/additional-dir-args" "$RUNTIME/system-additional-dirs"
+	# Remove this instance's sanitized cred-inject mirrors (QEMU is dead now, so
+	# the 9p source is no longer in use). The mirror is hardlinks/no secret, but
+	# tidy it rather than leave it under the data root until the next boot.
+	rm -rf "$BASE_DATA/mirrors/${EFFECTIVE_NAME}"
+	rmdir "$BASE_DATA/mirrors" 2>/dev/null
+	# Retain the fenced result for requested stops AND unexpected guest exits.
+	# A guest panic can exit QEMU zero, so even an unrequested zero exit carries
+	# no clean-shutdown proof. The next start clears this bounded history under
+	# the lifetime flock; failed starts retain the log shown by `cogbox start`.
+	if [ "$STOP_REQUESTED" -eq 1 ]; then
+		echo "cogbox-launch: shutdown outcome=$STOP_OUTCOME"
+		cogbox_stop_result || echo "cogbox-launch: cannot persist shutdown outcome" >&2
+	elif [ -n "$QEMU_PID" ]; then
+		# QEMU had launched, so the start itself succeeded -- this is the VM
+		# ending later with NO stop request: an in-guest reboot/poweroff or a
+		# panic (both exit zero under -no-reboot), a crash, an external kill.
+		# `exited` lets a stop caller tell "it was already gone" from a stop it
+		# requested; exit zero is still no clean-shutdown proof. Keep the dir:
+		# cogbox.log/console.log are the post-mortem for that exit.
+		STOP_OUTCOME=exited
+		cogbox_stop_result || echo "cogbox-launch: cannot persist shutdown outcome" >&2
+		if [ "$rc" -eq 0 ]; then
+			echo "cogbox-launch: guest exited on its own (status 0; in-guest reboot/poweroff or panic); keeping runtime dir for diagnosis: $RUNTIME/cogbox.log" >&2
+		else
+			echo "cogbox-launch: VM terminated unexpectedly (status $rc); keeping runtime dir for diagnosis: $RUNTIME/cogbox.log" >&2
+		fi
+	elif [ "$rc" -eq 0 ]; then
+		rm -rf "$RUNTIME"
+	else
+		# Failed before QEMU ever launched (port probe/passt/L7/persist) -- the
+		# "VM did not come up" case; keep the log the start error points the
+		# user at. `start-failed` (not the default `failed`) tells a later
+		# `cogbox stop`/`restart` that no guest ever needed shutdown, so the
+		# retained record does not block restarting after a failed start.
+		STOP_OUTCOME=start-failed
+		cogbox_stop_result || echo "cogbox-launch: cannot persist shutdown outcome" >&2
+		echo "cogbox-launch: start failed (status $rc); keeping runtime dir for diagnosis: $RUNTIME/cogbox.log" >&2
+	fi
+	# Leave $LOCK in place: it is an flock target, not a pid file. Our held
+	# fd is released when this process exits (kernel-managed); unlinking it
+	# here would only risk a new starter racing on a fresh inode. The empty
+	# file lingers harmlessly in the tmpfs runtime base (cleared on logout).
+}
+trap cogbox_cleanup EXIT
+cogbox_stop_traps
+# Publish the run identity only after handlers exist. The legacy pid marker
+# follows the port probe below (see the note there); `cogbox stop` already
+# falls back to this identity's pid, so a stop during the probe is fenced.
+cogbox_stop_init || die "cannot initialize shutdown identity" 70
 
 # -- Ensure the host ports we are about to bind are actually free ----
 # next_available_ports keeps ports disjoint among THIS user's instances, but
@@ -1568,84 +1665,11 @@ fi
 # Bound to runtime, not config, so post-boot edits to config.json don't
 # misdirect connections to a port the VM isn't listening on.
 echo "$SSH_PORT $BIND_ADDR" > "$RUNTIME/ssh-endpoint"
-PASST_PID=""
-L7PROXY_PID=""
-L7MITM_PID=""
-L7AUTH_PID=""
-QEMU_PID=""
-CLEANED=0
-# Packaged, trusted shutdown functions; shared with real-process tests.
-source @shutdown@
-cogbox_cleanup() {
-	# Capture the status that triggered the EXIT trap BEFORE any command below
-	# overwrites $? -- it tells us whether the start succeeded.
-	local rc=$?
-	[ "$CLEANED" -eq 1 ] && return
-	CLEANED=1
-	# Coalesce repeated normal requests before any child wait. Otherwise a
-	# second TERM can interrupt Bash wait and masquerade as a child failure.
-	# USR1 remains available to shorten an in-progress graceful attempt.
-	trap '' TERM INT
-	if ! cogbox_stop_child; then
-		echo "cogbox-launch: shutdown failed; child termination unconfirmed, retaining runtime" >&2
-		cogbox_stop_result || true
-		return
-	fi
-	if ! cogbox_stop_aux "$PASST_PID" "$L7PROXY_PID" "$L7MITM_PID" "$L7AUTH_PID"; then
-		STOP_OUTCOME=failed
-		echo "cogbox-launch: supporting process termination unconfirmed; retaining runtime" >&2
-		cogbox_stop_result || true
-		return
-	fi
-	# Publish no active-process hints after confirmed child-first cleanup.
-	# Keep the run identity/result instead: PID reuse must neither signal an
-	# unrelated process nor make the next start consume old QEMU readiness.
-	if ! rm -f "$RUNTIME/pid" "$RUNTIME/qemu.pid"; then
-		STOP_OUTCOME=failed
-		cogbox_stop_result || true
-		return
-	fi
-	# Dynamic 9p sources and their manifest may contain caller path bytes. QEMU
-	# is dead before these are removed; retained failed-launch runtimes keep only
-	# diagnostics, never stale grants for a later launch.
-	rm -rf "$RUNTIME/additional-dirs"
-	rm -f "$RUNTIME/additional-dir-args" "$RUNTIME/system-additional-dirs"
-	# Remove this instance's sanitized cred-inject mirrors (QEMU is dead now, so
-	# the 9p source is no longer in use). The mirror is hardlinks/no secret, but
-	# tidy it rather than leave it under the data root until the next boot.
-	rm -rf "$BASE_DATA/mirrors/${EFFECTIVE_NAME}"
-	rmdir "$BASE_DATA/mirrors" 2>/dev/null
-	# Retain the fenced result for requested stops AND unexpected guest exits.
-	# A guest panic can exit QEMU zero, so even an unrequested zero exit carries
-	# no clean-shutdown proof. The next start clears this bounded history under
-	# the lifetime flock; failed starts retain the log shown by `cogbox start`.
-	if [ "$STOP_REQUESTED" -eq 1 ]; then
-		echo "cogbox-launch: shutdown outcome=$STOP_OUTCOME"
-		cogbox_stop_result || echo "cogbox-launch: cannot persist shutdown outcome" >&2
-	elif [ -n "$QEMU_PID" ]; then
-		# QEMU had launched, so the start itself succeeded -- this is the VM
-		# dying later (a crash, an external SIGKILL, a guest fault). Keep the
-		# dir: cogbox.log/console.log are the post-mortem for that exit.
-		STOP_OUTCOME=unverified
-		cogbox_stop_result || echo "cogbox-launch: cannot persist shutdown outcome" >&2
-		echo "cogbox-launch: VM terminated unexpectedly (status $rc); keeping runtime dir for diagnosis: $RUNTIME/cogbox.log" >&2
-	elif [ "$rc" -eq 0 ]; then
-		rm -rf "$RUNTIME"
-	else
-		# Failed before QEMU ever launched (passt/L7/persist) -- the "VM did not
-		# come up" case; keep the log the start error points the user at.
-		cogbox_stop_result || echo "cogbox-launch: cannot persist shutdown outcome" >&2
-		echo "cogbox-launch: start failed (status $rc); keeping runtime dir for diagnosis: $RUNTIME/cogbox.log" >&2
-	fi
-	# Leave $LOCK in place: it is an flock target, not a pid file. Our held
-	# fd is released when this process exits (kernel-managed); unlinking it
-	# here would only risk a new starter racing on a fresh inode. The empty
-	# file lingers harmlessly in the tmpfs runtime base (cleared on logout).
-}
-trap cogbox_cleanup EXIT
-cogbox_stop_traps
-# Publish protocol only after handlers exist, then the legacy pid marker.
-cogbox_stop_init || die "cannot initialize shutdown identity" 70
+# The legacy pid marker stays AFTER the ssh-endpoint write above: `cogbox ssh`
+# gates on pid and then dies on a missing endpoint, so publishing pid earlier
+# would turn a launch caught in the port probe into a misleading error. The
+# shutdown handlers and run identity are already live (hoisted above the
+# probe), so a stop request during the probe is honored and recorded.
 echo "$$" > "$RUNTIME/pid"
 
 # Stage dynamic sources behind numeric aliases. Caller paths appear only as
@@ -2067,7 +2091,14 @@ launch_vm() {
 	# Readiness/liveness marker the parent (`cogbox start`) waits on. Written
 	# the instant QEMU is launched, regardless of whether the serial console
 	# rewrite applied, so a console-less VM (e.g. a flake that disables
-	# serialConsole) is still detected as up rather than timing out.
+	# serialConsole) is still detected as up rather than timing out. The
+	# parent's readiness proof (stop.zig childProof) accepts qemu.pid only with
+	# a live, launcher-parented process whose starttime matches qemu.start, so
+	# a zombie or reused PID is never "ready". The starttime is written first
+	# so a reader that sees the pid can immediately see the start; the reverse
+	# order would only delay readiness by one poll. No starttime (QEMU already
+	# gone) -> no qemu.start -> never ready.
+	[ -n "$QEMU_START" ] && echo "$QEMU_START" > "$RUNTIME/qemu.start"
 	echo "$QEMU_PID" > "$RUNTIME/qemu.pid"
 	wait "$QEMU_PID"
 }

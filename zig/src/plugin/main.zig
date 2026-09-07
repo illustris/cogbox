@@ -2267,22 +2267,26 @@ fn printRestartHint(ctx: *const Ctx, why: []const u8) !void {
 	}
 }
 
+/// Same probe as cli/util.zig instanceRunningConservative, inlined because the
+/// CLI module imports this one (build.zig) and cannot be imported back. The
+/// launcher holds an exclusive flock on <runtime>.lock for its whole lifetime
+/// (inherited by QEMU), so a held lock is the verdict; a pid file cannot tell a
+/// dead launch from PID reuse. Fail closed: an uninspectable lock counts as
+/// running, so the hint says "restart" rather than "at the next start".
 fn isRunning(ctx: *const Ctx) bool {
-	const pid_path = std.fs.path.join(ctx.allocator, &.{ ctx.runtime_path, "pid" }) catch return false;
-	defer ctx.allocator.free(pid_path);
-
-	const cwd = std.Io.Dir.cwd();
-	const file = cwd.openFile(ctx.io, pid_path, .{}) catch return false;
+	const lock_path = std.fmt.allocPrint(ctx.allocator, "{s}.lock", .{ctx.runtime_path}) catch return true;
+	defer ctx.allocator.free(lock_path);
+	const file = std.Io.Dir.cwd().openFile(ctx.io, lock_path, .{}) catch |err| switch (err) {
+		error.FileNotFound => return false,
+		else => return true,
+	};
 	defer file.close(ctx.io);
-	var buf: [64]u8 = undefined;
-	var reader = file.reader(ctx.io, &buf);
-	const text = reader.interface.allocRemaining(ctx.allocator, .limited(64)) catch return false;
-	defer ctx.allocator.free(text);
-	const pid = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, text, " \t\r\n"), 10) catch return false;
-
-	const sig_zero: std.posix.SIG = @enumFromInt(0);
-	std.posix.kill(pid, sig_zero) catch return false;
-	return true;
+	const linux = std.os.linux;
+	return switch (linux.errno(linux.flock(file.handle, 2 | 4))) { // LOCK_EX | LOCK_NB
+		.SUCCESS => false,
+		.AGAIN => true,
+		else => true,
+	};
 }
 
 /// Interactive confirmation. Non-tty stdin auto-confirms, matching the

@@ -62,3 +62,33 @@ pub fn die(
 
 	std.process.exit(code);
 }
+
+/// Whether an instance launch is alive. The launcher holds an exclusive flock
+/// on `<runtime>.lock` for its whole lifetime and QEMU/passt inherit the fd,
+/// so the kernel releases it only once every owned process is gone. A PID
+/// file cannot tell a dead launch from unrelated PID reuse, and the pid marker
+/// is published only after the launcher's port probe, so a launch caught in
+/// that window has no pid at all. The probe takes LOCK_EX|LOCK_NB and drops it
+/// on close; the launcher's `flock -w` absorbs that flicker.
+pub fn instanceRunning(allocator: std.mem.Allocator, io: std.Io, runtime: []const u8) !bool {
+	const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{runtime});
+	defer allocator.free(lock_path);
+	const file = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch |err| switch (err) {
+		error.FileNotFound => return false,
+		else => return err,
+	};
+	defer file.close(io);
+	const linux = std.os.linux;
+	return switch (linux.errno(linux.flock(file.handle, 2 | 4))) { // LOCK_EX | LOCK_NB
+		.SUCCESS => false,
+		.AGAIN => true,
+		else => error.CannotInspectLaunchLock,
+	};
+}
+
+/// `instanceRunning` for callers that only need a verdict. An uninspectable
+/// lock counts as RUNNING (fail closed): never delete, report "stopped" or
+/// hint "next start" over a launch that may still be alive.
+pub fn instanceRunningConservative(allocator: std.mem.Allocator, io: std.Io, runtime: []const u8) bool {
+	return instanceRunning(allocator, io, runtime) catch true;
+}

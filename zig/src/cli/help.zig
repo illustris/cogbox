@@ -183,6 +183,8 @@ pub const STOP =
     \\
     \\Idempotent when no launch is recorded. A retained launch consumes its
     \\matching stop result; failed, missing or changed outcomes remain errors.
+    \\A guest that already ended on its own (reboot, poweroff, panic, crash) or
+    \\a start that failed before QEMU launched reports not running, exit 0.
     \\Normal stop allows up to 45s for orderly guest shutdown, then uses bounded
     \\forced termination with a data-loss warning. Total wait is at most 65s.
     \\Even without fallback, clean guest shutdown cannot be verified; a warning

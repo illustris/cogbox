@@ -640,6 +640,9 @@ done
 # lands on exactly this line, and the whole point of Restart=always is that the
 # sandbox comes straight back. Delaying it would turn an in-guest reboot into a
 # multi-minute "Booting" with nothing to explain it.
+# (An in-guest `poweroff` leaves QEMU lingering halted, so this exit's cgroup
+# TERM lets the launcher run its full ~45s orderly lane first; a `reboot`
+# exits QEMU and is unaffected. See docs/graceful-guest-shutdown.md.)
 ga_del cogworx/ready || true
 note "sandbox is no longer running; exiting so the unit restarts"
 exit 1
