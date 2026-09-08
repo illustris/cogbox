@@ -4,11 +4,13 @@
 // Liveness is a two-step check. First the launch's lifetime flock
 // (<runtime>.lock, held by the bash launch script and inherited by QEMU) must
 // be held -- util.instanceRunning; the pid file is only a best-effort hint for
-// the report line. That alone is NOT sufficient: on a
-// guest-initiated power-off (`poweroff`, `shutdown -h now`, `systemctl
-// poweroff`) the QEMU `microvm` machine type does NOT exit the QEMU process --
-// it halts the guest but lingers -- so the daemon's `wait` never returns and
-// its PID stays alive even though the VM is down. To catch that, we then ask
+// the report line. That alone is NOT sufficient in general: a QEMU `microvm`
+// machine can halt the guest on a guest-initiated power-off (`poweroff`,
+// `shutdown -h now`, `systemctl poweroff`) yet keep the QEMU process alive, so
+// the daemon's `wait` would never return and its PID would stay alive even
+// though the VM is down. (Live observation 2026-09-07 on the current runner:
+// power-off DID end QEMU, so this is a belt-and-braces check today, not the
+// common path -- keep it, runners change.) To catch a halted guest, we then ask
 // QEMU itself via the QMP control socket (`query-status`): a `shutdown`,
 // `guest-panicked`, or `internal-error` run-state means the guest is down, so
 // status reports stopped. QMP being unreachable (socket missing, no answer,
