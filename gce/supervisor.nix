@@ -154,9 +154,9 @@ in
 				# cgroup. KillSignal deliberately stays at its SIGTERM default: when
 				# the main process exits nonzero on its own (supervise.sh leg (j),
 				# an in-guest reboot included) systemd SKIPS ExecStop, and the
-				# cgroup signal is then the ONLY grace a still-live QEMU gets -- the
-				# launcher's TERM trap drains the guest; SIGKILL there cut a live
-				# guest with zero grace. FinalKillSignal/SendSIGKILL defaults
+				# cgroup TERM permits signal handling. It also reaches QEMU and its
+				# supporting processes, so the launcher's orderly attempt has no
+				# guaranteed guest drain window. FinalKillSignal/SendSIGKILL defaults
 				# (SIGKILL once TimeoutStopSec expires) remain the backstop.
 				KillMode = "control-group";
 				TimeoutStopFailureMode = "kill";

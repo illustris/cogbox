@@ -180,6 +180,20 @@ fn tmpStoreDir(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
 	return std.fmt.allocPrint(gpa, "zig-secret-store-{s}", .{hexb});
 }
 
+fn expectStoreEntries(io: std.Io, path: []const u8, names: []const []const u8) !void {
+	var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+	defer dir.close(io);
+	var iter = dir.iterate();
+	var count: usize = 0;
+	while (try iter.next(io)) |entry| {
+		for (names) |name| {
+			if (std.mem.eql(u8, entry.name, name)) break;
+		} else return error.UnexpectedStoreEntry;
+		count += 1;
+	}
+	try t.expectEqual(names.len, count);
+}
+
 test "addForProxy stages the proxy group + 0640 on the value file, leaving the meta owner-only" {
 	const gpa = t.allocator;
 	var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -222,9 +236,137 @@ test "addForProxy stages the proxy group + 0640 on the value file, leaving the m
 	defer gpa.free(got);
 	try t.expectEqualStrings("tok-abc123", got);
 
-	const tmp = try std.fs.path.join(gpa, &.{ dir, "api-token.tmp" });
-	defer gpa.free(tmp);
-	try t.expectError(error.FileNotFound, cwd.statFile(io, tmp, .{}));
+	try expectStoreEntries(io, dir, &.{ "api-token", "api-token.meta" });
+}
+
+test "addForProxy cleans a failed staged rename before an owner-only retry" {
+	const gpa = t.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+	const dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(dir);
+	defer cwd.deleteTree(io, dir) catch {};
+	const path = try std.fs.path.join(gpa, &.{ dir, "api-token" });
+	defer gpa.free(path);
+	// A directory at the destination forces rename to fail AFTER staging 0640.
+	try cwd.createDirPath(io, path);
+	const gid: store.Gid = @intCast(std.os.linux.getgid());
+	if (store.addForProxy(gpa, io, dir, "api-token", "fake-proxy-value", .{ .audience = "api.example.com" }, gid)) |_| {
+		return error.ExpectedRenameFailure;
+	} else |_| {}
+	try expectStoreEntries(io, dir, &.{"api-token"});
+	try cwd.deleteDir(io, path);
+	const outcome = try store.addForProxy(gpa, io, dir, "api-token", "fake-owner-only-value", .{}, gid);
+	try t.expect(!outcome.proxy_readable);
+	try t.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, path));
+	const got = try cwd.readFileAlloc(io, path, gpa, .limited(1 << 10));
+	defer gpa.free(got);
+	try t.expectEqualStrings("fake-owner-only-value", got);
+	try expectStoreEntries(io, dir, &.{ "api-token", "api-token.meta" });
+}
+
+test "addForProxy ignores legacy group-readable temps and symlinks" {
+	const gpa = t.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+	const dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(dir);
+	defer cwd.deleteTree(io, dir) catch {};
+	try cwd.createDirPath(io, dir);
+	const legacy = try std.fs.path.join(gpa, &.{ dir, "api-token.tmp" });
+	defer gpa.free(legacy);
+	{
+		const f = try cwd.createFile(io, legacy, .{});
+		defer f.close(io);
+		try f.setPermissions(io, .fromMode(0o640));
+		var buf: [64]u8 = undefined;
+		var writer = f.writer(io, &buf);
+		try writer.interface.writeAll("fake-stale-value");
+		try writer.flush();
+	}
+	const link = try std.fs.path.join(gpa, &.{ dir, "app-session.tmp" });
+	defer gpa.free(link);
+	try cwd.symLink(io, "api-token.tmp", link, .{});
+	const gid: store.Gid = @intCast(std.os.linux.getgid());
+	for ([_][]const u8{ "api-token", "app-session" }) |name| {
+		const outcome = try store.addForProxy(gpa, io, dir, name, "fake-owner-only-value", .{}, gid);
+		try t.expect(!outcome.proxy_readable);
+		const path = try std.fs.path.join(gpa, &.{ dir, name });
+		defer gpa.free(path);
+		try t.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, path));
+		const got = try cwd.readFileAlloc(io, path, gpa, .limited(1 << 10));
+		defer gpa.free(got);
+		try t.expectEqualStrings("fake-owner-only-value", got);
+	}
+	const stale = try cwd.readFileAlloc(io, legacy, gpa, .limited(1 << 10));
+	defer gpa.free(stale);
+	try t.expectEqualStrings("fake-stale-value", stale);
+	try t.expectEqual(@as(std.posix.mode_t, 0o640), try modeOf(io, legacy));
+	try t.expectEqual(.sym_link, (try cwd.statFile(io, link, .{ .follow_symlinks = false })).kind);
+	try expectStoreEntries(io, dir, &.{ "api-token.tmp", "app-session.tmp", "api-token", "api-token.meta", "app-session", "app-session.meta" });
+}
+
+const ConcurrentBind = struct {
+	dir: []const u8,
+	value: []const u8,
+	start: *std.atomic.Value(bool),
+	failure: ?anyerror = null,
+
+	fn run(self: *@This()) void {
+		var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+		defer threaded.deinit();
+		while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+		for (0..10) |_| {
+			_ = store.addForProxy(std.heap.page_allocator, threaded.io(), self.dir, "api-token", self.value, .{
+				.audience = "api.example.com",
+			}, @intCast(std.os.linux.getgid())) catch |err| {
+				self.failure = err;
+				return;
+			};
+		}
+	}
+};
+
+test "addForProxy overlapping binds publish whole values without sharing temps" {
+	const gpa = t.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+	const dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(dir);
+	defer cwd.deleteTree(io, dir) catch {};
+	try cwd.createDirPath(io, dir);
+	// Payloads span many buffer flushes. Metadata is identical: concurrent
+	// value/metadata pairs are not a transaction, and this does not claim one.
+	const a = "a" ** (128 * 1024);
+	const b = "b" ** (128 * 1024);
+	var start: std.atomic.Value(bool) = .init(false);
+	var first: ConcurrentBind = .{ .dir = dir, .value = a, .start = &start };
+	var second: ConcurrentBind = .{ .dir = dir, .value = b, .start = &start };
+	{
+		const th1 = try std.Thread.spawn(.{}, ConcurrentBind.run, .{&first});
+		defer th1.join();
+		// Release the first thread even if spawning the second one fails.
+		defer start.store(true, .release);
+		const th2 = try std.Thread.spawn(.{}, ConcurrentBind.run, .{&second});
+		defer th2.join();
+		start.store(true, .release);
+	}
+	if (first.failure) |err| return err;
+	if (second.failure) |err| return err;
+	const path = try std.fs.path.join(gpa, &.{ dir, "api-token" });
+	defer gpa.free(path);
+	const got = try cwd.readFileAlloc(io, path, gpa, .limited(a.len + 1));
+	defer gpa.free(got);
+	try t.expect(std.mem.eql(u8, got, a) or std.mem.eql(u8, got, b));
+	try t.expectEqual(@as(std.posix.mode_t, 0o640), try modeOf(io, path));
+	try t.expectEqual(@as(store.Gid, @intCast(std.os.linux.getgid())), try gidOf(path));
+	try expectStoreEntries(io, dir, &.{ "api-token", "api-token.meta" });
 }
 
 test "addForProxy leaves the store owner-only with no proxy gid, and for a secret with no audience" {

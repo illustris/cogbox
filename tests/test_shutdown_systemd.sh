@@ -223,8 +223,8 @@ for case_name in success main-exit main-exit-unrequested failed-stop hung-stop n
     wait_event main-ready
     property_is KillMode control-group
     # KillSignal is deliberately the SIGTERM default (gce/supervisor.nix): a
-    # self-exiting main skips ExecStop, so the cgroup signal is the launcher's
-    # only grace. FinalKillSignal/SendSIGKILL defaults remain the backstop.
+    # self-exiting main skips ExecStop, so TERM permits leftover signal handlers
+    # to run. FinalKillSignal/SendSIGKILL defaults remain the backstop.
     property_is KillSignal 15
     property_is FinalKillSignal 9
     property_is SendSIGKILL yes
@@ -235,10 +235,12 @@ for case_name in success main-exit main-exit-unrequested failed-stop hung-stop n
     if [[ $case_name == main-exit-unrequested ]]; then
         # No stop job. Main exits 1 on its own, exactly as supervise.sh leg (j)
         # does after an in-guest reboot. systemd SKIPS ExecStop here, so the
-        # leftover child (the launcher/QEMU in production) gets only the
+        # synthetic leftover child gets only the
         # cgroup KillSignal -- which must therefore be TERM, delivered promptly,
         # never a SIGKILL and never a 3s wait for the final kill. ExecStopPost
-        # still runs, then Restart=always brings main back.
+        # still runs, then Restart=always brings main back. The child exits
+        # immediately on TERM: this checks signal delivery, cleanup and restart,
+        # not QEMU behavior, guest flushing or a guest drain window.
         start_ms=$(monotonic_ms)
         : >"$case_dir/exit-request"
         wait_event main-exit

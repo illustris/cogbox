@@ -172,9 +172,10 @@ cgroup; merely sending the request and returning is insufficient. Leave
 requested stop is covered by ExecStop, but when the supervisor's main process
 exits nonzero on its own (every `supervise.sh` exit is nonzero, including the
 ordinary in-guest reboot on leg (j)) systemd SKIPS ExecStop and goes straight
-to signaling the cgroup: that TERM, caught by the launcher's trap, is the only
-grace a still-live QEMU gets there. SIGKILL in that position killed a live
-guest with zero grace; the realized-unit check asserts the ABSENCE of any
+to signaling the cgroup. TERM lets the launcher and remaining processes run
+their signal handlers, but also reaches QEMU and its supporting processes;
+it does not reserve a guest drain window. SIGKILL in that position prevents
+signal handling entirely; the realized-unit check asserts the ABSENCE of any
 `KillSignal=` line. Set `TimeoutStopFailureMode=kill` for command timeout.
 `FinalKillSignal`/`SendSIGKILL` stay at their defaults (SIGKILL once
 `TimeoutStopSec` expires) as the backstop. Consequence to accept: after a
@@ -185,20 +186,23 @@ regression. Preserve the existing ordering after the state mount, floor,
 resolver and network so their reverse stop order keeps guest storage and
 supporting services available.
 
-When the SIGTERM default actually matters: only when `supervise.sh` leg (j)
-fires while QEMU is still alive -- a readiness timeout on a healthy guest, or a
-`cogbox status` failure that outruns the guest. Then the cgroup TERM reaches the
-launcher's trap, which sets a stop request and runs the full orderly lane (up to
-the 45-second grace) before TERM/KILL fallback, all inside `TimeoutStopSec=75s`.
-That path is exercised by the systemd fixture's `main-exit-unrequested` case,
-not by anything a user does inside the guest: on the current image both an
-in-guest `reboot` and an in-guest `poweroff` end the QEMU process before the
-supervisor notices (observed live 2026-09-07: `poweroff` -> launcher cleanup
-records `exited` -> leg (j) exits 1 with an empty cgroup -> restart in ~7 s), so
-neither triggers a requested stop and both land on the `exited` outcome. If a
-future runner keeps QEMU halted-but-alive on power-off, the halted guest is
-indistinguishable from a draining one and the orderly lane above is the correct,
-merely slower, behaviour.
+On an unexpected supervisor exit while QEMU is still alive -- for example,
+`supervise.sh` leg (j) after a readiness timeout on a healthy guest, or a
+`cogbox status` failure that outruns the guest -- the cgroup TERM reaches the
+launcher's trap, which sets a stop request and attempts the orderly lane before
+TERM/KILL fallback, all inside `TimeoutStopSec=75s`.
+With `KillMode=control-group`, however, QEMU and its supporting processes
+receive TERM at the same time, so they can exit before the launcher's orderly
+attempt completes. The full 45-second guest drain window is not guaranteed on
+this path. The systemd fixture's `main-exit-unrequested` case proves TERM
+delivery, cleanup and restart with a synthetic child that exits immediately
+on TERM; it does not run QEMU or prove guest flushing or orderly shutdown.
+On the current image both an in-guest `reboot` and an in-guest `poweroff` end
+the QEMU process before the supervisor notices (observed live 2026-09-07:
+`poweroff` -> launcher cleanup records `exited` -> leg (j) exits 1 with an
+empty cgroup -> restart in ~7 s), so neither triggers a requested stop and
+both land on the `exited` outcome. A future runner that keeps QEMU
+halted-but-alive on power-off would need separate validation of this path.
 
 Retain `Restart=always` for ordinary guest exits/reboots. During a systemd stop
 transaction, automatic restart is suppressed by systemd itself; do not manually

@@ -6042,9 +6042,9 @@
 				done
 				# KillSignal must stay at its SIGTERM default. A spontaneous nonzero
 				# main exit (supervise.sh leg (j): an in-guest reboot) SKIPS ExecStop,
-				# so the cgroup signal is the launcher's only chance to drain the
-				# guest; any override here (SIGKILL shipped once) kills a live guest
-				# with zero grace. Assert the ABSENCE of a KillSignal= line.
+				# so TERM must permit signal handling. QEMU and its supporting
+				# processes receive it too; this does not guarantee guest draining.
+				# Assert the ABSENCE of a KillSignal= line.
 				if grep -q '^KillSignal=' "$sup"; then
 					echo "FAIL: supervisor overrides KillSignal ($(grep '^KillSignal=' "$sup")); a self-exiting main skips ExecStop and the cgroup signal must stay SIGTERM" >&2
 					fails=$((fails + 1))

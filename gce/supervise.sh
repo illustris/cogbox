@@ -642,8 +642,9 @@ done
 # multi-minute "Booting" with nothing to explain it.
 # (On the current image both `reboot` and `poweroff` end QEMU before this
 # line runs, so the cgroup TERM finds nothing to drain; it only matters when
-# a LIVE QEMU is still here -- readiness timeout, status failure -- and then
-# the launcher runs its ~45s orderly lane. See docs/graceful-guest-shutdown.md.)
+# a LIVE QEMU is still here -- readiness timeout, status failure. TERM also
+# reaches QEMU and its supporting processes, so the launcher's orderly attempt
+# has no guaranteed guest drain window. See docs/graceful-guest-shutdown.md.)
 ga_del cogworx/ready || true
 note "sandbox is no longer running; exiting so the unit restarts"
 exit 1
