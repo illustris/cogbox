@@ -185,15 +185,20 @@ regression. Preserve the existing ordering after the state mount, floor,
 resolver and network so their reverse stop order keeps guest storage and
 supporting services available.
 
-Cost of the SIGTERM default on the in-guest `poweroff` path: the microvm
-machine type does not exit QEMU on a guest power-off (it lingers halted, see
-`status.zig`), so `supervise.sh` leg (j) fires with a LIVE QEMU. The cgroup
-TERM then reaches the launcher's trap, which sets a stop request and runs the
-full orderly lane -- Ctrl-Alt-Delete against an already-halted guest, up to the
-45-second grace -- before TERM/KILL fallback. A halted guest is
-indistinguishable from a draining one, so this is correct, and it stays inside
-`TimeoutStopSec=75s`; it only makes a `poweroff` restart slower than a `reboot`
-(`-no-reboot` exits QEMU, so `reboot` is unaffected).
+When the SIGTERM default actually matters: only when `supervise.sh` leg (j)
+fires while QEMU is still alive -- a readiness timeout on a healthy guest, or a
+`cogbox status` failure that outruns the guest. Then the cgroup TERM reaches the
+launcher's trap, which sets a stop request and runs the full orderly lane (up to
+the 45-second grace) before TERM/KILL fallback, all inside `TimeoutStopSec=75s`.
+That path is exercised by the systemd fixture's `main-exit-unrequested` case,
+not by anything a user does inside the guest: on the current image both an
+in-guest `reboot` and an in-guest `poweroff` end the QEMU process before the
+supervisor notices (observed live 2026-09-07: `poweroff` -> launcher cleanup
+records `exited` -> leg (j) exits 1 with an empty cgroup -> restart in ~7 s), so
+neither triggers a requested stop and both land on the `exited` outcome. If a
+future runner keeps QEMU halted-but-alive on power-off, the halted guest is
+indistinguishable from a draining one and the orderly lane above is the correct,
+merely slower, behaviour.
 
 Retain `Restart=always` for ordinary guest exits/reboots. During a systemd stop
 transaction, automatic restart is suppressed by systemd itself; do not manually
