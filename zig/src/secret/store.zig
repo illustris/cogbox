@@ -120,7 +120,9 @@ fn metaPath(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) ![]
 	return std.fs.path.join(allocator, &.{ dir, base });
 }
 
-/// Atomically write `bytes` to `path` with mode 0600 (.tmp + rename).
+/// Atomically write `bytes` to `path` with mode 0600 (unique temp + rename).
+/// Exclusive creation never reuses a stale inode or follows a planted symlink.
+/// Each write owns its temp; errors remove it without touching other writers.
 ///
 /// `group`, when set, is the L7 proxy's gid (see proxygid.zig): the temp file is
 /// chowned to it and widened to 0640 BEFORE the rename, so the file is
@@ -137,21 +139,30 @@ fn metaPath(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) ![]
 /// group the file happened to carry.
 fn writeFile0600(allocator: std.mem.Allocator, io: std.Io, path: []const u8, bytes: []const u8, group: ?Gid) !bool {
 	const cwd = std.Io.Dir.cwd();
-	const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
-	defer allocator.free(tmp);
-	var granted = false;
-	{
-		const f = try cwd.createFile(io, tmp, .{ .truncate = true, .permissions = std.Io.File.Permissions.fromMode(0o600) });
+	for (0..8) |_| {
+		var rnd: [16]u8 = undefined;
+		io.random(&rnd);
+		var hexb: [32]u8 = undefined;
+		_ = std.fmt.bufPrint(&hexb, "{x}", .{&rnd}) catch unreachable;
+		const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp-{s}", .{ path, hexb });
+		defer allocator.free(tmp);
+		const f = cwd.createFile(io, tmp, .{ .exclusive = true, .permissions = std.Io.File.Permissions.fromMode(0o600) }) catch |err| switch (err) {
+			error.PathAlreadyExists => continue,
+			else => return err,
+		};
+		errdefer cwd.deleteFile(io, tmp) catch {};
 		defer f.close(io);
 		var wbuf: [4096]u8 = undefined;
 		var w = f.writer(io, &wbuf);
 		try w.interface.writeAll(bytes);
 		try w.flush();
 		try f.sync(io);
+		var granted = false;
 		if (group) |gid| granted = stageGroupRead(io, f, gid);
+		try cwd.rename(tmp, cwd, path, io);
+		return granted;
 	}
-	try cwd.rename(tmp, cwd, path, io);
-	return granted;
+	return error.PathAlreadyExists;
 }
 
 /// chown+chmod the still-unpublished temp file so `gid` may read it: 0600 ->
