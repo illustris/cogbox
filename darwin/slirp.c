@@ -60,13 +60,25 @@ static void on_signal(int sig) { (void)sig; quitting = 1; }
 
 // A partial frame cannot be dropped, and QEMU stops reading this stream while
 // the guest cannot receive (a paused VM, a full virtio queue). Block until it
-// drains: nothing else needs service while the guest is stalled, and SIGTERM
-// or SIGINT still interrupts the send. Only a real socket error closes the link.
+// drains, but keep every write cancelable, including later libslirp callbacks
+// after a signal interrupts a frame. Nonblocking sends and a bounded poll also
+// cover a signal arriving between the quit check and either syscall. A poll
+// timeout retries the same bytes; it never drops a frame or closes the link.
 static int send_all(const void *data, size_t size) {
     const unsigned char *p = data;
     while (size) {
-        ssize_t n = send(peer, p, size, 0);
-        if (n < 0 && errno == EINTR && !quitting) continue;
+        if (quitting) { errno = EINTR; return -1; }
+        ssize_t n = send(peer, p, size, MSG_DONTWAIT);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd out = { .fd = peer, .events = POLLOUT };
+            int result = poll(&out, 1, 100);
+            if ((result < 0 && errno != EINTR) ||
+                    (result > 0 && (out.revents & (POLLERR | POLLHUP | POLLNVAL)))) {
+                quitting = 1; return -1;
+            }
+            continue;
+        }
         if (n <= 0) { quitting = 1; return -1; }
         p += n; size -= (size_t)n;
     }
