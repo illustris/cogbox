@@ -23,8 +23,9 @@ New instances default to 4 vCPUs and 8192 MiB of RAM. `--vcpu` and `--mem`
 override these values. Existing instance configuration retains its settings.
 Configuration remains in `~/.config/cogbox` and data in `~/.local/share/cogbox`,
 with the usual XDG overrides. Without `XDG_RUNTIME_DIR`, runtime sockets live in
-`/tmp/cogbox-runtime-$UID`; a launch refuses that path unless it is a directory
-this user created, since `/tmp` is shared. macOS resolves symlinks such as `/tmp` to
+`/tmp/cogbox-runtime-$UID`; a launch refuses symlinks and directories owned by
+another user, allowing the invoking user's or root's directory under sudo.
+macOS resolves symlinks such as `/tmp` to
 `/private/tmp` when canonicalizing additional directory grants.
 
 The VM uses the same 9p shares, read-only harness configuration, per-instance

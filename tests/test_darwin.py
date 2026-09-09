@@ -160,6 +160,51 @@ class DarwinTests(unittest.TestCase):
             self.assertEqual(self.read_frame(link)[:6], mac)
         self.assertEqual(p.wait(timeout=5), 0)
 
+    def test_slirp_termination_during_fragmented_reply(self):
+        # A large UDP reply makes libslirp send several fragments in one
+        # callback. After interrupting a blocked fragment, shutdown must also
+        # cancel the remaining fragments while QEMU keeps the stream open.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+            route.connect(("192.0.2.1", 9))  # Route lookup; sends no packet.
+            host = route.getsockname()[0]
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=sig), socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+                server.bind((host, 0)); server.settimeout(5)
+                path = self.root / (sig.name + ".sock")
+                p = self.spawn([os.environ["COGBOX_SLIRP"], "--socket", str(path), "-4"],
+                               stderr=subprocess.PIPE)
+                self.wait_for_socket(path, p)
+                with socket.socket(socket.AF_UNIX) as link:
+                    link.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                    link.settimeout(5); link.connect(str(path))
+                    def send_frame(frame):
+                        link.sendall(struct.pack("!I", len(frame)) + frame)
+                    mac = bytes.fromhex("525400123456")
+                    send_frame(self.arp_request(mac))
+                    gateway = self.read_frame(link)[6:12]
+                    payload = b"fragmented-reply"
+                    # IPv4 permits a zero UDP checksum; compute the IP checksum.
+                    udp = struct.pack("!HHHH", 5555, server.getsockname()[1],
+                                      8 + len(payload), 0) + payload
+                    header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 1, 0,
+                                         64, 17, 0, socket.inet_aton("10.0.2.15"),
+                                         socket.inet_aton(host))
+                    checksum = sum(struct.unpack("!10H", header))
+                    while checksum >> 16:
+                        checksum = (checksum & 0xFFFF) + (checksum >> 16)
+                    header = header[:10] + struct.pack("!H", (~checksum) & 0xFFFF) + header[12:]
+                    send_frame(gateway + mac + b"\x08\x00" + header + udp)
+                    request, peer = server.recvfrom(65535)
+                    self.assertEqual(request, payload)
+                    server.sendto(b"x" * 10000, peer)
+                    self.assertTrue(select.select([link], [], [], 5)[0])
+                    time.sleep(0.15)  # Let the unread fragments fill the stream.
+                    self.assertIsNone(p.poll())
+                    p.send_signal(sig)
+                    self.assertEqual(p.wait(timeout=2), 0)
+                    self.assertFalse(path.exists())
+
     def test_platform_process_and_lock(self):
         helper = os.environ["COGBOX_PLATFORM"]
         p = self.spawn(["sleep", "30"])

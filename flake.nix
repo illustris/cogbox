@@ -5499,10 +5499,11 @@
 			# context, which matters wherever the launcher's stderr lands somewhere
 			# retained outside the machine.
 			launch-flag-tests = pkgs.runCommand "cogbox-launch-flag-tests" {
-				nativeBuildInputs = with pkgs; [ bash jq coreutils gnugrep ];
+				nativeBuildInputs = with pkgs; [ bash jq coreutils gnugrep python3 ];
 			} ''
 				export HOME=$TMPDIR
 				bash ${./tests/test_launch_flags.sh} ${./cogbox-launch.sh}
+				python3 ${./tests/test_runtime_base.py} ${./cogbox-launch.sh} -v
 				touch $out
 			'';
 
