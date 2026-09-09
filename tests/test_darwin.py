@@ -76,6 +76,29 @@ class DarwinTests(unittest.TestCase):
             p.stdin.close()
             self.assertEqual(p.wait(timeout=5), 0)
 
+    @staticmethod
+    def arp_request(mac):
+        # Ask the virtual gateway for its MAC.
+        return (b"\xff" * 6 + mac + b"\x08\x06" +
+                struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + mac +
+                socket.inet_aton("10.0.2.15") + b"\0" * 6 + socket.inet_aton("10.0.2.2"))
+
+    def read_frame(self, link):
+        def exact(n):
+            data = b""
+            while len(data) < n:
+                part = link.recv(n - len(data))
+                self.assertTrue(part)
+                data += part
+            return data
+        return exact(struct.unpack("!I", exact(4))[0])
+
+    def wait_for_socket(self, path, p):
+        deadline = time.monotonic() + 5
+        while not path.exists() and time.monotonic() < deadline:
+            self.assertIsNone(p.poll())
+            time.sleep(0.01)
+
     def test_slirp_framing(self):
         self.check_slirp_framing(filtered=False)
 
@@ -93,34 +116,48 @@ class DarwinTests(unittest.TestCase):
                        DYLD_INSERT_LIBRARIES=os.environ["COGBOX_NETFILTER"])
             args.append("--filtered")
         p = self.spawn(args, env=env)
-        deadline = time.monotonic() + 5
-        while not path.exists() and time.monotonic() < deadline:
-            self.assertIsNone(p.poll())
-            time.sleep(0.01)
+        self.wait_for_socket(path, p)
         with socket.socket(socket.AF_UNIX) as link:
             link.settimeout(5); link.connect(str(path))
             mac = bytes.fromhex("525400123456")
-            # Ask the virtual gateway for its MAC, split across stream reads.
-            arp = (b"\xff" * 6 + mac + b"\x08\x06" +
-                   struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + mac +
-                   socket.inet_aton("10.0.2.15") + b"\0" * 6 + socket.inet_aton("10.0.2.2"))
+            arp = self.arp_request(mac)
             frame = struct.pack("!I", len(arp)) + arp
+            # Split across stream reads.
             for chunk in (frame[:2], frame[2:9], frame[9:]):
                 link.sendall(chunk)
-            def exact(n):
-                data = b""
-                while len(data) < n:
-                    part = link.recv(n - len(data))
-                    self.assertTrue(part)
-                    data += part
-                return data
-            reply = exact(struct.unpack("!I", exact(4))[0])
+            reply = self.read_frame(link)
             self.assertEqual(reply[:6], mac)
             self.assertEqual(reply[12:14], b"\x08\x06")
             self.assertEqual(reply[20:22], b"\x00\x02")
             # An invalid length closes the stream instead of allocating it.
             link.sendall(struct.pack("!I", 0xFFFFFFFF))
             self.assertEqual(link.recv(1), b"")
+        self.assertEqual(p.wait(timeout=5), 0)
+
+    def test_slirp_survives_stalled_reader(self):
+        # QEMU stops reading the stream while the guest cannot receive (a
+        # paused VM). Replies must wait for it, not close the link: the helper
+        # used to time out after 1s and exit, leaving the guest without network.
+        path = self.root / "net.sock"
+        p = self.spawn([os.environ["COGBOX_SLIRP"], "--socket", str(path), "-4"])
+        self.wait_for_socket(path, p)
+        with socket.socket(socket.AF_UNIX) as link:
+            link.settimeout(5); link.connect(str(path))
+            mac = bytes.fromhex("525400123456")
+            arp = self.arp_request(mac)
+            frame = struct.pack("!I", len(arp)) + arp
+            # Replies well beyond the ~8 KiB a Unix stream buffers per direction,
+            # while the unread requests still fit in the other direction.
+            requests = 250
+            for _ in range(requests):
+                link.sendall(frame)
+            time.sleep(1.5)
+            self.assertIsNone(p.poll(), "helper gave up on a stalled reader")
+            for _ in range(requests):
+                self.assertEqual(self.read_frame(link)[:6], mac)
+            # The link still works once drained.
+            link.sendall(frame)
+            self.assertEqual(self.read_frame(link)[:6], mac)
         self.assertEqual(p.wait(timeout=5), 0)
 
     def test_platform_process_and_lock(self):

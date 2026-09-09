@@ -531,9 +531,19 @@ else
 	XDG_RUNTIME_BASE="$XDG_RUNTIME_DIR"
 fi
 if [ ! -d "$XDG_RUNTIME_BASE" ]; then
+	# /tmp is shared and sticky: any local user can pre-create this predictable
+	# name and would then own the parent of every socket, pid file and the run
+	# script (a symlink swap there is code execution as us). Never adopt a
+	# directory this uid did not create (no -p, no symlink), and only then
+	# tighten the mode. The CLI may already have created it 0755 for the
+	# launch log; that one is ours and is tightened here.
 	XDG_RUNTIME_BASE="/tmp/cogbox-runtime-$REAL_UID"
-	mkdir -p "$XDG_RUNTIME_BASE"
-	chmod 700 "$XDG_RUNTIME_BASE"
+	mkdir -m 700 "$XDG_RUNTIME_BASE" 2>/dev/null || true
+	if [ -L "$XDG_RUNTIME_BASE" ] || [ ! -d "$XDG_RUNTIME_BASE" ] ||
+		[ "$(stat -c %u "$XDG_RUNTIME_BASE")" != "$(id -u)" ] ||
+		! chmod 700 "$XDG_RUNTIME_BASE"; then
+		die "refusing runtime base $XDG_RUNTIME_BASE: not a directory owned by uid $(id -u)" 70
+	fi
 fi
 BASE_RUNTIME="$XDG_RUNTIME_BASE/cogbox"
 
@@ -2124,10 +2134,17 @@ launch_vm() {
 	[ -n "$QEMU_START" ] && echo "$QEMU_START" > "$RUNTIME/qemu.start"
 	echo "$QEMU_PID" > "$RUNTIME/qemu.pid"
 	if [ "$HOST_DARWIN" = 1 ]; then
-		# Inspection can fail transiently during exec. Keep servicing stop
-		# requests until termination is confirmed before entering Bash wait.
-		while ! cogbox_child_gone "$QEMU_PID"; do
-			cogbox_control_poll
+		# Service stop requests until QEMU's exit is confirmed, then reap. A
+		# request wakes the 1s control read at once, so only exit detection
+		# is paced. kill -0 is the liveness fast path; the libproc helper (a
+		# fork+exec) only confirms an apparent exit, plus a zombie kill -0
+		# still answers for at most every 10s. Inspection can fail
+		# transiently during exec: never gone until confirmed.
+		local tick=0
+		while kill -0 "$QEMU_PID" 2>/dev/null || ! cogbox_child_gone "$QEMU_PID"; do
+			cogbox_control_poll 1
+			tick=$((tick + 1))
+			[ "$((tick % 10))" -ne 0 ] || ! cogbox_child_gone "$QEMU_PID" || break
 		done
 	fi
 	wait "$QEMU_PID"
