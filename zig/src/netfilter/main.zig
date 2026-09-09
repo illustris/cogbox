@@ -702,9 +702,9 @@ comptime {
 // The Darwin helper requires this symbol before publishing its socket. Losing
 // DYLD_INSERT_LIBRARIES must refuse rules mode, never start unfiltered.
 fn filterReady() callconv(.c) c_int {
-    init();
-    return if (rules_fd >= 0) 1 else 0;
+	init();
+	return if (rules_fd >= 0) 1 else 0;
 }
 comptime {
-    if (darwin) @export(&filterReady, .{ .name = "cogbox_filter_ready" });
+	if (darwin) @export(&filterReady, .{ .name = "cogbox_filter_ready" });
 }

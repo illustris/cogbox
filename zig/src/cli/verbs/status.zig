@@ -28,7 +28,6 @@ const paths = @import("../paths.zig");
 // Blocking libc socket primitives for the QMP handshake (mirrors attach.zig);
 // std.posix lacks socket/connect on this Zig and a one-shot request/response is
 // clearest at the syscall level.
-extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
 extern "c" fn close(fd: c_int) c_int;
 // std.posix dropped `write` on this Zig (only `read` remains); use libc directly.
@@ -219,8 +218,7 @@ fn connectUnix(path: []const u8) !posix.fd_t {
 	@memset(&addr.path, 0);
 	@memcpy(addr.path[0..path.len], path);
 
-	const fd = socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-	if (fd < 0) return error.SocketFailed;
+	const fd = try @import("platform").streamSocket(posix.AF.UNIX);
 	errdefer _ = close(fd);
 	const len: c_uint = @intCast(@offsetOf(posix.sockaddr.un, "path") + path.len + 1);
 	if (connect(fd, @ptrCast(&addr), len) != 0) return error.ConnectFailed;

@@ -376,7 +376,6 @@ fn pidAlive(pid: c_int) bool {
 // --- sshd readiness probe -------------------------------------------------
 // Shared by `cogbox start` (default path) and `cogbox ssh --wait-for-ssh`.
 // Socket calls aren't in std.posix on this Zig; use libc (we link it).
-extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
 extern "c" fn inet_pton(af: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
 extern "c" fn close(fd: c_int) c_int;
@@ -436,8 +435,7 @@ fn daemonExited(pid: c_int) bool {
 /// readiness -- passt/SLIRP accept the host side before the guest is listening,
 /// then reset -- so the banner is the authoritative signal.
 fn probeSsh(sin: *const std.posix.sockaddr.in) bool {
-	const fd = socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-	if (fd < 0) return false;
+	const fd = @import("platform").streamSocket(std.posix.AF.INET) catch return false;
 	defer _ = close(fd);
 
 	if (connect(fd, @ptrCast(sin), @intCast(@sizeOf(std.posix.sockaddr.in))) != 0) return false;

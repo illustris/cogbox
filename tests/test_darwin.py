@@ -4,6 +4,7 @@ Run with COGBOX, COGBOX_PLATFORM, COGBOX_SLIRP, COGBOX_NETFILTER,
 COGBOX_NET_PROBE pointing at built artifacts. All state and ports are temporary.
 """
 import contextlib
+import concurrent.futures
 import json
 import os
 from pathlib import Path
@@ -147,6 +148,77 @@ class DarwinTests(unittest.TestCase):
                            env=env, capture_output=True, text=True, timeout=5)
         self.assertEqual(p.returncode, 70)
         self.assertFalse(path.exists())
+
+    def test_cli_socket_clients(self):
+        # Exercise the real TCP/Unix clients, which must not pass Darwin's
+        # synthetic SOCK_CLOEXEC value directly to libc socket(). The SSH
+        # readiness function is also used by start's default auto-attach path.
+        import fcntl
+        runtime = self.root / "run/cogbox"
+        runtime.mkdir(parents=True)
+        config = self.root / "config/cogbox/instances/default"
+        config.mkdir(parents=True)
+        (config / "config.json").write_text("{}")
+        (runtime / "pid").write_text(str(os.getpid()))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        ssh = bin_dir / "ssh"
+        ssh.write_text("#!/bin/sh\nprintf 'ssh-exec-ok\\n'\n")
+        ssh.chmod(0o755)
+        # Bypass only the PATH wrapper so execvp finds the SSH fixture after
+        # readiness. This is the same installed CLI executable the wrapper runs.
+        cogbox = str(Path(os.environ["COGBOX"]).with_name(".cogbox-wrapped"))
+        env = dict(os.environ, HOME=str(self.root), XDG_CONFIG_HOME=str(self.root / "config"),
+                   XDG_DATA_HOME=str(self.root / "data"), XDG_RUNTIME_DIR=str(runtime.parent),
+                   PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
+        def cli(*args, devnull=False):
+            stdin = {"stdin": subprocess.DEVNULL} if devnull else {"input": ""}
+            return subprocess.run([cogbox, *args], env=env, text=True,
+                                  capture_output=True, timeout=5, **stdin)
+        def serve(listener, handler):
+            listener.settimeout(3)
+            listener.listen()
+            def accept():
+                with listener.accept()[0] as peer:
+                    peer.settimeout(3)
+                    handler(peer)
+            return executor.submit(accept)
+        with (runtime.parent / "cogbox.lock").open("w") as lock, \
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+                (runtime / "ssh-endpoint").write_text(f"{port} 127.0.0.1\n")
+                server = serve(listener, lambda peer: peer.sendall(b"SSH-2.0-fixture\r\n"))
+                result = cli("ssh", "--wait-for-ssh", "--wait-timeout", "1")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "ssh-exec-ok\n")
+                server.result(timeout=3)
+            # A halted guest must override the still-held launcher lock. A
+            # failed QMP socket used to fall back silently to "running".
+            def qmp(peer):
+                with peer.makefile("rwb", buffering=0) as stream:
+                    stream.write(b'{"QMP":{}}\n')
+                    self.assertEqual(json.loads(stream.readline())["execute"], "qmp_capabilities")
+                    stream.write(b'{"return":{}}\n')
+                    self.assertEqual(json.loads(stream.readline())["execute"], "query-status")
+                    stream.write(b'{"return":{"status":"guest-panicked"}}\n')
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(str(runtime / "cogbox.socket"))
+                server = serve(listener, qmp)
+                result = cli("status")
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertEqual(result.stdout, "stopped\n")
+                server.result(timeout=3)
+            # Console and monitor share the same Unix socket attach function.
+            for verb, name in (("console", "console.sock"), ("monitor", "monitor.sock")):
+                with self.subTest(verb=verb), socket.socket(socket.AF_UNIX) as listener:
+                    listener.bind(str(runtime / name))
+                    server = serve(listener, lambda peer: self.assertEqual(peer.recv(1), b""))
+                    result = cli(verb, devnull=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    server.result(timeout=3)
 
     def test_cli_lifecycle(self):
         # Use a sleeping child to exercise the real launch/stop protocol without
