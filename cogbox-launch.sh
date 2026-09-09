@@ -533,16 +533,18 @@ fi
 if [ ! -d "$XDG_RUNTIME_BASE" ]; then
 	# /tmp is shared and sticky: any local user can pre-create this predictable
 	# name and would then own the parent of every socket, pid file and the run
-	# script (a symlink swap there is code execution as us). Never adopt a
-	# directory this uid did not create (no -p, no symlink), and only then
-	# tighten the mode. The CLI may already have created it 0755 for the
-	# launch log; that one is ours and is tightened here.
+	# script (a symlink swap there is code execution as us). Accept only our
+	# own directory or, under sudo, the invoking user's directory (no -p, no
+	# symlink), and only then tighten the mode. A previous sudo launch may
+	# have created it as root; the CLI may have created it 0755 for the log.
 	XDG_RUNTIME_BASE="/tmp/cogbox-runtime-$REAL_UID"
 	mkdir -m 700 "$XDG_RUNTIME_BASE" 2>/dev/null || true
+	RUNTIME_OWNER=$(stat -c %u "$XDG_RUNTIME_BASE") ||
+		die "cannot inspect runtime base $XDG_RUNTIME_BASE" 70
 	if [ -L "$XDG_RUNTIME_BASE" ] || [ ! -d "$XDG_RUNTIME_BASE" ] ||
-		[ "$(stat -c %u "$XDG_RUNTIME_BASE")" != "$(id -u)" ] ||
+		{ [ "$RUNTIME_OWNER" != "$REAL_UID" ] && [ "$RUNTIME_OWNER" != "$(id -u)" ]; } ||
 		! chmod 700 "$XDG_RUNTIME_BASE"; then
-		die "refusing runtime base $XDG_RUNTIME_BASE: not a directory owned by uid $(id -u)" 70
+		die "refusing runtime base $XDG_RUNTIME_BASE: not a directory owned by uid $REAL_UID or uid $(id -u)" 70
 	fi
 fi
 BASE_RUNTIME="$XDG_RUNTIME_BASE/cogbox"

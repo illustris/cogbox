@@ -16,7 +16,7 @@ in {
   };
   native-tools = self.packages.aarch64-darwin.cogbox-host-tools;
   native-runtime = pkgs.runCommand "cogbox-darwin-runtime-tests" {
-    nativeBuildInputs = [ pkgs.python3 pkgs.stdenv.cc ];
+    nativeBuildInputs = [ pkgs.python3 pkgs.stdenv.cc pkgs.bash pkgs.coreutils ];
     __darwinAllowLocalNetworking = true;
   } ''
     $CC -Wall -Wextra -Werror ${../tests/darwin-net-probe.c} -o probe
@@ -26,6 +26,7 @@ in {
     export COGBOX_SLIRP=${self.packages.aarch64-darwin.cogbox-slirp}/bin/cogbox-slirp
     export COGBOX=${self.packages.aarch64-darwin.cogbox-host-tools}/bin/cogbox
     python3 ${../tests/test_darwin.py} -v
+    python3 ${../tests/test_runtime_base.py} ${../cogbox-launch.sh} -v
     touch $out
   '';
 }
