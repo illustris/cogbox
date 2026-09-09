@@ -18,7 +18,6 @@ const std = @import("std");
 const posix = std.posix;
 
 // Socket/close/write are not in std.posix on this Zig; use libc (we link it).
-extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
@@ -121,7 +120,7 @@ pub fn attach(
         _ = posix.poll(&fds, -1) catch break;
 
         // Socket -> stdout.
-        if (fds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
+        if (fds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
             const n = posix.read(sock, &buf) catch 0;
             if (n == 0) {
                 if (orig) |t| posix.tcsetattr(stdin_fd, .FLUSH, t) catch {};
@@ -132,7 +131,9 @@ pub fn attach(
         }
 
         // Stdin -> socket, watching for the detach key.
-        if (fds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
+        // Darwin reports POLLNVAL for non-pollable input such as /dev/null.
+        // Read it once to observe EOF/error instead of spinning on that event.
+        if (fds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
             const n = posix.read(stdin_fd, &buf) catch 0;
             if (n == 0) break; // our stdin hit EOF -> detach
             if (std.mem.indexOfScalar(u8, buf[0..n], DETACH_BYTE)) |idx| {
@@ -184,8 +185,7 @@ fn connectUnix(path: []const u8) !posix.fd_t {
     @memset(&addr.path, 0);
     @memcpy(addr.path[0..path.len], path);
 
-    const fd = socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    if (fd < 0) return error.SocketFailed;
+    const fd = try @import("platform").streamSocket(posix.AF.UNIX);
     errdefer _ = close(fd);
     const len: c_uint = @intCast(@offsetOf(posix.sockaddr.un, "path") + path.len + 1);
     if (connect(fd, @ptrCast(&addr), len) != 0) return error.ConnectFailed;
