@@ -78,12 +78,7 @@ pub fn instanceRunning(allocator: std.mem.Allocator, io: std.Io, runtime: []cons
 		else => return err,
 	};
 	defer file.close(io);
-	const linux = std.os.linux;
-	return switch (linux.errno(linux.flock(file.handle, 2 | 4))) { // LOCK_EX | LOCK_NB
-		.SUCCESS => false,
-		.AGAIN => true,
-		else => error.CannotInspectLaunchLock,
-	};
+	return @import("platform").lockHeld(file.handle);
 }
 
 /// `instanceRunning` for callers that only need a verdict. An uninspectable

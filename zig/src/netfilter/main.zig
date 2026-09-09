@@ -1,8 +1,10 @@
 const std = @import("std");
 const filter = @import("filter");
 const socks5 = @import("socks5");
+const darwin = @import("platform").darwin;
 
 const c = @cImport({
+	@cDefine("_FORTIFY_SOURCE", "0");
 	@cDefine("_GNU_SOURCE", "1");
 	@cInclude("dlfcn.h");
 	@cInclude("sys/socket.h");
@@ -10,15 +12,16 @@ const c = @cImport({
 	@cInclude("errno.h");
 	@cInclude("stdlib.h");
 	@cInclude("string.h");
+	@cInclude("fcntl.h");
 });
 
 // netdb / arpa constants and prototypes -- declared directly. @cInclude of
 // netdb.h and arpa/inet.h drags in glibc's FORTIFY_SOURCE wrappers which
 // translate badly through @cImport in ReleaseSafe builds.
-const EAI_NONAME: c_int = -2;
+const EAI_NONAME: c_int = if (darwin) 8 else -2;
 const HOST_NOT_FOUND: c_int = 1;
 const AF_INET_LOCAL: c_int = 2;
-const AF_INET6_LOCAL: c_int = 10;
+const AF_INET6_LOCAL: c_int = c.AF_INET6;
 
 extern "c" fn __h_errno_location() *c_int;
 extern "c" fn inet_pton(af: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
@@ -47,11 +50,13 @@ const SOCK_TYPE_MASK: c_int = 0xff;
 // connect()+read+write to block until each step completes.
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
-const O_NONBLOCK: c_int = 0o4000;
+const O_NONBLOCK: c_int = c.O_NONBLOCK;
 extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
 
 // RTLD_NEXT = ((void *)-1)
 const RTLD_NEXT: *anyopaque = @ptrFromInt(~@as(usize, 0));
+
+const Mmsg = if (darwin) extern struct { msg_hdr: c.struct_msghdr, msg_len: c_uint } else c.struct_mmsghdr;
 
 // --- State ---
 
@@ -73,7 +78,7 @@ var reply_range: ?filter.PortRange = null;
 const ConnectFn = *const fn (c_int, ?*const c.struct_sockaddr, c.socklen_t) callconv(.c) c_int;
 const SendtoFn = *const fn (c_int, ?*const anyopaque, usize, c_int, ?*const c.struct_sockaddr, c.socklen_t) callconv(.c) isize;
 const SendmsgFn = *const fn (c_int, ?*const c.struct_msghdr, c_int) callconv(.c) isize;
-const SendmmsgFn = *const fn (c_int, ?[*]c.struct_mmsghdr, c_uint, c_int) callconv(.c) c_int;
+const SendmmsgFn = *const fn (c_int, ?[*]Mmsg, c_uint, c_int) callconv(.c) c_int;
 const SocketFn = *const fn (c_int, c_int, c_int) callconv(.c) c_int;
 const CloseFn = *const fn (c_int) callconv(.c) c_int;
 
@@ -203,7 +208,10 @@ fn isForwardReplySocket(fd: c_int, range: filter.PortRange) bool {
 	return filter.isForwardReplyLocal(local.addr, local.port, range);
 }
 
+extern "c" fn cogbox_original([*:0]const u8) ?*anyopaque;
+
 fn resolve(comptime name: [*:0]const u8) *anyopaque {
+	if (darwin) return cogbox_original(name) orelse @panic("netfilter: missing original symbol");
 	return c.dlsym(RTLD_NEXT, name) orelse @panic("netfilter: dlsym failed");
 }
 
@@ -222,17 +230,17 @@ fn resolve(comptime name: [*:0]const u8) *anyopaque {
 fn init() void {
 	if (initialized) return;
 
-	real_connect = @ptrCast(resolve("connect"));
-	real_sendto = @ptrCast(resolve("sendto"));
-	real_sendmsg = @ptrCast(resolve("sendmsg"));
-	real_sendmmsg = @ptrCast(resolve("sendmmsg"));
-	real_socket = @ptrCast(resolve("socket"));
-	real_close = @ptrCast(resolve("close"));
-	real_getaddrinfo = @ptrCast(resolve("getaddrinfo"));
-	real_gethostbyname = @ptrCast(resolve("gethostbyname"));
-	real_gethostbyname2 = @ptrCast(resolve("gethostbyname2"));
-	real_gethostbyname_r = @ptrCast(resolve("gethostbyname_r"));
-	real_gethostbyname2_r = @ptrCast(resolve("gethostbyname2_r"));
+	real_connect = @ptrCast(@alignCast(resolve("connect")));
+	real_sendto = @ptrCast(@alignCast(resolve("sendto")));
+	real_sendmsg = @ptrCast(@alignCast(resolve("sendmsg")));
+	if (!darwin) real_sendmmsg = @ptrCast(@alignCast(resolve("sendmmsg")));
+	real_socket = @ptrCast(@alignCast(resolve("socket")));
+	real_close = @ptrCast(@alignCast(resolve("close")));
+	real_getaddrinfo = @ptrCast(@alignCast(resolve("getaddrinfo")));
+	real_gethostbyname = @ptrCast(@alignCast(resolve("gethostbyname")));
+	real_gethostbyname2 = @ptrCast(@alignCast(resolve("gethostbyname2")));
+	if (!darwin) real_gethostbyname_r = @ptrCast(@alignCast(resolve("gethostbyname_r")));
+	if (!darwin) real_gethostbyname2_r = @ptrCast(@alignCast(resolve("gethostbyname2_r")));
 
 	// Install SIGUSR1 handler for rule reload.
 	// Requires rt_sigreturn in passt's seccomp allowlist.
@@ -318,6 +326,7 @@ fn denyErrno() void {
 fn buildIpv4Sockaddr(addr: filter.IpAddr, port: u16) c.struct_sockaddr_in {
 	var sa: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
 	sa.sin_family = c.AF_INET;
+	if (darwin) sa.sin_len = @sizeOf(c.struct_sockaddr_in);
 	sa.sin_port = std.mem.nativeToBig(u16, port);
 	const ipv4: [4]u8 = switch (addr) {
 		.ipv4 => |ip| ip,
@@ -329,14 +338,14 @@ fn buildIpv4Sockaddr(addr: filter.IpAddr, port: u16) c.struct_sockaddr_in {
 
 // --- Exported wrappers ---
 
-export fn socket(domain: c_int, sock_type: c_int, protocol_: c_int) callconv(.c) c_int {
+fn socket(domain: c_int, sock_type: c_int, protocol_: c_int) callconv(.c) c_int {
 	init();
 	const fd = real_socket.?(domain, sock_type, protocol_);
 	if (fd >= 0) trackSocket(fd, sock_type);
 	return fd;
 }
 
-export fn close(fd: c_int) callconv(.c) c_int {
+fn close(fd: c_int) callconv(.c) c_int {
 	// Order: untrack first so we never read stale state after close
 	// returns. close() does NOT trigger full init() because passt's
 	// early-startup close_open_files() runs before any socket() and
@@ -344,12 +353,12 @@ export fn close(fd: c_int) callconv(.c) c_int {
 	// early. Lazy-resolve real_close via dlsym instead.
 	untrackFd(fd);
 	if (real_close == null) {
-		real_close = @ptrCast(c.dlsym(RTLD_NEXT, "close") orelse @panic("netfilter: dlsym close failed"));
+		real_close = @ptrCast(@alignCast(resolve("close")));
 	}
 	return real_close.?(fd);
 }
 
-export fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) callconv(.c) c_int {
+fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) callconv(.c) c_int {
 	init();
 	checkReload();
 
@@ -469,7 +478,7 @@ fn doRemappedConnect(
 	}
 }
 
-export fn sendto(fd: c_int, buf: ?*const anyopaque, len: usize, flags: c_int, dest_addr: ?*const c.struct_sockaddr, addrlen: c.socklen_t) callconv(.c) isize {
+fn sendto(fd: c_int, buf: ?*const anyopaque, len: usize, flags: c_int, dest_addr: ?*const c.struct_sockaddr, addrlen: c.socklen_t) callconv(.c) isize {
 	init();
 	checkReload();
 
@@ -497,7 +506,7 @@ export fn sendto(fd: c_int, buf: ?*const anyopaque, len: usize, flags: c_int, de
 	return real_sendto.?(fd, buf, len, flags, dest_addr, addrlen);
 }
 
-export fn sendmsg(fd: c_int, msg: ?*const c.struct_msghdr, flags: c_int) callconv(.c) isize {
+fn sendmsg(fd: c_int, msg: ?*const c.struct_msghdr, flags: c_int) callconv(.c) isize {
 	init();
 	checkReload();
 
@@ -525,7 +534,7 @@ export fn sendmsg(fd: c_int, msg: ?*const c.struct_msghdr, flags: c_int) callcon
 	return real_sendmsg.?(fd, msg, flags);
 }
 
-export fn sendmmsg(fd: c_int, msgvec: ?[*]c.struct_mmsghdr, vlen: c_uint, flags: c_int) callconv(.c) c_int {
+fn sendmmsg(fd: c_int, msgvec: ?[*]Mmsg, vlen: c_uint, flags: c_int) callconv(.c) c_int {
 	init();
 	checkReload();
 
@@ -584,10 +593,13 @@ fn dnsDenies(name_c: [*:0]const u8) bool {
 }
 
 fn setHostNotFound() void {
-	__h_errno_location().* = HOST_NOT_FOUND;
+	if (darwin) {
+		const netdb = @cImport({ @cInclude("netdb.h"); });
+		netdb.h_errno = HOST_NOT_FOUND;
+	} else __h_errno_location().* = HOST_NOT_FOUND;
 }
 
-export fn getaddrinfo(
+fn getaddrinfo(
 	node: ?[*:0]const u8,
 	service: ?[*:0]const u8,
 	hints: ?*const anyopaque,
@@ -602,7 +614,7 @@ export fn getaddrinfo(
 	return real_getaddrinfo.?(node, service, hints, res);
 }
 
-export fn gethostbyname(name: ?[*:0]const u8) callconv(.c) ?*anyopaque {
+fn gethostbyname(name: ?[*:0]const u8) callconv(.c) ?*anyopaque {
 	init();
 	checkReload();
 
@@ -615,7 +627,7 @@ export fn gethostbyname(name: ?[*:0]const u8) callconv(.c) ?*anyopaque {
 	return real_gethostbyname.?(name);
 }
 
-export fn gethostbyname2(name: ?[*:0]const u8, af: c_int) callconv(.c) ?*anyopaque {
+fn gethostbyname2(name: ?[*:0]const u8, af: c_int) callconv(.c) ?*anyopaque {
 	init();
 	checkReload();
 
@@ -628,7 +640,7 @@ export fn gethostbyname2(name: ?[*:0]const u8, af: c_int) callconv(.c) ?*anyopaq
 	return real_gethostbyname2.?(name, af);
 }
 
-export fn gethostbyname_r(
+fn gethostbyname_r(
 	name: ?[*:0]const u8,
 	ret: ?*anyopaque,
 	buf: [*]u8,
@@ -651,7 +663,7 @@ export fn gethostbyname_r(
 	return real_gethostbyname_r.?(name, ret, buf, buflen, result, h_errnop);
 }
 
-export fn gethostbyname2_r(
+fn gethostbyname2_r(
 	name: ?[*:0]const u8,
 	af: c_int,
 	ret: ?*anyopaque,
@@ -671,4 +683,28 @@ export fn gethostbyname2_r(
 		}
 	}
 	return real_gethostbyname2_r.?(name, af, ret, buf, buflen, result, h_errnop);
+}
+
+comptime {
+	@export(&socket, .{ .name = if (darwin) "cogbox_socket" else "socket" });
+	@export(&close, .{ .name = if (darwin) "cogbox_close" else "close" });
+	@export(&connect, .{ .name = if (darwin) "cogbox_connect" else "connect" });
+	@export(&sendto, .{ .name = if (darwin) "cogbox_sendto" else "sendto" });
+	@export(&sendmsg, .{ .name = if (darwin) "cogbox_sendmsg" else "sendmsg" });
+	if (!darwin) @export(&sendmmsg, .{ .name = if (darwin) "cogbox_sendmmsg" else "sendmmsg" });
+	@export(&getaddrinfo, .{ .name = if (darwin) "cogbox_getaddrinfo" else "getaddrinfo" });
+	@export(&gethostbyname, .{ .name = if (darwin) "cogbox_gethostbyname" else "gethostbyname" });
+	@export(&gethostbyname2, .{ .name = if (darwin) "cogbox_gethostbyname2" else "gethostbyname2" });
+	if (!darwin) @export(&gethostbyname_r, .{ .name = if (darwin) "cogbox_gethostbyname_r" else "gethostbyname_r" });
+	if (!darwin) @export(&gethostbyname2_r, .{ .name = if (darwin) "cogbox_gethostbyname2_r" else "gethostbyname2_r" });
+}
+
+// The Darwin helper requires this symbol before publishing its socket. Losing
+// DYLD_INSERT_LIBRARIES must refuse rules mode, never start unfiltered.
+fn filterReady() callconv(.c) c_int {
+    init();
+    return if (rules_fd >= 0) 1 else 0;
+}
+comptime {
+    if (darwin) @export(&filterReady, .{ .name = "cogbox_filter_ready" });
 }

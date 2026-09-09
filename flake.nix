@@ -40,7 +40,9 @@
 	outputs = { self, nixpkgs, microvm, nix-mcp, ... }@inputs: let
 		lib = nixpkgs.lib;
 		illustris-lib = import "${inputs.illustris-lib}/lib" { inherit lib; };
-		supportedSystems = [ "x86_64-linux" "aarch64-linux" "riscv64-linux" ];
+		linuxSystems = [ "x86_64-linux" "aarch64-linux" "riscv64-linux" ];
+		supportedSystems = linuxSystems ++ [ "aarch64-darwin" ];
+		forLinuxSystems = f: lib.genAttrs linuxSystems f;
 		forAllSystems = f: lib.genAttrs supportedSystems f;
 		mkHermesHomeHelper = pkgs: pkgs.writeShellApplication {
 			name = "cogbox-hermes-home";
@@ -2902,7 +2904,7 @@
 					# readline monitor humans actually want to type at. The
 					# ${runtimeDir} sentinel is sed-rewritten to the live $RUNTIME
 					# by cogbox-launch.sh, same as the fw_cfg paths below.
-					qemu.extraArgs = [
+					qemu.extraArgs = lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [
 						# Re-emit `-cpu` to mask RDRAND/RDSEED off the guest CPU while
 						# KEEPING KVM accel. microvm.nix's own runner emits
 						# `-enable-kvm -cpu host,+x2apic,-sgx`; setting the microvm.cpu
@@ -2918,6 +2920,7 @@
 						# differ. VM-only (isVm); the container has no qemu args.
 						"-cpu"
 						"host,+x2apic,-sgx,-rdrand,-rdseed"
+					] ++ [
 						"-monitor"
 						"unix:${runtimeDir}/monitor.sock,server,nowait"
 					] ++ lib.concatMap (p: [
@@ -4260,7 +4263,12 @@
 		lib.mkGceHost = mkGceHost;
 		nixosModules.gce-host = ./gce/cogbox-host.nix;
 
-		packages = forAllSystems (system: let
+		packages = forAllSystems (system: if system == "aarch64-darwin" then
+			import ./darwin/packages.nix {
+				inherit self nixpkgs lib runtimeDir mkHarnesses;
+				runner = self.nixosConfigurations.cogbox-aarch64-darwin.config.microvm.declaredRunner;
+			}
+		else let
 			pkgs = nixpkgs.legacyPackages.${system};
 			runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner;
 			# The HOSTED-storage-profile guest runner. Same module tree, same
@@ -4764,7 +4772,7 @@
 		# image straight into the destination registry. Supply the ref as the arg
 		# or via $COGBOX_POD_REF (default is a placeholder); registry auth comes
 		# from $REGISTRY_AUTH_FILE, else ~/.docker/config.json.
-		apps = forAllSystems (system: let
+		apps = forLinuxSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 			image = self.packages.${system}.cogbox-pod-image;
 			agentImage = self.packages.${system}.agent-image;
@@ -4895,7 +4903,7 @@
 			};
 		});
 
-		checks = forAllSystems (system: let
+		checks = forLinuxSystems (system: let
 			pkgs = nixpkgs.legacyPackages.${system};
 			hermesHomeHelper = mkHermesHomeHelper pkgs;
 			containerStateScript = self.nixosConfigurations."${configName system}-container".config.systemd.services.cogbox-container-state.serviceConfig.ExecStart;
@@ -9385,16 +9393,30 @@
 				bash ${./tests/test_floor.sh} ${gceFloorInstall} ${gceFloorVerify}
 				touch $out
 			'';
-		});
+		}) // {
+			aarch64-darwin = import ./darwin/checks.nix {
+				inherit self nixpkgs lib;
+			};
+		};
 
-		nixosConfigurations = lib.listToAttrs (map (system: {
+		nixosConfigurations = {
+			cogbox-aarch64-darwin = mkMicrovm "aarch64-linux" "cogbox" {
+				vcpu = 4;
+				mem = 8192;
+				extraModules = cogboxModules "aarch64-linux" {} ++ [ {
+					microvm.vmHostPackages = nixpkgs.legacyPackages.aarch64-darwin;
+					# Require native hardware acceleration and the ARM GIC supported by HVF.
+					microvm.qemu.machineOpts = { accel = "hvf"; gic-version = "3"; };
+				} ];
+			};
+		} // lib.listToAttrs (map (system: {
 			name = configName system;
 			value = mkMicrovm system "cogbox" {
 				vcpu = 16;
 				mem = 32768;
 				extraModules = cogboxModules system {};
 			};
-		}) supportedSystems)
+		}) linuxSystems)
 		# The HOSTED-profile guest: identical modules, cogbox.storage.profile =
 		# "hosted". It has to be a separate nixosConfiguration rather than a
 		# host-side or launch-time switch, because packages.cogbox bakes the guest
@@ -9409,7 +9431,7 @@
 				mem = 32768;
 				extraModules = cogboxModules system {} ++ [ { cogbox.storage.profile = "hosted"; } ];
 			};
-		}) supportedSystems)
+		}) linuxSystems)
 		# The CONTAINER config exposed as a buildable nixosConfiguration so the
 		# per-instance FULL toplevel builds via `--override-input userExtensions`
 		# (prebuildToplevelLocal / agentInit's realise target). SAME args as the
@@ -9423,7 +9445,7 @@
 			value = mkContainer system "cogbox" {
 				extraModules = cogboxModules system { target = "container"; };
 			};
-		}) supportedSystems) // {
+		}) linuxSystems) // {
 			# The GCE backend HOST system (see mkGceHost). x86_64 only: GCE
 			# nested virtualization is offered on Intel machine series only
 			# so there is no aarch64/riscv64 twin to generate.

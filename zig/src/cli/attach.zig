@@ -213,7 +213,7 @@ fn replayRange(io: std.Io, out_fd: posix.fd_t, path: []const u8, end: u64) void 
     defer file.close(io);
 
     const start: u64 = if (end > TAIL_BYTES) end - TAIL_BYTES else 0;
-    if (start > 0) _ = std.os.linux.lseek(file.handle, @intCast(start), posix.SEEK.SET);
+    if (start > 0) _ = std.c.lseek(file.handle, @intCast(start), posix.SEEK.SET);
 
     var remaining: u64 = end - start;
     var buf: [4096]u8 = undefined;

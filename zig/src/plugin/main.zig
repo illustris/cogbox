@@ -1232,7 +1232,7 @@ fn prebuildAndPushRunner(ctx: *const Ctx) void {
 	// The config-name suffix: cogbox-x86_64 / cogbox-aarch64. builtin.cpu.arch
 	// is fixed at compile time to the arch this cogbox image was built for, and
 	// its tag name (x86_64 / aarch64) matches flake.nix's archSuffix exactly.
-	const arch = @tagName(builtin_mod.cpu.arch);
+	const arch = if (@import("platform").darwin) "aarch64-darwin" else @tagName(builtin_mod.cpu.arch);
 
 	// Combine the per-instance file:// cache with cogworx's remote substituters
 	// so the runner's transitive deps substitute rather than build from source.
@@ -2281,12 +2281,7 @@ fn isRunning(ctx: *const Ctx) bool {
 		else => return true,
 	};
 	defer file.close(ctx.io);
-	const linux = std.os.linux;
-	return switch (linux.errno(linux.flock(file.handle, 2 | 4))) { // LOCK_EX | LOCK_NB
-		.SUCCESS => false,
-		.AGAIN => true,
-		else => true,
-	};
+	return @import("platform").lockHeld(file.handle) catch true;
 }
 
 /// Interactive confirmation. Non-tty stdin auto-confirms, matching the

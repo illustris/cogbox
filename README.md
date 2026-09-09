@@ -15,6 +15,11 @@ Currently supported harnesses: `claude-code` ([Claude Code](https://docs.anthrop
 
 ## Quick start
 
+Linux hosts and Apple Silicon Macs (`aarch64-darwin`) are supported. On macOS,
+the CLI, QEMU, and network proxies run natively; the sandbox is an ARM64 Linux
+guest accelerated by Apple's Hypervisor.framework. See [macOS setup](docs/macos.md)
+for the Linux build prerequisite and platform differences.
+
 ```
 nix run github:illustris/cogbox
 ```

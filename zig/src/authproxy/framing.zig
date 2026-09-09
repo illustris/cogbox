@@ -371,9 +371,8 @@ fn stripPort(h: []const u8) ?[]const u8 {
 extern "c" fn recv(fd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
 extern "c" fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
 
-// Numeric per the stable Linux ABI (the l7proxy convention for constants the
-// cImport does not surface; framing.zig deliberately has no cImport).
-const MSG_NOSIGNAL: c_int = 0x4000;
+// Use the target libc flag: Darwin and Linux assign different values.
+const MSG_NOSIGNAL: c_int = std.c.MSG.NOSIGNAL;
 
 pub const FdReader = struct {
 	fd: c_int,
