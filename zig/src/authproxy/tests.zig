@@ -33,13 +33,16 @@ test {
 
 const Harness = struct {
 	gpa: std.mem.Allocator,
-	threaded: std.Io.Threaded,
+	threaded: *std.Io.Threaded,
 	io: std.Io,
 	dir: []u8,
 	cred_path: []u8,
 
 	fn init(gpa: std.mem.Allocator) !Harness {
-		var threaded: std.Io.Threaded = .init(gpa, .{});
+		const threaded = try gpa.create(std.Io.Threaded);
+		errdefer gpa.destroy(threaded);
+		threaded.* = .init(gpa, .{});
+		errdefer threaded.deinit();
 		const io = threaded.io();
 		var rnd: [8]u8 = undefined;
 		io.random(&rnd);
@@ -57,6 +60,7 @@ const Harness = struct {
 		self.gpa.free(self.cred_path);
 		self.gpa.free(self.dir);
 		self.threaded.deinit();
+		self.gpa.destroy(self.threaded);
 	}
 
 	/// A conf naming the temp cred file, one gitlab provider on git.example.com
@@ -813,7 +817,8 @@ test "e2e: a large response body streams without being buffered whole" {
 	// upstream script reader has been consumed. Streaming (not buffering)
 	// means the first downstream bytes leave BEFORE the last upstream byte is
 	// read -- a structural assertion, not a flaky timing one.
-	var rec = RecordingWriter.init(gpa, &fake.reader);
+	var rec: RecordingWriter = undefined;
+	rec.init(gpa, &fake.reader);
 	defer rec.deinit();
 
 	var store = conf.Store.initStatic(gpa, h.io, gen);
@@ -839,10 +844,9 @@ const RecordingWriter = struct {
 	buf: [64]u8 = undefined,
 	writer: std.Io.Writer = undefined,
 
-	fn init(gpa: std.mem.Allocator, upstream_reader: *std.Io.Reader) RecordingWriter {
-		var self = RecordingWriter{ .gpa = gpa, .upstream_reader = upstream_reader };
+	fn init(self: *RecordingWriter, gpa: std.mem.Allocator, upstream_reader: *std.Io.Reader) void {
+		self.* = .{ .gpa = gpa, .upstream_reader = upstream_reader };
 		self.writer = .{ .vtable = &.{ .drain = drain }, .buffer = &self.buf, .end = 0 };
-		return self;
 	}
 	fn deinit(self: *RecordingWriter) void {
 		self.sink.deinit(self.gpa);

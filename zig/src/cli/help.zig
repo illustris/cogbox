@@ -54,7 +54,7 @@ pub const TOP_LEVEL =
     \\Paths (XDG basedir spec):
     \\  Config:  $XDG_CONFIG_HOME/cogbox        (default: ~/.config/cogbox)
     \\  Data:    $XDG_DATA_HOME/cogbox          (default: ~/.local/share/cogbox)
-    \\  Runtime: $XDG_RUNTIME_DIR/cogbox        (default: /run/user/$UID/cogbox)
+    \\  Runtime: $XDG_RUNTIME_DIR/cogbox        (fallback: /tmp/cogbox-runtime-$UID/cogbox)
     \\
     \\Environment variables:
     \\  COGBOX_DATA              Override the data root.
@@ -92,8 +92,8 @@ pub const START =
     \\                        the VM in the background and return.
     \\  -f, --foreground      Attach the serial console after launch instead of
     \\                        sshing. Detaching (Ctrl-]) leaves the VM running.
-    \\  --vcpu N              vCPU count (default: 16; or value from config.json)
-    \\  --mem N               RAM in megabytes (default: 32768; or from config.json)
+    \\  --vcpu N              vCPU count (default: 4 on macOS, 16 on Linux; or config.json)
+    \\  --mem N               RAM in MB (default: 8192 on macOS, 32768 on Linux; or config.json)
     \\  --network MODE        Network mode: full, none, or rules (default: rules)
     \\  --add-dir DIR         Mount an existing host directory read-write at its
     \\                        canonical absolute path in the guest. Repeatable.

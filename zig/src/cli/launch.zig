@@ -2,7 +2,7 @@
 //
 // The launch script lives in $out/libexec/cogbox-launch.sh, alongside
 // the binary at $out/bin/cogbox. We resolve the path at runtime via
-// /proc/self/exe so the binary is relocatable (no compile-time bake).
+// the executable path so the binary is relocatable (no compile-time bake).
 //
 // Launch modes (passed to the script):
 //   --init-only   seed host state + (for custom flakes) warm the runner
@@ -14,6 +14,7 @@
 //                 which forks before exec'ing the script in this mode.
 
 const std = @import("std");
+extern "c" fn _NSGetExecutablePath([*]u8, *u32) c_int;
 
 
 pub const AdditionalDir = struct {
@@ -232,8 +233,8 @@ test "buildLaunchArgs forwards every additional host directory in argv order" {
 	try std.testing.expectEqualStrings("--init-only", init_argv[1]);
 }
 
-/// Resolve the absolute path to a sibling libexec script by reading
-/// /proc/self/exe and walking up (exe = .../bin/cogbox -> .../libexec/<name>),
+/// Resolve a sibling libexec script via the platform's executable path
+/// (/proc/self/exe or _NSGetExecutablePath) and walk up (exe = .../bin/cogbox -> .../libexec/<name>),
 /// so the binary stays relocatable. An explicit `override` env var wins (used by
 /// the wrapper's --set and by tests).
 fn resolveLibexec(
@@ -248,7 +249,11 @@ fn resolveLibexec(
 	}
 
 	var buf: [std.fs.max_path_bytes]u8 = undefined;
-	const n = try std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", &buf);
+	const n = if (@import("platform").darwin) blk: {
+		var size: u32 = buf.len;
+		if (_NSGetExecutablePath(&buf, &size) != 0) return error.NameTooLong;
+		break :blk std.mem.indexOfScalar(u8, &buf, 0) orelse return error.NameTooLong;
+	} else try std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", &buf);
 	const exe = buf[0..n];
 	const bin_dir = std.fs.path.dirname(exe) orelse return error.NoBinDir;
 	const prefix = std.fs.path.dirname(bin_dir) orelse return error.NoPrefix;

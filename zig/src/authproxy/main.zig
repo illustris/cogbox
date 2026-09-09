@@ -1308,7 +1308,7 @@ pub fn maybeWritePidFile(io: std.Io, runtime_dir: []const u8, parsed_ok: bool, w
 	defer f.close(io);
 	var wbuf: [32]u8 = undefined;
 	var w = f.writer(io, &wbuf);
-	w.interface.print("{d}\n", .{std.os.linux.getpid()}) catch |err| return .{ .write_failed = err };
+	w.interface.print("{d}\n", .{@import("platform").getpid()}) catch |err| return .{ .write_failed = err };
 	w.flush() catch |err| return .{ .write_failed = err };
 	written.* = true;
 	return .written;

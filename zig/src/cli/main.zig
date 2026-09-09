@@ -90,6 +90,11 @@ pub fn main(init: std.process.Init) !void {
 		}
 	}
 
+	if (@import("platform").darwin and
+		(std.mem.eql(u8, verb, "enforce") or std.mem.eql(u8, verb, "__divertshim"))) {
+		util.die(allocator, io, verb, exit_codes.usage, "this container backend requires Linux", .{});
+	}
+
 	// Resolve XDG paths and check for legacy migration before dispatch.
 	var p = paths.resolve(allocator, io, env) catch |err| {
 		util.die(allocator, io, null, exit_codes.software, "failed to resolve paths: {s}", .{@errorName(err)});

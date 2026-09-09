@@ -42,8 +42,8 @@ extern "c" fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
 extern "c" fn _exit(code: c_int) noreturn;
 
 const O_WRONLY: c_int = 1;
-const O_CREAT: c_int = 0o100;
-const O_TRUNC: c_int = 0o1000;
+const O_CREAT: c_int = if (@import("platform").darwin) 0x200 else 0o100;
+const O_TRUNC: c_int = if (@import("platform").darwin) 0x400 else 0o1000;
 const O_RDONLY: c_int = 0;
 const WNOHANG: c_int = 1;
 

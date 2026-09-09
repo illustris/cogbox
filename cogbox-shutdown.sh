@@ -14,6 +14,9 @@ STOP_OUTCOME=failed
 SHUTDOWN_HELPER_PID=""
 QEMU_START=""
 
+# Linux receives signals; Darwin overrides this to consume nonce-bound requests.
+cogbox_control_poll() { :; }
+
 # Monotonic host uptime, in centiseconds. Poll-loop work must count against
 # the budget too; counting sleeps alone can silently extend a host shutdown.
 cogbox_shutdown_now() {
@@ -141,7 +144,7 @@ cogbox_cancel_helper() {
 }
 
 cogbox_stop_child() {
-	local helper="$RUNNER_DIR/bin/microvm-shutdown" deadline helper_rc=0 qemu_rc helper_done=0
+	local helper="${COGBOX_SHUTDOWN_HELPER:-$RUNNER_DIR/bin/microvm-shutdown}" deadline helper_rc=0 qemu_rc helper_done=0
 	STOP_OUTCOME=already-stopped
 	[ -n "$QEMU_PID" ] || return 0
 	if [ -z "$QEMU_START" ] && ! cogbox_child_gone "$QEMU_PID"; then
@@ -156,8 +159,8 @@ cogbox_stop_child() {
 	STOP_OUTCOME=forced
 	if [ "$STOP_REQUESTED" -eq 1 ] && [ "$STOP_FORCE" -eq 0 ] &&
 		[ -x "$helper" ] && [ -S "$RUNTIME/cogbox.socket" ]; then
-		# The selected pinned helper sends Ctrl-Alt-Delete. QEMU's no-reboot
-		# exits after guest shutdown. No SSH/network and no raw QMP in logs.
+		# The selected helper requests guest shutdown through QMP. QEMU's
+		# no-reboot exits after shutdown. No SSH/network or raw QMP in logs.
 		cogbox_shutdown_now || { STOP_OUTCOME=failed; return 1; }
 		# Reserve the final second INSIDE the 45s budget for helper-group
 		# termination/reap, including a helper that ignores TERM.
@@ -167,6 +170,7 @@ cogbox_stop_child() {
 		(cd "$RUNTIME" && exec timeout --signal=KILL 44s "$helper") >/dev/null 2>&1 &
 		SHUTDOWN_HELPER_PID=$!
 		while [ "$COGBOX_SHUTDOWN_NOW" -lt "$deadline" ]; do
+			cogbox_control_poll 0.001
 			[ "$STOP_FORCE" -eq 0 ] || break
 			if [ "$helper_done" -eq 0 ] && ! cogbox_child_live "$SHUTDOWN_HELPER_PID"; then
 				cogbox_child_gone "$SHUTDOWN_HELPER_PID" || break

@@ -108,7 +108,7 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Envir
 		if (sudo_user_z != null) {
 			if (try lookupUid(allocator, io, user_buf)) |u| break :blk u;
 		}
-		break :blk @intCast(std.os.linux.getuid());
+		break :blk @intCast(@import("platform").getuid());
 	};
 
 	// Config dir
@@ -176,6 +176,20 @@ fn lookupUid(allocator: std.mem.Allocator, io: std.Io, user: []const u8) !?u32 {
 
 /// Parse /etc/passwd for `user` and return the requested 0-based field.
 fn lookupPasswdField(allocator: std.mem.Allocator, io: std.Io, user: []const u8, field: usize) !?[]const u8 {
+	if (@import("platform").darwin) {
+		const c = @cImport({ @cInclude("pwd.h"); });
+		const name = try allocator.dupeZ(u8, user);
+		defer allocator.free(name);
+		var entry: c.struct_passwd = undefined;
+		var result: ?*c.struct_passwd = null;
+		var buffer: [16384]u8 = undefined;
+		if (c.getpwnam_r(name.ptr, &entry, &buffer, buffer.len, &result) != 0 or result == null) return null;
+		return switch (field) {
+			2 => try std.fmt.allocPrint(allocator, "{d}", .{entry.pw_uid}),
+			5 => try allocator.dupe(u8, std.mem.span(entry.pw_dir)),
+			else => null,
+		};
+	}
 	const cwd = std.Io.Dir.cwd();
 	const file = cwd.openFile(io, "/etc/passwd", .{}) catch return null;
 	defer file.close(io);

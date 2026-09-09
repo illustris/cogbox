@@ -101,22 +101,31 @@ pub fn run(
         // this an idempotent completed stop. Missing/failed records still fail.
         if (id.start != start) return reportCompleted(allocator, io, result_path, identity);
     }
-    // A pidfd ensures the final signal cannot hit a reused PID between the
-    // starttime check and delivery. This is Linux-only, like the VM launcher.
-    const opened = linux.pidfd_open(pid, 0);
-    if (linux.errno(opened) == .SRCH) return reportCompleted(allocator, io, result_path, identity);
-    if (linux.errno(opened) != .SUCCESS) return error.CannotOpenLauncher;
-    const pidfd: std.posix.fd_t = @intCast(opened);
-    defer _ = linux.close(pidfd);
-    const verified = processStart(allocator, io, pid) catch |err| switch (err) {
-        error.FileNotFound, error.ProcessExited => return reportCompleted(allocator, io, result_path, identity),
-        else => return err,
-    };
-    if (verified != start) return reportCompleted(allocator, io, result_path, identity);
-    const signal = if (force and identity != null) std.posix.SIG.USR1 else std.posix.SIG.TERM;
-    const sent = linux.errno(linux.pidfd_send_signal(pidfd, signal, null, 0));
-    if (sent == .SRCH) return reportCompleted(allocator, io, result_path, identity);
-    if (sent != .SUCCESS) return error.CannotSignalLauncher;
+    // Linux signals through a pidfd. Darwin sends a nonce-bound request that
+    // the launcher consumes itself; neither path signals a potentially reused PID.
+    if (@import("platform").darwin) {
+        const id = identity orelse return error.MissingLaunchIdentity;
+        const control = try std.fmt.allocPrintSentinel(allocator, "{s}/control", .{inst_runtime}, 0);
+        defer allocator.free(control);
+        const request = try std.fmt.allocPrint(allocator, "{s} {s}\n", .{id.nonce, if (force) "force" else "stop"});
+        defer allocator.free(request);
+        try @import("platform").requestStop(control, request);
+    } else {
+        const opened = linux.pidfd_open(pid, 0);
+        if (linux.errno(opened) == .SRCH) return reportCompleted(allocator, io, result_path, identity);
+        if (linux.errno(opened) != .SUCCESS) return error.CannotOpenLauncher;
+        const pidfd: std.posix.fd_t = @intCast(opened);
+        defer _ = linux.close(pidfd);
+        const verified = processStart(allocator, io, pid) catch |err| switch (err) {
+            error.FileNotFound, error.ProcessExited => return reportCompleted(allocator, io, result_path, identity),
+            else => return err,
+        };
+        if (verified != start) return reportCompleted(allocator, io, result_path, identity);
+        const signal = if (force and identity != null) std.posix.SIG.USR1 else std.posix.SIG.TERM;
+        const sent = linux.errno(linux.pidfd_send_signal(pidfd, signal, null, 0));
+        if (sent == .SRCH) return reportCompleted(allocator, io, result_path, identity);
+        if (sent != .SUCCESS) return error.CannotSignalLauncher;
+    }
 
     const max_wait_ms: i64 = 65_000;
     const step_ms: i64 = 100;
@@ -205,7 +214,12 @@ fn readSmall(allocator: std.mem.Allocator, io: std.Io, path: []const u8, limit: 
     return reader.interface.allocRemaining(allocator, .limited(limit));
 }
 
-fn processStart(allocator: std.mem.Allocator, io: std.Io, pid: std.posix.pid_t) !u64 {
+fn processStart(allocator: std.mem.Allocator, io: std.Io, pid: std.posix.pid_t) anyerror!u64 {
+    if (@import("platform").darwin) {
+        const p = try @import("platform").process(pid);
+        if (p.zombie) return error.ProcessExited;
+        return p.start;
+    }
     const path = try std.fmt.allocPrint(allocator, "/proc/{d}/stat", .{pid});
     defer allocator.free(path);
     const data = try readSmall(allocator, io, path, 4096);
@@ -234,6 +248,10 @@ pub fn ownsReadyChild(allocator: std.mem.Allocator, io: std.Io, runtime: []const
     const pid_path = std.fs.path.join(allocator, &.{ runtime, "qemu.pid" }) catch return false;
     defer allocator.free(pid_path);
     const pid = readPid(allocator, io, pid_path) catch return false;
+    if (@import("platform").darwin) {
+        const p = @import("platform").process(pid) catch return false;
+        return !p.zombie and p.parent == launcher and p.start == expected_start;
+    }
     const stat_path = std.fmt.allocPrint(allocator, "/proc/{d}/stat", .{pid}) catch return false;
     defer allocator.free(stat_path);
     const stat = readSmall(allocator, io, stat_path, 4096) catch return false;
