@@ -58,7 +58,10 @@ static void guest_error(const char *message, void *opaque) {
 }
 static void on_signal(int sig) { (void)sig; quitting = 1; }
 
-// A partial frame cannot be dropped: close the link on a bounded send failure.
+// A partial frame cannot be dropped, and QEMU stops reading this stream while
+// the guest cannot receive (a paused VM, a full virtio queue). Block until it
+// drains: nothing else needs service while the guest is stalled, and SIGTERM
+// or SIGINT still interrupts the send. Only a real socket error closes the link.
 static int send_all(const void *data, size_t size) {
     const unsigned char *p = data;
     while (size) {
@@ -169,8 +172,6 @@ int main(int argc, char **argv) {
     do { peer = accept(listener, NULL, NULL); } while (peer < 0 && errno == EINTR && !quitting);
     close(listener);
     if (peer < 0) { unlink(path); return quitting ? 0 : 70; }
-    struct timeval timeout = { .tv_sec = 1 };
-    if (setsockopt(peer, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout))) fail("send timeout");
     unsigned char frame[MAX_FRAME + 4]; size_t used = 0, wanted = 4;
     while (!quitting) {
         polls[0] = (struct pollfd){peer, POLLIN, 0}; poll_count = 1;
