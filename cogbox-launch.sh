@@ -42,6 +42,8 @@
 # The last four seed config.json on FIRST init only, like every other init
 # flag. All four are absent by default, so a config written without them is
 # byte-identical to one written before they existed.
+HOST_DARWIN=0
+[ "${COGBOX_HOST_SYSTEM:-}" = aarch64-darwin ] && HOST_DARWIN=1
 INIT_ONLY=0
 FLAG_VCPU=""
 FLAG_MEM=""
@@ -162,8 +164,13 @@ ensure_cogbox_key() {
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
 	SUDO_INVOCATION=1
 	REAL_USER="$SUDO_USER"
-	REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-	REAL_UID=$(getent passwd "$SUDO_USER" | cut -d: -f3)
+	if [ "$HOST_DARWIN" = 1 ]; then
+		REAL_HOME=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory | cut -d' ' -f2-)
+		REAL_UID=$(id -u "$SUDO_USER")
+	else
+		REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+		REAL_UID=$(getent passwd "$SUDO_USER" | cut -d: -f3)
+	fi
 else
 	SUDO_INVOCATION=0
 	REAL_USER="$(id -un)"
@@ -868,8 +875,8 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		done < <(harness_pathkeys "$h")
 	done
 
-	INIT_VCPU="${FLAG_VCPU:-16}"
-	INIT_MEM="${FLAG_MEM:-32768}"
+	INIT_VCPU="${FLAG_VCPU:-${COGBOX_DEFAULT_VCPU:-16}}"
+	INIT_MEM="${FLAG_MEM:-${COGBOX_DEFAULT_MEM:-32768}}"
 	INIT_NETWORK="${FLAG_NETWORK:-rules}"
 
 	# Build network value for config: "full"/"none" as string, rules as object.
@@ -1355,6 +1362,11 @@ BIND_ADDR=$(jq -r '.bindAddr // "127.0.0.1"' "$ACTIVE_CONFIG")
 #                      name different ranges. Unset => no -u and the passt argv
 #                      is byte-identical to before the knob existed. `none`
 #                      mode (SLIRP) ignores it: mosh is unsupported there.
+if [ "$HOST_DARWIN" = 1 ]; then
+	for _linux_knob in COGBOX_PASST_RUNAS COGBOX_PROXY_RUNAS COGBOX_GUEST_RESOLVER COGBOX_HOST_RESOLVER COGBOX_MOSH_UDP_FORWARD; do
+		[ -z "${!_linux_knob}" ] || die "$_linux_knob requires the Linux network backend" 64
+	done
+fi
 PASST_RUNAS_ARGS=()
 [ -n "${COGBOX_PASST_RUNAS:-}" ] && PASST_RUNAS_ARGS=(--runas "$COGBOX_PASST_RUNAS")
 PASST_DNS_ARGS=()
@@ -1367,6 +1379,7 @@ fi
 # on the target passt build before relying on this knob.
 PASST_FWD_PREFIX=""
 [ -n "${COGBOX_PASST_BIND_FORWARDS:-}" ] && PASST_FWD_PREFIX="${BIND_ADDR}/"
+[ "$HOST_DARWIN" = 1 ] && PASST_FWD_PREFIX="${BIND_ADDR}/"
 # mosh UDP forward. Validated to <digits>-<digits> so a stray colon (the
 # mosh-server `-p lo:hi` spelling) or a bare port can never reach passt, whose
 # own parse error would only surface as a boot-loop; the passt(1) range form
@@ -2007,15 +2020,25 @@ start_l7mitm() {
 		-s "@l7addon@" -q &
 	L7MITM_PID=$!
 	echo "$L7MITM_PID" > "$RUNTIME/l7mitm.pid"
-	# Wait for mitmproxy to generate its CA (first run) or confirm it exists.
-	for _ in $(seq 1 100); do
-		[ -s "$ca_dir/mitmproxy-ca-cert.pem" ] && break
+	# A cold Python/mitmproxy import on macOS can exceed ten seconds. Wait
+	# for the native listener too: an existing CA alone is not readiness.
+	local mitm_attempts=100 mitm_ready=0
+	[ "$HOST_DARWIN" = 1 ] && mitm_attempts=400
+	for _ in $(seq 1 "$mitm_attempts"); do
+		cogbox_control_poll 0.001
+		if [ -s "$ca_dir/mitmproxy-ca-cert.pem" ]; then
+			if [ "$HOST_DARWIN" != 1 ] || port_taken 127.0.0.1 "$L7_MITM_PORT"; then
+				mitm_ready=1
+				break
+			fi
+		fi
 		kill -0 "$L7MITM_PID" 2>/dev/null || break
 		sleep 0.1
 	done
-	if ! kill -0 "$L7MITM_PID" 2>/dev/null || [ ! -s "$ca_dir/mitmproxy-ca-cert.pem" ]; then
+	if ! kill -0 "$L7MITM_PID" 2>/dev/null || [ "$mitm_ready" != 1 ]; then
 		echo "cogbox-launch: warning: L7 terminate backend failed to start; terminate hosts will be blocked." >&2
-		L7MITM_PID=""
+		# Keep the PID tracked: a slow process may still be importing. The
+		# normal child-first cleanup must reap it even when startup timed out.
 		return
 	fi
 	# Stage the CA CERT (cert only) for fw_cfg. Guard against ever leaking the
@@ -2100,6 +2123,13 @@ launch_vm() {
 	# gone) -> no qemu.start -> never ready.
 	[ -n "$QEMU_START" ] && echo "$QEMU_START" > "$RUNTIME/qemu.start"
 	echo "$QEMU_PID" > "$RUNTIME/qemu.pid"
+	if [ "$HOST_DARWIN" = 1 ]; then
+		# Inspection can fail transiently during exec. Keep servicing stop
+		# requests until termination is confirmed before entering Bash wait.
+		while ! cogbox_child_gone "$QEMU_PID"; do
+			cogbox_control_poll
+		done
+	fi
 	wait "$QEMU_PID"
 }
 
@@ -2118,9 +2148,14 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 	# socket ... Network is unreachable", 10-12 per boot) before falling back
 	# to IPv4. IPv4-only turns RA/NDP/DHCPv6 off in one flag; every other
 	# argv piece (-t/-u binds, --dns-forward/--dns-host) is an IPv4 literal.
+	FILTER_ENV=("LD_PRELOAD=@netfilter@")
+	FILTER_ARGS=()
+	if [ "$HOST_DARWIN" = 1 ]; then
+		FILTER_ENV=("DYLD_INSERT_LIBRARIES=@netfilter@")
+		FILTER_ARGS=(--filtered)
+	fi
 	NETFILTER_RULES="$RUNTIME/netfilter-rules" \
-	LD_PRELOAD="@netfilter@" \
-	passt --foreground --socket "$PASST_SOCK" -4 \
+	env "${FILTER_ENV[@]}" "${COGBOX_NET_BACKEND:-passt}" --foreground --socket "$PASST_SOCK" -4 "${FILTER_ARGS[@]}" \
 		"${PASST_RUNAS_ARGS[@]}" "${PASST_DNS_ARGS[@]}" \
 		-t "${PASST_FWD_PREFIX}${SSH_PORT}:22" -t "${PASST_FWD_PREFIX}${HTTP_PORT}:8080" "${PASST_MOSH_ARGS[@]}" &
 	PASST_PID=$!
@@ -2152,7 +2187,7 @@ elif [ "$NETWORK_MODE" != "none" ]; then
 	# applied here too, not only in rules mode. Likewise `-4`: the RA-induced
 	# IPv6-first fast-fail (see the rules-mode comment) is a passt property,
 	# not a filter one.
-	passt --foreground --socket "$PASST_SOCK" -4 \
+	"${COGBOX_NET_BACKEND:-passt}" --foreground --socket "$PASST_SOCK" -4 \
 		"${PASST_RUNAS_ARGS[@]}" "${PASST_DNS_ARGS[@]}" \
 		-t "${PASST_FWD_PREFIX}${SSH_PORT}:22" -t "${PASST_FWD_PREFIX}${HTTP_PORT}:8080" "${PASST_MOSH_ARGS[@]}" &
 	PASST_PID=$!

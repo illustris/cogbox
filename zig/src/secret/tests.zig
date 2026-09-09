@@ -161,10 +161,7 @@ test "appendSecretJson emits bound and unbound shapes" {
 fn gidOf(path: []const u8) !store.Gid {
 	var buf: [std.fs.max_path_bytes]u8 = undefined;
 	const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
-	var sx: std.os.linux.Statx = undefined;
-	const rc = std.os.linux.statx(std.posix.AT.FDCWD, path_z, 0, .{ .GID = true }, &sx);
-	if (rc != 0) return error.StatxFailed;
-	return sx.gid;
+	return (try @import("platform").statPath(path_z)).gid;
 }
 
 fn modeOf(io: std.Io, path: []const u8) !std.posix.mode_t {
@@ -207,7 +204,7 @@ test "addForProxy stages the proxy group + 0640 on the value file, leaving the m
 
 	// The test process's own primary gid: the one group it may chown a file it
 	// owns to without privileges. It stands in for the proxy's gid.
-	const gid: store.Gid = @intCast(std.os.linux.getgid());
+	const gid: store.Gid = @intCast(@import("platform").getgid());
 
 	const outcome = try store.addForProxy(gpa, io, dir, "api-token", "tok-abc123", .{
 		.audience = "api.example.com",
@@ -252,7 +249,7 @@ test "addForProxy cleans a failed staged rename before an owner-only retry" {
 	defer gpa.free(path);
 	// A directory at the destination forces rename to fail AFTER staging 0640.
 	try cwd.createDirPath(io, path);
-	const gid: store.Gid = @intCast(std.os.linux.getgid());
+	const gid: store.Gid = @intCast(@import("platform").getgid());
 	if (store.addForProxy(gpa, io, dir, "api-token", "fake-proxy-value", .{ .audience = "api.example.com" }, gid)) |_| {
 		return error.ExpectedRenameFailure;
 	} else |_| {}
@@ -291,7 +288,7 @@ test "addForProxy ignores legacy group-readable temps and symlinks" {
 	const link = try std.fs.path.join(gpa, &.{ dir, "app-session.tmp" });
 	defer gpa.free(link);
 	try cwd.symLink(io, "api-token.tmp", link, .{});
-	const gid: store.Gid = @intCast(std.os.linux.getgid());
+	const gid: store.Gid = @intCast(@import("platform").getgid());
 	for ([_][]const u8{ "api-token", "app-session" }) |name| {
 		const outcome = try store.addForProxy(gpa, io, dir, name, "fake-owner-only-value", .{}, gid);
 		try t.expect(!outcome.proxy_readable);
@@ -323,7 +320,7 @@ const ConcurrentBind = struct {
 		for (0..10) |_| {
 			_ = store.addForProxy(std.heap.page_allocator, threaded.io(), self.dir, "api-token", self.value, .{
 				.audience = "api.example.com",
-			}, @intCast(std.os.linux.getgid())) catch |err| {
+			}, @intCast(@import("platform").getgid())) catch |err| {
 				self.failure = err;
 				return;
 			};
@@ -365,7 +362,7 @@ test "addForProxy overlapping binds publish whole values without sharing temps" 
 	defer gpa.free(got);
 	try t.expect(std.mem.eql(u8, got, a) or std.mem.eql(u8, got, b));
 	try t.expectEqual(@as(std.posix.mode_t, 0o640), try modeOf(io, path));
-	try t.expectEqual(@as(store.Gid, @intCast(std.os.linux.getgid())), try gidOf(path));
+	try t.expectEqual(@as(store.Gid, @intCast(@import("platform").getgid())), try gidOf(path));
 	try expectStoreEntries(io, dir, &.{ "api-token", "api-token.meta" });
 }
 
@@ -380,7 +377,7 @@ test "addForProxy leaves the store owner-only with no proxy gid, and for a secre
 	defer gpa.free(dir);
 	defer cwd.deleteTree(io, dir) catch {};
 
-	const gid: store.Gid = @intCast(std.os.linux.getgid());
+	const gid: store.Gid = @intCast(@import("platform").getgid());
 
 	// No uid split configured (container/k8s/local): byte-for-byte the old
 	// behavior, 0600 and nothing granted.
@@ -482,7 +479,7 @@ test "secret add: COGBOX_PROXY_RUNAS reaches the store through dispatch, so the 
 	defer env.deinit();
 	// The test process's own primary gid, spelled NUMERICALLY (the one gid it may
 	// chown to unprivileged, and the one spelling that needs no /etc/group).
-	const gid: store.Gid = @intCast(std.os.linux.getgid());
+	const gid: store.Gid = @intCast(@import("platform").getgid());
 	const spec = try std.fmt.allocPrint(gpa, "cogbox-proxy:{d}", .{gid});
 	defer gpa.free(spec);
 	try env.put("COGBOX_PROXY_RUNAS", spec);
@@ -494,13 +491,13 @@ test "secret add: COGBOX_PROXY_RUNAS reaches the store through dispatch, so the 
 	// dispatch calls -- every other test in this file drives the store directly,
 	// which is why this is the only one that needs it.
 	const devnull = try std.posix.openatZ(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
-	defer _ = std.os.linux.close(devnull);
-	const saved_stdout: i32 = @intCast(std.os.linux.dup(1));
+	defer _ = std.c.close(devnull);
+	const saved_stdout: i32 = @intCast(std.c.dup(1));
 	defer {
-		_ = std.os.linux.dup2(saved_stdout, 1);
-		_ = std.os.linux.close(saved_stdout);
+		_ = std.c.dup2(saved_stdout, 1);
+		_ = std.c.close(saved_stdout);
 	}
-	_ = std.os.linux.dup2(devnull, 1);
+	_ = std.c.dup2(devnull, 1);
 
 	try main.dispatch(gpa, io, dir, &.{ "add", "api-token", "--from-file", src, "--audience", "api.example.com", "--kind", "bearer" }, &env);
 

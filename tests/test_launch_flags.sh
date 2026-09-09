@@ -163,7 +163,7 @@ fi
 # it. Asserting the invocation count too, so a third one cannot slip by
 # unchecked.
 
-n_passt=$(grep -c 'passt --foreground' "$LAUNCH")
+n_passt=$(grep -c ' --foreground --socket' "$LAUNCH")
 if [ "$n_passt" -ne 2 ]; then
 	bad "expected 2 passt invocations in the launcher, found $n_passt"
 else
@@ -176,7 +176,7 @@ else
 				*) bad "passt invocation at line $ln does not carry $tok"; missing=1 ;;
 			esac
 		done
-	done < <(grep -n 'passt --foreground' "$LAUNCH" | cut -d: -f1)
+	done < <(grep -n ' --foreground --socket' "$LAUNCH" | cut -d: -f1)
 	[ "$missing" -eq 0 ] && ok "both passt invocations carry the uid / guest-DNS / bind / mosh knobs"
 	# Both must run passt IPv4-only. No host has IPv6 egress, and passt (since
 	# 2026_07) with no host IPv6 interface to template still sends router
@@ -190,7 +190,7 @@ else
 			*' -4 '*|*'--ipv4-only'*) ;;
 			*) bad "passt invocation at line $ln is not IPv4-only (-4); the guest would pick up a router advertisement and dial IPv6 first"; v4=1 ;;
 		esac
-	done < <(grep -n 'passt --foreground' "$LAUNCH" | cut -d: -f1)
+	done < <(grep -n ' --foreground --socket' "$LAUNCH" | cut -d: -f1)
 	[ "$v4" -eq 0 ] && ok "both passt invocations run IPv4-only (-4)"
 	# Neither invocation may pin passt's outbound source address: the netfilter
 	# shim's mosh reply exemption (zig/src/netfilter) tells passt's inbound
@@ -203,7 +203,7 @@ else
 		case "$window" in
 			*'--outbound-addr'*|*' -o '*) bad "passt invocation at line $ln pins an outbound address; the shim's mosh reply exemption would then match guest-originated UDP too"; oa=1 ;;
 		esac
-	done < <(grep -n 'passt --foreground' "$LAUNCH" | cut -d: -f1)
+	done < <(grep -n ' --foreground --socket' "$LAUNCH" | cut -d: -f1)
 	[ "$oa" -eq 0 ] && ok "no passt invocation passes --outbound-addr / -o"
 fi
 

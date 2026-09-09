@@ -1462,7 +1462,7 @@ fn tmpPathFor(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 
 	io.random(&rnd);
 	var hexb: [16]u8 = undefined;
 	_ = std.fmt.bufPrint(&hexb, "{x}", .{&rnd}) catch unreachable;
-	return std.fmt.allocPrint(allocator, "{s}.tmp-{d}-{s}", .{ path, std.os.linux.getpid(), hexb });
+	return std.fmt.allocPrint(allocator, "{s}.tmp-{d}-{s}", .{ path, @import("platform").getpid(), hexb });
 }
 
 /// How old a `<name>.tmp-*` has to be before the sweep will consider deleting it.
@@ -3045,7 +3045,7 @@ fn observeRuntimeFile(st: *ObserveState) void {
 			_ = st.missing.fetchAdd(1, .monotonic);
 			continue;
 		};
-		defer _ = std.os.linux.close(fd);
+		defer _ = std.c.close(fd);
 		var total: usize = 0;
 		while (total < buf.len) {
 			const n = std.posix.read(fd, buf[total..]) catch break;
@@ -3205,7 +3205,7 @@ test "sweepStaleTmps: reaps only a tmp that is BOTH dead-pid and aged; a live pi
 	// (2^22 at its largest), so `kill(pid, 0)` is ESRCH on any kernel.
 	const dead_pid: std.posix.pid_t = std.math.maxInt(std.posix.pid_t);
 	// A pid that certainly IS live: this test process.
-	const live_pid: std.posix.pid_t = @intCast(std.os.linux.getpid());
+	const live_pid: std.posix.pid_t = @intCast(@import("platform").getpid());
 	const aged_ns: i128 = 1_000_000_000; // 2001-09-09, far past stale_tmp_age_ns
 
 	// (1) Someone else's LIVE temp, YOUNG: the plain concurrent-render case.
@@ -3285,10 +3285,7 @@ test "sweepStaleTmps: reaps only a tmp that is BOTH dead-pid and aged; a live pi
 fn inodeOf(path: []const u8) !u64 {
 	var buf: [std.fs.max_path_bytes]u8 = undefined;
 	const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
-	var sx: std.os.linux.Statx = undefined;
-	const rc = std.os.linux.statx(std.posix.AT.FDCWD, path_z, 0, .{ .INO = true }, &sx);
-	if (rc != 0) return error.StatxFailed;
-	return sx.ino;
+	return (try @import("platform").statPath(path_z)).ino;
 }
 
 test "writeRuntimeRules keeps netfilter-rules' INODE; writeRuntimeFile replaces it" {

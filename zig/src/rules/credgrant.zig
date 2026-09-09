@@ -413,10 +413,7 @@ fn setMtime(io: std.Io, path: []const u8, nanoseconds: i96) !void {
 fn gidOf(path: []const u8) !Gid {
 	var buf: [std.fs.max_path_bytes]u8 = undefined;
 	const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
-	var sx: std.os.linux.Statx = undefined;
-	const rc = std.os.linux.statx(std.posix.AT.FDCWD, path_z, 0, .{ .GID = true }, &sx);
-	if (rc != 0) return error.StatxFailed;
-	return sx.gid;
+	return (try @import("platform").statPath(path_z)).gid;
 }
 
 test "apply grants group-read on exactly the noted cred file, revokes a stale grant, and leaves the meta sidecar alone" {
@@ -433,7 +430,7 @@ test "apply grants group-read on exactly the noted cred file, revokes a stale gr
 
 	// The test process's own primary gid: the one group it may chown a file it
 	// owns to without privileges. It stands in for the proxy's gid.
-	const gid: Gid = @intCast(std.os.linux.getgid());
+	const gid: Gid = @intCast(@import("platform").getgid());
 
 	var grants = Grants.init(gpa, gid);
 	defer grants.deinit();
@@ -521,7 +518,7 @@ test "a grant TRANSITION moves the cred file's mtime; a steady-state render does
 	const dir = try tmpStore(gpa, io, 0o600);
 	defer gpa.free(dir);
 	defer cwd.deleteTree(io, dir) catch {};
-	const gid: Gid = @intCast(std.os.linux.getgid());
+	const gid: Gid = @intCast(@import("platform").getgid());
 
 	const named = try std.fs.path.join(gpa, &.{ dir, "claude-oauth" });
 	defer gpa.free(named);

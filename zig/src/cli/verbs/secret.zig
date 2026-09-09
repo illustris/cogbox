@@ -422,7 +422,7 @@ test "a RUNTIME bind's re-render grants the dropped L7 proxy read on the credent
 	// image's boot script would have missed exactly this, so the environment the
 	// control exec carries has to name the proxy identity (which is why the GCE
 	// cogbox wrapper sets COGBOX_PROXY_RUNAS, asserted by gce-cogbox-wrapper-env).
-	const gid: std.Io.File.Gid = @intCast(std.os.linux.getgid());
+	const gid: std.Io.File.Gid = @intCast(@import("platform").getgid());
 	const runas = try std.fmt.allocPrint(gpa, "cogbox-proxy:{d}", .{gid});
 	defer gpa.free(runas);
 	var env = std.process.Environ.Map.init(gpa);

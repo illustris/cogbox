@@ -3,6 +3,14 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
 	const target = b.standardTargetOptions(.{});
 	const optimize = b.standardOptimizeOption(.{});
+	const platform_mod = b.createModule(.{
+		.root_source_file = b.path("src/platform.zig"),
+		.target = target, .optimize = optimize, .link_libc = true,
+	});
+	if (target.result.os.tag == .macos) {
+		platform_mod.addCSourceFile(.{ .file = b.path("src/darwin-process.c"), .flags = &.{} });
+		b.installArtifact(b.addExecutable(.{ .name = "cogbox-platform", .root_module = platform_mod }));
+	}
 
 	const filter_mod = b.createModule(.{
 		.root_source_file = b.path("src/filter.zig"),
@@ -26,6 +34,9 @@ pub fn build(b: *std.Build) void {
 	});
 	lib_mod.addImport("filter", filter_mod);
 	lib_mod.addImport("socks5", socks5_mod);
+	if (target.result.os.tag == .macos) {
+		lib_mod.addCSourceFile(.{ .file = b.path("src/netfilter/darwin-interpose.c"), .flags = &.{} });
+	}
 
 	// Host-side L7 proxy (cogbox __l7proxy). Reuses the filter rule engine;
 	// links libc for getaddrinfo + the socket layer.
@@ -285,6 +296,15 @@ pub fn build(b: *std.Build) void {
 		.root_module = cli_verbs_test_mod,
 	});
 	const run_cli_verbs_tests = b.addRunArtifact(cli_verbs_tests);
+
+	for ([_]*std.Build.Module{ filter_mod, socks5_mod, lib_mod, l7proxy_mod,
+		authproxy_mod, divertshim_mod, rules_mod, remap_mod, l7_mod, secret_mod,
+		plugin_mod, cli_mod, l7proxy_test_mod, divertshim_test_mod, authproxy_test_mod,
+		rules_test_mod, remap_test_mod, l7_test_mod, plugin_test_mod, secret_test_mod,
+		cli_test_mod, cli_verbs_test_mod }) |mod| {
+		mod.addImport("platform", platform_mod);
+		mod.link_libc = true;
+	}
 
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_filter_tests.step);

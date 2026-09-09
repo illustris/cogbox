@@ -1076,10 +1076,7 @@ fn modeOfPath(io: std.Io, path: []const u8) !std.posix.mode_t {
 fn gidOfPath(path: []const u8) !std.Io.File.Gid {
 	var buf: [std.fs.max_path_bytes]u8 = undefined;
 	const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
-	var sx: std.os.linux.Statx = undefined;
-	const rc = std.os.linux.statx(std.posix.AT.FDCWD, path_z, 0, .{ .GID = true }, &sx);
-	if (rc != 0) return error.StatxFailed;
-	return sx.gid;
+	return (try @import("platform").statPath(path_z)).gid;
 }
 
 test "renderFiles: a GCE-shaped render (COGBOX_PROXY_RUNAS set) makes the NAMED cred file readable by the proxy gid and leaves an unnamed one unreadable" {
@@ -1110,7 +1107,7 @@ test "renderFiles: a GCE-shaped render (COGBOX_PROXY_RUNAS set) makes the NAMED 
 	// (`user:group`) and as the wrapper hands it to a control-channel exec. The
 	// group is given numerically as the TEST PROCESS's own gid: the one group a
 	// non-root test may chown its own files to, standing in for cogbox-proxy's.
-	const gid: std.Io.File.Gid = @intCast(std.os.linux.getgid());
+	const gid: std.Io.File.Gid = @intCast(@import("platform").getgid());
 	const runas = try std.fmt.allocPrint(gpa, "cogbox-proxy:{d}", .{gid});
 	defer gpa.free(runas);
 	var env = std.process.Environ.Map.init(gpa);
@@ -1195,7 +1192,7 @@ test "renderFiles: a GCE-shaped render over a STAGED bind is a permission no-op 
 
 	// The test process's own gid, standing in for cogbox-proxy's -- the one group
 	// a non-root test may chown its own files to.
-	const gid: std.Io.File.Gid = @intCast(std.os.linux.getgid());
+	const gid: std.Io.File.Gid = @intCast(@import("platform").getgid());
 
 	// The bind cogworx issues on the GCE host image: `secret add` resolves
 	// COGBOX_PROXY_RUNAS and hands the gid straight to addForProxy, so the value

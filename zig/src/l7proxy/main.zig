@@ -40,9 +40,8 @@ const c = @cImport({
 	@cInclude("string.h");
 });
 
-// CLOCK_MONOTONIC (numeric per the stable Linux ABI; not surfaced as a named
-// constant by the time.h cImport under our FORTIFY-disabled translate-c).
-const CLOCK_MONOTONIC: c_int = 1;
+// CLOCK_MONOTONIC uses different ABI values on Linux and Darwin.
+const CLOCK_MONOTONIC: c_int = if (@import("platform").darwin) 6 else 1;
 
 /// Monotonic milliseconds, used only to bound the fast-path classification peek.
 /// Monotonic (not wall-clock) so a clock step can't lengthen or shorten it.
@@ -241,17 +240,21 @@ fn installSignals() void {
 /// size, and the nanosecond mtime closes the same-size case.
 pub const FileKey = struct { mtime_ns: i128, size: u64 };
 
-/// `statx` on the OPEN fd (AT_EMPTY_PATH), not on the path: this file is the one
+/// Stat the OPEN fd (statx on Linux, fstat on Darwin): this file is the one
 /// the renderer must NOT rename, so the inode under the path cannot change
 /// underneath the two stats and keying on the fd removes the path-resolution
 /// TOCTOU the addon's path-based readers have to live with.
 fn statKeyOf(fd: c_int) ?FileKey {
-	var sx: std.os.linux.Statx = undefined;
-	const rc = std.os.linux.statx(fd, "", std.posix.AT.EMPTY_PATH, .{ .MTIME = true, .SIZE = true }, &sx);
-	if (rc != 0) return null;
+	if (!@import("platform").darwin) {
+		var sx: std.os.linux.Statx = undefined;
+		if (std.os.linux.statx(fd, "", std.posix.AT.EMPTY_PATH, .{ .MTIME = true, .SIZE = true }, &sx) != 0) return null;
+		return .{ .mtime_ns = @as(i128, sx.mtime.sec) * std.time.ns_per_s + sx.mtime.nsec, .size = sx.size };
+	}
+	var st: std.c.Stat = undefined;
+	if (std.c.fstat(fd, &st) != 0) return null;
 	return .{
-		.mtime_ns = @as(i128, sx.mtime.sec) * std.time.ns_per_s + @as(i128, sx.mtime.nsec),
-		.size = sx.size,
+		.mtime_ns = @as(i128, st.mtime().sec) * std.time.ns_per_s + @as(i128, st.mtime().nsec),
+		.size = @intCast(st.size),
 	};
 }
 
@@ -904,7 +907,7 @@ pub fn peekClassify(
 				// EINTR (e.g. a SIGHUP reload delivered to this worker thread): retry
 				// within the remaining budget. Any other, persistent poll error ->
 				// fail closed rather than busy-spin until the deadline.
-				if (c.__errno_location().* == c.EINTR) continue;
+				if (std.c._errno().* == c.EINTR) continue;
 				buffered.* = n;
 				return .deny;
 			}
