@@ -89,6 +89,37 @@ test "buildMeta/parseMeta round-trip" {
 	try t.expectEqualStrings("bearer", parsed.kind);
 	try t.expectEqualStrings("durable", parsed.tier);
 	try t.expectEqual(@as(i64, 1234), parsed.bound_at.?);
+	// A bind without the operator inject flags round-trips to the inert defaults.
+	try t.expect(!parsed.inject);
+	try t.expect(parsed.cookie_name == null);
+	try t.expect(parsed.port == null);
+	try t.expectEqualStrings(store.on_guest_replace, parsed.on_guest_credential);
+}
+
+test "buildMeta/parseMeta round-trip the operator inject keys (inject / cookie_name / port / on_guest_credential)" {
+	const a = t.allocator;
+	const m: store.Meta = .{
+		.audience = "app.example.com",
+		.kind = "cookie",
+		.tier = "durable",
+		.bound_at = 1234,
+		.inject = true,
+		.cookie_name = "session",
+		.port = 9200,
+		.on_guest_credential = store.on_guest_keep,
+	};
+	const json = try store.buildMeta(a, m);
+	defer a.free(json);
+	// The on-disk shape carries the four keys literally (jq --tab layout), after bound_at.
+	try t.expect(std.mem.indexOf(u8, json, "\"bound_at\": 1234,\n\t\"inject\": true,\n\t\"cookie_name\": \"session\",\n\t\"port\": 9200,\n\t\"on_guest_credential\": \"keep\"\n}\n") != null);
+
+	var arena = std.heap.ArenaAllocator.init(a);
+	defer arena.deinit();
+	const parsed = try store.parseMeta(arena.allocator(), json);
+	try t.expect(parsed.inject);
+	try t.expectEqualStrings("session", parsed.cookie_name.?);
+	try t.expectEqual(@as(?u16, 9200), parsed.port);
+	try t.expectEqualStrings("keep", parsed.on_guest_credential);
 }
 
 test "parseMeta handles null audience and missing fields with defaults" {
@@ -100,6 +131,62 @@ test "parseMeta handles null audience and missing fields with defaults" {
 	try t.expectEqualStrings("cookie", parsed.kind);
 	try t.expectEqualStrings("durable", parsed.tier); // default kept
 	try t.expect(parsed.bound_at == null);
+	// A meta written before the operator inject keys existed (every pre-feature
+	// bind) reads as an inert, replace-mode bind: nothing seeds, nothing changes.
+	try t.expect(!parsed.inject);
+	try t.expect(parsed.cookie_name == null);
+	try t.expect(parsed.port == null);
+	try t.expectEqualStrings("replace", parsed.on_guest_credential);
+}
+
+test "parseMeta types the operator inject keys: a non-bool inject, an empty cookie name, an out-of-range port and an unknown precedence fall back to the inert defaults" {
+	const a = t.allocator;
+	var arena = std.heap.ArenaAllocator.init(a);
+	defer arena.deinit();
+	{
+		const parsed = try store.parseMeta(arena.allocator(),
+			\\{"audience":"a.test","inject":"yes","cookie_name":"","port":70000,"on_guest_credential":"maybe"}
+		);
+		try t.expect(!parsed.inject);
+		try t.expect(parsed.cookie_name == null);
+		try t.expect(parsed.port == null);
+		try t.expectEqualStrings("replace", parsed.on_guest_credential);
+	}
+	{
+		const parsed = try store.parseMeta(arena.allocator(),
+			\\{"audience":"a.test","inject":true,"cookie_name":"sid","port":65535,"on_guest_credential":"keep"}
+		);
+		try t.expect(parsed.inject);
+		try t.expectEqualStrings("sid", parsed.cookie_name.?);
+		try t.expectEqual(@as(?u16, 65535), parsed.port);
+		try t.expectEqualStrings("keep", parsed.on_guest_credential);
+	}
+	// The port range is 1..65535: 0 is out, 1 is in, a string is not a port.
+	try t.expect((try store.parseMeta(arena.allocator(), "{\"port\": 0}")).port == null);
+	try t.expectEqual(@as(?u16, 1), (try store.parseMeta(arena.allocator(), "{\"port\": 1}")).port);
+	try t.expect((try store.parseMeta(arena.allocator(), "{\"port\": \"9200\"}")).port == null);
+}
+
+test "validCookieName (moved from plugin/mutate.zig) and validOnGuestCredential tables" {
+	try t.expect(store.validCookieName("session"));
+	try t.expect(store.validCookieName("app.sid"));
+	try t.expect(store.validCookieName("_gl_session"));
+	try t.expect(!store.validCookieName("a=b")); // separator
+	try t.expect(!store.validCookieName("a;b"));
+	try t.expect(!store.validCookieName("a,b"));
+	try t.expect(!store.validCookieName("a b"));
+	try t.expect(!store.validCookieName("a\"b"));
+	try t.expect(!store.validCookieName("a\tb")); // control char
+	try t.expect(!store.validCookieName("a\x7fb"));
+	// (The empty name is refused by the verb, not here -- the manifest validator
+	// checks emptiness itself before calling this.)
+	try t.expect(store.validOnGuestCredential("replace"));
+	try t.expect(store.validOnGuestCredential("keep"));
+	try t.expectEqualStrings("replace", store.on_guest_replace);
+	try t.expectEqualStrings("keep", store.on_guest_keep);
+	try t.expect(!store.validOnGuestCredential(""));
+	try t.expect(!store.validOnGuestCredential("Keep"));
+	try t.expect(!store.validOnGuestCredential("prefer-guest"));
 }
 
 test "parseMeta tolerates malformed json -> defaults (fail safe)" {
@@ -120,11 +207,18 @@ test "buildMeta emits null audience/bound_at literally" {
 	try t.expect(std.mem.indexOf(u8, json, "\"kind\": \"cookie\"") != null);
 	try t.expect(std.mem.indexOf(u8, json, "\"tier\": \"derived\"") != null);
 	try t.expect(std.mem.indexOf(u8, json, "\"bound_at\": null") != null);
+	// The operator inject keys are ALWAYS written, defaults included.
+	try t.expect(std.mem.indexOf(u8, json, "\"inject\": false") != null);
+	try t.expect(std.mem.indexOf(u8, json, "\"cookie_name\": null") != null);
+	try t.expect(std.mem.indexOf(u8, json, "\"port\": null") != null);
+	try t.expect(std.mem.indexOf(u8, json, "\"on_guest_credential\": \"replace\"") != null);
 }
 
 // `secret ls --json` shape the control plane (cogworx) parses. A bound secret
 // carries its audience + bound_at; an unset audience / missing value render as
 // JSON null / bound:false so cogworx shows the inject request as not injectable.
+// The four operator-inject keys are ALWAYS present (defaults included): their
+// absence is how cogworx recognises an agent that predates them.
 test "appendSecretJson emits bound and unbound shapes" {
 	const a = t.allocator;
 	{
@@ -132,7 +226,7 @@ test "appendSecretJson emits bound and unbound shapes" {
 		defer out.deinit(a);
 		try main.appendSecretJson(a, &out, "api-token", .{ .audience = "api.example.com", .kind = "bearer", .tier = "durable", .bound_at = 1700000000 }, true);
 		try t.expectEqualStrings(
-			"{\"name\":\"api-token\",\"kind\":\"bearer\",\"audience\":\"api.example.com\",\"tier\":\"durable\",\"bound\":true,\"bound_at\":1700000000}",
+			"{\"name\":\"api-token\",\"kind\":\"bearer\",\"audience\":\"api.example.com\",\"tier\":\"durable\",\"bound\":true,\"bound_at\":1700000000,\"inject\":false,\"cookie_name\":null,\"port\":null,\"on_guest_credential\":\"replace\"}",
 			out.items,
 		);
 	}
@@ -141,7 +235,18 @@ test "appendSecretJson emits bound and unbound shapes" {
 		defer out.deinit(a);
 		try main.appendSecretJson(a, &out, "app-session", .{ .audience = null, .kind = "cookie", .tier = "durable", .bound_at = null }, false);
 		try t.expectEqualStrings(
-			"{\"name\":\"app-session\",\"kind\":\"cookie\",\"audience\":null,\"tier\":\"durable\",\"bound\":false,\"bound_at\":null}",
+			"{\"name\":\"app-session\",\"kind\":\"cookie\",\"audience\":null,\"tier\":\"durable\",\"bound\":false,\"bound_at\":null,\"inject\":false,\"cookie_name\":null,\"port\":null,\"on_guest_credential\":\"replace\"}",
+			out.items,
+		);
+	}
+	{
+		// An operator inject bind: every key set, the cookie name JSON-escaped
+		// like any other string.
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(a);
+		try main.appendSecretJson(a, &out, "app-session", .{ .audience = "app.example.com", .kind = "cookie", .tier = "durable", .bound_at = 1700000000, .inject = true, .cookie_name = "session", .port = 8443, .on_guest_credential = "keep" }, true);
+		try t.expectEqualStrings(
+			"{\"name\":\"app-session\",\"kind\":\"cookie\",\"audience\":\"app.example.com\",\"tier\":\"durable\",\"bound\":true,\"bound_at\":1700000000,\"inject\":true,\"cookie_name\":\"session\",\"port\":8443,\"on_guest_credential\":\"keep\"}",
 			out.items,
 		);
 	}
@@ -531,4 +636,286 @@ test "secret add: COGBOX_PROXY_RUNAS reaches the store through dispatch, so the 
 	const spath = try std.fs.path.join(gpa, &.{ dir, "app-session" });
 	defer gpa.free(spath);
 	try t.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(io, spath));
+}
+
+// --- operator inject flags at the verb (`secret add --inject ...`) ----------
+//
+// die() exits the PROCESS, so an exit-code assertion cannot run in-process: each
+// refusal case forks, runs dispatch in the child with stdout at /dev/null (under
+// `zig build test` fd 1 is the build runner's protocol pipe) and stderr captured
+// through a pipe, and the parent asserts on the code + the bytes. The child's
+// stdin is a pipe the parent PRE-FILLS with a value and reads back afterwards,
+// which is how "nothing was read before the refusal" is proven rather than
+// assumed -- the exit-64 contract cogworx relies on is exactly that.
+
+const ChildResult = struct { code: u8, stderr: []u8, stdin_left: []u8 };
+
+fn dispatchInChild(gpa: std.mem.Allocator, dir: []const u8, argv: []const []const u8, stdin_payload: []const u8) !ChildResult {
+	var err_fds: [2]i32 = undefined;
+	if (std.os.linux.pipe(&err_fds) != 0) return error.PipeFailed;
+	var in_fds: [2]i32 = undefined;
+	if (std.os.linux.pipe(&in_fds) != 0) return error.PipeFailed;
+	// The whole payload sits in the pipe buffer before the child starts, and
+	// EVERY write end is closed right after the fork (below, in both
+	// processes): a child that wrongly reaches the stdin read then sees the
+	// payload followed by EOF, binds it and exits 0 -- a clean exit-code
+	// failure for the caller, never a hang on a pipe nobody will close.
+	if (std.os.linux.write(in_fds[1], stdin_payload.ptr, stdin_payload.len) != stdin_payload.len) return error.WriteFailed;
+	const devnull = try std.posix.openatZ(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+
+	const rc = std.os.linux.fork();
+	if (std.os.linux.errno(rc) != .SUCCESS) return error.ForkFailed;
+	if (rc == 0) {
+		// CHILD. Only this thread survived the fork, so touch no parent-owned
+		// lock: page_allocator and a fresh Io.
+		_ = std.os.linux.close(err_fds[0]);
+		_ = std.os.linux.close(in_fds[1]);
+		_ = std.os.linux.dup2(err_fds[1], 2);
+		_ = std.os.linux.dup2(in_fds[0], 0);
+		_ = std.os.linux.dup2(devnull, 1);
+		var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+		main.dispatch(std.heap.page_allocator, threaded.io(), dir, argv, null) catch std.process.exit(99);
+		std.process.exit(0);
+	}
+	// PARENT. in_fds[0] stays open here: it is read back below, once the
+	// child is gone, for whatever the child left unconsumed; in_fds[1] goes
+	// now so that read (and any read the child makes) ends at EOF.
+	_ = std.os.linux.close(err_fds[1]);
+	_ = std.os.linux.close(in_fds[1]);
+	_ = std.os.linux.close(devnull);
+	var err_out: std.ArrayList(u8) = .empty;
+	errdefer err_out.deinit(gpa);
+	var buf: [4096]u8 = undefined;
+	while (true) {
+		// std.posix.read retries EINTR (the child's exit can interrupt a
+		// blocking read) and types any other failure.
+		const n = try std.posix.read(err_fds[0], &buf);
+		if (n == 0) break;
+		try err_out.appendSlice(gpa, buf[0..n]);
+	}
+	_ = std.os.linux.close(err_fds[0]);
+	var status: u32 = 0;
+	while (true) {
+		const wr = std.os.linux.waitpid(@intCast(rc), &status, 0);
+		if (std.os.linux.errno(wr) == .INTR) continue;
+		if (std.os.linux.errno(wr) != .SUCCESS) return error.WaitFailed;
+		break;
+	}
+	if (!std.os.linux.W.IFEXITED(status)) return error.ChildSignalled;
+	// Whatever the child did not consume is still in the stdin pipe.
+	var left: std.ArrayList(u8) = .empty;
+	errdefer left.deinit(gpa);
+	while (true) {
+		const n = try std.posix.read(in_fds[0], &buf);
+		if (n == 0) break;
+		try left.appendSlice(gpa, buf[0..n]);
+	}
+	_ = std.os.linux.close(in_fds[0]);
+	return .{ .code = std.os.linux.W.EXITSTATUS(status), .stderr = try err_out.toOwnedSlice(gpa), .stdin_left = try left.toOwnedSlice(gpa) };
+}
+
+fn expectRefused(gpa: std.mem.Allocator, dir: []const u8, argv: []const []const u8, code: u8, needle: []const u8) !void {
+	const r = try dispatchInChild(gpa, dir, argv, "tok-never-read\n");
+	defer gpa.free(r.stderr);
+	defer gpa.free(r.stdin_left);
+	try t.expectEqual(code, r.code);
+	try t.expect(std.mem.startsWith(u8, r.stderr, "cogbox secret: error: "));
+	try t.expect(std.mem.indexOf(u8, r.stderr, needle) != null);
+	// Refused BEFORE the value was read: the payload is still in the pipe...
+	try t.expectEqualStrings("tok-never-read\n", r.stdin_left);
+	// ...and nothing landed in the store (no dir is ever created).
+	try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_for_access, dir, .{}));
+}
+
+// expectRefused needs an Io for the access probe; a file-scope Threaded keeps
+// the helper's signature small.
+var access_threaded: ?std.Io.Threaded = null;
+var io_for_access: std.Io = undefined;
+
+test "secret add: an unknown flag is exit 64 with the byte-exact `cogbox secret: error: unknown flag '<flag>'` payload cogworx classifies, before any value is read or validated" {
+	const gpa = t.allocator;
+	access_threaded = .init(gpa, .{});
+	defer {
+		access_threaded.?.deinit();
+		access_threaded = null;
+	}
+	io_for_access = access_threaded.?.io();
+	const dir = try tmpStoreDir(gpa, io_for_access);
+	defer gpa.free(dir);
+
+	// The exact rendering (prefix, quotes, newline) is the CROSS-REPO CONTRACT:
+	// cogworx matches `cogbox secret: error: unknown flag '--inject'` /
+	// `... '--on-guest-credential'` on exit 64 to turn an old-agent bind into a
+	// coded "agent update required" refusal. This binary knows those flags, so
+	// the rendering is pinned on a flag no binary knows, with the SAME die.
+	{
+		const r = try dispatchInChild(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--no-such-flag", "--audience", "api.example.com" }, "tok-never-read\n");
+		defer gpa.free(r.stderr);
+		defer gpa.free(r.stdin_left);
+		try t.expectEqual(@as(u8, 64), r.code);
+		try t.expectEqualStrings("cogbox secret: error: unknown flag '--no-such-flag'\n", r.stderr);
+		try t.expectEqualStrings("tok-never-read\n", r.stdin_left);
+	}
+	// Parse order: the unknown flag fires where it is met, ahead of a later
+	// value flag's exit-65 validation (`--kind bogus` never gets a say) -- so an
+	// old binary's refusal of `--inject` can never be masked by a 65.
+	{
+		const r = try dispatchInChild(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--no-such-flag", "--kind", "bogus" }, "x\n");
+		defer gpa.free(r.stderr);
+		defer gpa.free(r.stdin_left);
+		try t.expectEqual(@as(u8, 64), r.code);
+		try t.expectEqualStrings("cogbox secret: error: unknown flag '--no-such-flag'\n", r.stderr);
+	}
+	// The payload string as cogworx spells it, produced by the same format.
+	const rendered = try std.fmt.allocPrint(gpa, "cogbox secret: error: unknown flag '{s}'\n", .{"--inject"});
+	defer gpa.free(rendered);
+	try t.expectEqualStrings("cogbox secret: error: unknown flag '--inject'\n", rendered);
+	try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_for_access, dir, .{}));
+}
+
+test "secret add: operator-inject validation exits 65 BEFORE the value is read, binding nothing" {
+	const gpa = t.allocator;
+	access_threaded = .init(gpa, .{});
+	defer {
+		access_threaded.?.deinit();
+		access_threaded = null;
+	}
+	io_for_access = access_threaded.?.io();
+	const dir = try tmpStoreDir(gpa, io_for_access);
+	defer gpa.free(dir);
+
+	// --inject without an audience: nothing to seed the spec's host from.
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--inject" }, 65, "--inject requires --audience");
+	// --inject is for the operator kinds only; the platform kinds are seeded by
+	// the control plane and must never get a whole-host operator spec.
+	try expectRefused(gpa, dir, &.{ "add", "git-example", "--from-stdin", "--audience", "git.example.com", "--kind", "gitlab-oauth", "--inject" }, 65, "applies to bearer|cookie|basic");
+	try expectRefused(gpa, dir, &.{ "add", "claude-oauth", "--from-stdin", "--audience", "api.anthropic.com", "--kind", "anthropic-oauth", "--inject" }, 65, "applies to bearer|cookie|basic");
+	try expectRefused(gpa, dir, &.{ "add", "git-example", "--from-stdin", "--audience", "git.example.com", "--kind", "gitlab-authproxy", "--inject" }, 65, "applies to bearer|cookie|basic");
+	// A cookie inject bind needs the cookie name (the addon's cookie arm is a
+	// no-op without one); a cookie name is meaningless on any other kind.
+	try expectRefused(gpa, dir, &.{ "add", "app-session", "--from-stdin", "--audience", "app.example.com", "--kind", "cookie", "--inject" }, 65, "requires --cookie-name");
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--audience", "api.example.com", "--kind", "bearer", "--cookie-name", "session" }, 65, "applies only to --kind cookie");
+	try expectRefused(gpa, dir, &.{ "add", "app-session", "--from-stdin", "--audience", "app.example.com", "--kind", "cookie", "--cookie-name", "a;b", "--inject" }, 65, "invalid --cookie-name");
+	try expectRefused(gpa, dir, &.{ "add", "app-session", "--from-stdin", "--audience", "app.example.com", "--kind", "cookie", "--cookie-name=", "--inject" }, 65, "invalid --cookie-name");
+	// Port 1..65535, digits only.
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--audience", "api.example.com", "--inject", "--port", "0" }, 65, "invalid --port");
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--audience", "api.example.com", "--inject", "--port", "70000" }, 65, "invalid --port");
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--audience", "api.example.com", "--inject", "--port=nine" }, 65, "invalid --port");
+	// Precedence is exactly replace|keep.
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--audience", "api.example.com", "--inject", "--on-guest-credential", "maybe" }, 65, "invalid --on-guest-credential");
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--audience", "api.example.com", "--on-guest-credential=Keep" }, 65, "invalid --on-guest-credential");
+	// With --inject the audience becomes a policy LINE (l7-rules and
+	// l7-inject-hosts are whitespace-tokenized), so it must be one exact bare
+	// host: no rule tokens after a space (`insecure`), no extra lines after a
+	// newline (`mode passthrough`), no wildcard, no port, no trailing dot.
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--inject", "--audience", "a.example.com insecure" }, 65, "invalid --audience");
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--inject", "--audience", "b.example.com\nmode passthrough" }, 65, "invalid --audience");
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--inject", "--audience", "*.example.com" }, 65, "invalid --audience");
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--inject", "--audience=c.example.com:9200" }, 65, "invalid --audience");
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--inject", "--audience", "d.example.com." }, 65, "invalid --audience");
+	try expectRefused(gpa, dir, &.{ "add", "api-token", "--from-stdin", "--audience", " api.example.com", "--kind", "bearer", "--inject" }, 65, "invalid --audience");
+}
+
+test "secret add --inject --port=9200 --on-guest-credential keep binds the meta the render seeds from; a plain bind and a plugin-spec bind choosing keep stay inject=false" {
+	const gpa = t.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(dir);
+	defer cwd.deleteTree(io, dir) catch {};
+
+	// The value arrives by --from-file (never stdin under the test runner).
+	const src_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(src_dir);
+	defer cwd.deleteTree(io, src_dir) catch {};
+	try cwd.createDirPath(io, src_dir);
+	const src = try std.fs.path.join(gpa, &.{ src_dir, "value" });
+	defer gpa.free(src);
+	{
+		const f = try cwd.createFile(io, src, .{ .truncate = true });
+		defer f.close(io);
+		var wbuf: [64]u8 = undefined;
+		var w = f.writer(io, &wbuf);
+		try w.interface.writeAll("elastic:FAKE\n");
+		try w.flush();
+	}
+
+	// stdout is the build runner's protocol pipe under `zig build test`; the
+	// announce line must not reach it (see the COGBOX_PROXY_RUNAS test above).
+	const devnull = try std.posix.openatZ(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+	defer _ = std.os.linux.close(devnull);
+	const saved_stdout: i32 = @intCast(std.os.linux.dup(1));
+	defer {
+		_ = std.os.linux.dup2(saved_stdout, 1);
+		_ = std.os.linux.close(saved_stdout);
+	}
+	_ = std.os.linux.dup2(devnull, 1);
+
+	var arena = std.heap.ArenaAllocator.init(gpa);
+	defer arena.deinit();
+
+	// The cogworx argv for an injecting basic bind on a non-standard port, keep
+	// precedence (both flag spellings).
+	try main.dispatch(gpa, io, dir, &.{ "add", "es-creds", "--from-file", src, "--audience", "es.example.com", "--kind", "basic", "--inject", "--on-guest-credential", "keep", "--port=9200" }, null);
+	{
+		const r = (try store.lookup(arena.allocator(), io, dir, "es-creds")).?;
+		try t.expect(r.bound);
+		try t.expectEqualStrings("es.example.com", r.meta.audience.?);
+		try t.expectEqualStrings("basic", r.meta.kind);
+		try t.expect(r.meta.inject);
+		try t.expectEqual(@as(?u16, 9200), r.meta.port);
+		try t.expect(r.meta.cookie_name == null);
+		try t.expectEqualStrings("keep", r.meta.on_guest_credential);
+	}
+	// A cookie inject bind records the cookie the proxy replaces.
+	try main.dispatch(gpa, io, dir, &.{ "add", "app-session", "--from-file", src, "--audience", "app.example.com", "--kind", "cookie", "--cookie-name", "session", "--inject" }, null);
+	{
+		const r = (try store.lookup(arena.allocator(), io, dir, "app-session")).?;
+		try t.expect(r.meta.inject);
+		try t.expectEqualStrings("session", r.meta.cookie_name.?);
+		try t.expect(r.meta.port == null);
+		try t.expectEqualStrings("replace", r.meta.on_guest_credential);
+	}
+	// Today's argv (plugin "Bind now", claude/git reconcile): inert defaults.
+	try main.dispatch(gpa, io, dir, &.{ "add", "api-token", "--from-file", src, "--audience", "api.example.com", "--kind", "bearer" }, null);
+	{
+		const r = (try store.lookup(arena.allocator(), io, dir, "api-token")).?;
+		try t.expect(!r.meta.inject);
+		try t.expect(r.meta.cookie_name == null);
+		try t.expect(r.meta.port == null);
+		try t.expectEqualStrings("replace", r.meta.on_guest_credential);
+	}
+	// A plugin-spec bind may choose keep WITHOUT --inject: the precedence rides
+	// through the plugin's spec (the render reads it from this meta).
+	try main.dispatch(gpa, io, dir, &.{ "add", "plugin-tok", "--from-file", src, "--audience", "api.example.com", "--kind", "bearer", "--on-guest-credential", "keep" }, null);
+	{
+		const r = (try store.lookup(arena.allocator(), io, dir, "plugin-tok")).?;
+		try t.expect(!r.meta.inject);
+		try t.expectEqualStrings("keep", r.meta.on_guest_credential);
+	}
+	// The audience grammar gate admits an IP literal and mixed case (the render
+	// compares case-insensitively, the rules reader too) with --inject...
+	try main.dispatch(gpa, io, dir, &.{ "add", "ip-token", "--from-file", src, "--audience", "10.0.0.5", "--kind", "bearer", "--inject" }, null);
+	try main.dispatch(gpa, io, dir, &.{ "add", "cased-token", "--from-file", src, "--audience", "Api.Example.Com", "--kind", "bearer", "--inject" }, null);
+	{
+		const r = (try store.lookup(arena.allocator(), io, dir, "ip-token")).?;
+		try t.expect(r.meta.inject);
+		try t.expectEqualStrings("10.0.0.5", r.meta.audience.?);
+		const c = (try store.lookup(arena.allocator(), io, dir, "cased-token")).?;
+		try t.expect(c.meta.inject);
+		try t.expectEqualStrings("Api.Example.Com", c.meta.audience.?);
+	}
+	// ...and applies ONLY with --inject: today's argv keeps accepting an audience
+	// the render only ever compares against a plugin spec's host (folded, so a
+	// trailing dot still matches), never renders as a line.
+	try main.dispatch(gpa, io, dir, &.{ "add", "dotted-plain", "--from-file", src, "--audience", "api.example.com.", "--kind", "bearer" }, null);
+	{
+		const r = (try store.lookup(arena.allocator(), io, dir, "dotted-plain")).?;
+		try t.expect(r.bound);
+		try t.expect(!r.meta.inject);
+		try t.expectEqualStrings("api.example.com.", r.meta.audience.?);
+	}
 }

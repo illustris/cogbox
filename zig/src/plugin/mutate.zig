@@ -217,7 +217,7 @@ pub fn validatePluginInjectSpec(v: std.json.Value) InjectSpecError!void {
 	if (std.mem.eql(u8, style, "cookie")) {
 		const cn = v.object.get("cookieName") orelse return error.MissingCookieName;
 		if (cn != .string or cn.string.len == 0) return error.MissingCookieName;
-		if (!validCookieName(cn.string)) return error.BadCookieName;
+		if (!secret_store.validCookieName(cn.string)) return error.BadCookieName;
 	}
 
 	if (v.object.get("stub")) |st| {
@@ -232,15 +232,10 @@ pub fn validatePluginInjectSpec(v: std.json.Value) InjectSpecError!void {
 	if (v.object.get("port")) |pv| {
 		if (pv != .integer or pv.integer < 1 or pv.integer > 65535) return error.BadPort;
 	}
-}
-
-fn validCookieName(name: []const u8) bool {
-	for (name) |c| switch (c) {
-		0...0x1f, 0x7f => return false, // control chars (incl tab/space-low)
-		'=', ';', ',', ' ', '"' => return false, // cookie separators
-		else => {},
-	};
-	return true;
+	// A manifest `on_guest_credential` key is IGNORED (neither validated nor
+	// merged): guest-credential precedence is the operator's choice at bind
+	// time (`cogbox secret add --on-guest-credential`, secret_store.Meta) and
+	// the inject render reads it from the secret's meta, never from a spec.
 }
 
 /// Prepend `incoming` as a contiguous block at the head of the rules array

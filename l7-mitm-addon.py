@@ -699,7 +699,8 @@ def apply_injection(headers, style, token, account_id=None, cookie_name=None):
         headers["authorization"] = "Bearer " + token
 
 
-def should_inject(headers, style, stub_token, cookie_name=None):
+def should_inject(headers, style, stub_token, cookie_name=None,
+                  on_guest_credential="replace"):
     """Whether to overwrite this request's credential with the injected token.
 
     When the spec carries a `stub_token` (the recognizable placeholder the
@@ -711,21 +712,37 @@ def should_inject(headers, style, stub_token, cookie_name=None):
     /v1/code/sessions/<id>/worker + the SSE event stream); clobbering that with
     the OAuth token breaks it (401 -> worker_register_failed -> "Transport closed
     (code 403)"). With no stub_token (harnesses that still mount their real token
-    in-guest), keep the legacy always-inject behavior."""
-    if not stub_token:
+    in-guest), keep the legacy always-inject behavior.
+
+    `on_guest_credential` is the operator's per-bind precedence (the conf key
+    the render emits only for "keep"; absent/None/"replace" is today's
+    behaviour): under "keep" the credential is injected ONLY when the style's
+    slot is empty -- bearer/basic look at the whole Authorization header (any
+    scheme counts as "the sandbox sent one"), cookie at the single named cookie
+    -- and a request that carries its own is forwarded untouched. A spec with a
+    stub_token keeps the stricter stub gate regardless (the stub still counts
+    as "empty"). keep can only ever inject LESS than replace: a compromised
+    guest can suppress injection for its own requests, never redirect the
+    operator's credential."""
+    keep = on_guest_credential == "keep"
+    if not stub_token and not keep:
         return True
     if style == "cookie":
         cur = get_cookie(headers, cookie_name)
-        return cur is None or cur == "" or cur == stub_token
-    if style == "anthropic-apikey":
+        stub_cur = stub_token
+    elif style == "anthropic-apikey":
         cur = headers.get("x-api-key", "")
-        return cur == "" or cur == stub_token
-    if style == "basic":
+        stub_cur = stub_token
+    elif style == "basic":
         cur = headers.get("authorization", "")
-        encoded_stub = "Basic " + base64.b64encode(stub_token.encode()).decode()
-        return cur == "" or cur == encoded_stub
-    cur = headers.get("authorization", "")
-    return cur == "" or cur == "Bearer " + stub_token
+        stub_cur = ("Basic " + base64.b64encode(stub_token.encode()).decode()
+                    if stub_token else None)
+    else:
+        cur = headers.get("authorization", "")
+        stub_cur = ("Bearer " + stub_token) if stub_token else None
+    if cur is None or cur == "":
+        return True
+    return stub_cur is not None and cur == stub_cur
 
 
 # --- Host-side token refresh -----------------------------------------------
@@ -920,7 +937,8 @@ class CredStore(_PolledFile):
         # here exactly as it does on the healthy path (a present-but-None style
         # would defeat resolve_gitlab_style's "bearer" default).
         self.known_stubs = {
-            h: {k: sp[k] for k in ("style", "stub_token", "cookie_name", "git_user")
+            h: {k: sp[k] for k in ("style", "stub_token", "cookie_name", "git_user",
+                                   "on_guest_credential")
                 if k in sp}
             for h, sp in specs.items()
         }
@@ -971,7 +989,8 @@ class CredStore(_PolledFile):
             return True
         style, _prefix = resolve_gitlab_style(stub, path)
         return should_inject(headers, style, stub.get("stub_token"),
-                             stub.get("cookie_name"))
+                             stub.get("cookie_name"),
+                             stub.get("on_guest_credential"))
 
     def _read_json(self, cred_file):
         """The parsed JSON cred file, cached on `_stat_key` -- the same
@@ -1423,18 +1442,22 @@ def _enforce_and_inject(flow, path, query_service=None):
     # skip: the auth proxy stamps the credential itself, so a stale gitlab-oauth
     # bind lingering through a mode flip must never let the addon double-stamp.
     if AUTH_HOSTS.contains(host):
-        # One-shot per-host-per-conf-generation warning when a host has BOTH an
-        # inject spec and an auth entry -- a control-plane bug the version gate
-        # is supposed to make impossible (the new kind is never seeded as a
-        # spec). We retarget regardless: the auth entry wins, the spec is
-        # ignored, no token is stamped here.
+        # One-shot per-host-per-conf-generation notice when a host has BOTH an
+        # inject spec and an auth entry. Legitimate now: an operator bind with
+        # `--inject` on a host a git grant covers seeds a spec beside the auth
+        # entry (the gitlab-authproxy kind itself is never seeded -- the version
+        # gate keeps that impossible). We retarget regardless: the auth entry
+        # wins, the spec is ignored, no token is stamped here -- the grant's
+        # policy governs all of the host's traffic while it is active
+        # (docs/authproxy.md Hardening), and cogworx labels the bind as
+        # superseded.
         if CREDS.spec_for(host) is not None:
             gen = CREDS.stat
             if _auth_conflict_logged.get(host) != gen:
                 _auth_conflict_logged[host] = gen
                 _cred_log("CONFLICT host=%s has both an inject spec and an auth "
                           "entry; retargeting to the auth proxy and ignoring the "
-                          "spec (control-plane bug)" % host)
+                          "spec (the grant supersedes the bound credential)" % host)
         if not retarget_to_authproxy(flow, host, sni):
             # Could not retarget (auth port unusable / no vetted upstream): fail
             # closed rather than forward the request unauthenticated.
@@ -1459,13 +1482,15 @@ def _enforce_and_inject(flow, path, query_service=None):
         # pass straight through.
         style, token_prefix = resolve_gitlab_style(spec, path)
         do_inject = should_inject(flow.request.headers, style,
-                                  spec.get("stub_token"), spec.get("cookie_name"))
+                                  spec.get("stub_token"), spec.get("cookie_name"),
+                                  spec.get("on_guest_credential"))
         if os.environ.get("COGBOX_L7_DEBUG_INJECT"):
             # Safe to log: host + path + decision only, never any token material.
             has_auth = bool(flow.request.headers.get("authorization")
                             or flow.request.headers.get("x-api-key"))
-            _cred_log("inject host=%s path=%s inject=%s had_auth=%s"
-                      % (host, path, do_inject, has_auth))
+            _cred_log("inject host=%s path=%s inject=%s had_auth=%s mode=%s"
+                      % (host, path, do_inject, has_auth,
+                         spec.get("on_guest_credential") or "replace"))
         rules_tag = spec.get("rules_tag")
         if do_inject and rules_tag and \
                 evaluate(RULES, host, path, method, query_service, require_tag=rules_tag) != "allow":

@@ -282,6 +282,22 @@ test "secret re-render signals BOTH passt and the L7 proxy (the seeded funnel is
 	defer gpa.free(st.config_dir);
 	defer gpa.free(st.base_runtime);
 	defer cwd.deleteTree(io, st.root) catch {};
+	// Plus an OPERATOR inject bind on a non-standard port (`cogbox secret add
+	// es-creds --audience es.example.com --kind basic --inject --port 9200`):
+	// its funnel remap is netfilter-rules state too, so the same two signals
+	// must carry it.
+	{
+		const store_dir = try std.fmt.allocPrint(gpa, "{s}/secrets", .{st.config_dir});
+		defer gpa.free(store_dir);
+		try secret_module.store.add(gpa, io, store_dir, "es-creds", "elastic:FAKE", .{
+			.audience = "es.example.com",
+			.kind = "basic",
+			.tier = "durable",
+			.bound_at = 2,
+			.inject = true,
+			.port = 9200,
+		});
+	}
 
 	// SA_RESTART so a caught signal can't surface as EINTR in the surrounding I/O.
 	var act: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
@@ -320,6 +336,14 @@ test "secret re-render signals BOTH passt and the L7 proxy (the seeded funnel is
 	const nf = try readTestFile(gpa, io, nf_path);
 	defer gpa.free(nf);
 	try std.testing.expect(std.mem.indexOf(u8, nf, "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:") != null);
+	// The operator bind's :9200 funnel is in the same file, and its whole-host
+	// terminate-allow in l7-rules (the L7 proxy's half).
+	try std.testing.expect(std.mem.indexOf(u8, nf, "remap tcp 0.0.0.0/0:9200 -> tcp 127.0.0.1:") != null);
+	const l7_path = try std.fmt.allocPrint(gpa, "{s}/l7-rules", .{st.runtime});
+	defer gpa.free(l7_path);
+	const l7 = try readTestFile(gpa, io, l7_path);
+	defer gpa.free(l7);
+	try std.testing.expect(std.mem.indexOf(u8, l7, "allow es.example.com terminate\n") != null);
 
 	// ...so BOTH consumers must have been told. SIGHUP alone (the omission this
 	// test pins) leaves the shim on its stale ruleset: the guest's :443 keeps

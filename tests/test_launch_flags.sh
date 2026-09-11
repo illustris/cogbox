@@ -479,6 +479,107 @@ STUB
 	ok "precreate on an unwritable runtime dir warns and continues"
 fi
 
+# --- 8. harness hosts are withheld from l7-inject-hosts after the merge ------
+#
+# The L7 proxy routes a host's PLAIN-HTTP egress to the injecting addon when
+# the host is listed in l7-inject-hosts, and the addon resolves a host to the
+# LAST conf element naming it -- after the launcher's merge, the HARNESS spec
+# (the real host-side OAuth token). A rendered spec that names a harness host
+# (a plugin's, the claude seed's, an operator `secret add --inject` bind's)
+# lists it, so the launcher must strip it back out or a guest-forced
+# http://api.anthropic.com/... gets the harness token stamped on a cleartext
+# leg. Extracted and driven like the mosh block: the merge runs after
+# __render-rules, which --init-only never reaches.
+withhold_src=$(sed -n '/^withhold_harness_inject_hosts() {$/,/^}$/p' "$LAUNCH")
+if [ -z "$withhold_src" ]; then
+	bad "withhold_harness_inject_hosts() not found in the launcher (the extraction anchor moved?)"
+else
+	# $1 = the harness conf JSON, $2 = the l7-inject-hosts body to start from
+	# ("-" = no file at all). Leaves the result in $wh_rt/l7-inject-hosts and
+	# the function's stderr in $WORK/withhold.log.
+	wh_rt="$WORK/withhold-rt"
+	run_withhold() {
+		local conf="$1" body="$2"
+		rm -rf "$wh_rt"; mkdir -p "$wh_rt"
+		[ "$body" = "-" ] || printf '%s' "$body" > "$wh_rt/l7-inject-hosts"
+		( eval "$withhold_src"
+		  RUNTIME="$wh_rt"
+		  withhold_harness_inject_hosts "$conf" ) 2>"$WORK/withhold.log"
+	}
+	same_bytes() { [ "$(cksum < "$1")" = "$(printf '%s' "$2" | cksum)" ]; }
+	HARNESS_CANARY="sk-ant-oat01-cogbox-test-canary-never-logged"
+	harness_conf='[{"host":"api.anthropic.com","style":"anthropic-oauth","cred_file":"/home/testuser/.claude/.credentials.json","token_path":"claudeAiOauth.accessToken","stub_token":"'"$HARNESS_CANARY"'"},{"host":"chatgpt.com","style":"openai-chatgpt","cred_file":"/home/testuser/.codex/auth.json","token_path":"tokens.access_token"}]'
+
+	# (a) rendered specs listed both harness hosts (one in another case, as an
+	# operator's --audience may spell it): both leave, the ordinary host stays,
+	# and the warning names the withheld hosts and nothing else from the conf
+	run_withhold "$harness_conf" $'API.Anthropic.com\napi.example.com\nchatgpt.com\n'
+	same_bytes "$wh_rt/l7-inject-hosts" $'api.example.com\n' \
+		&& ok "harness hosts are stripped from l7-inject-hosts (case-insensitively); the ordinary host stays" \
+		|| bad "l7-inject-hosts after the strip: '$(cat "$wh_rt/l7-inject-hosts")' (expected api.example.com only)"
+	if grep -q "withholding plain-HTTP inject-routing" "$WORK/withhold.log" \
+		&& grep -q "API.Anthropic.com" "$WORK/withhold.log" && grep -q "chatgpt.com" "$WORK/withhold.log"; then
+		ok "the strip warns, naming the withheld hosts"
+	else
+		bad "the strip did not warn with the withheld hosts (log: $(cat "$WORK/withhold.log"))"
+	fi
+	if grep -q "$HARNESS_CANARY\|credentials.json\|auth.json" "$WORK/withhold.log"; then
+		bad "the strip's warning echoed conf content beyond the hosts: $(cat "$WORK/withhold.log")"
+	else
+		ok "the strip's warning carries hosts only (no cred_file path, no stub)"
+	fi
+
+	# (b) every listed host is a harness host: an EMPTY list is published (a
+	# valid file the proxy parses to "route nothing"), not a missing one
+	run_withhold "$harness_conf" $'api.anthropic.com\n'
+	[ -f "$wh_rt/l7-inject-hosts" ] && [ ! -s "$wh_rt/l7-inject-hosts" ] \
+		&& ok "a list of only harness hosts becomes an empty file" \
+		|| bad "a list of only harness hosts did not become an empty file: '$(cat "$wh_rt/l7-inject-hosts" 2>&1)'"
+
+	# (c) no harness host listed -- the steady state under a control plane,
+	# where the render names none: byte-identical, nothing logged
+	run_withhold "$harness_conf" $'api.example.com\napp.example.com\n'
+	same_bytes "$wh_rt/l7-inject-hosts" $'api.example.com\napp.example.com\n' && [ ! -s "$WORK/withhold.log" ] \
+		&& ok "a list with no harness host is untouched and nothing is logged" \
+		|| bad "a harness-free list was rewritten or warned about (file: '$(cat "$wh_rt/l7-inject-hosts")', log: $(cat "$WORK/withhold.log"))"
+
+	# (d) no harness half at all (`[]`: nobody logged in host-side, which is
+	# every cogworx VM): untouched, so a rendered api.anthropic.com -- then the
+	# ONLY spec for the host -- keeps routing exactly as before
+	run_withhold '[]' $'api.anthropic.com\n'
+	same_bytes "$wh_rt/l7-inject-hosts" $'api.anthropic.com\n' && [ ! -s "$WORK/withhold.log" ] \
+		&& ok "an empty harness conf leaves the list alone" \
+		|| bad "an empty harness conf rewrote the list (file: '$(cat "$wh_rt/l7-inject-hosts")', log: $(cat "$WORK/withhold.log"))"
+
+	# (e) a harness conf jq cannot read: the merge failed the same way, so no
+	# harness spec landed and there is nothing to strip
+	run_withhold 'not json' $'api.anthropic.com\n'
+	same_bytes "$wh_rt/l7-inject-hosts" $'api.anthropic.com\n' && [ ! -s "$WORK/withhold.log" ] \
+		&& ok "an unparseable harness conf strips nothing (no merge happened either)" \
+		|| bad "an unparseable harness conf rewrote the list (file: '$(cat "$wh_rt/l7-inject-hosts")', log: $(cat "$WORK/withhold.log"))"
+
+	# (f) the list itself cannot be read: fail CLOSED to an empty one, loudly
+	run_withhold "$harness_conf" -
+	if [ -f "$wh_rt/l7-inject-hosts" ] && [ ! -s "$wh_rt/l7-inject-hosts" ] && grep -q "cannot read" "$WORK/withhold.log"; then
+		ok "an unreadable l7-inject-hosts is replaced by an empty one, with a warning"
+	else
+		bad "an unreadable l7-inject-hosts was not failed closed (file: $(cat "$wh_rt/l7-inject-hosts" 2>&1), log: $(cat "$WORK/withhold.log"))"
+	fi
+
+	# (g) the call site: exactly one, inside the merge's SUCCESS branch (only a
+	# merge that landed put a harness spec in the conf) and right after the
+	# conf is published
+	call_ln=$(grep -n 'withhold_harness_inject_hosts "\$_harness_conf"' "$LAUNCH" | cut -d: -f1)
+	mv_ln=$(grep -n 'mv "\$RUNTIME/l7-inject-conf.json.tmp" "\$RUNTIME/l7-inject-conf.json"$' "$LAUNCH" | cut -d: -f1)
+	if [ "$(printf '%s\n' "$call_ln" | grep -c .)" = 1 ] && [ "$(printf '%s\n' "$mv_ln" | grep -c .)" = 1 ] \
+		&& [ "$call_ln" -gt "$mv_ln" ] && [ $((call_ln - mv_ln)) -le 20 ] \
+		&& ! sed -n "${mv_ln},${call_ln}p" "$LAUNCH" | grep -q '^\s*else$\|^\s*fi$'; then
+		ok "the strip runs once, in the merge's success branch, after the conf is published"
+	else
+		bad "the strip's call site moved (mv at '$mv_ln', call at '$call_ln')"
+	fi
+fi
+
 if [ "$fails" -gt 0 ]; then
 	echo "$fails check(s) failed" >&2
 	exit 1
