@@ -157,6 +157,8 @@ The same store copy is symlinked into each layout (no duplication). OMP consumes
 
 Each merged rule/spec carries a `"plugin": "<name>"` field, so `del`/`update` remove or replace exactly what that plugin brought in. **Rule/inject changes hot-reload** into a running instance; **kit/module changes need a `cogbox restart`** — that asymmetry is the §"organizing principle" above. An `mcp` server may name only `command`/`args`/`env`/`url`/`headers` — a token/cred_file/secret path is rejected (MCP auth goes through host-side inject, never inline).
 
+A spec's `style` is what the wire gets: it wins over the bound secret's `--kind` (the render keys the element's style off the spec; only the platform kinds `anthropic-oauth` / `gitlab-oauth` force a style of their own). What a plugin cannot choose is the **precedence over a credential the sandbox already sends**: that is the operator's choice at bind time (`cogbox secret add --on-guest-credential replace|keep`), stored in the secret's meta, and it rides through the plugin's spec unchanged -- a manifest `on_guest_credential` key is ignored (neither merged nor a validation error). A plugin spec is also authoritative for its host: an operator `cogbox secret add --inject` bind targeting the same host is skipped at render (one spec per host), so bind the plugin's named secret rather than a second one.
+
 See [Credential injection](network-filtering.md#host-side-credential-injection) for the full security model and the [`cogbox secret`](network-filtering.md#the-secret-store) reference.
 
 ## Pinning and updates

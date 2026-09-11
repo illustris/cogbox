@@ -97,6 +97,28 @@ fn l7Rules(network: std.json.Value) ?std.json.Array {
 	return r.array;
 }
 
+/// Host equality as the addon sees it (`host.rstrip('.').lower()`, and the
+/// claude seed's eqlIgnoreCase): ASCII case-insensitive, one trailing dot
+/// stripped from each side. The inject render's audience gate and the operator
+/// seed's one-spec-per-host rule both use it. It folds SPELLING only -- two
+/// different DNS names can never compare equal, so the audience stays the
+/// exfiltration gate it always was.
+fn hostEqlFold(a: []const u8, b: []const u8) bool {
+	return std.ascii.eqlIgnoreCase(stripTrailingDot(a), stripTrailingDot(b));
+}
+
+fn stripTrailingDot(h: []const u8) []const u8 {
+	if (h.len > 1 and h[h.len - 1] == '.') return h[0 .. h.len - 1];
+	return h;
+}
+
+/// A render-time warning about a bind a seed could not honour. stderr through
+/// credgrant's emitter (never stdout -- a render runs inside the launcher and
+/// inside control-channel execs; silent under `zig build test`).
+fn warnRender(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+	credgrant.warn(io, "render: " ++ fmt, args);
+}
+
 fn hostNamedInRules(rules: ?std.json.Array, host: []const u8) bool {
 	const r = rules orelse return false;
 	for (r.items) |item| {
@@ -417,8 +439,9 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 /// `COGBOX_L7_INJECT_CONF` the mitmproxy addon reads as a JSON list). For each
 /// `.network.l7.inject.specs[]` entry, resolve its NAMED secret host-side
 /// (instance store first, then global) and emit a conf element ONLY when the
-/// secret is bound AND its audience matches the spec host. Unbound or
-/// audience-mismatched specs render nothing -- fail closed: the addon then has
+/// secret is bound AND its audience matches the spec host (folded for case and
+/// a trailing dot, hostEqlFold). Unbound or audience-mismatched specs render
+/// nothing -- fail closed: the addon then has
 /// no spec for that host and never stamps a stale/foreign credential. The
 /// cred_file is the store's value path; cred_format "raw" (the addon's
 /// token_for reads its first non-empty line). NOT pure -- reads the store.
@@ -479,7 +502,10 @@ fn buildInjectArray(
 			const resolved = (try resolveSecret(arena, io, instance_secrets_dir, global_secrets_dir, secret_name)) orelse continue;
 			if (!resolved.bound) continue;
 			const audience = resolved.meta.audience orelse continue; // unset -> not injectable
-			if (!std.mem.eql(u8, audience, host)) continue; // exfiltration gate
+			// Exfiltration gate: the bound audience must BE the spec host. Folded
+			// for case and a trailing dot only (the addon keys specs the same way),
+			// which can never admit a different host.
+			if (!hostEqlFold(audience, host)) continue;
 
 			// A kind=anthropic-oauth secret (the per-user Claude setup-token bind)
 			// forces the anthropic-oauth inject style + the shared host stub
@@ -493,6 +519,13 @@ fn buildInjectArray(
 			// (`git_user:<token>`) on git smart-HTTP paths and Bearer elsewhere.
 			const git_kind = std.mem.eql(u8, resolved.meta.kind, secret_mod.gitlab_oauth_kind);
 			if (git_kind) style = secret_mod.gitlab_oauth_kind;
+
+			// A cookie-style element with no cookie name is skipped -- fail closed:
+			// the addon's cookie arm is a no-op without one, so emitting it would
+			// terminate the host and stamp nothing while every surface reads
+			// "injecting".
+			const cookie_name = strField(spec.object, "cookieName");
+			if (std.mem.eql(u8, style, "cookie") and cookie_name == null) continue;
 
 			var el: std.json.ObjectMap = .empty;
 			try el.put(arena, "host", .{ .string = host });
@@ -508,8 +541,18 @@ fn buildInjectArray(
 			// plugin manifest or operator override supplied.
 			if (grants) |g| try g.note(resolved.value_path);
 			try el.put(arena, "cred_format", .{ .string = "raw" });
-			if (strField(spec.object, "cookieName")) |cn| {
+			if (cookie_name) |cn| {
 				try el.put(arena, "cookie_name", .{ .string = cn });
+			}
+			// Guest-credential precedence, read from the secret's META -- the
+			// bind's choice (`secret add --on-guest-credential`), never the spec's,
+			// so a plugin manifest cannot pick it and the choice rides through a
+			// plugin spec naming this secret too. Emitted for `keep` ONLY: a
+			// replace bind's element stays byte-identical to the pre-feature one
+			// (the addon reads a missing key as replace). Never for the platform
+			// kinds, whose stub / rules_tag gates are their own precedence.
+			if (!oauth_kind and !git_kind and std.mem.eql(u8, resolved.meta.on_guest_credential, secret_store.on_guest_keep)) {
+				try el.put(arena, "on_guest_credential", .{ .string = secret_store.on_guest_keep });
 			}
 			if (oauth_kind) {
 				// A setup-token is long-lived/static -> NO refresh block, just the
@@ -775,6 +818,178 @@ pub fn seedGitInjectSpecs(
 		try spec.put(arena, "secret", .{ .string = try arena.dupe(u8, name) });
 		try spec.put(arena, "git_user", .{ .string = secret_mod.default_git_user });
 		try spec.put(arena, "stub", .{ .string = secret_mod.gitlab_stub_token });
+		try specs.append(.{ .object = spec });
+	};
+}
+
+fn nameLessThan(_: void, a: []const u8, b: []const u8) bool {
+	return std.mem.lessThan(u8, a, b);
+}
+
+/// An upper bound on the lines renderAuthProxyConf can append to
+/// l7-inject-hosts (finding N1): one per host a policy-doc provider entry
+/// claims. Over-counts a host claimed twice or never bound -- deliberately, so
+/// the seed's cap guard below can only ever under-fill the file, never let a
+/// later line overflow filter.max_inject_hosts (whose reader drops the tail,
+/// and the auth hosts are the tail).
+fn authPolicyHostCount(network: std.json.Value) usize {
+	const providers = authPolicyProviders(network) orelse return 0;
+	var n: usize = 0;
+	for (providers.items) |p| {
+		if (p != .object) continue;
+		const hosts = p.object.get("hosts") orelse continue;
+		if (hosts != .array) continue;
+		n += hosts.array.items.len;
+	}
+	return n;
+}
+
+/// Seed an inject spec into `network.l7.inject.specs[]` for every BOUND secret
+/// of an operator kind (bearer|cookie|basic) whose meta carries `inject: true`
+/// (`cogbox secret add --inject`), so a FREE-FORM bind -- one no plugin spec
+/// names -- actually injects. THE BIND IS THE SPEC: the seeded element is
+/// `{host: audience, style: kind, secret: name[, cookieName][, port]}`, a
+/// render-time overlay that is never written to config.json (so `cogbox l7
+/// list` does not show it) and that unbinding withdraws at the next render, with
+/// its terminate-allow, funnel port, conf element and hosts line -- symmetry
+/// for free, no unbind bookkeeping. Both stores are enumerated, instance first
+/// (an instance secret shadows a global one of the same name, as resolveSecret
+/// resolves), each SORTED by name so the one-spec-per-host rule below picks the
+/// same bind on every render regardless of directory order.
+///
+/// Gates, in order, per secret: bound; `inject`; an operator kind (the platform
+/// kinds have their own seeds and are refused at the verb too); an audience;
+/// the audience is ONE EXACT BARE HOST in the L7 grammar (filter.isValidHostName
+/// -- it becomes a whitespace-tokenized LINE in l7-rules and l7-inject-hosts,
+/// so any other spelling would smuggle rule tokens or whole rule lines into
+/// the policy; the verb refuses it with --inject, this is the render's belt);
+/// a cookie bind must carry a cookie name (fail closed -- see buildInjectArray).
+/// Then ONE SPEC PER HOST: a spec already targeting the audience (a plugin's, the
+/// claude seed's, the git seed's, an earlier operator bind's) wins and this bind
+/// is skipped with a warning -- a plugin spec is authoritative for its host and
+/// cogworx refuses a second injecting bind per host up front; here it is the
+/// render-side belt for hand-CLI binds. A spec naming THIS secret for THIS host
+/// is a prior seed (or the global twin of an instance bind) and is skipped
+/// silently -- idempotent, like the other seeds.
+///
+/// The launcher's HARNESS specs (cogbox-launch.sh gen_inject_conf, merged into
+/// l7-inject-conf.json AFTER the boot render, last) are a fourth writer this
+/// belt cannot see: they live in no config and no store, only in that file, so
+/// a bind on a harness host (api.anthropic.com with no claude-oauth bound,
+/// chatgpt.com, ...) IS seeded here. They win the host anyway -- at the addon by
+/// last-write-by-host, and the host is never HTTP-routed: the launcher strips
+/// it from l7-inject-hosts right after its merge and every live render
+/// withholds it (withholdForeignHosts) -- so such a bind is inert on the wire
+/// while every other surface still reads it as injecting.
+///
+/// EGRESS, stated plainly: unlike the gitlab-oauth seed's rule gate, this seed
+/// MAY union a WHOLE-HOST `allow <host> terminate` into l7-rules (renderL7's
+/// inject union) for an audience no L7 rule names -- exactly what a plugin's
+/// inject spec does at `plugin add`, i.e. plugin-install parity, and cogworx
+/// gates `--inject` on the same owner|admin principals that can install one. A
+/// deny rule naming the host suppresses the union (hostNamedInRules counts deny)
+/// while the host still routes to the addon, which denies: fail closed.
+///
+/// CAP GUARDS. (1) l7-rules: `l7/cli.zig checkRenderedCap` budgets the
+/// terminate-allow union only for CONFIG specs (it runs before any seed), so a
+/// seeded union line is exactly what could push the rendered document past
+/// filter.max_l7_rules, whose reader compiles the first max and silently drops
+/// the rest while the addon reading the same document has no cap. When the seed
+/// would add a union line (no rule names the audience) and the document is
+/// already at the cap, the bind is skipped with a warning instead: this guard
+/// is what keeps the rendered document within the cap. (2) l7-inject-hosts:
+/// filter.parseInjectHosts keeps the first max_inject_hosts lines and drops the
+/// tail -- and the auth-proxy hosts are appended LAST -- so a seed that would
+/// overflow it is skipped the same way (counted conservatively: every existing
+/// spec plus every policy-doc host, whether or not each actually emits a line).
+///
+/// Called from rules/main.zig seedManagedInjectSpecs on EVERY render path (VM
+/// boot render, the container enforcer render, `secret reload -n`, the
+/// rule/plugin-mutation reload), after the claude and git seeds. Mutates
+/// `network` in place; new values allocated in `arena`. Reads the store, NOT pure.
+pub fn seedOperatorInjectSpecs(
+	arena: std.mem.Allocator,
+	io: std.Io,
+	network: *std.json.Value,
+	instance_secrets_dir: []const u8,
+	global_secrets_dir: []const u8,
+) !void {
+	if (network.* != .object) return; // "full"/"none" mode carries no L7 object
+	const instance_names = try secret_store.listBound(arena, io, instance_secrets_dir);
+	const global_names = try secret_store.listBound(arena, io, global_secrets_dir);
+	std.mem.sort([]const u8, instance_names, {}, nameLessThan);
+	std.mem.sort([]const u8, global_names, {}, nameLessThan);
+	for ([_][]const []const u8{ instance_names, global_names }) |names| for (names) |name| {
+		const resolved = (try resolveSecret(arena, io, instance_secrets_dir, global_secrets_dir, name)) orelse continue;
+		if (!resolved.bound) continue;
+		if (!resolved.meta.inject) continue;
+		const kind = resolved.meta.kind;
+		if (!secret_mod.operatorKind(kind)) continue;
+		const audience = resolved.meta.audience orelse continue; // unset -> not injectable
+		// The audience is about to become a LINE in l7-rules (`allow <host>
+		// terminate`, via renderL7's inject union) and in l7-inject-hosts, both
+		// whitespace-tokenized policy files, so it must be one exact host in
+		// the L7 grammar the rules reader compiles -- LDH labels or an IP
+		// literal; no wildcard, port, path, whitespace or trailing dot -- the
+		// gate a plugin spec's host passes at `plugin add` (plugin/mutate.zig
+		// validatePluginInjectSpec). Any other spelling would smuggle extra
+		// rule tokens (`insecure`, `passthrough`) or whole extra lines
+		// (`tag=git-grants`, `mode passthrough`) into the enforcer's policy.
+		// The verb refuses such an audience with --inject; this is the render
+		// side's belt for a hand-edited meta. The raw value is deliberately not
+		// echoed (it may carry a newline); `secret ls --json` shows it escaped.
+		if (!filter.isValidHostName(audience)) {
+			warnRender(io, "secret '{s}' not injected: its audience is not an exact bare host", .{name});
+			continue;
+		}
+		// The verb refuses this shape, but a hand-edited meta can carry it.
+		if (std.mem.eql(u8, kind, "cookie") and resolved.meta.cookie_name == null) {
+			warnRender(io, "secret '{s}' not injected: a cookie bind needs a cookie name", .{name});
+			continue;
+		}
+
+		const specs = (try ensureInjectSpecs(arena, network)) orelse return;
+		var already = false;
+		var host_taken = false;
+		for (specs.items) |s| {
+			if (s != .object) continue;
+			const h = strField(s.object, "host") orelse continue;
+			if (!hostEqlFold(h, audience)) continue;
+			host_taken = true;
+			const sn = strField(s.object, "secret") orelse continue;
+			if (std.mem.eql(u8, sn, name)) {
+				already = true;
+				break;
+			}
+		}
+		if (already) continue; // a prior seed / the global twin of an instance bind
+		if (host_taken) {
+			warnRender(io, "secret '{s}' not injected: host {s} already has an inject spec", .{ name, audience });
+			continue;
+		}
+
+		// Cap guard (1): the seed adds a union line only when no rule names the
+		// audience -- the same predicate InjectUnionIter applies.
+		const rules = l7Rules(network.*);
+		if (!hostNamedInRules(rules, audience)) {
+			const rules_len: usize = if (rules) |r| r.items.len else 0;
+			if (rules_len + injectUnionCount(network.*) + 1 > filter.max_l7_rules) {
+				warnRender(io, "secret '{s}' not injected: l7-rules at cap ({d})", .{ name, filter.max_l7_rules });
+				continue;
+			}
+		}
+		// Cap guard (2): the plain-HTTP inject-routing list.
+		if (specs.items.len + authPolicyHostCount(network.*) + 1 > filter.max_inject_hosts) {
+			warnRender(io, "secret '{s}' not injected: l7-inject-hosts at cap ({d})", .{ name, filter.max_inject_hosts });
+			continue;
+		}
+
+		var spec: std.json.ObjectMap = .empty;
+		try spec.put(arena, "host", .{ .string = try arena.dupe(u8, audience) });
+		try spec.put(arena, "style", .{ .string = try arena.dupe(u8, kind) });
+		try spec.put(arena, "secret", .{ .string = try arena.dupe(u8, name) });
+		if (resolved.meta.cookie_name) |cn| try spec.put(arena, "cookieName", .{ .string = try arena.dupe(u8, cn) });
+		if (resolved.meta.port) |p| try spec.put(arena, "port", .{ .integer = p });
 		try specs.append(.{ .object = spec });
 	};
 }
@@ -1160,6 +1375,53 @@ fn warnForeign(io: std.Io, path: []const u8, why: []const u8) void {
 	credgrant.warn(io, "could not carry over the inject specs {s} holds that this render did not author (the launcher's harness half); they are dropped until the next boot render: {s}", .{ path, why });
 }
 
+/// Drop from `hosts` (the l7-inject-hosts buffer, one host per line) every line
+/// a PRESERVED foreign spec claims, under hostEqlFold -- the L7 proxy's own
+/// compare (filter.InjectHosts.contains is case-insensitive and strips a root
+/// dot), so a spelling the proxy would match is a spelling this withholds.
+///
+/// Why: a preserved spec is appended LAST, so it wins its host at the addon
+/// (CredStore._load_conf is last-write-by-host). When a RENDERED spec -- a
+/// plugin's, the claude seed's, an operator `secret add --inject` bind's --
+/// names the same host, buildInjectArray has already listed that host, and the
+/// L7 proxy would route the host's PLAIN-HTTP egress to the addon, which would
+/// stamp the HARNESS credential (the real host-side OAuth token) onto a
+/// cleartext leg the guest chose by dialling http://. The launcher enforces the
+/// same rule at boot (withhold_harness_inject_hosts, right after its merge);
+/// this is the live renders' half, so the file never names a harness host
+/// whatever seeded it. Applied to the COMPLETE buffer (the auth-proxy hosts
+/// included), as the launcher's strip is, so a boot render and a live render
+/// publish the same list. LOUD: one warning per withheld line, because the
+/// bind still reads as injecting on every other surface. A no-op when nothing
+/// was preserved (the boot render; every render on the container path), so
+/// the buffer is byte-identical there.
+fn withholdForeignHosts(allocator: std.mem.Allocator, io: std.Io, hosts: *std.ArrayList(u8), foreign: []const std.json.Value) !void {
+	if (foreign.len == 0 or hosts.items.len == 0) return;
+	var kept: std.ArrayList(u8) = .empty;
+	defer kept.deinit(allocator);
+	var lines = std.mem.splitScalar(u8, hosts.items, '\n');
+	while (lines.next()) |line| {
+		if (line.len == 0) continue;
+		if (foreignClaimsHost(foreign, line)) {
+			warnRender(io, "host {s}: plain-HTTP inject-routing withheld -- a harness inject spec claims the host and wins it, and its provider is HTTPS-only", .{line});
+			continue;
+		}
+		try kept.appendSlice(allocator, line);
+		try kept.append(allocator, '\n');
+	}
+	hosts.clearRetainingCapacity();
+	try hosts.appendSlice(allocator, kept.items);
+}
+
+fn foreignClaimsHost(foreign: []const std.json.Value, host: []const u8) bool {
+	for (foreign) |spec| {
+		if (spec != .object) continue;
+		const h = strField(spec.object, "host") orelse continue;
+		if (hostEqlFold(h, host)) return true;
+	}
+	return false;
+}
+
 /// Write `<runtime>/l7-inject-conf.json` (the mitmproxy addon's
 /// COGBOX_L7_INJECT_CONF), `<runtime>/l7-auth-conf.json` (the auth proxy's
 /// conf), `<runtime>/l7-inject-hosts` (the L7 proxy's plain-HTTP
@@ -1208,10 +1470,13 @@ fn warnForeign(io: std.Io, path: []const u8, why: []const u8) void {
 /// A preserved spec is carried over VERBATIM and is otherwise inert here: its
 /// host is NOT added to l7-inject-hosts (the launcher deliberately keeps harness
 /// hosts out of the plain-HTTP inject-routing list, so the guest cannot force a
-/// cleartext send of the real token), it seeds no terminate-allow (a stale conf
-/// must never widen l7-rules), and it is NOT noted in `grants` -- only a store
-/// path this render resolved can ever be granted, never a cred_file that arrived
-/// from another writer.
+/// cleartext send of the real token) -- and a RENDERED host it also claims is
+/// WITHHELD from that file (withholdForeignHosts): appended last, the preserved
+/// spec wins the host at the addon, so HTTP-routing a rendered spec's host that
+/// a harness spec names too would stamp the harness token on a cleartext leg.
+/// It seeds no terminate-allow (a stale conf must never widen l7-rules), and it
+/// is NOT noted in `grants` -- only a store path this render resolved can ever
+/// be granted, never a cred_file that arrived from another writer.
 ///
 /// The other three files have one writer and are always fully re-rendered. The
 /// exception worth knowing: under the operator override COGBOX_L7_INJECT_CONF the
@@ -1243,10 +1508,12 @@ pub fn writeL7Inject(
 	defer arena_inst.deinit();
 	const arena = arena_inst.allocator();
 	var arr = try buildInjectArray(allocator, arena, io, network, global_secrets_dir, instance_secrets_dir, &hosts, &grants);
+	var foreign_specs: []const std.json.Value = &.{};
 	if (foreign == .preserve) {
 		// Read the file we are about to replace, keep what we did not author, and
 		// append it LAST -- the launcher's own precedence (see the contract above).
-		for (try readForeignInjectSpecs(arena, io, runtime_dir, global_secrets_dir, instance_secrets_dir)) |spec| try arr.append(spec);
+		foreign_specs = try readForeignInjectSpecs(arena, io, runtime_dir, global_secrets_dir, instance_secrets_dir);
+		for (foreign_specs) |spec| try arr.append(spec);
 	}
 	try config.writeJqTab(allocator, &out, .{ .array = arr });
 	// The auth-proxy conf renders inside the SAME Grants transaction, and it
@@ -1256,6 +1523,11 @@ pub fn writeL7Inject(
 	// every `secret reload`. It also appends the auth hosts to `hosts` (the
 	// l7-inject-hosts buffer -- finding N1) before that file is written.
 	try renderAuthProxyConf(allocator, io, network, global_secrets_dir, instance_secrets_dir, &auth_out, &auth_hosts, &hosts, &grants);
+	// The hosts buffer is complete now (inject + auth hosts): withhold every
+	// host a preserved spec claims, exactly as the launcher strips the harness
+	// hosts after its boot-time merge -- the file never names one, whatever
+	// seeded it.
+	try withholdForeignHosts(allocator, io, &hosts, foreign_specs);
 	// BEFORE the confs are written, deliberately: the addon and the auth proxy
 	// re-read their confs when the mtime changes, so a cred file they are
 	// about to be told about has to be readable already or the first requests
@@ -2583,6 +2855,609 @@ test "seedGitInjectSpecs fails closed: GLOBAL-bound gitlab-oauth + NO rule namin
 		// and still nothing for the git host
 		try std.testing.expect(std.mem.indexOf(u8, out.items, "git.example.internal") == null);
 	}
+}
+
+// --- seedOperatorInjectSpecs (operator `secret add --inject` binds) ---------
+
+/// A `cogbox secret add --inject` bind, as the store records it.
+fn bindOperator(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, audience: ?[]const u8, kind: []const u8, opts: struct {
+	inject: bool = true,
+	cookie_name: ?[]const u8 = null,
+	port: ?u16 = null,
+	on_guest: []const u8 = secret_store.on_guest_replace,
+}) !void {
+	try secret_store.add(gpa, io, dir, name, "fake-operator-value", .{
+		.audience = audience,
+		.kind = kind,
+		.tier = "durable",
+		.bound_at = 1,
+		.inject = opts.inject,
+		.cookie_name = opts.cookie_name,
+		.port = opts.port,
+		.on_guest_credential = opts.on_guest,
+	});
+}
+
+fn specsOf(net: std.json.Value) ?std.json.Array {
+	return injectSpecs(net);
+}
+
+fn specCount(net: std.json.Value) usize {
+	return if (specsOf(net)) |s| s.items.len else 0;
+}
+
+test "seedOperatorInjectSpecs: a GLOBAL-bound inject=true bearer secret (the cogworx shape) -> spec, allow-union line, inject element, hosts line; silent for inject=false / no audience / platform kinds / cookie without cookie_name" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	// cogworx's `secret add` writes the GLOBAL store; no instance dir exists.
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = "zig-inject-test-no-instance";
+
+	try bindOperator(gpa, io, glob_dir, "api-token", "api.example.com", "bearer", .{});
+	// Each of these must stay inert: a pre-feature / plugin-spec bind, a bind
+	// with nothing to seed a host from, the platform kinds (their own seeds and
+	// gates own them), and a cookie bind with no cookie name (fail closed).
+	try bindOperator(gpa, io, glob_dir, "plain", "plain.example.com", "bearer", .{ .inject = false });
+	try bindOperator(gpa, io, glob_dir, "noaud", null, "bearer", .{});
+	try bindOperator(gpa, io, glob_dir, "git-example", "git.example.com", secret_mod.gitlab_oauth_kind, .{});
+	try bindOperator(gpa, io, glob_dir, "git-proxied", "git-alt.example.com", secret_mod.gitlab_authproxy_kind, .{});
+	try bindOperator(gpa, io, glob_dir, "claude-oauth", secret_mod.anthropic_api_host, secret_mod.anthropic_oauth_kind, .{});
+	try bindOperator(gpa, io, glob_dir, "app-session", "app.example.com", "cookie", .{});
+
+	// The default rules-mode network: an L4 allow-list and NO `.l7` at all.
+	const src = "{\"rules\":[{\"allow\":\"0.0.0.0/0\"}]}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+	try seedOperatorInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+
+	// Exactly one spec, the bind's: {host: audience, style: kind, secret: name},
+	// and none of the optional keys.
+	try std.testing.expectEqual(@as(usize, 1), specCount(net));
+	const s0 = specsOf(net).?.items[0].object;
+	try std.testing.expectEqualStrings("api.example.com", s0.get("host").?.string);
+	try std.testing.expectEqualStrings("bearer", s0.get("style").?.string);
+	try std.testing.expectEqualStrings("api-token", s0.get("secret").?.string);
+	try std.testing.expect(s0.get("cookieName") == null);
+	try std.testing.expect(s0.get("port") == null);
+	try std.testing.expect(s0.get("plugin") == null);
+
+	// The seed is what activates the funnel, the whole-host terminate-allow
+	// (plugin-spec parity: no rule named the host), the conf element and the
+	// plain-HTTP routing line -- with no new render plumbing.
+	try std.testing.expect(l7Active(net));
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		try renderL7(gpa, net, &out);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "allow api.example.com terminate\n") != null);
+		try std.testing.expectEqual(@as(usize, 1), injectUnionCount(net));
+	}
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		var hosts: std.ArrayList(u8) = .empty;
+		defer hosts.deinit(gpa);
+		try renderL7Inject(gpa, io, net, glob_dir, inst_dir, &out, &hosts, null);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "\"host\": \"api.example.com\"") != null);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "\"style\": \"bearer\"") != null);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "/api-token\"") != null);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "\"origin\": \"render\"") != null);
+		// replace (the default) emits NO precedence key: byte-identical to a
+		// plugin-spec element.
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "on_guest_credential") == null);
+		try std.testing.expectEqualStrings("api.example.com\n", hosts.items);
+		for ([_][]const u8{ "plain.example.com", "git.example.com", "git-alt.example.com", secret_mod.anthropic_api_host, "app.example.com" }) |h| {
+			try std.testing.expect(std.mem.indexOf(u8, out.items, h) == null);
+		}
+	}
+
+	// Idempotent: a re-seed (every live render re-seeds) adds nothing.
+	try seedOperatorInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+	try std.testing.expectEqual(@as(usize, 1), specCount(net));
+}
+
+test "seedOperatorInjectSpecs: an audience that is not an exact bare host seeds nothing -- a space, a newline, a wildcard, a port and a trailing dot never become l7-rules tokens or lines" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = "zig-inject-test-no-instance";
+
+	// l7-rules and l7-inject-hosts are whitespace-tokenized LINE formats. An
+	// audience carrying a space would append rule TOKENS to the union line
+	// (`insecure` turns upstream verification off, `passthrough` drops the
+	// terminate tier); one carrying a newline would append whole LINES
+	// (`tag=git-grants` is the gitlab-oauth injection gate, `mode passthrough`
+	// flips the document's default tier). The verb refuses each with --inject;
+	// a hand-edited meta is the render's to refuse.
+	try bindOperator(gpa, io, glob_dir, "padded", "a.example.com insecure", "bearer", .{});
+	try bindOperator(gpa, io, glob_dir, "multiline", "b.example.com\nallow git.example.com tag=git-grants\nmode passthrough", "bearer", .{});
+	try bindOperator(gpa, io, glob_dir, "wild", "*.example.com", "bearer", .{});
+	try bindOperator(gpa, io, glob_dir, "ported", "c.example.com:9200", "bearer", .{});
+	try bindOperator(gpa, io, glob_dir, "dotted", "d.example.com.", "bearer", .{});
+	// One well-formed bind beside them: the gate is per secret, not per store.
+	try bindOperator(gpa, io, glob_dir, "api-token", "api.example.com", "bearer", .{});
+
+	const src = "{\"rules\":[{\"allow\":\"0.0.0.0/0\"}]}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+	try seedOperatorInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+
+	try std.testing.expectEqual(@as(usize, 1), specCount(net));
+	try std.testing.expectEqualStrings("api.example.com", specsOf(net).?.items[0].object.get("host").?.string);
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderL7(gpa, net, &out);
+	// Exactly the one union line, and none of the smuggled tokens or lines.
+	try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.items, "allow "));
+	try std.testing.expect(std.mem.indexOf(u8, out.items, "allow api.example.com terminate\n") != null);
+	for ([_][]const u8{ "insecure", "passthrough", "tag=", "git.example.com", "a.example.com", "b.example.com", "*.example.com", "c.example.com", "d.example.com" }) |needle| {
+		try std.testing.expect(std.mem.indexOf(u8, out.items, needle) == null);
+	}
+	// What the enforcer compiles from that document: one exact-host allow,
+	// terminating, verifying upstream, default tier untouched.
+	var set: filter.L7RuleSet = undefined;
+	filter.parseL7Rules(out.items, &set);
+	try std.testing.expect(set.mode_terminate);
+	try std.testing.expectEqual(@as(usize, 1), set.len);
+	try std.testing.expectEqualStrings("api.example.com", set.rules[0].host.slice());
+	try std.testing.expect(set.rules[0].terminate);
+	try std.testing.expect(!set.rules[0].insecure_upstream);
+	try std.testing.expect(!set.rules[0].passthrough);
+
+	// The conf and the plain-HTTP routing list carry the one bind only.
+	var conf: std.ArrayList(u8) = .empty;
+	defer conf.deinit(gpa);
+	var hosts: std.ArrayList(u8) = .empty;
+	defer hosts.deinit(gpa);
+	try renderL7Inject(gpa, io, net, glob_dir, inst_dir, &conf, &hosts, null);
+	try std.testing.expectEqualStrings("api.example.com\n", hosts.items);
+	try std.testing.expect(std.mem.indexOf(u8, conf.items, "/api-token\"") != null);
+	for ([_][]const u8{ "padded", "multiline", "wild", "ported", "dotted", "insecure", "tag=" }) |needle| {
+		try std.testing.expect(std.mem.indexOf(u8, conf.items, needle) == null);
+	}
+}
+
+test "seedOperatorInjectSpecs: one spec per host -- two operator binds on one host yield exactly one, chosen by sorted name; an instance bind shadows its global twin" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(inst_dir);
+	defer cwd.deleteTree(io, inst_dir) catch {};
+
+	// Two binds for ONE host, bound in reverse-alphabetical order so directory
+	// order cannot be what picks the winner.
+	try bindOperator(gpa, io, glob_dir, "zeta", "shared.example.com", "bearer", .{});
+	try bindOperator(gpa, io, glob_dir, "gamma", "shared.example.com", "basic", .{});
+	// The same name in BOTH stores with different audiences: the instance bind
+	// wins (resolveSecret precedence) and its global twin adds nothing.
+	try bindOperator(gpa, io, glob_dir, "alpha", "global.example.com", "bearer", .{});
+	try bindOperator(gpa, io, inst_dir, "alpha", "inst.example.com", "bearer", .{});
+
+	const src = "{\"rules\":[{\"allow\":\"0.0.0.0/0\"}]}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+	try seedOperatorInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+
+	const specs = specsOf(net).?;
+	try std.testing.expectEqual(@as(usize, 2), specs.items.len);
+	// Instance store first: alpha -> inst.example.com.
+	try std.testing.expectEqualStrings("alpha", specs.items[0].object.get("secret").?.string);
+	try std.testing.expectEqualStrings("inst.example.com", specs.items[0].object.get("host").?.string);
+	// Then the global store, sorted: gamma wins shared.example.com, zeta is
+	// skipped (warned, not seeded), and global alpha is the silent shadow twin.
+	try std.testing.expectEqualStrings("gamma", specs.items[1].object.get("secret").?.string);
+	try std.testing.expectEqualStrings("shared.example.com", specs.items[1].object.get("host").?.string);
+	try std.testing.expectEqualStrings("basic", specs.items[1].object.get("style").?.string);
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	var hosts: std.ArrayList(u8) = .empty;
+	defer hosts.deinit(gpa);
+	try renderL7Inject(gpa, io, net, glob_dir, inst_dir, &out, &hosts, null);
+	try std.testing.expect(std.mem.indexOf(u8, out.items, "/zeta\"") == null);
+	try std.testing.expect(std.mem.indexOf(u8, out.items, "global.example.com") == null);
+	try std.testing.expectEqualStrings("inst.example.com\nshared.example.com\n", hosts.items);
+	// Deterministic across renders: a fresh tree seeds the same two.
+	var parsed2 = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed2.deinit();
+	var net2 = parsed2.value;
+	try seedOperatorInjectSpecs(parsed2.arena.allocator(), io, &net2, inst_dir, glob_dir);
+	try std.testing.expectEqualStrings("gamma", specsOf(net2).?.items[1].object.get("secret").?.string);
+}
+
+test "seedOperatorInjectSpecs: a plugin spec or the claude seed already on the host wins (folded host compare); the platform seeds run first" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = "zig-inject-test-no-instance";
+
+	// A plugin spec targets plugin.example.com under its own secret; the
+	// operator bind for the SAME host (spelled in another case -- a trailing
+	// dot never reaches this compare, the audience grammar gate refuses it
+	// first) must not add a second spec beside it -- the plugin's is
+	// authoritative for its host.
+	try bindOperator(gpa, io, glob_dir, "beta", "Plugin.Example.com", "bearer", .{});
+	// The connected owner's claude-oauth is seeded by the claude seed; an
+	// operator bind for api.anthropic.com is skipped the same way.
+	try secret_store.add(gpa, io, glob_dir, secret_mod.claude_oauth_secret, "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKE", .{
+		.audience = secret_mod.anthropic_api_host,
+		.kind = secret_mod.anthropic_oauth_kind,
+		.tier = "durable",
+		.bound_at = 1,
+	});
+	try bindOperator(gpa, io, glob_dir, "mine", secret_mod.anthropic_api_host, "bearer", .{});
+	// And one free host, which seeds normally.
+	try bindOperator(gpa, io, glob_dir, "api-token", "api.example.com", "bearer", .{});
+
+	const src =
+		\\{"rules":[{"allow":"0.0.0.0/0"}],"l7":{"inject":{"specs":[
+		\\  {"host":"plugin.example.com","style":"bearer","secret":"plugin-tok","plugin":"obs-plugin"}]}}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+	try seedClaudeInjectSpec(parsed.arena.allocator(), &net);
+	try seedOperatorInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+
+	const specs = specsOf(net).?;
+	try std.testing.expectEqual(@as(usize, 3), specs.items.len);
+	try std.testing.expectEqualStrings("plugin-tok", specs.items[0].object.get("secret").?.string);
+	try std.testing.expectEqualStrings(secret_mod.claude_oauth_secret, specs.items[1].object.get("secret").?.string);
+	try std.testing.expectEqualStrings("api-token", specs.items[2].object.get("secret").?.string);
+	for (specs.items) |s| {
+		const name = s.object.get("secret").?.string;
+		try std.testing.expect(!std.mem.eql(u8, name, "beta"));
+		try std.testing.expect(!std.mem.eql(u8, name, "mine"));
+	}
+}
+
+test "seedOperatorInjectSpecs: a seeded port funnels an extra remap; cookieName rides into the spec + conf; keep rides into the element, replace omits the key" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = "zig-inject-test-no-instance";
+
+	// `--kind basic --inject --port 9200` and
+	// `--kind cookie --cookie-name session --inject --on-guest-credential keep`.
+	try bindOperator(gpa, io, glob_dir, "es-creds", "es.example.com", "basic", .{ .port = 9200 });
+	try bindOperator(gpa, io, glob_dir, "app-session", "app.example.com", "cookie", .{ .cookie_name = "session", .on_guest = secret_store.on_guest_keep });
+
+	const src = "{\"rules\":[{\"allow\":\"0.0.0.0/0\"}]}";
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var net = parsed.value;
+	try seedOperatorInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+
+	const specs = specsOf(net).?;
+	try std.testing.expectEqual(@as(usize, 2), specs.items.len);
+	// Sorted: app-session, es-creds.
+	const cookie_spec = specs.items[0].object;
+	try std.testing.expectEqualStrings("app-session", cookie_spec.get("secret").?.string);
+	try std.testing.expectEqualStrings("cookie", cookie_spec.get("style").?.string);
+	try std.testing.expectEqualStrings("session", cookie_spec.get("cookieName").?.string);
+	const es_spec = specs.items[1].object;
+	try std.testing.expectEqual(@as(i64, 9200), es_spec.get("port").?.integer);
+
+	// The seeded port is funnelled exactly like a plugin spec's (renderRules
+	// runs after the seeds on every render path).
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		try renderRules(gpa, net, 18443, &out);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "remap tcp 0.0.0.0/0:9200 -> tcp 127.0.0.1:18444\n") != null);
+	}
+	// The conf: the cookie element carries cookie_name AND the keep key; the
+	// basic element (replace) carries no precedence key at all.
+	{
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		var hosts: std.ArrayList(u8) = .empty;
+		defer hosts.deinit(gpa);
+		try renderL7Inject(gpa, io, net, glob_dir, inst_dir, &out, &hosts, null);
+		var conf = try std.json.parseFromSlice(std.json.Value, gpa, out.items, .{});
+		defer conf.deinit();
+		try std.testing.expectEqual(@as(usize, 2), conf.value.array.items.len);
+		for (conf.value.array.items) |el| {
+			const host = el.object.get("host").?.string;
+			if (std.mem.eql(u8, host, "app.example.com")) {
+				try std.testing.expectEqualStrings("cookie", el.object.get("style").?.string);
+				try std.testing.expectEqualStrings("session", el.object.get("cookie_name").?.string);
+				const ogc = el.object.get("on_guest_credential") orelse return error.MissingPrecedenceKey;
+				try std.testing.expectEqualStrings("keep", ogc.string);
+			} else {
+				try std.testing.expectEqualStrings("es.example.com", host);
+				try std.testing.expectEqualStrings("basic", el.object.get("style").?.string);
+				try std.testing.expect(el.object.get("on_guest_credential") == null);
+				try std.testing.expect(el.object.get("cookie_name") == null);
+			}
+			// Never a stub / rules_tag on an operator element.
+			try std.testing.expect(el.object.get("stub_token") == null);
+			try std.testing.expect(el.object.get("rules_tag") == null);
+		}
+		try std.testing.expectEqualStrings("app.example.com\nes.example.com\n", hosts.items);
+	}
+}
+
+test "renderL7Inject: keep rides into the element through a PLUGIN spec too (read from META, never the spec); the audience gate folds case + trailing dot; a cookie spec without cookieName emits nothing" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const inst_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(inst_dir);
+	defer cwd.deleteTree(io, inst_dir) catch {};
+
+	// A plugin "Bind now" bind that chose keep (no --inject: the plugin's spec
+	// names the secret), with a differently-spelled audience.
+	try bindOperator(gpa, io, inst_dir, "api-token", "API.Example.com.", "bearer", .{ .inject = false, .on_guest = secret_store.on_guest_keep });
+	// A cookie bind whose plugin spec forgot cookieName.
+	try bindOperator(gpa, io, inst_dir, "app-session", "app.example.com", "cookie", .{ .inject = false });
+	// A bind whose audience is a DIFFERENT host than the spec's: never emitted.
+	try bindOperator(gpa, io, inst_dir, "other", "api.example.com", "bearer", .{ .inject = false });
+
+	const src =
+		\\{"l7":{"mode":"terminate","inject":{"enabled":true,"specs":[
+		\\  {"host":"api.example.com","style":"bearer","secret":"api-token","plugin":"obs-plugin","on_guest_credential":"replace"},
+		\\  {"host":"app.example.com","style":"cookie","secret":"app-session","plugin":"obs-plugin"},
+		\\  {"host":"api.example.org","style":"bearer","secret":"other","plugin":"obs-plugin"}]}}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	var hosts: std.ArrayList(u8) = .empty;
+	defer hosts.deinit(gpa);
+	try renderL7Inject(gpa, io, parsed.value, "zig-inject-test-no-global", inst_dir, &out, &hosts, null);
+	const s = out.items;
+
+	// api.example.com: the folded audience matched, and the META's keep won over
+	// the manifest's (ignored) "replace".
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"host\": \"api.example.com\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "\"on_guest_credential\": \"keep\"") != null);
+	// The cookie spec without a name is skipped -- no element, no hosts line.
+	try std.testing.expect(std.mem.indexOf(u8, s, "app.example.com") == null);
+	// A different host is still a different host.
+	try std.testing.expect(std.mem.indexOf(u8, s, "api.example.org") == null);
+	try std.testing.expectEqualStrings("api.example.com\n", hosts.items);
+}
+
+test "seedOperatorInjectSpecs cap guards: an at-cap rules array skips the seed (l7-rules stays within filter.max_l7_rules) unless a rule names the audience; a full l7-inject-hosts skips it too" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = "zig-inject-test-no-instance";
+	try bindOperator(gpa, io, glob_dir, "api-token", "api.example.com", "bearer", .{});
+
+	// (1) max_l7_rules allow lines, none naming the audience: the seed would add
+	// a max+1th line -- the one `l7 replace`'s cap check cannot see -- so it is
+	// skipped, and the rendered document stays exactly at the cap.
+	{
+		var src: std.ArrayList(u8) = .empty;
+		defer src.deinit(gpa);
+		try src.appendSlice(gpa, "{\"l7\":{\"mode\":\"terminate\",\"rules\":[");
+		for (0..filter.max_l7_rules) |i| {
+			if (i > 0) try src.appendSlice(gpa, ",");
+			try src.appendSlice(gpa, "{\"allow\":\"a.test\"}");
+		}
+		try src.appendSlice(gpa, "]}}");
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src.items, .{});
+		defer parsed.deinit();
+		var net = parsed.value;
+		try seedOperatorInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+		try std.testing.expectEqual(@as(usize, 0), specCount(net));
+
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		try renderL7(gpa, net, &out);
+		try std.testing.expect(std.mem.indexOf(u8, out.items, "api.example.com") == null);
+		var rendered: usize = 0;
+		var lines = std.mem.splitScalar(u8, out.items, '\n');
+		while (lines.next()) |line| {
+			if (std.mem.startsWith(u8, line, "allow ") or std.mem.startsWith(u8, line, "deny ")) rendered += 1;
+		}
+		try std.testing.expectEqual(filter.max_l7_rules, rendered);
+	}
+	// (2) The same at-cap array with its LAST rule naming the audience: no union
+	// line is needed, so the seed lands and the document is still at the cap --
+	// the guard is about the union line, not about seeding as such.
+	{
+		var src: std.ArrayList(u8) = .empty;
+		defer src.deinit(gpa);
+		try src.appendSlice(gpa, "{\"l7\":{\"mode\":\"terminate\",\"rules\":[");
+		for (0..filter.max_l7_rules - 1) |_| try src.appendSlice(gpa, "{\"allow\":\"a.test\"},");
+		try src.appendSlice(gpa, "{\"allow\":\"api.example.com\"}]}}");
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src.items, .{});
+		defer parsed.deinit();
+		var net = parsed.value;
+		try seedOperatorInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+		try std.testing.expectEqual(@as(usize, 1), specCount(net));
+		try std.testing.expectEqual(@as(usize, 0), injectUnionCount(net));
+
+		var out: std.ArrayList(u8) = .empty;
+		defer out.deinit(gpa);
+		var hosts: std.ArrayList(u8) = .empty;
+		defer hosts.deinit(gpa);
+		try renderL7Inject(gpa, io, net, glob_dir, inst_dir, &out, &hosts, null);
+		try std.testing.expectEqualStrings("api.example.com\n", hosts.items);
+	}
+	// (3) l7-inject-hosts: max_inject_hosts plugin specs already fill the reader
+	// (it keeps the first max and drops the tail -- where the auth-proxy hosts
+	// land), so the seed is skipped even though l7-rules has room (the audience
+	// is rule-named).
+	{
+		var src: std.ArrayList(u8) = .empty;
+		defer src.deinit(gpa);
+		try src.appendSlice(gpa, "{\"l7\":{\"mode\":\"terminate\",\"rules\":[{\"allow\":\"api.example.com\"}],\"inject\":{\"specs\":[");
+		for (0..filter.max_inject_hosts) |i| {
+			if (i > 0) try src.appendSlice(gpa, ",");
+			var b: [96]u8 = undefined;
+			try src.appendSlice(gpa, try std.fmt.bufPrint(&b, "{{\"host\":\"h{d}.example.com\",\"style\":\"bearer\",\"secret\":\"s\",\"plugin\":\"obs-plugin\"}}", .{i}));
+		}
+		try src.appendSlice(gpa, "]}}}");
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src.items, .{});
+		defer parsed.deinit();
+		var net = parsed.value;
+		try seedOperatorInjectSpecs(parsed.arena.allocator(), io, &net, inst_dir, glob_dir);
+		try std.testing.expectEqual(filter.max_inject_hosts, specCount(net));
+		// One fewer plugin spec and it fits.
+		_ = specsOf(net).?.items[0];
+		var parsed2 = try std.json.parseFromSlice(std.json.Value, gpa, src.items, .{});
+		defer parsed2.deinit();
+		var net2 = parsed2.value;
+		_ = net2.object.getPtr("l7").?.object.getPtr("inject").?.object.getPtr("specs").?.array.pop();
+		try seedOperatorInjectSpecs(parsed2.arena.allocator(), io, &net2, inst_dir, glob_dir);
+		try std.testing.expectEqual(filter.max_inject_hosts, specCount(net2));
+		try std.testing.expectEqualStrings("api-token", specsOf(net2).?.items[filter.max_inject_hosts - 1].object.get("secret").?.string);
+	}
+}
+
+test "seedOperatorInjectSpecs unbind symmetry: bind -> render -> rm -> render drops the element, the hosts line and the allow line" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const glob_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(glob_dir);
+	defer cwd.deleteTree(io, glob_dir) catch {};
+	const inst_dir = "zig-inject-test-no-instance";
+	try bindOperator(gpa, io, glob_dir, "api-token", "api.example.com", "bearer", .{ .port = 8443 });
+
+	// Every render loads the config afresh (the seed is an overlay, never
+	// persisted), so each pass parses its own tree.
+	const src = "{\"rules\":[{\"allow\":\"0.0.0.0/0\"}]}";
+	const Files = struct { l7: []u8, conf: []u8, hosts: []u8, nf: []u8 };
+	const render = struct {
+		fn run(g: std.mem.Allocator, i: std.Io, s: []const u8, glob: []const u8, inst: []const u8) !Files {
+			var parsed = try std.json.parseFromSlice(std.json.Value, g, s, .{});
+			defer parsed.deinit();
+			var net = parsed.value;
+			try seedOperatorInjectSpecs(parsed.arena.allocator(), i, &net, inst, glob);
+			var l7: std.ArrayList(u8) = .empty;
+			errdefer l7.deinit(g);
+			try renderL7(g, net, &l7);
+			var conf: std.ArrayList(u8) = .empty;
+			errdefer conf.deinit(g);
+			var hosts: std.ArrayList(u8) = .empty;
+			errdefer hosts.deinit(g);
+			try renderL7Inject(g, i, net, glob, inst, &conf, &hosts, null);
+			var nf: std.ArrayList(u8) = .empty;
+			errdefer nf.deinit(g);
+			try renderRules(g, net, 18443, &nf);
+			return .{ .l7 = try l7.toOwnedSlice(g), .conf = try conf.toOwnedSlice(g), .hosts = try hosts.toOwnedSlice(g), .nf = try nf.toOwnedSlice(g) };
+		}
+	};
+
+	const bound = try render.run(gpa, io, src, glob_dir, inst_dir);
+	defer gpa.free(bound.l7);
+	defer gpa.free(bound.conf);
+	defer gpa.free(bound.hosts);
+	defer gpa.free(bound.nf);
+	try std.testing.expect(std.mem.indexOf(u8, bound.l7, "allow api.example.com terminate\n") != null);
+	try std.testing.expect(std.mem.indexOf(u8, bound.conf, "\"host\": \"api.example.com\"") != null);
+	try std.testing.expectEqualStrings("api.example.com\n", bound.hosts);
+	try std.testing.expect(std.mem.indexOf(u8, bound.nf, "0.0.0.0/0:8443 ->") != null);
+
+	// `cogbox secret rm api-token`, then the re-render every unbind path runs.
+	try std.testing.expect(try secret_store.remove(gpa, io, glob_dir, "api-token"));
+	const gone = try render.run(gpa, io, src, glob_dir, inst_dir);
+	defer gpa.free(gone.l7);
+	defer gpa.free(gone.conf);
+	defer gpa.free(gone.hosts);
+	defer gpa.free(gone.nf);
+	try std.testing.expect(std.mem.indexOf(u8, gone.l7, "api.example.com") == null);
+	try std.testing.expect(std.mem.indexOf(u8, gone.conf, "api.example.com") == null);
+	try std.testing.expectEqualStrings("", gone.hosts);
+	try std.testing.expect(std.mem.indexOf(u8, gone.nf, "8443") == null);
+	// No spec at all -> the funnel itself is gone (l7Active false).
+	try std.testing.expect(std.mem.indexOf(u8, gone.nf, "127.0.0.1:") == null);
+}
+
+test "withholdForeignHosts: a host a preserved (harness) spec claims leaves l7-inject-hosts -- folded for case, auth hosts included; nothing preserved -> byte-identical" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+
+	// Two harness specs as cogbox-launch.sh's gen_inject_conf emits them
+	// (host-side cred files, no `origin`), plus the junk readForeignInjectSpecs
+	// never returns but a hand-edited conf could hold.
+	const foreign_src =
+		\\[{"host":"api.anthropic.com","style":"anthropic-oauth","cred_file":"/home/testuser/.claude/.credentials.json","token_path":"claudeAiOauth.accessToken"},
+		\\ {"host":"chatgpt.com","style":"openai-chatgpt","cred_file":"/home/testuser/.codex/auth.json","token_path":"tokens.access_token"},
+		\\ 7, {"style":"bearer"}]
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, foreign_src, .{});
+	defer parsed.deinit();
+	const foreign = parsed.value.array.items;
+
+	var hosts: std.ArrayList(u8) = .empty;
+	defer hosts.deinit(gpa);
+	// As buildInjectArray + renderAuthProxyConf leave the buffer: an operator
+	// bind whose --audience spells the harness host in another case, a plugin
+	// host, the claude seed's spelling, a codex host, and a git auth host last.
+	try hosts.appendSlice(gpa, "API.Anthropic.com\napi.example.com\napi.anthropic.com\nchatgpt.com\ngit.example.com\n");
+	try withholdForeignHosts(gpa, io, &hosts, foreign);
+	try std.testing.expectEqualStrings("api.example.com\ngit.example.com\n", hosts.items);
+
+	// Every line withheld -> an EMPTY list (a valid file the proxy parses to
+	// "route nothing"), not a missing one.
+	hosts.clearRetainingCapacity();
+	try hosts.appendSlice(gpa, "chatgpt.com\n");
+	try withholdForeignHosts(gpa, io, &hosts, foreign);
+	try std.testing.expectEqualStrings("", hosts.items);
+
+	// Nothing preserved (the boot render; the container path; a live render on
+	// a box with no host login): the buffer is untouched, byte for byte -- the
+	// claude seed's host still routes there, as it always did.
+	hosts.clearRetainingCapacity();
+	try hosts.appendSlice(gpa, "api.anthropic.com\napi.example.com\n");
+	try withholdForeignHosts(gpa, io, &hosts, &.{});
+	try std.testing.expectEqualStrings("api.anthropic.com\napi.example.com\n", hosts.items);
 }
 
 // --- renderAuthProxyConf (the per-sandbox auth proxy's policy render) --------

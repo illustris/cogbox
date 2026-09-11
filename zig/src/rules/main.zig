@@ -216,6 +216,13 @@ fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
 ///     and where the stricter fail-closed check lives.
 ///   * git: a value file + kind=gitlab-oauth + an audience + an l7 rule already
 ///     naming that host (fail closed -- no grant rules, no spec).
+///   * operator (`cogbox secret add --inject`): a value file + `inject: true` in
+///     the meta + an operator kind (bearer|cookie|basic) + an audience (+ a
+///     cookie name for a cookie bind), one spec per host with any earlier spec
+///     winning, under the l7-rules / l7-inject-hosts cap guards. Unlike the git
+///     seed it MAY whole-host terminate-allow its audience (plugin-spec parity;
+///     see reload.seedOperatorInjectSpecs). Runs LAST so the claude and git
+///     seeds always win a host.
 /// Mutates `net_val` in place; new values are allocated in the config tree's arena.
 fn seedManagedInjectSpecs(
 	allocator: std.mem.Allocator,
@@ -235,6 +242,10 @@ fn seedManagedInjectSpecs(
 	// one of the same name, mirroring resolveSecret). Enumerates the stores
 	// (secret names are `git-<provider>`, not knowable a priori).
 	try reload.seedGitInjectSpecs(loaded.treeAllocator(), io, net_val, dirs.instance, dirs.global);
+	// Operator inject binds: seed a spec for every bound bearer|cookie|basic
+	// secret whose meta carries `inject: true` (a free-form bind no plugin spec
+	// names). After the platform seeds, so they win a host.
+	try reload.seedOperatorInjectSpecs(loaded.treeAllocator(), io, net_val, dirs.instance, dirs.global);
 }
 
 /// Full render: write EVERY runtime wire file from config.json. Backs the hidden
@@ -588,6 +599,18 @@ test "renderFiles: a VM-shaped render (NO secret-dir overrides) seeds the claude
 	const global_store = try std.fs.path.join(gpa, &.{ root, "secrets" });
 	defer gpa.free(global_store);
 	try bindClaudeOAuth(gpa, io, global_store);
+	// ...and beside it an OPERATOR inject bind, the free-form shape cogworx sends
+	// for a Secrets-page bind with Inject on: `cogbox secret add api-token
+	// --audience api.example.com --kind bearer --inject --port 8443`. No plugin
+	// spec names it; the render must seed one.
+	try secret_store.add(gpa, io, global_store, "api-token", "tok-FAKE", .{
+		.audience = "api.example.com",
+		.kind = "bearer",
+		.tier = "durable",
+		.bound_at = 2,
+		.inject = true,
+		.port = 8443,
+	});
 
 	var env = std.process.Environ.Map.init(gpa);
 	defer env.deinit();
@@ -615,6 +638,22 @@ test "renderFiles: a VM-shaped render (NO secret-dir overrides) seeds the claude
 	const nf = try readRuntimeFile(gpa, io, root, "netfilter-rules");
 	defer gpa.free(nf);
 	try std.testing.expect(std.mem.indexOf(u8, nf, "remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:") != null);
+
+	// 4. The operator bind rendered through the SAME seams: its conf element (no
+	//    stub, no precedence key for replace), its whole-host terminate-allow,
+	//    its plain-HTTP routing line and its :8443 funnel -- all from one render,
+	//    and nothing of it persisted into config.json (a render-time overlay).
+	try std.testing.expect(std.mem.indexOf(u8, conf, "\"host\": \"api.example.com\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, conf, "/api-token\"") != null);
+	try std.testing.expect(std.mem.indexOf(u8, conf, "on_guest_credential") == null);
+	try std.testing.expect(std.mem.indexOf(u8, l7, "allow api.example.com terminate\n") != null);
+	const hosts = try readRuntimeFile(gpa, io, root, "l7-inject-hosts");
+	defer gpa.free(hosts);
+	try std.testing.expect(std.mem.indexOf(u8, hosts, "api.example.com\n") != null);
+	try std.testing.expect(std.mem.indexOf(u8, nf, "remap tcp 0.0.0.0/0:8443 -> tcp 127.0.0.1:") != null);
+	const on_disk = try readWholeFile(gpa, io, cfg_path);
+	defer gpa.free(on_disk);
+	try std.testing.expect(std.mem.indexOf(u8, on_disk, "api.example.com") == null);
 }
 
 test "renderFiles: a VM-shaped render with NOTHING bound leaves api.anthropic.com untouched (never-connected owner)" {
@@ -873,6 +912,23 @@ test "maybeReload: the HARNESS inject spec cogbox-launch.sh merged in survives a
 	// Boot state: __render-rules wrote an EMPTY conf (nothing in config or the
 	// store names a spec), then the launcher merged the harness half on top.
 	try writeRuntimeFileRaw(gpa, io, rt, "l7-inject-conf.json", launcher_merged_conf);
+	// Meanwhile an OPERATOR inject bind landed in the global store (`cogbox
+	// secret add api-token --audience api.example.com --inject
+	// --on-guest-credential keep`, no `-n`): the live render below is the first
+	// render after it. The two writers must COMPOSE -- the harness half carried
+	// over, the operator element rendered, neither displacing the other.
+	{
+		const global_store = try std.fs.path.join(gpa, &.{ root, "secrets" });
+		defer gpa.free(global_store);
+		try secret_store.add(gpa, io, global_store, "api-token", "tok-FAKE", .{
+			.audience = "api.example.com",
+			.kind = "bearer",
+			.tier = "durable",
+			.bound_at = 2,
+			.inject = true,
+			.on_guest_credential = secret_store.on_guest_keep,
+		});
+	}
 
 	// The routine live verb: `cogbox plugin add`, `rules add`, or cogworx's git
 	// reconcile `cogbox l7 replace`.
@@ -889,8 +945,22 @@ test "maybeReload: the HARNESS inject spec cogbox-launch.sh merged in survives a
 	defer gpa.free(conf);
 	try std.testing.expect(std.mem.indexOf(u8, conf, "/home/testuser/.claude/.credentials.json") != null);
 	try std.testing.expect(std.mem.indexOf(u8, conf, "\"host\": \"api.anthropic.com\"") != null);
-	// Carried over verbatim: no `origin` stamp is invented for someone else's spec.
-	try std.testing.expect(std.mem.indexOf(u8, conf, "\"origin\"") == null);
+	// Carried over verbatim: no `origin` stamp is invented for someone else's
+	// spec -- the only stamped element is the operator one this render authored,
+	// which carries the bind's keep precedence; and the harness spec comes LAST.
+	{
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, conf, .{});
+		defer parsed.deinit();
+		const els = parsed.value.array.items;
+		try std.testing.expectEqual(@as(usize, 2), els.len);
+		try std.testing.expectEqualStrings("api.example.com", els[0].object.get("host").?.string);
+		try std.testing.expectEqualStrings("render", els[0].object.get("origin").?.string);
+		const ogc = els[0].object.get("on_guest_credential") orelse return error.MissingPrecedenceKey;
+		try std.testing.expectEqualStrings("keep", ogc.string);
+		try std.testing.expectEqualStrings("api.anthropic.com", els[1].object.get("host").?.string);
+		try std.testing.expect(els[1].object.get("origin") == null);
+		try std.testing.expect(els[1].object.get("on_guest_credential") == null);
+	}
 	// The NESTED refresh object survives the round-trip through std.json and the
 	// re-serialisation, keys and all. Losing it is the quiet half of this bug: the
 	// injection would keep working until the access token expired and only then
@@ -910,17 +980,115 @@ test "maybeReload: the HARNESS inject spec cogbox-launch.sh merged in survives a
 	defer gpa.free(conf2);
 	try std.testing.expectEqual(@as(usize, 1), countOccurrences(conf2, "/home/testuser/.claude/.credentials.json"));
 	try std.testing.expectEqual(@as(usize, 1), countOccurrences(conf2, "\"refresh\""));
+	// ...and the operator element is re-rendered ONCE too, never carried over as
+	// a foreign copy beside a fresh one (it is stamped, so the render owns it).
+	try std.testing.expectEqual(@as(usize, 1), countOccurrences(conf2, "\"host\": \"api.example.com\""));
 
+	// The operator bind's whole-host terminate-allow is unioned after the rules
+	// (plugin-spec parity); the harness host stays exactly as the config names it.
 	const l7 = try readRuntimeFile(gpa, io, root, "l7-rules");
 	defer gpa.free(l7);
-	try std.testing.expectEqualStrings("mode terminate\nallow api.anthropic.com\n", l7);
+	try std.testing.expectEqualStrings("mode terminate\nallow api.anthropic.com\nallow api.example.com terminate\n", l7);
 
 	// A preserved spec is inert beyond the conf: its host does NOT join the
 	// plain-HTTP inject-routing list (the launcher keeps harness hosts out of it so
-	// the guest cannot force a cleartext send of the real token).
+	// the guest cannot force a cleartext send of the real token). The rendered
+	// operator host does.
 	const inj_hosts = try readRuntimeFile(gpa, io, root, "l7-inject-hosts");
 	defer gpa.free(inj_hosts);
-	try std.testing.expectEqualStrings("", inj_hosts);
+	try std.testing.expectEqualStrings("api.example.com\n", inj_hosts);
+}
+
+test "maybeReload: an operator --inject bind on a HARNESS host is never HTTP-routed -- l7-inject-hosts omits it while the merged harness spec keeps the host (two-writer contract)" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpInstanceLayout(gpa, io, harness_only_network);
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+	const cfg_path = try std.fs.path.join(gpa, &.{ root, "instances", "web", "config.json" });
+	defer gpa.free(cfg_path);
+	const rt = try std.fs.path.join(gpa, &.{ root, "rt" });
+	defer gpa.free(rt);
+	try writeDeadPasstPid(gpa, io, rt);
+	// Boot state on a box with HOST login: the launcher merged the claude-code
+	// harness spec on top of the boot render's conf.
+	try writeRuntimeFileRaw(gpa, io, rt, "l7-inject-conf.json", launcher_merged_conf);
+	// A hand-CLI operator bind for the harness host ITSELF. No claude-oauth is
+	// bound, so no in-memory spec claims api.anthropic.com and the operator seed
+	// lands: its one-spec-per-host belt sees config + seeds, never the file the
+	// launcher merged into. Beside it an ordinary bind, to prove the
+	// withholding is per host.
+	{
+		const global_store = try std.fs.path.join(gpa, &.{ root, "secrets" });
+		defer gpa.free(global_store);
+		try secret_store.add(gpa, io, global_store, "mine", "tok-FAKE-mine", .{
+			.audience = "api.anthropic.com",
+			.kind = "bearer",
+			.tier = "durable",
+			.bound_at = 2,
+			.inject = true,
+		});
+		try secret_store.add(gpa, io, global_store, "api-token", "tok-FAKE", .{
+			.audience = "api.example.com",
+			.kind = "bearer",
+			.tier = "durable",
+			.bound_at = 2,
+			.inject = true,
+		});
+	}
+
+	var loaded = try config.load(gpa, io, cfg_path);
+	defer loaded.deinit();
+	try maybeReload(gpa, io, rt, &loaded);
+
+	// THE INVARIANT: l7-inject-hosts never names a harness host, whatever seeded
+	// it. Listed, the L7 proxy would route a guest-forced
+	// http://api.anthropic.com/... to the addon, whose last-write-by-host lookup
+	// hands that host to the HARNESS spec below -- the real host-side OAuth
+	// token stamped onto a cleartext leg. The ordinary bind's host routes as
+	// before.
+	const inj_hosts = try readRuntimeFile(gpa, io, root, "l7-inject-hosts");
+	defer gpa.free(inj_hosts);
+	try std.testing.expectEqualStrings("api.example.com\n", inj_hosts);
+
+	// The conf: the harness spec is preserved ONCE and is the LAST element for
+	// its host, so it keeps winning at the addon. The operator element is
+	// rendered ahead of it -- the render cannot see the merged file when it
+	// seeds, and a boot render publishes the same conf -- and is inert on the
+	// wire: never resolved for the host, never HTTP-routed.
+	const conf = try readRuntimeFile(gpa, io, root, "l7-inject-conf.json");
+	defer gpa.free(conf);
+	{
+		var parsed = try std.json.parseFromSlice(std.json.Value, gpa, conf, .{});
+		defer parsed.deinit();
+		const els = parsed.value.array.items;
+		try std.testing.expectEqual(@as(usize, 3), els.len);
+		var last_for_host: ?usize = null;
+		var unstamped: usize = 0;
+		for (els, 0..) |el, i| {
+			if (std.mem.eql(u8, el.object.get("host").?.string, "api.anthropic.com")) last_for_host = i;
+			if (el.object.get("origin") == null) unstamped += 1;
+		}
+		try std.testing.expectEqual(@as(usize, 1), unstamped);
+		const last = els[last_for_host orelse return error.HarnessSpecDropped].object;
+		try std.testing.expect(last.get("origin") == null);
+		try std.testing.expectEqualStrings("/home/testuser/.claude/.credentials.json", last.get("cred_file").?.string);
+	}
+	// No union line for the harness host (the config's rule names it); the
+	// ordinary bind's whole-host allow is unioned as before.
+	const l7 = try readRuntimeFile(gpa, io, root, "l7-rules");
+	defer gpa.free(l7);
+	try std.testing.expectEqualStrings("mode terminate\nallow api.anthropic.com\nallow api.example.com terminate\n", l7);
+
+	// Stable across renders: the next live render withholds the same host.
+	try maybeReload(gpa, io, rt, &loaded);
+	const inj_hosts2 = try readRuntimeFile(gpa, io, root, "l7-inject-hosts");
+	defer gpa.free(inj_hosts2);
+	try std.testing.expectEqualStrings("api.example.com\n", inj_hosts2);
 }
 
 test "maybeReload: rendered specs are replaced (a withdrawn one goes) while the harness spec is preserved LAST" {
@@ -972,6 +1140,14 @@ test "maybeReload: rendered specs are replaced (a withdrawn one goes) while the 
 	// precedence cogbox-launch.sh's `jq -s add` establishes at boot.
 	const foreign_at = std.mem.indexOf(u8, conf, "/home/testuser/.claude/.credentials.json") orelse return error.HarnessSpecDropped;
 	try std.testing.expect(foreign_at > rendered_at);
+	// ...and because the harness spec wins the host, the claude seed's host is
+	// WITHHELD from the plain-HTTP inject-routing list: routed, a guest-forced
+	// http://api.anthropic.com/... would have the addon stamp the harness token
+	// on a cleartext leg. (With nothing merged -- every cogworx VM -- the seeded
+	// host routes as before; see the render test above.)
+	const inj_hosts = try readRuntimeFile(gpa, io, root, "l7-inject-hosts");
+	defer gpa.free(inj_hosts);
+	try std.testing.expectEqualStrings("", inj_hosts);
 }
 
 test "maybeReload: an UNSTAMPED spec naming a store path is re-rendered, not preserved (pre-stamp image skew)" {

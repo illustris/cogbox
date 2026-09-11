@@ -507,6 +507,70 @@ check(not m.should_inject(CIDict({"Cookie": "app.sid=realsession"}), "cookie", C
 check(m.should_inject(CIDict({"Cookie": "app.sid=anything"}), "cookie", None, cookie_name="app.sid"),
       "should_inject cookie: no stub_token -> legacy always-inject")
 
+# --- on_guest_credential: the operator's per-bind precedence -----------------
+# The conf key the render emits only for "keep" (rules/reload.zig
+# buildInjectArray reads it from the secret's META). Absent / None / "replace"
+# is today's behaviour: always inject. Under keep the credential is injected
+# ONLY when the style's slot is empty -- bearer/basic look at the whole
+# Authorization header (ANY scheme counts as "the sandbox sent one"; a
+# PRIVATE-TOKEN header alone does not), cookie at the single named cookie.
+check(m.should_inject(CIDict({"Authorization": "Bearer mine"}), "bearer", None, on_guest_credential=None),
+      "keep: on_guest_credential=None behaves as replace (legacy always-inject)")
+check(m.should_inject(CIDict({"Authorization": "Bearer mine"}), "bearer", None, on_guest_credential="replace"),
+      "keep: replace always injects, no stub")
+check(m.should_inject(CIDict({"Authorization": "Basic cmVhbDpjcmVk"}), "basic", None, on_guest_credential="replace"),
+      "keep: replace always injects (basic)")
+check(m.should_inject(CIDict({"Cookie": "app.sid=real"}), "cookie", None, cookie_name="app.sid", on_guest_credential="replace"),
+      "keep: replace always injects (cookie)")
+# bearer
+check(m.should_inject(CIDict({}), "bearer", None, on_guest_credential="keep"),
+      "keep bearer: no Authorization -> inject")
+check(m.should_inject(CIDict({"Authorization": ""}), "bearer", None, on_guest_credential="keep"),
+      "keep bearer: empty Authorization -> inject")
+check(not m.should_inject(CIDict({"Authorization": "Bearer x"}), "bearer", None, on_guest_credential="keep"),
+      "keep bearer: a Bearer credential is kept")
+check(not m.should_inject(CIDict({"Authorization": "Basic y"}), "bearer", None, on_guest_credential="keep"),
+      "keep bearer: ANY scheme counts as present (no scheme parsing)")
+check(not m.should_inject(CIDict({"Authorization": "garbage"}), "bearer", None, on_guest_credential="keep"),
+      "keep bearer: even a malformed value counts as present")
+check(m.should_inject(CIDict({"Private-Token": "glpat-x"}), "bearer", None, on_guest_credential="keep"),
+      "keep bearer: a PRIVATE-TOKEN header alone is not an Authorization credential")
+# basic
+check(m.should_inject(CIDict({}), "basic", None, on_guest_credential="keep"),
+      "keep basic: no Authorization -> inject")
+check(not m.should_inject(CIDict({"Authorization": "Basic cmVhbDpjcmVk"}), "basic", None, on_guest_credential="keep"),
+      "keep basic: a Basic credential is kept")
+check(not m.should_inject(CIDict({"Authorization": "Bearer x"}), "basic", None, on_guest_credential="keep"),
+      "keep basic: another scheme counts as present")
+# cookie: only the named cookie
+check(m.should_inject(CIDict({}), "cookie", None, cookie_name="app.sid", on_guest_credential="keep"),
+      "keep cookie: no Cookie header -> inject")
+check(m.should_inject(CIDict({"Cookie": "a=1; b=2"}), "cookie", None, cookie_name="app.sid", on_guest_credential="keep"),
+      "keep cookie: other cookies only -> inject")
+check(not m.should_inject(CIDict({"Cookie": "a=1; app.sid=real"}), "cookie", None, cookie_name="app.sid", on_guest_credential="keep"),
+      "keep cookie: the named cookie present -> kept")
+check(m.should_inject(CIDict({"Cookie": "app.sid=; a=1"}), "cookie", None, cookie_name="app.sid", on_guest_credential="keep"),
+      "keep cookie: the named cookie EMPTY -> inject")
+# keep + stub_token: the stub gate stays the stricter one (the stub counts as
+# "empty"; anything else is a secondary credential and is kept).
+check(m.should_inject(CIDict({"Authorization": "Bearer " + STUB}), "anthropic-oauth", STUB, on_guest_credential="keep"),
+      "keep+stub: the stub -> inject")
+check(m.should_inject(CIDict({}), "anthropic-oauth", STUB, on_guest_credential="keep"),
+      "keep+stub: no credential -> inject")
+check(not m.should_inject(CIDict({"Authorization": "Bearer eyJ.worker.jwt"}), "anthropic-oauth", STUB, on_guest_credential="keep"),
+      "keep+stub: a secondary credential -> kept")
+check(m.should_inject(CIDict({"Authorization": _bstub_encoded}), "basic", BSTUB, on_guest_credential="keep"),
+      "keep+stub basic: the encoded stub -> inject")
+check(not m.should_inject(CIDict({"Authorization": "Basic cmVhbDpjcmVk"}), "basic", BSTUB, on_guest_credential="keep"),
+      "keep+stub basic: a real credential -> kept")
+check(m.should_inject(CIDict({"Cookie": "app.sid=" + CSTUB}), "cookie", CSTUB, cookie_name="app.sid", on_guest_credential="keep"),
+      "keep+stub cookie: the stub -> inject")
+# replace + stub: byte-for-byte the pre-feature gate.
+check(not m.should_inject(CIDict({"Authorization": "Bearer eyJ.worker.jwt"}), "anthropic-oauth", STUB, on_guest_credential="replace"),
+      "replace+stub: a secondary credential still passes through")
+check(m.should_inject(CIDict({"Authorization": "Bearer " + STUB}), "anthropic-oauth", STUB, on_guest_credential="replace"),
+      "replace+stub: the stub is still replaced")
+
 
 def _write_raw(path, text, mtime):
     with open(path, "w") as f:
@@ -1275,6 +1339,32 @@ finally:
 check(not any("CONFLICT" in c for c in _conflicts2),
       "retarget: the conflict warning is one-shot per conf generation")
 
+# An OPERATOR bind (`cogbox secret add --inject`) on a host a grant covers: the
+# render seeds a plain bearer spec beside the auth entry -- a legitimate state
+# now, not a control-plane bug. The retarget still wins: the operator credential
+# is never stamped here (the grant's policy governs the host while it is
+# active; cogworx labels the bind as superseded), and the notice fires once,
+# without calling it a bug.
+_ocred_auth = os.path.join(_ad, "api-token")
+_write_raw(_ocred_auth, "tok-OPERATOR\n", 5100)
+_write(_aconf, [{"host": _ahost, "style": "bearer", "cred_file": _ocred_auth,
+                 "cred_format": "raw", "origin": "render"}], 5100)
+m.CREDS = m.CredStore(_aconf)
+_conflicts3 = []
+m._cred_log = lambda msg: _conflicts3.append(msg)
+try:
+    _afl5 = _AFlow(_ahost, "GET", CIDict({"Host": _ahost}),
+                   sni=_ahost, vetted_ip="203.0.113.9", vetted_port=443)
+    m._enforce_and_inject(_afl5, "/api/v4/projects/1234/issues")
+finally:
+    m._cred_log = _orig_cred_log
+check(_afl5.response is None and _afl5.request.data.port == 19999,
+      "operator bind on a grant host: retargeted to the auth proxy, not denied")
+check(_afl5.request.headers.get("authorization") is None,
+      "operator bind on a grant host: superseded -- the operator credential is never stamped here")
+check(any("CONFLICT" in c and "supersedes" in c and "control-plane bug" not in c for c in _conflicts3),
+      "operator bind on a grant host: the one-shot notice fires and no longer calls it a control-plane bug")
+
 # Auth port unusable / no vetted upstream -> retarget refuses (the caller then
 # fails closed via _deny, which needs mitmproxy; assert the primitive directly).
 m.AUTH_PORT = ""
@@ -1505,6 +1595,90 @@ try:
     m._enforce_and_inject(_fbare, "/grp/repo.git/git-upload-pack")
     check(_fbare.response is not None and _fbare.response.status_code == 403,
           "fail-closed: an uncredentialed request to an injected host is denied")
+finally:
+    m.http = _orig_http
+
+
+# --- on_guest_credential end to end: an operator bind with keep ----------------
+# The conf element an operator `secret add --inject --on-guest-credential keep`
+# renders (origin stamp, raw cred file, the keep key). The request's own
+# credential wins; a bare request gets the operator's; the SAME conf without
+# the key (a replace bind) always sets it; and the stale-conf fail-closed path
+# asks the same question, so under keep only a credential-less request is
+# denied while a credential-bearing one is forwarded untouched.
+_od = tempfile.mkdtemp()
+_ohost = "api.example.com"
+_ocred = os.path.join(_od, "api-token")
+_write_raw(_ocred, "tok-OPERATOR\n", 1000)
+_okeep = {"host": _ohost, "style": "bearer", "cred_file": _ocred,
+          "cred_format": "raw", "origin": "render", "on_guest_credential": "keep"}
+_oconf = os.path.join(_od, "inject.json")
+_write(_oconf, [_okeep], 1000)
+_ocs = m.CredStore(_oconf)
+check(_ocs.spec_for(_ohost).get("on_guest_credential") == "keep",
+      "keep e2e: the conf key rides into the spec")
+check(_ocs.known_stubs[_ohost].get("on_guest_credential") == "keep",
+      "keep e2e: _load_conf remembers the precedence for the stale-conf path")
+_orules = os.path.join(_od, "l7-rules")
+with open(_orules, "w") as f:
+    f.write("mode terminate\nallow api.example.com terminate\n")
+os.utime(_orules, (2100, 2100))
+m.RULES_PATH = _orules
+m.RULES = m.Rules()
+m.CREDS = _ocs
+m.AUTH_HOSTS = m.AuthHosts("")  # no grant on this host
+m.http = _HttpStub
+try:
+    _fb = _GFlow(_ohost, "GET", CIDict({"Host": _ohost}), sni=_ohost)
+    m._enforce_and_inject(_fb, "/v1/things")
+    check(_fb.response is None
+          and _fb.request.headers.get("authorization") == "Bearer tok-OPERATOR",
+          "keep e2e: a bare request gets the operator credential")
+    _fk = _GFlow(_ohost, "GET", CIDict({"Host": _ohost, "Authorization": "Bearer guest-own"}),
+                 sni=_ohost)
+    m._enforce_and_inject(_fk, "/v1/things")
+    check(_fk.response is None
+          and _fk.request.headers.get("authorization") == "Bearer guest-own",
+          "keep e2e: the sandbox's own credential is forwarded untouched")
+    _fkb = _GFlow(_ohost, "GET", CIDict({"Host": _ohost, "Authorization": "Basic Zm9vOmJhcg=="}),
+                  sni=_ohost)
+    m._enforce_and_inject(_fkb, "/v1/things")
+    check(_fkb.request.headers.get("authorization") == "Basic Zm9vOmJhcg==",
+          "keep e2e: any Authorization scheme is kept for a bearer bind")
+
+    # replace: the identical element WITHOUT the key (what a replace bind
+    # renders) overwrites the guest's credential, as before this feature.
+    _orepl = {k: v for k, v in _okeep.items() if k != "on_guest_credential"}
+    _write(_oconf, [_orepl], 1100)
+    _fr = _GFlow(_ohost, "GET", CIDict({"Host": _ohost, "Authorization": "Bearer guest-own"}),
+                 sni=_ohost)
+    m._enforce_and_inject(_fr, "/v1/things")
+    check(_fr.request.headers.get("authorization") == "Bearer tok-OPERATOR",
+          "keep e2e: a replace element (no key) still overwrites the guest's credential")
+
+    # Stale conf under keep: back to the keep element, then the conf vanishes.
+    _write(_oconf, [_okeep], 1200)
+    check(_ocs.spec_for(_ohost).get("on_guest_credential") == "keep",
+          "keep e2e: the keep element reloads")
+    os.remove(_oconf)
+    # The poll that notices (spec_for -> _load_conf: stat fails, the specs go,
+    # conf_stale is set, known_hosts/known_stubs are kept).
+    check(_ocs.spec_for(_ohost) is None and _ocs.conf_stale,
+          "keep e2e: the vanished conf marks the store stale, hosts remembered")
+    check(_ocs.conf_unavailable_for(_ohost, CIDict({}), "/v1/things"),
+          "keep e2e: conf_unavailable_for denies a bare request (it would have been injected)")
+    check(not _ocs.conf_unavailable_for(_ohost, CIDict({"Authorization": "Bearer guest-own"}), "/v1/things"),
+          "keep e2e: conf_unavailable_for forwards a credential-bearing request (it would have been kept)")
+    _fs1 = _GFlow(_ohost, "GET", CIDict({"Host": _ohost}), sni=_ohost)
+    m._enforce_and_inject(_fs1, "/v1/things")
+    check(_fs1.response is not None and _fs1.response.status_code == 403,
+          "keep e2e: an unreadable conf 403s the bare request")
+    _fs2 = _GFlow(_ohost, "GET", CIDict({"Host": _ohost, "Authorization": "Bearer guest-own"}),
+                  sni=_ohost)
+    m._enforce_and_inject(_fs2, "/v1/things")
+    check(_fs2.response is None
+          and _fs2.request.headers.get("authorization") == "Bearer guest-own",
+          "keep e2e: an unreadable conf forwards the credential-bearing request untouched")
 finally:
     m.http = _orig_http
 

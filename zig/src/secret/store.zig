@@ -2,9 +2,10 @@
 //
 // An operator binds a credential by NAME, host-side, with `cogbox secret add`.
 // The value lives at <dir>/<name> (the raw secret, 0600) and metadata at
-// <dir>/<name>.meta (JSON: audience, kind, tier, bound-at). The global store is
-// <config>/secrets/; sidecar-produced per-instance secrets use the same layout
-// under <config>/instances/<inst>/secrets/.
+// <dir>/<name>.meta (JSON: audience, kind, tier, bound-at, plus the operator
+// inject keys inject / cookie_name / port / on_guest_credential). The global
+// store is <config>/secrets/; sidecar-produced per-instance secrets use the
+// same layout under <config>/instances/<inst>/secrets/.
 //
 // SECURITY: the store NEVER holds a path or value chosen by a plugin -- a plugin
 // only NAMES a secret it wants injected and the AUDIENCE host it targets; the
@@ -50,7 +51,52 @@ pub const Meta = struct {
 	/// sidecar loginSecret.
 	tier: []const u8 = "durable",
 	bound_at: ?i64 = null,
+	/// Operator-authored injection (`cogbox secret add --inject`): true asks the
+	/// render to seed an inject spec {host: audience, style: kind, secret: name}
+	/// for this bind (rules/reload.zig seedOperatorInjectSpecs), so a free-form
+	/// bind -- one no plugin spec names -- actually injects. Default false, so a
+	/// meta written before this key existed, and every plugin-spec bind, stays
+	/// exactly as inert/spec-driven as before.
+	inject: bool = false,
+	/// The cookie the seeded spec replaces (kind=cookie only; the addon's cookie
+	/// arm is a no-op without a name, so the seed skips a cookie bind that has none).
+	cookie_name: ?[]const u8 = null,
+	/// Non-standard service port for the seeded spec (1..65535), funnelled by
+	/// renderRules exactly like a plugin spec's `port`. null = 80/443 only.
+	port: ?u16 = null,
+	/// What the injected credential does when the request from inside the
+	/// sandbox ALREADY carries one in the style's slot: `replace` (default,
+	/// today's always-set behaviour) or `keep` (inject only when the slot is
+	/// empty). Read from HERE by the inject render for every bearer|cookie|basic
+	/// element -- plugin specs naming this secret included -- so a manifest can
+	/// never choose it; the bind does. See on_guest_replace / on_guest_keep.
+	on_guest_credential: []const u8 = on_guest_replace,
 };
+
+/// The two `on_guest_credential` values. `replace` is what every bind before
+/// this field existed did (the addon always SETs the credential); `keep` is the
+/// only value the render ever writes into the inject conf (the conf key is
+/// emitted for keep alone, so a replace bind's conf element is byte-identical
+/// to the pre-feature one).
+pub const on_guest_replace = "replace";
+pub const on_guest_keep = "keep";
+
+pub fn validOnGuestCredential(v: []const u8) bool {
+	return std.mem.eql(u8, v, on_guest_replace) or std.mem.eql(u8, v, on_guest_keep);
+}
+
+/// A cookie NAME the inject render may stamp: no control characters and none of
+/// the `Cookie` header's separators. Shared by the plugin manifest validator
+/// (plugin/mutate.zig validatePluginInjectSpec) and `secret add --cookie-name`,
+/// so a name the manifest path refuses is refused at the bind too.
+pub fn validCookieName(name: []const u8) bool {
+	for (name) |c| switch (c) {
+		0...0x1f, 0x7f => return false, // control chars (incl tab/space-low)
+		'=', ';', ',', ' ', '"' => return false, // cookie separators
+		else => {},
+	};
+	return true;
+}
 
 pub fn appendJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
 	try out.append(allocator, '"');
@@ -84,13 +130,29 @@ pub fn buildMeta(allocator: std.mem.Allocator, meta: Meta) ![]u8 {
 		var nb: [32]u8 = undefined;
 		try out.appendSlice(allocator, std.fmt.bufPrint(&nb, "{d}", .{b}) catch unreachable);
 	} else try out.appendSlice(allocator, "null");
+	// The operator inject keys, always written (a reader that predates them
+	// ignores unknown keys, so an old binary sees a plain bind).
+	try out.appendSlice(allocator, ",\n\t\"inject\": ");
+	try out.appendSlice(allocator, if (meta.inject) "true" else "false");
+	try out.appendSlice(allocator, ",\n\t\"cookie_name\": ");
+	if (meta.cookie_name) |cn| try appendJsonString(allocator, &out, cn) else try out.appendSlice(allocator, "null");
+	try out.appendSlice(allocator, ",\n\t\"port\": ");
+	if (meta.port) |p| {
+		var pb: [8]u8 = undefined;
+		try out.appendSlice(allocator, std.fmt.bufPrint(&pb, "{d}", .{p}) catch unreachable);
+	} else try out.appendSlice(allocator, "null");
+	try out.appendSlice(allocator, ",\n\t\"on_guest_credential\": ");
+	try appendJsonString(allocator, &out, meta.on_guest_credential);
 	try out.appendSlice(allocator, "\n}\n");
 	return out.toOwnedSlice(allocator);
 }
 
 /// Parse the meta JSON `text`. Missing/invalid fields fall back to defaults
-/// (audience null, kind "bearer"). String fields are dup'd into `allocator`.
-/// Pure (no IO).
+/// (audience null, kind "bearer", inject false, on_guest_credential replace --
+/// so a meta written before the operator inject keys existed reads as an
+/// inert, replace-mode bind). Unknown keys are ignored, so a NEWER meta read
+/// by an older binary is equally inert. String fields are dup'd into
+/// `allocator`. Pure (no IO).
 pub fn parseMeta(allocator: std.mem.Allocator, text: []const u8) !Meta {
 	var meta: Meta = .{};
 	var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return meta;
@@ -108,6 +170,22 @@ pub fn parseMeta(allocator: std.mem.Allocator, text: []const u8) !Meta {
 	}
 	if (root.object.get("bound_at")) |v| {
 		if (v == .integer) meta.bound_at = v.integer;
+	}
+	if (root.object.get("inject")) |v| {
+		if (v == .bool) meta.inject = v.bool;
+	}
+	if (root.object.get("cookie_name")) |v| {
+		if (v == .string and v.string.len > 0) meta.cookie_name = try allocator.dupe(u8, v.string);
+	}
+	if (root.object.get("port")) |v| {
+		// Out-of-range / non-integer -> null: the seed then funnels nothing
+		// extra, exactly as a plugin spec's bad `port` is dropped (injectPort).
+		if (v == .integer and v.integer >= 1 and v.integer <= 65535) meta.port = @intCast(v.integer);
+	}
+	if (root.object.get("on_guest_credential")) |v| {
+		// Only the two known values; anything else is the default (replace),
+		// which is the mode every bind before this key existed ran in.
+		if (v == .string and validOnGuestCredential(v.string)) meta.on_guest_credential = try allocator.dupe(u8, v.string);
 	}
 	return meta;
 }

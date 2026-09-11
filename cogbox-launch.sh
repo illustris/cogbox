@@ -351,6 +351,44 @@ gen_inject_conf() {
 	'
 }
 
+# Withhold plain-HTTP inject-routing for the HARNESS hosts: strip every host
+# the merged harness conf ($1, gen_inject_conf's JSON array) names from the
+# $RUNTIME/l7-inject-hosts that __render-rules just wrote. The render never adds
+# a harness host there itself (their providers are HTTPS-only), but a RENDERED
+# spec can name the same host -- a plugin's, the claude seed's, an operator
+# `secret add --inject` bind's -- and the merge hands the HARNESS spec that host
+# at the addon (last-write-by-host): HTTP-routing it would have the addon stamp
+# the real host-side OAuth token onto a cleartext leg the guest chose by
+# dialling http://. So the file never names a harness host, whatever seeded it;
+# the live renders apply the same rule to the specs they preserve
+# (zig/src/rules/reload.zig withholdForeignHosts). Case-insensitive, like the
+# proxy's own compare. jq's and grep's exits are each observed on their own: a
+# harness conf jq cannot read never merged above either, so there is nothing to
+# strip; an l7-inject-hosts grep cannot read fails CLOSED to an empty list --
+# no routing, never a wrong one. Warns when it strips: the bind still reads as
+# injecting on every other surface.
+withhold_harness_inject_hosts() {
+	local harness_conf="$1" hosts dropped rc
+	[ "$harness_conf" = '[]' ] && return 0
+	hosts=$(printf '%s' "$harness_conf" | jq -r '.[].host // empty' 2>/dev/null) || return 0
+	[ -n "$hosts" ] || return 0
+	rc=0
+	dropped=$(printf '%s\n' "$hosts" | grep -ixF -f - "$RUNTIME/l7-inject-hosts" 2>/dev/null) || rc=$?
+	# 1 = no listed host is a harness host: the list is already right.
+	[ "$rc" -eq 1 ] && return 0
+	if [ "$rc" -eq 0 ]; then
+		echo "cogbox-launch: warning: withholding plain-HTTP inject-routing for harness host(s) $(printf '%s' "$dropped" | tr '\n' ' ')-- a rendered inject spec named them, but the merged harness spec wins the host and its provider is HTTPS-only." >&2
+	else
+		echo "cogbox-launch: warning: cannot read $RUNTIME/l7-inject-hosts to strip the harness hosts; publishing an empty list (no plain-HTTP inject-routing)." >&2
+	fi
+	# grep -v exits 1 when NOTHING survived (every line was a harness host): the
+	# empty file it left is the right one. Any other failure: empty too.
+	if ! printf '%s\n' "$hosts" | grep -vixF -f - "$RUNTIME/l7-inject-hosts" > "$RUNTIME/l7-inject-hosts.tmp" 2>/dev/null; then
+		: > "$RUNTIME/l7-inject-hosts.tmp"
+	fi
+	mv "$RUNTIME/l7-inject-hosts.tmp" "$RUNTIME/l7-inject-hosts"
+}
+
 # The secret file to scrub from the guest when injection is active, as
 # "<overlay-pathkey> <basename>". When the harness defines a redactor (below) the
 # file is REWRITTEN with its tokens replaced by placeholders but its non-secret
@@ -1860,14 +1898,21 @@ if [ "$NETWORK_MODE" = "rules" ]; then
 		if printf '%s\n%s' "$_plugin_conf" "$_harness_conf" \
 			| jq -s 'add' > "$RUNTIME/l7-inject-conf.json.tmp" 2>/dev/null; then
 			mv "$RUNTIME/l7-inject-conf.json.tmp" "$RUNTIME/l7-inject-conf.json"
+			# l7-inject-hosts (the L7 proxy's plain-HTTP inject-routing list) was
+			# already written by __render-rules from the PLUGIN/OPERATOR specs only.
+			# We deliberately do NOT add the HARNESS hosts to it: their providers are
+			# HTTPS-only, and routing their plain-HTTP egress through the injector
+			# would let the guest force a cleartext send of the real OAuth token.
+			# A rendered spec naming a harness host anyway (a plugin's, the claude
+			# seed's, an operator `secret add --inject` bind's) put it there -- and
+			# the merge that just landed hands the HARNESS spec that host at the
+			# addon -- so those are stripped back out: the file never names a
+			# harness host, whatever seeded it. Inside the success branch on
+			# purpose: only a merge that landed put a harness spec in the conf.
+			withhold_harness_inject_hosts "$_harness_conf"
 		else
 			rm -f "$RUNTIME/l7-inject-conf.json.tmp"
 		fi
-		# l7-inject-hosts (the L7 proxy's plain-HTTP inject-routing list) was
-		# already written by __render-rules from the PLUGIN/OPERATOR specs only.
-		# We deliberately do NOT add the HARNESS hosts to it: their providers are
-		# HTTPS-only, and routing their plain-HTTP egress through the injector
-		# would let the guest force a cleartext send of the real OAuth token.
 	else
 		# Operator override: the addon reads exactly $COGBOX_L7_INJECT_CONF, so
 		# the proxy's HTTP inject-routing list must mirror ITS hosts (replacing

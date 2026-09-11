@@ -97,13 +97,17 @@ pub fn build(b: *std.Build) void {
 
 	// Secret verb + store. Host-only named credential store the operator binds
 	// with `cogbox secret`; the rules renderer resolves a plugin's requested
-	// secret through it. Pure std (no libc, no other cogbox modules), so it can
-	// be imported by both the CLI and the rules module without a cycle.
+	// secret through it. Pure std plus the leaf filter module (no libc, no other
+	// cogbox module), so it can be imported by both the CLI and the rules
+	// module without a cycle.
 	const secret_mod = b.createModule(.{
 		.root_source_file = b.path("src/secret/main.zig"),
 		.target = target,
 		.optimize = optimize,
 	});
+	// `secret add --inject` validates the audience against the L7 host grammar
+	// (filter.isValidHostName): the render turns it into an l7-rules line.
+	secret_mod.addImport("filter", filter_mod);
 	// The rules renderer (renderL7Inject) resolves bound secrets host-side.
 	rules_mod.addImport("secret_module", secret_mod);
 
@@ -250,6 +254,7 @@ pub fn build(b: *std.Build) void {
 		.target = target,
 		.optimize = optimize,
 	});
+	secret_test_mod.addImport("filter", filter_mod);
 	const secret_tests = b.addTest(.{
 		.root_module = secret_test_mod,
 	});

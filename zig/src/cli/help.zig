@@ -563,7 +563,9 @@ pub const SECRET =
     \\
     \\Usage:
     \\  cogbox secret add NAME --from-file F | --from-stdin
-    \\                        [--audience HOST] [--kind bearer|cookie] [-n INSTANCE]
+    \\                        [--audience HOST] [--kind bearer|cookie|basic]
+    \\                        [--inject] [--cookie-name N] [--port P]
+    \\                        [--on-guest-credential replace|keep] [-n INSTANCE]
     \\  cogbox secret ls [--json]
     \\  cogbox secret rm NAME [-n INSTANCE]
     \\  cogbox secret reload -n INSTANCE
@@ -575,8 +577,32 @@ pub const SECRET =
     \\                    is NOT injectable until its audience is set; the
     \\                    inject-conf renderer refuses to stamp a secret onto any
     \\                    host other than its bound audience, so a plugin cannot
-    \\                    redirect a bound credential to an attacker host.
-    \\  --kind K          Injection style hint: bearer (default) or cookie
+    \\                    redirect a bound credential to an attacker host. With
+    \\                    --inject it must be one exact bare host (LDH labels or
+    \\                    an IP literal; no wildcard, port, path or whitespace).
+    \\  --kind K          Injection style: bearer (default), cookie or basic
+    \\                    (the stored value is a raw token, a cookie value, or
+    \\                    user:password respectively)
+    \\  --inject          Inject this bind WITHOUT a plugin spec: the render seeds
+    \\                    an inject spec for the audience (style = --kind), which
+    \\                    terminate-allows exactly that host (like a plugin's
+    \\                    inject spec) and stamps the credential on every request
+    \\                    to it. Unbinding withdraws all of it. Requires
+    \\                    --audience; bearer|cookie|basic only. A host a plugin
+    \\                    spec already injects into keeps the plugin's spec.
+    \\  --cookie-name N   With --kind cookie: the cookie the proxy replaces
+    \\                    (required together with --inject)
+    \\  --port P          With --inject: the host is served on port P (not
+    \\                    80/443); the guest's :P egress is funnelled to the proxy
+    \\  --on-guest-credential replace|keep
+    \\                    What to do when the request from inside the sandbox
+    \\                    already carries a credential: replace it (default --
+    \\                    the proxy always sets the injected one) or keep the
+    \\                    sandbox's (inject only when the slot is empty). keep
+    \\                    inspects the whole Authorization header for bearer and
+    \\                    basic (any scheme counts as present) and only the named
+    \\                    cookie for cookie. Read from the bind for a plugin's
+    \\                    spec naming this secret too; a manifest cannot set it.
     \\  -n INSTANCE       After the bind/remove, re-render that instance's inject
     \\                    conf and SIGHUP its proxy, so the change takes effect on a
     \\                    RUNNING VM without a restart. Omit to only write the store
@@ -592,12 +618,19 @@ pub const SECRET =
     \\shell history).
     \\
     \\The store lives at <config>/secrets/ (value 0600 + a <name>.meta sidecar with
-    \\audience/kind/tier). `cogbox plugin add` prints a checklist of the secrets a
-    \\plugin needs so you know what to bind.
+    \\audience/kind/tier/inject/cookie_name/port/on_guest_credential). `cogbox
+    \\plugin add` prints a checklist of the secrets a plugin needs so you know
+    \\what to bind. Exit codes: 64 usage (incl. an unknown flag), 65 an invalid
+    \\value, 73 the store could not be written.
     \\
     \\Examples:
     \\  cogbox secret add api-bearer --from-file ~/.secrets/api.token \
     \\        --audience api.example.com
+    \\  echo -n 'elastic:pw' | cogbox secret add es-creds --from-stdin \
+    \\        --audience es.example.com --kind basic --inject --port 9200
+    \\  echo -n "$SID" | cogbox secret add app-session --from-stdin \
+    \\        --audience app.example.com --kind cookie --cookie-name session \
+    \\        --inject --on-guest-credential keep -n web
     \\  printf '%s' "$TOKEN" | cogbox secret add api-token --from-stdin --audience api.internal
     \\  cogbox secret ls
     \\  cogbox secret ls --json   # name/kind/audience/bound, for a control plane

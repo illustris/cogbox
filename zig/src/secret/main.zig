@@ -6,6 +6,10 @@
 //
 //   cogbox secret add <name> --from-file F | --from-stdin
 //        [--audience HOST] [--kind bearer|cookie|basic|anthropic-oauth] [-n INST]
+//        [--inject] [--cookie-name N] [--port P] [--on-guest-credential replace|keep]
+//        (--inject makes a FREE-FORM bind -- one no plugin spec names -- inject:
+//        the render seeds a spec for the audience, which must then be one
+//        exact bare host in the L7 grammar; see store.Meta.inject)
 //   cogbox secret ls [--json]
 //   cogbox secret rm <name> [-n INST]
 //   cogbox secret reload -n INST   (-n + reload handled by the cli verb layer:
@@ -13,6 +17,7 @@
 //      module only writes the store.)
 
 const std = @import("std");
+const filter = @import("filter");
 pub const store = @import("store.zig");
 pub const proxygid = @import("proxygid.zig");
 
@@ -111,9 +116,18 @@ pub fn stubCredentialJson(allocator: std.mem.Allocator) ![]u8 {
 /// rollout's version gate -- see gitlab_authproxy_kind). Pure, so the allowlist
 /// is unit-testable without IO.
 pub fn validKind(kind: []const u8) bool {
-	return eql(kind, "bearer") or eql(kind, "cookie") or eql(kind, "basic") or
+	return operatorKind(kind) or
 		eql(kind, anthropic_oauth_kind) or eql(kind, gitlab_oauth_kind) or
 		eql(kind, gitlab_authproxy_kind);
+}
+
+/// The kinds an OPERATOR bind may inject under (`--inject`): the plain wire
+/// primitives. The platform kinds (anthropic-oauth, gitlab-oauth,
+/// gitlab-authproxy) are seeded/routed by the control plane and are refused
+/// here AND skipped by the operator seed (rules/reload.zig
+/// seedOperatorInjectSpecs) -- single-sourced so the verb and the seed agree.
+pub fn operatorKind(kind: []const u8) bool {
+	return eql(kind, "bearer") or eql(kind, "cookie") or eql(kind, "basic");
 }
 
 /// `env` is only consulted for COGBOX_PROXY_RUNAS (the L7 proxy's uid split, see
@@ -144,6 +158,10 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 	var from_stdin = false;
 	var audience: ?[]const u8 = null;
 	var kind: []const u8 = "bearer";
+	var inject = false;
+	var cookie_name: ?[]const u8 = null;
+	var port_arg: ?[]const u8 = null;
+	var on_guest: []const u8 = store.on_guest_replace;
 
 	var i: usize = 0;
 	while (i < argv.len) : (i += 1) {
@@ -156,7 +174,21 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 			audience = v;
 		} else if (flagValue(a, "--kind", argv, &i)) |v| {
 			kind = v;
+		} else if (eql(a, "--inject")) {
+			inject = true;
+		} else if (flagValue(a, "--cookie-name", argv, &i)) |v| {
+			cookie_name = v;
+		} else if (flagValue(a, "--port", argv, &i)) |v| {
+			port_arg = v;
+		} else if (flagValue(a, "--on-guest-credential", argv, &i)) |v| {
+			on_guest = v;
 		} else if (std.mem.startsWith(u8, a, "-")) {
+			// CROSS-REPO CONTRACT: this exact rendering ("cogbox secret: error:
+			// unknown flag '--inject'" / "... '--on-guest-credential'") on exit 64
+			// is how cogworx tells "this agent predates operator inject binds"
+			// from any other bind failure, and it fires HERE, before the stdin
+			// value is read, so on an old binary nothing is bound. Keep the
+			// format, the code and the parse order as they are.
 			return die(allocator, io, "unknown flag '{s}'", .{a}, 64);
 		} else if (name == null) {
 			name = a;
@@ -174,6 +206,46 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 	}
 	if (from_file != null and from_stdin) {
 		return die(allocator, io, "--from-file and --from-stdin are mutually exclusive", .{}, 64);
+	}
+
+	// Operator-inject validation (exit 65, EX_DATAERR), all of it BEFORE the
+	// value is read: a refused bind consumes nothing and binds nothing.
+	if (!store.validOnGuestCredential(on_guest)) {
+		return die(allocator, io, "invalid --on-guest-credential '{s}' (expected replace|keep)", .{on_guest}, 65);
+	}
+	const port: ?u16 = blk: {
+		const s = port_arg orelse break :blk null;
+		const n = std.fmt.parseInt(u16, s, 10) catch 0;
+		if (n == 0) return die(allocator, io, "invalid --port '{s}' (expected 1..65535)", .{s}, 65);
+		break :blk n;
+	};
+	if (inject and audience == null) {
+		return die(allocator, io, "--inject requires --audience HOST (the one host the secret is injected to)", .{}, 65);
+	}
+	// With --inject the audience becomes a LINE in the rendered l7-rules and
+	// l7-inject-hosts (whitespace-tokenized policy files), so it must be one
+	// exact bare host in the L7 grammar -- the gate a plugin spec's host passes
+	// at `plugin add`. Anything else could smuggle rule tokens (`insecure`) or
+	// whole lines (`mode passthrough`) into the enforcer's policy; the render
+	// refuses such a meta too (rules/reload.zig seedOperatorInjectSpecs). A
+	// plain bind keeps today's acceptance: its audience is only ever COMPARED
+	// against a plugin spec's host, never rendered.
+	if (inject and !filter.isValidHostName(audience.?)) {
+		return die(allocator, io, "invalid --audience '{s}' with --inject (expected one exact bare host: LDH labels or an IP literal; no wildcard, port, path, whitespace or trailing dot)", .{audience.?}, 65);
+	}
+	if (inject and !operatorKind(kind)) {
+		return die(allocator, io, "--inject applies to bearer|cookie|basic binds; anthropic-oauth/gitlab-* are seeded by the control plane", .{}, 65);
+	}
+	if (cookie_name != null and !eql(kind, "cookie")) {
+		return die(allocator, io, "--cookie-name applies only to --kind cookie", .{}, 65);
+	}
+	if (inject and eql(kind, "cookie") and cookie_name == null) {
+		return die(allocator, io, "--kind cookie with --inject requires --cookie-name NAME (the cookie the proxy replaces)", .{}, 65);
+	}
+	if (cookie_name) |cn| {
+		if (cn.len == 0 or !store.validCookieName(cn)) {
+			return die(allocator, io, "invalid --cookie-name '{s}' (no control characters, '=', ';', ',', space or '\"')", .{cn}, 65);
+		}
 	}
 
 	const raw = blk: {
@@ -198,6 +270,10 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 		.kind = kind,
 		.tier = "durable",
 		.bound_at = bound_at,
+		.inject = inject,
+		.cookie_name = cookie_name,
+		.port = port,
+		.on_guest_credential = on_guest,
 	};
 	// The L7 proxy's gid, where the deployment runs a uid split. Staged onto the
 	// value file inside the same atomic write so the credential is readable by
@@ -222,7 +298,11 @@ fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, arg
 	}
 
 	if (audience) |aud| {
-		try announce(allocator, io, "Bound secret '{s}' (kind={s}, audience={s}).", .{ nm, kind, aud });
+		if (inject) {
+			try announce(allocator, io, "Bound secret '{s}' (kind={s}, audience={s}) inject=on (on-guest-credential={s}).", .{ nm, kind, aud, on_guest });
+		} else {
+			try announce(allocator, io, "Bound secret '{s}' (kind={s}, audience={s}).", .{ nm, kind, aud });
+		}
 	} else {
 		try announce(allocator, io, "Bound secret '{s}' (kind={s}). NOTE: no --audience set -> not injectable until you set one (cogbox secret add '{s}' --audience HOST ...).", .{ nm, kind, nm });
 	}
@@ -296,6 +376,11 @@ fn cmdList(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, ar
 			try out.appendSlice(allocator, resolved.meta.kind);
 			try out.appendSlice(allocator, " audience=");
 			try out.appendSlice(allocator, resolved.meta.audience orelse "(unset, not injectable)");
+			if (resolved.meta.inject) {
+				try out.appendSlice(allocator, " inject=on (on-guest-credential=");
+				try out.appendSlice(allocator, resolved.meta.on_guest_credential);
+				try out.append(allocator, ')');
+			}
 			if (!resolved.bound) try out.appendSlice(allocator, " [MISSING VALUE]");
 			try out.append(allocator, '\n');
 		}
@@ -319,6 +404,12 @@ fn cmdList(allocator: std.mem.Allocator, io: std.Io, secrets_dir: []const u8, ar
 /// secret, so it can show a plugin's inject request as bound vs unbound without
 /// ever seeing the value. Pure (no IO); exposed for tests. `bound` is whether
 /// the value file exists; an unbound or audience-null secret is not injectable.
+///
+/// The four operator-inject keys (`inject`, `cookie_name`, `port`,
+/// `on_guest_credential`) are ALWAYS emitted: their absence is cogworx's
+/// zero-cost "this agent predates operator inject binds" probe (its mirror
+/// reads a missing key as null / ""), so a binary that has them must never
+/// omit them.
 pub fn appendSecretJson(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, meta: store.Meta, bound: bool) !void {
 	try out.appendSlice(allocator, "{\"name\":");
 	try store.appendJsonString(allocator, out, name);
@@ -335,6 +426,17 @@ pub fn appendSecretJson(allocator: std.mem.Allocator, out: *std.ArrayList(u8), n
 		var nb: [32]u8 = undefined;
 		try out.appendSlice(allocator, std.fmt.bufPrint(&nb, "{d}", .{b}) catch unreachable);
 	} else try out.appendSlice(allocator, "null");
+	try out.appendSlice(allocator, ",\"inject\":");
+	try out.appendSlice(allocator, if (meta.inject) "true" else "false");
+	try out.appendSlice(allocator, ",\"cookie_name\":");
+	if (meta.cookie_name) |cn| try store.appendJsonString(allocator, out, cn) else try out.appendSlice(allocator, "null");
+	try out.appendSlice(allocator, ",\"port\":");
+	if (meta.port) |p| {
+		var pb: [8]u8 = undefined;
+		try out.appendSlice(allocator, std.fmt.bufPrint(&pb, "{d}", .{p}) catch unreachable);
+	} else try out.appendSlice(allocator, "null");
+	try out.appendSlice(allocator, ",\"on_guest_credential\":");
+	try store.appendJsonString(allocator, out, meta.on_guest_credential);
 	try out.append(allocator, '}');
 }
 
