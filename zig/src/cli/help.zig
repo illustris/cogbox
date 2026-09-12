@@ -24,6 +24,7 @@ pub const TOP_LEVEL =
     \\  list      List all instances
     \\  init      Create instance config and host directories without launching
     \\  ssh       Connect to a running instance via SSH
+    \\  app       Open, list, or stop local browser previews
     \\  rules     Manage CIDR allow/deny rules for an instance
     \\  remap     Manage TCP destination-remap rules
     \\  l7        Manage L7 (vhost) allow/deny rules for an instance
@@ -641,6 +642,24 @@ pub const SECRET =
     \\
 ;
 
+pub const APP =
+    \\cogbox app - local browser previews through the guest app relay
+    \\
+    \\  cogbox app open [--name NAME] --port PORT [--background] [--no-browser]
+    \\                  [--adopt-local]
+    \\  cogbox app list [--name NAME] [--json]
+    \\  cogbox app stop [--name NAME] --port PORT
+    \\
+    \\Open prints a http://127.0.0.1:PORT/ URL and serves until Ctrl-C.
+    \\--background returns after readiness. --no-browser only prints the URL.
+    \\Repeated opens reuse the frontend. Stop never stops the guest application.
+    \\--adopt-local explicitly marks an older, unknown instance as locally owned;
+    \\it never adopts a cogworx-managed instance or overwrites a foreign secret.
+    \\The guest relay reserves port 8080. Cookies are shared across local ports.
+    \\Use -n as an alias for --name; omit it to use the default instance.
+    \\
+;
+
 pub fn forVerb(verb: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, verb, "start")) return START;
     if (std.mem.eql(u8, verb, "console")) return CONSOLE;
@@ -657,6 +676,7 @@ pub fn forVerb(verb: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, verb, "l7")) return L7;
     if (std.mem.eql(u8, verb, "plugin")) return PLUGIN;
     if (std.mem.eql(u8, verb, "secret")) return SECRET;
+    if (std.mem.eql(u8, verb, "app")) return APP;
     return null;
 }
 

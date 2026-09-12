@@ -197,6 +197,7 @@ let
 	} ''
 		mkdir -p $out/bin
 		makeWrapper ${self.packages.${system}.cogbox-hosted}/bin/cogbox $out/bin/cogbox \
+			--set COGBOX_ENVIRONMENT cogworx \
 			--set-default XDG_CONFIG_HOME ${cfg.stateDir}/config \
 			--set-default COGBOX_DATA ${cfg.stateDir}/data/cogbox \
 			--set-default COGBOX_PROXY_RUNAS ${cfg.proxyUser}:${cfg.proxyUser} \

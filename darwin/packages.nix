@@ -1,6 +1,7 @@
 { self, nixpkgs, lib, runtimeDir, mkHarnesses, runner }:
 let
   pkgs = nixpkgs.legacyPackages.aarch64-darwin;
+  app = import ../app-relay/package.nix { inherit pkgs; command = "app"; };
   powerdown = pkgs.writeShellApplication {
     name = "cogbox-powerdown";
     runtimeInputs = [ pkgs.socat pkgs.coreutils ];
@@ -62,6 +63,7 @@ let
     chmod +x $out/libexec/cogbox-launch.sh
     wrapProgram $out/bin/cogbox \
       --set COGBOX_LAUNCH_SCRIPT $out/libexec/cogbox-launch.sh \
+      --set COGBOX_APP_HELPER ${app}/bin/cogbox-app \
       --set COGBOX_HOST_SYSTEM aarch64-darwin \
       --set COGBOX_PLATFORM ${tools}/bin/cogbox-platform \
       --set COGBOX_SHUTDOWN_HELPER ${powerdown}/bin/cogbox-powerdown \
@@ -77,6 +79,7 @@ let
     ln -s cogbox $out/bin/cbx
   '';
 in {
+  cogbox-app = app;
   cogbox = mkCogbox runner;
   default = self.packages.aarch64-darwin.cogbox;
   cogbox-tools = tools;
