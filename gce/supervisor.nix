@@ -141,6 +141,7 @@ in
 				COGBOX_DATA = "${cfg.stateDir}/data/cogbox";
 				XDG_RUNTIME_DIR = "/run/cogbox";
 				COGWORX_STATE_DIR = cfg.stateDir;
+					COGBOX_ENVIRONMENT = "cogworx";
 				COGWORX_SERIAL = cfg.serialDevice;
 				HOME = "/root";
 			};

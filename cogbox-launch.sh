@@ -589,6 +589,8 @@ BASE_RUNTIME="$XDG_RUNTIME_BASE/cogbox"
 
 EFFECTIVE_NAME="${INSTANCE_NAME:-default}"
 INSTANCE_CONFIG_DIR="$CONFIG_DIR/instances/$EFFECTIVE_NAME"
+NEW_INSTANCE_CONFIG=0
+[ -e "$INSTANCE_CONFIG_DIR/config.json" ] || NEW_INSTANCE_CONFIG=1
 # The flake lives in its own subdir so unrelated edits to config.json /
 # authorized_keys don't bust the userExtensions flake's source hash.
 INSTANCE_FLAKE_DIR="$INSTANCE_CONFIG_DIR/flake"
@@ -1109,6 +1111,51 @@ if [ "$SUDO_INVOCATION" = 1 ]; then
 			fi
 		done < <(harness_pathkeys "$h")
 	done
+fi
+
+# -- Environment context (host authority, guest descriptive mirror) --
+# A legacy instance lacking this record stays unknown. Only first creation
+# proves an ordinary local init; every hosted wrapper explicitly supplies
+# cogworx, including init-only/re-exec paths before anything can provision apps.
+case "${COGBOX_ENVIRONMENT:-}" in
+	""|cogworx) ;;
+	*) die "COGBOX_ENVIRONMENT must be cogworx or unset" 64 ;;
+esac
+_environment="$INSTANCE_CONFIG_DIR/environment.json"
+[ ! -L "$_environment" ] || die "environment.json must not be a symlink" 70
+_mode=unknown
+_write_environment=1
+if [ -f "$_environment" ]; then
+	_mode=$(jq -er --arg name "$EFFECTIVE_NAME" 'select(.version == 1 and .instance == $name) | .mode | select(. == "local" or . == "cogworx" or . == "unknown")' "$_environment") || die "invalid environment.json" 70
+	_write_environment=0
+elif [ "$NEW_INSTANCE_CONFIG" = 1 ]; then
+	_mode=local
+	# Existing hosted integration is positive evidence even on an older
+	# wrapper that predates COGBOX_ENVIRONMENT. Never turn it into local mode.
+	if [ -n "${COGWORX_STATE_DIR:-}" ] || [ "${COGBOX_REEXEC_PACKAGE:-}" = cogbox-hosted ]; then
+		_mode=cogworx
+	fi
+fi
+if [ "${COGBOX_ENVIRONMENT:-}" = cogworx ] && [ "$_mode" != cogworx ]; then
+	_mode=cogworx
+	_write_environment=1
+fi
+if [ "$_write_environment" = 1 ]; then
+	_env_tmp=$(mktemp "$INSTANCE_CONFIG_DIR/environment.XXXXXX") || die "cannot stage environment context" 70
+	if ! jq -n --arg mode "$_mode" --arg instance "$EFFECTIVE_NAME" '{version:1,mode:$mode,instance:$instance}' > "$_env_tmp"; then
+		rm -f "$_env_tmp"
+		die "cannot render environment context" 70
+	fi
+	chmod 0600 "$_env_tmp"
+	mv -f "$_env_tmp" "$_environment" || die "cannot publish environment context" 70
+	[ "$SUDO_INVOCATION" != 1 ] || chown "$REAL_USER" "$_environment"
+fi
+# The guest can write this shared tree, so the host NEVER reads the mirror
+# when deciding whether to provision a local credential.
+_env_tmp=$(mktemp "$REAL_DATA/environment.XXXXXX") || die "cannot stage guest environment context" 70
+if ! cp "$_environment" "$_env_tmp" || ! chmod 0644 "$_env_tmp" || ! mv -f "$_env_tmp" "$REAL_DATA/environment.json"; then
+	rm -f "$_env_tmp"
+	die "cannot publish guest environment context" 70
 fi
 
 # -- Re-exec with per-instance extensions overlaid ----------------
@@ -1728,6 +1775,30 @@ fi
 # Bound to runtime, not config, so post-boot edits to config.json don't
 # misdirect connections to a port the VM isn't listening on.
 echo "$SSH_PORT $BIND_ADDR" > "$RUNTIME/ssh-endpoint"
+# An app proxy pins this endpoint to the launch identity; mutable config
+# changes cannot redirect an existing proxy to a different VM or listener.
+_http_tmp=$(mktemp "$RUNTIME/http-endpoint.XXXXXX") || die "cannot stage HTTP endpoint" 70
+if ! jq -n --arg host "$BIND_ADDR" --argjson port "$HTTP_PORT" --arg launch "$STOP_ID" \
+	'{version:1,host:$host,port:$port,launch:$launch}' > "$_http_tmp" || ! mv -f "$_http_tmp" "$RUNTIME/http-endpoint.json"; then
+	rm -f "$_http_tmp"
+	die "cannot publish HTTP endpoint" 70
+fi
+# The SSH provisioning script checks this expected generation inside the
+# guest before changing credentials. It is informational, never a source of
+# host ownership: guest root can edit the shared state. Publish a whole record
+# before starting QEMU so a recycled SSH forward cannot mutate the next run.
+_app_launch_tmp=$(mktemp "$REAL_DATA/.app-launch.XXXXXX") || die "cannot stage guest launch identity" 70
+if ! printf '%s\n' "$STOP_ID" > "$_app_launch_tmp" || ! chmod 0644 "$_app_launch_tmp" || ! mv -fT "$_app_launch_tmp" "$REAL_DATA/.app-launch"; then
+	rm -f "$_app_launch_tmp"
+	die "cannot publish guest launch identity" 70
+fi
+# The local host helper runs as the invoking user even when the launcher
+# needed sudo. These nonsecret identity records remain private to that user;
+# legacy unknown instances also need them to perform explicit local adoption.
+if [ "$SUDO_INVOCATION" = 1 ] && [ "$_mode" != cogworx ]; then
+	chmod 0600 "$RUNTIME/launch" "$RUNTIME/http-endpoint.json" "$RUNTIME/ssh-endpoint" || die "cannot protect local endpoint metadata" 70
+	chown "$REAL_USER" "$RUNTIME/launch" "$RUNTIME/http-endpoint.json" "$RUNTIME/ssh-endpoint" || die "cannot assign local endpoint ownership" 70
+fi
 # The legacy pid marker stays AFTER the ssh-endpoint write above: `cogbox ssh`
 # gates on pid and then dies on a missing endpoint, so publishing pid earlier
 # would turn a launch caught in the port probe into a misleading error. The

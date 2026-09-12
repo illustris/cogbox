@@ -129,6 +129,7 @@ attach and detach (`Ctrl-]`) freely without stopping the VM.
 | `remap` | Manage TCP destination-remap rules -- [docs](docs/network-filtering.md#tcp-destination-remap) |
 | `l7` | Manage L7 (vhost) allow/deny rules -- [docs](docs/network-filtering.md#l7-host-filtering) |
 | `plugin` | Manage guest plugins -- [docs](docs/plugins.md) |
+| `app` | Open, list, or stop local browser previews through the built-in relay -- [docs](docs/local-apps.md) |
 | `help` | `cogbox help VERB` ≡ `cogbox VERB --help` |
 
 Run `cogbox VERB --help` for verb-specific options.

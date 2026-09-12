@@ -18,6 +18,7 @@ const remap_verb = @import("verbs/remap.zig");
 const l7_verb = @import("verbs/l7.zig");
 const plugin_verb = @import("verbs/plugin.zig");
 const secret_verb = @import("verbs/secret.zig");
+const app_verb = @import("verbs/app.zig");
 const run_verb = @import("verbs/run.zig");
 const rules_module = @import("rules_module");
 const l7proxy_module = @import("l7proxy_module");
@@ -33,7 +34,7 @@ const claude_stub_verb = @import("verbs/claude_stub.zig");
 const KNOWN_VERBS = [_][]const u8{
 	"start", "stop",  "restart", "status",  "list",    "init",
 	"ssh",   "rules", "remap",   "l7",      "plugin",  "secret",
-	"console", "monitor", "delete", "help",
+	"console", "monitor", "delete", "help", "app",
 	// Hidden re-exec / helper targets, recognized below but omitted from
 	// help: "__launch" (re-exec), "__l7proxy" (the host-side L7 proxy),
 	// "__render-rules" (boot-time runtime-file renderer), "enforce" (the
@@ -126,6 +127,7 @@ pub fn main(init: std.process.Init) !void {
 	if (std.mem.eql(u8, verb, "l7")) return l7_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "plugin")) return plugin_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "secret")) return secret_verb.run(allocator, io, env, &p, rest);
+	if (std.mem.eql(u8, verb, "app")) return app_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "enforce")) return enforce_verb.run(allocator, io, env, rest);
 	if (std.mem.eql(u8, verb, "__l7proxy")) {
 		if (rest.len < 1) util.die(allocator, io, null, exit_codes.usage, "__l7proxy requires a runtime dir [l7-base-port]", .{});

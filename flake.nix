@@ -623,6 +623,7 @@
 					# in gce/cogbox-host.nix.
 				};
 			})
+			./modules/app-relay.nix
 			userExt
 			# `options` is taken here (not just `config`) for ONE reason: the plugin
 			# brain below has to know WHICH plugin defined each cogbox.contents root,
@@ -1865,7 +1866,7 @@
 					""
 					"# Installed capabilities"
 					""
-					"Plugin-provided skills available in this sandbox. Load a skill by relevance before answering domain questions in its area."
+					"Built-in and plugin-provided skills available in this sandbox. Load a skill by relevance before answering domain questions in its area."
 					""
 					"| skill | plugin | description |"
 					"|---|---|---|"
@@ -3827,7 +3828,7 @@
 								"XDG_CONFIG_HOME=${stateRoot}/config"
 								"COGBOX_DATA=${cogboxData}"
 							];
-							PassEnvironment = [ "COGBOX_INSTANCE" ];
+							PassEnvironment = [ "COGBOX_INSTANCE" "COGBOX_ENVIRONMENT" ];
 							ExecStart = cogboxInitScript;
 						};
 					};
@@ -4460,6 +4461,8 @@
 
 				wrapProgram $out/bin/cogbox \
 					--set COGBOX_LAUNCH_SCRIPT $out/libexec/cogbox-launch.sh \
+					--set COGBOX_APP_HELPER ${self.packages.${system}.cogbox-app}/bin/cogbox-app \
+					${lib.optionalString (reexecAttr == "cogbox-hosted") "--set COGBOX_ENVIRONMENT cogworx"} \
 					--set COGBOX_ENFORCE_SCRIPT $out/libexec/cogbox-enforce.sh \
 					--set-default COGBOX_FLAKE_SOURCE "${self}" \
 					--set-default COGBOX_NIXPKGS_SOURCE "${nixpkgs}" \
@@ -4477,6 +4480,8 @@
 			# stays exactly as it was and keeps re-execing through `cogbox`.
 			mkCogbox = mkCogboxAttr "cogbox";
 		in rec {
+			cogbox-app = import ./app-relay/package.nix { inherit pkgs; command = "app"; };
+			cogbox-app-relay = import ./app-relay/package.nix { inherit pkgs; command = "relay"; };
 			cogbox-tools = pkgs.stdenv.mkDerivation {
 				pname = "cogbox-tools";
 				version = "0.1.0";
@@ -4610,7 +4615,7 @@
 				];
 				config = {
 					Entrypoint = [ "/bin/sh" ];
-					Env = [ "PATH=/bin" "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
+					Env = [ "PATH=/bin" "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" "COGBOX_ENVIRONMENT=cogworx" ];
 				};
 			};
 
@@ -4665,6 +4670,7 @@
 						"PATH=/run/current-system/sw/bin:/usr/bin:/bin"
 						"XDG_CONFIG_HOME=/var/lib/cogbox-state/config"
 						"COGBOX_DATA=/var/lib/cogbox-state/data/cogbox"
+						"COGBOX_ENVIRONMENT=cogworx"
 						"XDG_RUNTIME_DIR=/run/cogbox"
 						"SSL_CERT_FILE=/run/cogbox/ca-bundle.crt"
 						# UTF-8 locale for a `kubectl exec` (which sources no login
@@ -5498,12 +5504,38 @@
 			# and k8s backends untouched. Plus: no failure path echoes credential
 			# context, which matters wherever the launcher's stderr lands somewhere
 			# retained outside the machine.
+			native-app-module = let
+				configs = [
+					self.nixosConfigurations.${configName system}
+					self.nixosConfigurations."${configName system}-container"
+				];
+				checkConfig = base: let
+					legacy = (base.extendModules { modules = [ ./tests/fixtures/native-app/legacy-module.nix ]; }).config;
+					native = base.config;
+					envs = [ "-/var/lib/cogbox/app-relay.env" "-/var/lib/cogbox-state/app-relay.env" ];
+				in assert native.systemd.services.cogbox-app-relay.serviceConfig.EnvironmentFile == envs;
+					assert lib.hasInfix "/bin/cogbox-app-relay --listen 0.0.0.0:8080" native.systemd.services.cogbox-app-relay.serviceConfig.ExecStart;
+					assert lib.hasInfix "/bin/app-relay --listen 0.0.0.0:8080" legacy.systemd.services.cogbox-app-relay.serviceConfig.ExecStart;
+					assert legacy.systemd.services.cogbox-app-relay.serviceConfig.EnvironmentFile == envs;
+					assert legacy.system.build.cogboxBrainUnits.skills.app-relay == ./skills/app-relay;
+					assert native.system.build.cogboxBrainUnits.skills.cogbox-environment == ./skills/cogbox-environment;
+					true;
+			in assert lib.all checkConfig configs;
+				pkgs.runCommand "cogbox-native-app-module" {
+					nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.coreutils ];
+				} ''
+					python3 ${./tests/test_guest_environment.py} \
+						${pkgs.writeText "vm-environment.sh" (builtins.head configs).config.systemd.services.cogbox-environment.script} \
+						${pkgs.writeText "container-environment.sh" (builtins.elemAt configs 1).config.systemd.services.cogbox-environment.script} -v
+					touch $out
+				'';
 			launch-flag-tests = pkgs.runCommand "cogbox-launch-flag-tests" {
 				nativeBuildInputs = with pkgs; [ bash jq coreutils gnugrep python3 ];
 			} ''
 				export HOME=$TMPDIR
 				bash ${./tests/test_launch_flags.sh} ${./cogbox-launch.sh}
 				python3 ${./tests/test_runtime_base.py} ${./cogbox-launch.sh} -v
+				python3 ${./tests/test_app_environment.py} ${./cogbox-launch.sh} -v
 				touch $out
 			'';
 
