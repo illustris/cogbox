@@ -513,13 +513,15 @@ the guest's stage 1 cannot boot without.
 The read-only harness lower is identical in both profiles -- that is the
 security property, and the hosted case loses nothing by keeping it.
 
-Pre-installed tools: core — `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`, `nixfs`; search/files — `ripgrep`, `fd`, `bat`, `sd`; data wrangling — `yq-go`, `duckdb`, `miller`, `dasel`, `gron`, `datamash`, `jo`; HTTP/DNS/web — `xh`, `websocat`, `dnsutils`, `htmlq`, `pup`; shell glue — `moreutils` (plus `xargs -P` for parallelism); remote shell - `mosh-server` (server half only, for cogworx's mosh relay; the guest admits UDP 60000-60031 per `mosh-udp-range.nix`).
+Pre-installed tools: core — `git`, `curl`, `jq`, `vim`, `ncdu`, `tmux`, `htop`; search/files — `ripgrep`, `fd`, `bat`, `sd`; data wrangling — `yq-go`, `duckdb`, `miller`, `dasel`, `gron`, `datamash`, `jo`; HTTP/DNS/web — `xh`, `websocat`, `dnsutils`, `htmlq`, `pup`; shell glue — `moreutils` (plus `xargs -P` for parallelism); remote shell - `mosh-server` (server half only, for cogworx's mosh relay; the guest admits UDP 60000-60031 per `mosh-udp-range.nix`).
 Harness binaries (with launchers): `claude-code` (`c`), `hermes-agent`
 (`h`), `opencode` (`oc`), and `pi` (`p`) on `x86_64-linux` and
 `aarch64-linux` (sourced from `numtide/llm-agents.nix`). `codex` (`cx`)
 is opt-in (see above) and built in only when `enableCodex` is set.
 Architecture-conditional extras: `bpftrace` (x86_64, aarch64), `nix-mcp`
-(where the `nix-mcp` flake publishes a build).
+(where the `nix-mcp` flake publishes a build), and `herdr`, a terminal
+workspace manager for AI coding agents (wherever `llm-agents.nix` publishes a
+package set).
 
 ## GCE backend image
 

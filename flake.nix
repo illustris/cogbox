@@ -624,6 +624,7 @@
 				};
 			})
 			./modules/app-relay.nix
+			./modules/sandbox-skills.nix
 			userExt
 			# `options` is taken here (not just `config`) for ONE reason: the plugin
 			# brain below has to know WHICH plugin defined each cogbox.contents root,
@@ -2781,6 +2782,15 @@
 				]
 				++ lib.optionals (system != "riscv64-linux") [
 					bpftrace
+				]
+				# herdr is a terminal workspace manager for AI coding agents: it
+				# drives the harnesses rather than being one, so it stays out of
+				# mkHarnesses (no launcher letter, no host-config mount, no auth key
+				# of its own) and is just another tool on PATH. Gated on the arch
+				# because llm-agents.nix publishes no riscv64-linux package set, and
+				# an ungated reference would break that config's evaluation.
+				++ lib.optionals (builtins.hasAttr system inputs.llm-agents.packages) [
+					inputs.llm-agents.packages.${system}.herdr
 				]
 				# Container backend: the cogbox CLI itself, so cogworx can
 				# `kubectl exec <pod> -c agent -- cogbox <verb> -n <name>` to drive
@@ -5519,6 +5529,8 @@
 					assert legacy.systemd.services.cogbox-app-relay.serviceConfig.EnvironmentFile == envs;
 					assert legacy.system.build.cogboxBrainUnits.skills.app-relay == ./skills/app-relay;
 					assert native.system.build.cogboxBrainUnits.skills.cogbox-environment == ./skills/cogbox-environment;
+					assert native.system.build.cogboxBrainUnits.skills.cogbox-filesystem == ./skills/cogbox-filesystem;
+					assert native.system.build.cogboxBrainUnits.skills.cogbox-packages == ./skills/cogbox-packages;
 					true;
 			in assert lib.all checkConfig configs;
 				pkgs.runCommand "cogbox-native-app-module" {
