@@ -21,12 +21,8 @@ not permissions or credentials. A missing or malformed file means unknown.
 For web previews, load the `app-relay` skill. Never read or print relay secrets
 to discover a URL. Report observed readiness separately from configuration.
 
-Keep project work in `~/work` (`/root/work`), the sandbox's persistent workspace.
-Other root filesystem paths have different lifetimes: some caches and harness
-homes are persisted or overlaid, while other paths belong to the disposable
-guest/container system. Do not assume arbitrary files under `/root`, `/tmp`,
-or the system filesystem survive a restart. Installed Nix packages and guest
-configuration are managed by the base and per-instance extensions.
+Keep project work in `~/work` (`/root/work`), the sandbox's persistent
+workspace, and load the `cogbox-filesystem` skill for path lifetimes.
 
 Network mode determines egress: `none` blocks outbound access, `full` permits
 it, and `rules` applies the host's configured policy. A connection failure can
