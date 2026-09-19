@@ -45,14 +45,6 @@ extern "c" fn getsockname(fd: c_int, addr: *c.struct_sockaddr, len: *c.socklen_t
 // the low 8 bits.
 const SOCK_TYPE_MASK: c_int = 0xff;
 
-// fcntl bits used to toggle O_NONBLOCK around the remap+SOCKS5 path.
-// passt creates non-blocking sockets; the SOCKS5 handshake needs the
-// connect()+read+write to block until each step completes.
-const F_GETFL: c_int = 3;
-const F_SETFL: c_int = 4;
-const O_NONBLOCK: c_int = c.O_NONBLOCK;
-extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
-
 // RTLD_NEXT = ((void *)-1)
 const RTLD_NEXT: *anyopaque = @ptrFromInt(~@as(usize, 0));
 
@@ -433,49 +425,71 @@ fn connect(fd: c_int, addr: ?*const c.struct_sockaddr, len: c.socklen_t) callcon
 	return real_connect.?(fd, addr, len);
 }
 
-/// Execute a TCP connect with destination rewritten to `target` and a
-/// SOCKS5 CONNECT handshake driven on the fd to carry the original
-/// destination to the proxy. The handshake is synchronous, so we must
-/// clear O_NONBLOCK for its duration (passt sets it on every socket).
+/// The whole remapped exchange -- the TCP connect to the proxy and the SOCKS5
+/// CONNECT handshake on top of it -- shares one monotonic budget. A stalled
+/// proxy must not hold passt's only event-loop thread for longer than this.
+const remap_budget_ms: u32 = 5000;
+
+const RemapCtx = struct {
+	orig_addr: filter.IpAddr,
+	orig_port: u16,
+	target: filter.RemapTarget,
+};
+
+/// The session dials through the dlsym'd libc connect: calling `connect()`
+/// here would re-enter this shim's own wrapper. The sockaddr is untyped
+/// across the module boundary because socks5's @cImport produces a distinct
+/// `struct sockaddr` type from this one.
+fn realConnect(fd: c_int, sa: *const anyopaque, len: u32) callconv(.c) c_int {
+	return real_connect.?(fd, @ptrCast(@alignCast(sa)), len);
+}
+
+fn remapBody(session: *socks5.Session, ctx: RemapCtx) socks5.Error!void {
+	const target_sa = buildIpv4Sockaddr(ctx.target.addr, ctx.target.port);
+	try session.connect(&realConnect, &target_sa, @sizeOf(c.struct_sockaddr_in));
+	try session.handshake(ctx.orig_addr, ctx.orig_port);
+}
+
+/// Map a session failure onto the errno the guest's connect() will see.
+fn remapErrno(err: socks5.Error) void {
+	std.c._errno().* = switch (err) {
+		// The dial, or a syscall the session made around it (fcntl,
+		// getsockopt, setsockopt, read, write), already left the real reason
+		// in errno -- including EAGAIN from ephemeral-port exhaustion, which
+		// is emphatically not a timeout. Keep it. EIO only covers the
+		// theoretical case of a failure that set nothing.
+		error.ConnectFailed, error.IoError => blk: {
+			const e = std.c._errno().*;
+			break :blk if (e == 0) c.EIO else e;
+		},
+		// The shared budget ran out, wherever it ran out.
+		error.TimedOut => c.ETIMEDOUT,
+		// The proxy answered but refused, or did not speak SOCKS5, or hung up
+		// mid-reply: the guest's destination is not reachable through it.
+		error.AuthMethodRejected, error.ConnectRejected, error.ProtocolError, error.Truncated => c.EHOSTUNREACH,
+	};
+}
+
 fn doRemappedConnect(
 	fd: c_int,
 	orig_addr: filter.IpAddr,
 	orig_port: u16,
 	target: filter.RemapTarget,
 ) c_int {
-	const old_flags = fcntl(fd, F_GETFL);
-	if (old_flags < 0) {
-		denyErrno();
+	const ctx: RemapCtx = .{ .orig_addr = orig_addr, .orig_port = orig_port, .target = target };
+	// Session.run restores the fd's blocking mode and socket timeouts on every
+	// path. A failed exchange keeps its own error and errno: the restore can
+	// never mask it. A successful exchange survives a timeout that could not
+	// be put back, but NOT a blocking mode that could not be put back --
+	// passt would go on to drive a blocking fd from its single-threaded epoll
+	// loop, so this one flow is failed (with the fcntl errno) instead of
+	// risking the whole loop. The shim has no logging channel, so the
+	// discarded timeout-restore failure is necessarily silent.
+	socks5.Session.run(fd, remap_budget_ms, ctx, remapBody) catch |err| {
+		remapErrno(err);
 		return -1;
-	}
-	const was_nonblock = (old_flags & O_NONBLOCK) != 0;
-	if (was_nonblock) {
-		if (fcntl(fd, F_SETFL, old_flags & ~O_NONBLOCK) < 0) {
-			denyErrno();
-			return -1;
-		}
-	}
-
-	var target_sa = buildIpv4Sockaddr(target.addr, target.port);
-	const target_len: c.socklen_t = @intCast(@sizeOf(c.struct_sockaddr_in));
-	const sa_ptr: *const c.struct_sockaddr = @ptrCast(&target_sa);
-
-	const rc = real_connect.?(fd, sa_ptr, target_len);
-	if (rc != 0) {
-		const saved = std.c._errno().*;
-		if (was_nonblock) _ = fcntl(fd, F_SETFL, old_flags);
-		std.c._errno().* = saved;
-		return rc;
-	}
-
-	const hs = socks5.handshake(fd, orig_addr, orig_port);
-	if (was_nonblock) _ = fcntl(fd, F_SETFL, old_flags);
-	if (hs) |_| {
-		return 0;
-	} else |_| {
-		std.c._errno().* = c.EHOSTUNREACH;
-		return -1;
-	}
+	};
+	return 0;
 }
 
 fn sendto(fd: c_int, buf: ?*const anyopaque, len: usize, flags: c_int, dest_addr: ?*const c.struct_sockaddr, addrlen: c.socklen_t) callconv(.c) isize {

@@ -109,7 +109,7 @@ test "socks5 carry: the recovered orig dst becomes the SOCKS5 CONNECT target" {
 	// Pre-stage the enforcer's SOCKS5 server replies, then drive the client side.
 	try writeAll(sv[1], &.{ 0x05, 0x00 }); // method select: no-auth
 	try writeAll(sv[1], &.{ 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }); // CONNECT ok
-	try socks5.handshake(sv[0], orig.addr, orig.port);
+	try socks5.handshake(sv[0], main.handshake_budget_ms, orig.addr, orig.port);
 
 	// Inspect the greeting + CONNECT the shim wrote: it must carry the recovered
 	// IP:port verbatim (this is what the enforcer's socks5 accept path parses).
