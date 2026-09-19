@@ -35,7 +35,11 @@ default port forwards bind to loopback; `bindAddr` selects another address.
 In `rules` and `full` mode, a separate `cogbox-slirp` process translates QEMU's
 Ethernet frames using libslirp. In `rules` mode it loads `libnetfilter.dylib` via
 dyld interposition, sharing the existing L4 rules, DNS rules, TCP remapping,
-L7 proxies, and credential injection. It refuses to start if the filter or its
+L7 proxies, and credential injection. The remap path dials its proxy differently
+here than on Linux -- macOS does not bound `connect()` with `SO_SNDTIMEO`, and
+this host is under no seccomp filter, so the dial is non-blocking and waited for
+with `poll()`; see the remap deadline section of
+[network filtering](network-filtering.md#tcp-destination-remap). It refuses to start if the filter or its
 rules file is missing. The library is loaded only into the network helper.
 `none` mode uses QEMU's restricted networking with the SSH/HTTP port forwards.
 

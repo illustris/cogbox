@@ -49,6 +49,9 @@ const SO_ORIGINAL_DST: c_int = 80;
 const MSG_NOSIGNAL: c_int = c.MSG_NOSIGNAL;
 
 const io_timeout_secs: i32 = 15;
+/// Budget for the whole SOCKS5 handshake to the enforcer. Stated here
+/// rather than inherited from the socks5 client, which has no default.
+pub const handshake_budget_ms: u32 = @as(u32, @intCast(io_timeout_secs)) * 1000;
 const relay_idle_ms: c_int = 120_000;
 const relay_buf: usize = 32 * 1024;
 const max_conns: usize = 512;
@@ -133,7 +136,10 @@ fn worker(client_fd: c_int) void {
 	defer _ = c.close(efd);
 	setTimeouts(efd);
 
-	socks5.handshake(efd, orig.addr, orig.port) catch return;
+	// The shim states its own handshake budget rather than inheriting the
+	// passt remap's much tighter one: this hop is a pod-network call to the
+	// enforcer's ClusterIP, sized like every other I/O here (io_timeout_secs).
+	socks5.handshake(efd, handshake_budget_ms, orig.addr, orig.port) catch return;
 	relay(client_fd, efd);
 }
 

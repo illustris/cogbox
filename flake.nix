@@ -5644,6 +5644,14 @@
 						&& touch $out
 				'';
 			};
+		} // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+			remap-deadline = pkgs.runCommand "cogbox-remap-deadline" {
+				nativeBuildInputs = [ pkgs.python3 ];
+				NETFILTER_TEST_LIB = "${self.packages.${system}.cogbox-tools}/lib/libnetfilter.so";
+			} ''
+				python3 ${./tests/test_remap_deadline.py}
+				touch $out
+			'';
 		} // lib.optionalAttrs (system == "x86_64-linux") {
 			# On the container backend the guest half
 			# (plugin commands/skills/agents + cogbox.packages) is
