@@ -164,11 +164,14 @@ pub fn writeCompositionFlake(
 
 	const path = try std.fs.path.join(allocator, &.{ dir, "flake.nix" });
 	defer allocator.free(path);
-	const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+	var nonce: [16]u8 = undefined;
+	io.random(&nonce);
+	const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ path, nonce });
 	defer allocator.free(tmp_path);
+	defer cwd.deleteFile(io, tmp_path) catch {};
 
 	{
-		const f = try cwd.createFile(io, tmp_path, .{ .truncate = true });
+		const f = try cwd.createFile(io, tmp_path, .{ .exclusive = true });
 		defer f.close(io);
 		var write_buf: [4096]u8 = undefined;
 		var writer = f.writer(io, &write_buf);

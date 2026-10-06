@@ -55,6 +55,7 @@ pub fn run(
     argv: []const []const u8,
 ) !void {
     const flags = [_]parse.Flag{
+        .{ .long = "existing", .kind = .bool },
         .{ .long = "name", .short = 'n', .kind = .value },
         .{ .long = "vcpu", .kind = .value },
         .{ .long = "mem", .kind = .value },

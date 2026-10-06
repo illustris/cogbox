@@ -21,6 +21,7 @@ pub const TOP_LEVEL =
     \\  restart   Stop then start
     \\  delete    Delete an instance's config and persistent files
     \\  status    Print whether an instance is running, its ports, and net mode
+    \\  config    Inspect host context or set stopped-instance resources
     \\  list      List all instances
     \\  init      Create instance config and host directories without launching
     \\  ssh       Connect to a running instance via SSH
@@ -93,6 +94,7 @@ pub const START =
     \\                        the VM in the background and return.
     \\  -f, --foreground      Attach the serial console after launch instead of
     \\                        sshing. Detaching (Ctrl-]) leaves the VM running.
+    \\  --existing            Require an existing instance; never initialize it
     \\  --vcpu N              vCPU count (default: 4 on macOS, 16 on Linux; or config.json)
     \\  --mem N               RAM in MB (default: 8192 on macOS, 32768 on Linux; or config.json)
     \\  --network MODE        Network mode: full, none, or rules (default: rules)
@@ -271,6 +273,7 @@ pub const INIT =
     \\
     \\Options:
     \\  -n, --name NAME       Instance name (default: "default")
+    \\  --exclusive           Refuse an existing name, including concurrent init
     \\  --vcpu N              vCPU count to bake into the new config
     \\  --mem N               RAM in megabytes to bake into the new config
     \\  --network MODE        Network mode: full, none, or rules
@@ -569,7 +572,7 @@ pub const SECRET =
     \\                        [--on-guest-credential replace|keep] [-n INSTANCE]
     \\  cogbox secret ls [--json]
     \\  cogbox secret rm NAME [-n INSTANCE]
-    \\  cogbox secret reload -n INSTANCE
+    \\  cogbox secret reload [-n INSTANCE]
     \\
     \\Options:
     \\  --from-file F     Read the secret value from file F (mode preserved 0600)
@@ -661,6 +664,7 @@ pub const APP =
 ;
 
 pub fn forVerb(verb: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, verb, "config")) return CONFIG;
     if (std.mem.eql(u8, verb, "start")) return START;
     if (std.mem.eql(u8, verb, "console")) return CONSOLE;
     if (std.mem.eql(u8, verb, "monitor")) return MONITOR;
@@ -683,3 +687,14 @@ pub fn forVerb(verb: []const u8) ?[]const u8 {
 pub fn print(io: std.Io, body: []const u8) !void {
     try util.writeStdout(io, body);
 }
+
+pub const CONFIG =
+    \\Usage: cogbox config context --json
+    \\       cogbox config set [-n NAME] [--vcpu N] [--mem MB]
+    \\
+    \\context reports version 1, uid, user, configDir, dataDir and runtimeDir.
+    \\It resolves canonical paths without creating files or directories.
+    \\set updates an existing stopped instance and preserves other settings.
+    \\At least one resource setting is required; omit -n for the default instance.
+    \\
+;

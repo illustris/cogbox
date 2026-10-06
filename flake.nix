@@ -5542,12 +5542,19 @@
 					touch $out
 				'';
 			launch-flag-tests = pkgs.runCommand "cogbox-launch-flag-tests" {
-				nativeBuildInputs = with pkgs; [ bash jq coreutils gnugrep python3 ];
+				nativeBuildInputs = with pkgs; [ bash jq coreutils gnugrep python3 util-linux ];
 			} ''
 				export HOME=$TMPDIR
 				bash ${./tests/test_launch_flags.sh} ${./cogbox-launch.sh}
 				python3 ${./tests/test_runtime_base.py} ${./cogbox-launch.sh} -v
 				python3 ${./tests/test_app_environment.py} ${./cogbox-launch.sh} -v
+				touch $out
+			'';
+
+			config-contract-tests = pkgs.runCommand "cogbox-config-contract-tests" {
+				nativeBuildInputs = with pkgs; [ bash coreutils python3 util-linux jq gnugrep gnused diffutils ];
+			} ''
+				python3 ${./tests/test_config_contract.py} ${./cogbox-launch.sh} ${self.packages.${system}.cogbox-tools}/bin/cogbox -v
 				touch $out
 			'';
 

@@ -1838,16 +1838,26 @@ fn noteWrite(name: []const u8) void {
 /// If <runtime>/passt.pid exists and the process is alive, send SIGUSR1.
 /// Returns true if a signal was sent.
 pub fn maybeSignalPasst(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8) !bool {
-	return signalPidfile(allocator, io, runtime_dir, "passt.pid", std.posix.SIG.USR1);
+	return signalPidfile(allocator, io, runtime_dir, "passt.pid", std.posix.SIG.USR1, false);
 }
 
 /// If <runtime>/l7proxy.pid exists and the process is alive, send SIGHUP so
 /// the L7 proxy re-reads netfilter-rules + l7-rules. No-op if not running.
 pub fn maybeSignalL7proxy(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8) !bool {
-	return signalPidfile(allocator, io, runtime_dir, "l7proxy.pid", std.posix.SIG.HUP);
+	return signalPidfile(allocator, io, runtime_dir, "l7proxy.pid", std.posix.SIG.HUP, false);
 }
 
-fn signalPidfile(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, pidfile: []const u8, sig: std.posix.SIG) !bool {
+/// Explicit reload must report activation failures after publishing the files.
+/// Attempt both consumers before returning either failure. Missing/dead helpers
+/// remain normal: not every network mode starts both of them.
+pub fn signalHelpers(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8) !void {
+	const l7 = signalPidfile(allocator, io, runtime_dir, "l7proxy.pid", std.posix.SIG.HUP, true);
+	const passt = signalPidfile(allocator, io, runtime_dir, "passt.pid", std.posix.SIG.USR1, true);
+	_ = try l7;
+	_ = try passt;
+}
+
+fn signalPidfile(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, pidfile: []const u8, sig: std.posix.SIG, strict: bool) !bool {
 	const path = try std.fs.path.join(allocator, &.{ runtime_dir, pidfile });
 	defer allocator.free(path);
 
@@ -1860,15 +1870,31 @@ fn signalPidfile(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const 
 
 	var read_buf: [64]u8 = undefined;
 	var reader = file.reader(io, &read_buf);
-	const contents = reader.interface.allocRemaining(allocator, .limited(64)) catch return false;
+	const contents = reader.interface.allocRemaining(allocator, .limited(64)) catch |err| {
+		if (strict) return err;
+		return false;
+	};
 	defer allocator.free(contents);
 
 	const trimmed = std.mem.trim(u8, contents, " \t\r\n");
-	const pid = std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch return false;
+	const pid = std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch |err| {
+		if (strict) return err;
+		return false;
+	};
+	if (pid <= 0) {
+		if (strict) return error.InvalidHelperPid;
+		return false;
+	}
 
 	const sig_zero: std.posix.SIG = @enumFromInt(0);
-	std.posix.kill(pid, sig_zero) catch return false;
-	std.posix.kill(pid, sig) catch return false;
+	std.posix.kill(pid, sig_zero) catch |err| {
+		if (strict and err != error.ProcessNotFound) return err;
+		return false;
+	};
+	std.posix.kill(pid, sig) catch |err| {
+		if (strict and err != error.ProcessNotFound) return err;
+		return false;
+	};
 	return true;
 }
 

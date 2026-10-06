@@ -7,6 +7,7 @@ const exit_codes = @import("exit.zig");
 const paths = @import("paths.zig");
 const preflight = @import("preflight.zig");
 
+const config_verb = @import("verbs/config.zig");
 const list_verb = @import("verbs/list.zig");
 const status_verb = @import("verbs/status.zig");
 const stop_verb = @import("verbs/stop.zig");
@@ -34,7 +35,7 @@ const claude_stub_verb = @import("verbs/claude_stub.zig");
 const KNOWN_VERBS = [_][]const u8{
 	"start", "stop",  "restart", "status",  "list",    "init",
 	"ssh",   "rules", "remap",   "l7",      "plugin",  "secret",
-	"console", "monitor", "delete", "help", "app",
+	"console", "monitor", "delete", "help", "app", "config",
 	// Hidden re-exec / helper targets, recognized below but omitted from
 	// help: "__launch" (re-exec), "__l7proxy" (the host-side L7 proxy),
 	// "__render-rules" (boot-time runtime-file renderer), "enforce" (the
@@ -116,6 +117,7 @@ pub fn main(init: std.process.Init) !void {
 		return;
 	}
 
+	if (std.mem.eql(u8, verb, "config")) return config_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "list")) return list_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "status")) return status_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "stop")) return stop_verb.run(allocator, io, &p, rest);

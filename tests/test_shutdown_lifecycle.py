@@ -5,6 +5,7 @@ Unlike test_shutdown.py, no launcher functions or admission wiring are copied.
 The production substitution boundary supplies a hermetic runner and helper.
 """
 import fcntl
+import json
 import os
 from pathlib import Path
 import shlex
@@ -325,6 +326,56 @@ class Lifecycle(unittest.TestCase):
         self.assertNotEqual(identity[1], result[1])
         self.cli("stop")
         self.ended(identity)
+
+    def test_existing_start_rechecks_after_foreground_init(self):
+        self.cli("init", "--no-auto-keys", "--yes", "--network", "none")
+        original = self.script.with_name("original-launcher")
+        self.script.rename(original)
+        config_dir = self.root / "config/cogbox/instances/demo"
+        self.executable(self.script, f"#!{self.bash}\n"
+                        f"case \" $* \" in *' --init-only '*)\n"
+                        f"  {Q(str(original))} \"$@\" || exit $?\n"
+                        f"  rm -rf {Q(str(config_dir))}\n"
+                        f"  exit 0 ;;\nesac\n"
+                        f"exec {Q(str(original))} \"$@\"\n")
+        self.cli("start", "--existing", "--no-ssh", ok=False)
+        self.assertFalse(config_dir.exists(), "daemon phase recreated a deleted instance")
+
+    def test_launcher_port_update_and_waiting_writer_preserve_both_changes(self):
+        self.cli("init", "--no-auto-keys", "--yes", "--network", "rules")
+        cfg = self.root / "config/cogbox/instances/demo/config.json"
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            occupied = listener.getsockname()[1]
+            doc = json.loads(cfg.read_text())
+            doc["sshPort"] = occupied
+            doc["future"] = {"keep": True}
+            cfg.write_text(json.dumps(doc))
+            self.hold_probe.touch()
+            starter = subprocess.Popen([str(CLI), "start", "--existing", "-n", "demo", "--no-ssh", "--network", "none"],
+                                       env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.children.append(starter)
+            try:
+                self.wait_for(self.probe_entered.exists)
+                writer = subprocess.Popen([str(CLI), "rules", "add", "allow", "192.0.2.1/32", "-n", "demo"],
+                                          env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.children.append(writer)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    writer.communicate(timeout=.2)
+            finally:
+                self.hold_probe.unlink()
+            out, err = starter.communicate(timeout=8)
+            self.assertEqual(starter.returncode, 0, out + err)
+            out, err = writer.communicate(timeout=8)
+            self.assertEqual(writer.returncode, 0, out + err)
+        actual = json.loads(cfg.read_text())
+        self.assertNotEqual(actual["sshPort"], occupied)
+        self.assertEqual(actual["future"], doc["future"])
+        self.assertTrue(any(r.get("allow") == "192.0.2.1/32" for r in actual["network"]["rules"]))
+        # Successful live config mutation also proves the VM did not inherit
+        # the config lock for its lifetime.
+        self.cli("stop")
 
     def test_stale_qemu_hint_cannot_report_new_start_ready(self):
         self.cli("init", "--no-auto-keys", "--yes", "--network", "none")

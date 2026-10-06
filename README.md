@@ -169,6 +169,7 @@ Additional-directory grants are launch-only and do not change the `config.json` 
 | 65 | EX_DATAERR: invalid value or wrong-type directory input |
 | 66 | EX_NOINPUT: missing or inaccessible config, file, or directory |
 | 70 | EX_SOFTWARE: internal/system error |
+| 73 | EX_CANTCREAT: exclusive initialization found an existing name |
 | 75 | EX_TEMPFAIL: already running, port collision |
 
 ### Examples
@@ -193,6 +194,35 @@ cogbox -f                           # start and watch it boot
 cogbox console                      # attach the console later
 cogbox monitor                      # QEMU monitor ((qemu) prompt)
 ```
+
+### Local management contract
+
+A local web UI can inspect Cogbox's effective roots without initializing state:
+
+```sh
+cbx config context --json
+cbx config set -n work --vcpu 4 --mem 8192
+cbx init --exclusive -n work --yes
+cbx start --existing -n work --no-ssh
+cbx secret reload                    # reload the unnamed default instance
+```
+
+`config context --json` returns version `1`, numeric effective `uid`, OS `user`,
+and canonical absolute `configDir`, `dataDir` and `runtimeDir` paths. The runtime
+root includes `cogbox`; named instances append `-NAME`, while the unnamed default
+uses the root directly. Reading context creates no directories. An unset or
+missing runtime directory uses the same fallback in the CLI and launcher.
+
+`config set` requires at least one resource setting and an existing stopped
+instance. CPU bounds are 1–256; memory bounds are 256–1048576 MB. It persists only
+the requested fields and preserves other JSON settings. Configuration writers,
+initialization and deletion serialize through stable per-instance locks; edits
+use atomic replacement. `init --exclusive` rejects an already claimed name;
+`start --existing` refuses to recreate a missing instance in either launch phase.
+Omit `-n` for the default instance. Existing scripts retain implicit initialization
+and idempotent init when these flags are absent. Secrets remain shared across
+instances; use `secret reload [-n NAME]` on each running instance after a shared
+secret change.
 
 ## Network filtering
 

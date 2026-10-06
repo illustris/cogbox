@@ -91,12 +91,15 @@ pub fn save(allocator: std.mem.Allocator, io: std.Io, path: []const u8, value: s
 	defer out.deinit(allocator);
 	try writeJqTab(allocator, &out, value);
 
-	const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+	var nonce: [16]u8 = undefined;
+	io.random(&nonce);
+	const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ path, nonce });
 	defer allocator.free(tmp_path);
 
 	const cwd = std.Io.Dir.cwd();
+	defer cwd.deleteFile(io, tmp_path) catch {};
 	{
-		const f = try cwd.createFile(io, tmp_path, .{ .truncate = true });
+		const f = try cwd.createFile(io, tmp_path, .{ .exclusive = true });
 		defer f.close(io);
 		var write_buf: [4096]u8 = undefined;
 		var writer = f.writer(io, &write_buf);

@@ -75,8 +75,8 @@ pub fn run(
 	// `secret reload -n NAME`: re-render an instance's inject conf from the
 	// already-bound store + signal its proxy. No store mutation.
 	if (rest.items.len > 0 and std.mem.eql(u8, rest.items[0], "reload")) {
-		const n = name orelse util.die(allocator, io, "secret", exit_codes.usage, "secret reload requires -n NAME", .{});
-		try reRenderInstance(allocator, io, env, p, n, true);
+		if (rest.items.len != 1) util.die(allocator, io, "secret", exit_codes.usage, "secret reload accepts only -n NAME", .{});
+		try reRenderInstance(allocator, io, env, p, name, true);
 		return;
 	}
 
@@ -121,7 +121,7 @@ fn isMutation(sub: []const u8) bool {
 /// quietly when the instance isn't inited or isn't running (no live runtime dir)
 /// -- the boot render covers that case. `announce` adds a user-facing line (for
 /// the explicit `reload` verb).
-fn reRenderInstance(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, p: *const paths.Paths, name: []const u8, announce: bool) !void {
+fn reRenderInstance(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, p: *const paths.Paths, name: ?[]const u8, announce: bool) !void {
 	const inst_cfg = try paths.instanceConfigDir(allocator, p, name);
 	defer allocator.free(inst_cfg);
 	const cfg_path = try std.fs.path.join(allocator, &.{ inst_cfg, "config.json" });
@@ -130,14 +130,16 @@ fn reRenderInstance(allocator: std.mem.Allocator, io: std.Io, env: *std.process.
 	defer allocator.free(inst_runtime);
 
 	const cwd = std.Io.Dir.cwd();
-	cwd.access(io, cfg_path, .{}) catch {
-		if (announce) try util.say(allocator, io, "No config for '{s}' -- nothing to render.", .{name});
+	cwd.access(io, cfg_path, .{}) catch |err| {
+		if (announce and err != error.FileNotFound) return err;
+		if (announce) try util.say(allocator, io, "No config for '{s}' -- nothing to render.", .{name orelse "default"});
 		return;
 	};
 	// No live runtime dir => the instance isn't running; the boot render will
 	// pick up the binding on next start.
-	cwd.access(io, inst_runtime, .{}) catch {
-		if (announce) try util.say(allocator, io, "Instance '{s}' is not running; inject conf will render at its next start.", .{name});
+	cwd.access(io, inst_runtime, .{}) catch |err| {
+		if (announce and err != error.FileNotFound) return err;
+		if (announce) try util.say(allocator, io, "Instance '{s}' is not running; inject conf will render at its next start.", .{name orelse "default"});
 		return;
 	};
 
@@ -145,7 +147,6 @@ fn reRenderInstance(allocator: std.mem.Allocator, io: std.Io, env: *std.process.
 	// already carries the launcher's harness merge, so preserve what this render
 	// does not author -- see reload.writeL7Inject's two-writer contract.
 	try rules_module.renderFiles(allocator, io, env, cfg_path, inst_runtime, .preserve);
-	_ = rules_module.reload.maybeSignalL7proxy(allocator, io, inst_runtime) catch {};
 	// BOTH signals, for the same reason rules_module.maybeReload sends both: the
 	// render now SEEDS the control-plane inject specs, and netfilter-rules' L7
 	// funnel remaps + fail-closed denies are DERIVED from those specs -- so a
@@ -156,8 +157,13 @@ fn reRenderInstance(allocator: std.mem.Allocator, io: std.Io, env: *std.process.
 	// guest's :443 kept egressing directly -- the placeholder credential goes
 	// upstream and the harness stays logged out until a restart. No-op wherever
 	// there is no passt (the container enforcer writes no passt.pid).
-	_ = rules_module.reload.maybeSignalPasst(allocator, io, inst_runtime) catch {};
-	if (announce) try util.say(allocator, io, "Re-rendered inject conf for '{s}' and signalled its proxy.", .{name});
+	if (announce) {
+		try rules_module.reload.signalHelpers(allocator, io, inst_runtime);
+	} else {
+		_ = rules_module.reload.maybeSignalL7proxy(allocator, io, inst_runtime) catch {};
+		_ = rules_module.reload.maybeSignalPasst(allocator, io, inst_runtime) catch {};
+	}
+	if (announce) try util.say(allocator, io, "Re-rendered inject conf for '{s}' and signalled its proxy.", .{name orelse "default"});
 }
 
 // --- tests ------------------------------------------------------------------
