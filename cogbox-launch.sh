@@ -45,6 +45,8 @@
 HOST_DARWIN=0
 [ "${COGBOX_HOST_SYSTEM:-}" = aarch64-darwin ] && HOST_DARWIN=1
 INIT_ONLY=0
+REQUIRE_EXISTING=0
+EXCLUSIVE_INIT=0
 FLAG_VCPU=""
 FLAG_MEM=""
 FLAG_NETWORK=""
@@ -60,6 +62,8 @@ ASSUME_YES=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--init-only) INIT_ONLY=1; shift ;;
+		--existing) REQUIRE_EXISTING=1; shift ;;
+		--exclusive) EXCLUSIVE_INIT=1; shift ;;
 		--no-auto-keys) AUTO_KEYS=0; shift ;;
 		--yes|-y) ASSUME_YES=1; shift ;;
 		--name) INSTANCE_NAME="$2"; shift 2 ;;
@@ -109,6 +113,9 @@ for _additional_i in "${!FLAG_ADDITIONAL_DIR_PATHS[@]}"; do
 done
 [ "$AUTO_KEYS" -eq 0 ]  && ORIG_ARGS+=(--no-auto-keys)
 [ "$ASSUME_YES" -eq 1 ] && ORIG_ARGS+=(--yes)
+# Re-exec follows completed admission/init; never recreate a deleted instance
+# or apply --exclusive twice. Both modes recheck existence under lock.
+ORIG_ARGS+=(--existing)
 
 # Scaffold written into each instance's config dir on first init. Also used
 # by the re-exec check below: if the user hasn't edited flake.nix, the
@@ -589,6 +596,22 @@ BASE_RUNTIME="$XDG_RUNTIME_BASE/cogbox"
 
 EFFECTIVE_NAME="${INSTANCE_NAME:-default}"
 INSTANCE_CONFIG_DIR="$CONFIG_DIR/instances/$EFFECTIVE_NAME"
+# Serialize admission and config reads/writes against CLI mutations and deletion.
+# This inode survives deletion; config then lifetime is the lock order.
+mkdir -p "$CONFIG_DIR/.locks" || die "cannot create config lock directory" 70
+CONFIG_LOCK="$CONFIG_DIR/.locks/$EFFECTIVE_NAME.lock"
+exec {CONFIG_LOCK_FD}>"$CONFIG_LOCK" || die "cannot open config lock" 70
+# Unsubstituted source is also exercised by the no-VM launcher tests.
+CONFIG_FLOCK="@flock@"
+case "$CONFIG_FLOCK" in @*) CONFIG_FLOCK=flock ;; esac
+$CONFIG_FLOCK -w 86400 "$CONFIG_LOCK_FD" || die "cannot acquire config lock" 75
+if [ "$REQUIRE_EXISTING" -eq 1 ] && [ ! -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
+	die "instance '$EFFECTIVE_NAME' does not exist (--existing)" 66
+fi
+if [ "$EXCLUSIVE_INIT" -eq 1 ] && [ -e "$INSTANCE_CONFIG_DIR" ]; then
+	die "instance '$EFFECTIVE_NAME' already exists (--exclusive)" 73
+fi
+release_config_lock() { exec {CONFIG_LOCK_FD}>&-; }
 NEW_INSTANCE_CONFIG=0
 [ -e "$INSTANCE_CONFIG_DIR/config.json" ] || NEW_INSTANCE_CONFIG=1
 # The flake lives in its own subdir so unrelated edits to config.json /
@@ -1017,6 +1040,7 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 		# guest keeps whatever the flake declares (a fraction of RAM on the
 		# workstation profile, a block volume on the hosted one); an operator who
 		# sets the key explicitly still wins.
+		_init_tmp=$(mktemp "$INSTANCE_CONFIG_DIR/config.json.XXXXXX") || die "cannot stage instance config" 70
 		jq -n --tab \
 			--argjson vcpu "$INIT_VCPU" \
 			--argjson mem "$INIT_MEM" \
@@ -1034,7 +1058,8 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 				overlaySize: "128M",
 				bindAddr: $bindaddr,
 				network: $network
-			}' > "$INSTANCE_CONFIG_DIR/config.json"
+			}' > "$_init_tmp" || { rm -f "$_init_tmp"; die "cannot render instance config" 70; }
+		mv "$_init_tmp" "$INSTANCE_CONFIG_DIR/config.json" || die "cannot publish instance config" 70
 		[ -n "$INSTANCE_NAME" ] && echo "Instance \"$INSTANCE_NAME\" ports: SSH=$INIT_SSH HTTP=$INIT_HTTP L7=$INIT_L7"
 	fi
 
@@ -1293,6 +1318,7 @@ fi
 
 if [ -z "${COGBOX_REEXECED:-}" ] && [ "$FAST_PATH" -ne 1 ]; then
 	if [ "$PLUGIN_COUNT" -gt 0 ] && [ -f "$PLUGINS_FLAKE_DIR/flake.nix" ]; then
+		release_config_lock
 		exec env COGBOX_REEXECED=1 nix \
 			--extra-experimental-features "nix-command flakes" \
 			"${PLUGIN_SUBST_OPTS[@]}" \
@@ -1306,6 +1332,7 @@ if [ -z "${COGBOX_REEXECED:-}" ] && [ "$FAST_PATH" -ne 1 ]; then
 		exit 70
 	elif [ -f "$INSTANCE_FLAKE_DIR/flake.nix" ] \
 		&& ! printf '%s' "$SCAFFOLD_FLAKE" | cmp -s - "$INSTANCE_FLAKE_DIR/flake.nix"; then
+		release_config_lock
 		exec env COGBOX_REEXECED=1 nix \
 			--extra-experimental-features "nix-command flakes" \
 			"${PLUGIN_SUBST_OPTS[@]}" \
@@ -1770,6 +1797,10 @@ if [ "$PORTS_CHANGED" -eq 1 ]; then
 		die "failed to persist reallocated ports to $ACTIVE_CONFIG"
 	fi
 fi
+
+# Config writes are complete. Release before starting any long-lived helper;
+# only the lifetime lock belongs to VM descendants.
+release_config_lock
 
 # Snapshot the active SSH endpoint for the `ssh` subcommand to read.
 # Bound to runtime, not config, so post-boot edits to config.json don't

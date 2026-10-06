@@ -13,6 +13,7 @@ const parse = @import("../parse.zig");
 const help = @import("../help.zig");
 const exit_codes = @import("../exit.zig");
 const paths = @import("../paths.zig");
+const config_lock = @import("../config_lock.zig");
 
 pub fn run(
 	allocator: std.mem.Allocator,
@@ -43,6 +44,11 @@ pub fn run(
 	defer allocator.free(data_dir);
 	const runtime_dir = try paths.instanceRuntime(allocator, p, name);
 	defer allocator.free(runtime_dir);
+
+	// Fail promptly during VM boot; repeat under the config lock for admission.
+	if (util.instanceRunningConservative(allocator, io, runtime_dir)) util.die(allocator, io, "delete", exit_codes.tempfail, "instance is running; stop it first", .{});
+	const guard = try config_lock.acquire(allocator, io, p, name);
+	defer guard.deinit(io);
 
 	const cwd = std.Io.Dir.cwd();
 
@@ -80,19 +86,72 @@ pub fn run(
 		}
 	}
 
-	// deleteTree is a no-op on a path that doesn't exist, so the existence
-	// checks above are only for the prompt -- it's safe to call all three.
-	cwd.deleteTree(io, cfg_dir) catch |err| {
-		util.die(allocator, io, "delete", exit_codes.software, "removing config dir {s}: {s}", .{ cfg_dir, @errorName(err) });
+	const cfg_path = try std.fs.path.join(allocator, &.{ cfg_dir, "config.json" });
+	defer allocator.free(cfg_path);
+	const backup = readConfigBackup(allocator, io, cfg_path) catch |err| {
+		util.die(allocator, io, "delete", exit_codes.software, "cannot preserve config for a failed delete: {s}", .{@errorName(err)});
 	};
+	defer if (backup) |b| allocator.free(b.bytes);
+
+	// Keep the config discoverable until persistent and runtime cleanup both
+	// succeed. A failed delete must remain visible to inventory clients so the
+	// user can retry it. deleteTree is a no-op for already removed paths.
 	cwd.deleteTree(io, data_dir) catch |err| {
 		util.die(allocator, io, "delete", exit_codes.software, "removing data dir {s}: {s}", .{ data_dir, @errorName(err) });
 	};
 	cwd.deleteTree(io, runtime_dir) catch |err| {
 		util.die(allocator, io, "delete", exit_codes.software, "removing runtime dir {s}: {s}", .{ runtime_dir, @errorName(err) });
 	};
+	cwd.deleteTree(io, cfg_dir) catch |err| {
+		// deleteTree may unlink config.json before failing on a different child.
+		// Restore its exact bytes so an inventory client can still offer a retry.
+		if (backup) |b| {
+			restoreConfig(allocator, io, p, cfg_dir, cfg_path, b) catch |restore_err| {
+				util.die(allocator, io, "delete", exit_codes.software, "removing config dir {s}: {s}; restoring config for retry also failed: {s}", .{ cfg_dir, @errorName(err), @errorName(restore_err) });
+			};
+		}
+		util.die(allocator, io, "delete", exit_codes.software, "removing config dir {s}: {s}", .{ cfg_dir, @errorName(err) });
+	};
 
 	try util.say(allocator, io, "Deleted instance '{s}'.", .{label});
+}
+
+const ConfigBackup = struct { bytes: []u8, permissions: std.Io.File.Permissions };
+
+fn readConfigBackup(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !?ConfigBackup {
+	const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+		error.FileNotFound => return null,
+		else => return err,
+	};
+	defer file.close(io);
+	const stat = try file.stat(io);
+	var buf: [4096]u8 = undefined;
+	var reader = file.reader(io, &buf);
+	return .{ .bytes = try reader.interface.allocRemaining(allocator, .limited(1 << 20)), .permissions = stat.permissions };
+}
+
+fn restoreConfig(allocator: std.mem.Allocator, io: std.Io, p: *const paths.Paths, dir: []const u8, path: []const u8, backup: ConfigBackup) !void {
+	const cwd = std.Io.Dir.cwd();
+	// A failure before config.json was removed needs no repair (and may mean
+	// the config directory itself is unwritable).
+	if (exists(io, cwd, path)) return;
+	try cwd.createDirPath(io, dir);
+	var nonce: [16]u8 = undefined;
+	io.random(&nonce);
+	const tmp = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ path, nonce });
+	defer allocator.free(tmp);
+	defer cwd.deleteFile(io, tmp) catch {};
+	{
+		const file = try cwd.createFile(io, tmp, .{ .exclusive = true, .permissions = backup.permissions });
+		defer file.close(io);
+		if (std.c.geteuid() == 0 and p.real_uid != 0) try file.setOwner(io, p.real_uid, null);
+		var buf: [4096]u8 = undefined;
+		var writer = file.writer(io, &buf);
+		try writer.interface.writeAll(backup.bytes);
+		try writer.flush();
+		try file.sync(io);
+	}
+	try cwd.rename(tmp, cwd, path, io);
 }
 
 /// Resolve --name, applying the same rules as the other verbs: `default` is

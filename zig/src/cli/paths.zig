@@ -85,13 +85,12 @@ pub fn instanceRuntime(allocator: std.mem.Allocator, paths: *const Paths, name: 
 }
 
 pub fn resolve(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) !Paths {
-	const sudo_user_z = env.get("SUDO_USER");
+	const sudo_user_z = if (std.c.geteuid() == 0) env.get("SUDO_USER") else null;
 
 	const user_buf: []const u8 = if (sudo_user_z) |su|
 		try allocator.dupe(u8, su)
 	else blk: {
-		const me = env.get("USER") orelse "user";
-		break :blk try allocator.dupe(u8, me);
+		break :blk try effectiveUsername(allocator);
 	};
 
 	// Resolve real user's home and uid. Under sudo, lookup via /etc/passwd
@@ -108,20 +107,20 @@ pub fn resolve(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Envir
 		if (sudo_user_z != null) {
 			if (try lookupUid(allocator, io, user_buf)) |u| break :blk u;
 		}
-		break :blk @intCast(@import("platform").getuid());
+		break :blk @intCast(std.c.geteuid());
 	};
 
 	// Config dir
-	const config_root = env.get("XDG_CONFIG_HOME");
+	const config_root = nonEmpty(env, "XDG_CONFIG_HOME");
 	const config_dir = if (config_root) |c|
 		try std.fs.path.join(allocator, &.{ c, "cogbox" })
 	else
 		try std.fs.path.join(allocator, &.{ home, ".config", "cogbox" });
 
 	// Data dir
-	const base_data: []const u8 = if (env.get("COGBOX_DATA")) |d|
+	const base_data: []const u8 = if (nonEmpty(env, "COGBOX_DATA")) |d|
 		try allocator.dupe(u8, d)
-	else if (env.get("XDG_DATA_HOME")) |d|
+	else if (nonEmpty(env, "XDG_DATA_HOME")) |d|
 		try std.fs.path.join(allocator, &.{ d, "cogbox" })
 	else
 		try std.fs.path.join(allocator, &.{ home, ".local", "share", "cogbox" });
@@ -152,7 +151,9 @@ fn resolveRuntimeBase(
 ) ![]const u8 {
 	const xdg = env.get("XDG_RUNTIME_DIR");
 	if (!is_sudo and xdg != null and xdg.?.len > 0) {
-		return try allocator.dupe(u8, xdg.?);
+		const st = std.Io.Dir.cwd().statFile(io, xdg.?, .{}) catch null;
+		if (st != null and st.?.kind == .directory) return try allocator.dupe(u8, xdg.?);
+		return try std.fmt.allocPrint(allocator, "/tmp/cogbox-runtime-{d}", .{uid});
 	}
 	// /run/user/$UID
 	const candidate = try std.fmt.allocPrint(allocator, "/run/user/{d}", .{uid});
@@ -211,4 +212,36 @@ fn lookupPasswdField(allocator: std.mem.Allocator, io: std.Io, user: []const u8,
 		}
 	}
 	return null;
+}
+
+/// Resolve existing symlinks while retaining missing leaf components; read-only.
+pub fn canonicalRoot(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+	const cwd = std.Io.Dir.cwd();
+	const resolved = cwd.realPathFileAlloc(io, path, allocator) catch |err| switch (err) {
+		error.FileNotFound => null,
+		else => return err,
+	};
+	if (resolved) |r| {
+		defer allocator.free(r);
+		return allocator.dupe(u8, r);
+	}
+	const parent = std.fs.path.dirname(path) orelse ".";
+	const base = std.fs.path.basename(path);
+	const resolved_parent = try canonicalRoot(allocator, io, parent);
+	defer allocator.free(resolved_parent);
+	return std.fs.path.resolve(allocator, &.{ resolved_parent, base });
+}
+
+pub fn effectiveUsername(allocator: std.mem.Allocator) ![]const u8 {
+	const c = @cImport({ @cInclude("pwd.h"); });
+	var entry: c.struct_passwd = undefined;
+	var result: ?*c.struct_passwd = null;
+	var buffer: [16384]u8 = undefined;
+	if (c.getpwuid_r(std.c.geteuid(), &entry, &buffer, buffer.len, &result) != 0 or result == null) return error.UnknownUser;
+	return allocator.dupe(u8, std.mem.span(entry.pw_name));
+}
+
+fn nonEmpty(env: *std.process.Environ.Map, key: []const u8) ?[]const u8 {
+	const value = env.get(key) orelse return null;
+	return if (value.len == 0) null else value;
 }

@@ -22,6 +22,8 @@ pub const AdditionalDir = struct {
 	read_only: bool,
 };
 pub const LaunchOpts = struct {
+	existing: bool = false,
+	exclusive: bool = false,
 	name: ?[]const u8,
 	vcpu: ?u32,
 	mem: ?u32,
@@ -111,6 +113,8 @@ pub fn buildLaunchArgs(
 	}
 	if (!opts.auto_keys) try args.append(allocator, try allocator.dupe(u8, "--no-auto-keys"));
 	if (opts.yes) try args.append(allocator, try allocator.dupe(u8, "--yes"));
+	if (opts.existing) try args.append(allocator, try allocator.dupe(u8, "--existing"));
+	if (opts.exclusive) try args.append(allocator, try allocator.dupe(u8, "--exclusive"));
 	if (init_only) try args.append(allocator, try allocator.dupe(u8, "--init-only"));
 
 	return try args.toOwnedSlice(allocator);

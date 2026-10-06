@@ -8,6 +8,7 @@ const parse = @import("../parse.zig");
 const help = @import("../help.zig");
 const exit_codes = @import("../exit.zig");
 const paths = @import("../paths.zig");
+const config_lock = @import("../config_lock.zig");
 const plugin_module = @import("plugin_module");
 
 pub fn run(
@@ -55,6 +56,9 @@ pub fn run(
 			util.die(allocator, io, "plugin", exit_codes.dataerr, "instance name must start with a letter and contain only [a-zA-Z0-9-] (max 64 chars)", .{});
 		}
 	}
+
+	const guard = try config_lock.acquire(allocator, io, p, name);
+	defer guard.deinit(io);
 
 	const inst_cfg = try paths.instanceConfigDir(allocator, p, name);
 	defer allocator.free(inst_cfg);

@@ -20,6 +20,8 @@ pub fn run(
 	argv: []const []const u8,
 ) !void {
 	const flags = [_]parse.Flag{
+		.{ .long = "existing", .kind = .bool },
+		.{ .long = "exclusive", .kind = .bool },
 		.{ .long = "name", .short = 'n', .kind = .value },
 		.{ .long = "vcpu", .kind = .value },
 		.{ .long = "mem", .kind = .value },
@@ -64,6 +66,8 @@ pub fn launchInPlace(
 		util.die(allocator, io, null, exit_codes.usage, "unknown verb '__launch'", .{});
 	}
 	const flags = [_]parse.Flag{
+		.{ .long = "existing", .kind = .bool },
+		.{ .long = "exclusive", .kind = .bool },
 		.{ .long = "name", .short = 'n', .kind = .value },
 		.{ .long = "vcpu", .kind = .value },
 		.{ .long = "mem", .kind = .value },
@@ -151,6 +155,8 @@ pub fn validate(
 
 	return .{
 		.name = name,
+		.existing = parsed.isSet("existing"),
+		.exclusive = parsed.isSet("exclusive"),
 		.vcpu = vcpu,
 		.mem = mem,
 		.network = network,
