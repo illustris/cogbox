@@ -878,11 +878,11 @@ with subtest("Phase F: default harnesses wired into the VM (codex/pi opt-in, exc
     h_path = machine.succeed(as_user("cogbox ssh 'command -v h'")).strip()
     assert h_path, h_path
     om_version = machine.succeed(as_user("cogbox ssh 'om --version'")).strip()
-    assert om_version == "17.4.0", om_version
+    assert om_version == "18.8.4", om_version
     ds_path = machine.succeed(as_user("cogbox ssh 'command -v ds'")).strip()
     assert ds_path, ds_path
     ds_version = machine.succeed(as_user("cogbox ssh 'ds --version'")).strip()
-    assert "0.1.0-rc.7" in ds_version, ds_version
+    assert "0.2.0-rc.2" in ds_version, ds_version
     machine.succeed(as_user(
         "cogbox ssh 'om auth-broker --help | grep -q \"Manage the omp auth-broker\"'"
     ))
