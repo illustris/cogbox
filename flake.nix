@@ -20,6 +20,15 @@
 			url = "github:illustris/flake";
 			flake = false;
 		};
+		# Held at fdfc182 in flake.lock (update with `nix flake update` naming
+		# every OTHER input). microvm.nix 45c1f41 dropped its minimized QEMU
+		# (nixosTestRunner), whose force-uid0 9p patch cogbox relies on: without
+		# it a non-root host's 9p shares surface the host uid in the guest, so
+		# root's git refuses ~/work repos as "dubious ownership", and the runner
+		# QEMU gains a ~590 MiB GUI/audio closure. It also switched
+		# microvm-shutdown from Ctrl-Alt-Delete to system_powerdown, which
+		# docs/graceful-guest-shutdown.md describes. Take that bump as its own
+		# change: pin a minimized microvm.qemu.package and update the doc.
 		microvm = {
 			url = "github:microvm-nix/microvm.nix";
 			inputs.nixpkgs.follows = "nixpkgs";
@@ -5447,26 +5456,26 @@
 					esac
 				}
 
-				test '${releaseHarnesses.claude-code.version}' = '2.1.238'
-				test '${releaseHarnesses.opencode.version}' = '1.18.19'
-				test '${releaseHarnesses.codex.version}' = '0.149.0'
-				test '${releaseHarnesses.hermes-agent.version}' = '2026.8.18'
-				test '${releaseHarnesses.omp.version}' = '17.4.0'
-				test '${releaseHarnesses.pi.version}' = '0.84.2'
-				test '${releaseHarnesses.dsh.version}' = '0.1.0-rc.7'
+				test '${releaseHarnesses.claude-code.version}' = '2.1.293'
+				test '${releaseHarnesses.opencode.version}' = '1.18.35'
+				test '${releaseHarnesses.codex.version}' = '0.161.0'
+				test '${releaseHarnesses.hermes-agent.version}' = '2026.9.24'
+				test '${releaseHarnesses.omp.version}' = '18.8.4'
+				test '${releaseHarnesses.pi.version}' = '1.1.0'
+				test '${releaseHarnesses.dsh.version}' = '0.2.0-rc.2'
 
-				assert_version '2.1.238' ${releaseHarnesses.claude-code}/bin/claude --version
-				assert_version '1.18.19' ${releaseHarnesses.opencode}/bin/opencode --version
-				assert_version '0.149.0' ${releaseHarnesses.codex}/bin/codex --version
-				assert_version '17.4.0' ${releaseHarnesses.omp}/bin/omp --version
-				assert_version '0.84.2' ${releaseHarnesses.pi}/bin/pi --version
-				assert_version '0.1.0-rc.7' ${releaseHarnesses.dsh}/bin/dsh --version
+				assert_version '2.1.293' ${releaseHarnesses.claude-code}/bin/claude --version
+				assert_version '1.18.35' ${releaseHarnesses.opencode}/bin/opencode --version
+				assert_version '0.161.0' ${releaseHarnesses.codex}/bin/codex --version
+				assert_version '18.8.4' ${releaseHarnesses.omp}/bin/omp --version
+				assert_version '1.1.0' ${releaseHarnesses.pi}/bin/pi --version
+				assert_version '0.2.0-rc.2' ${releaseHarnesses.dsh}/bin/dsh --version
 
 				if ! hermes_output=$(${releaseHarnesses.hermes-agent}/bin/hermes --version 2>&1); then
 					printf 'version command failed: hermes --version\n%s\n' "$hermes_output" >&2
 					exit 1
 				fi
-				for expected in 'v0.20.4' '(2026.8.18)'; do
+				for expected in 'v0.21.5' '(2026.9.24)'; do
 					case "$hermes_output" in
 					*"$expected"*) ;;
 					*)
