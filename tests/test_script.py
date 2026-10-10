@@ -429,6 +429,14 @@ with subtest("Phase Q: plugin verb folds a flake into the guest + tagged rules")
     # `.module or {}` composition wrapper imports the same module values).
     plug_flake = "/home/testuser/cogbox-test-plugin/flake.nix"
     machine.succeed(as_user("mkdir -p /home/testuser/cogbox-test-plugin"))
+    # An executable file: the NAR records the exec bit, so a materialized copy
+    # that dropped it never hashed to the recorded narHash and the composition
+    # re-pin refused the plugin forever (asserted in Q5).
+    machine.succeed(as_user(
+        "mkdir -p /home/testuser/cogbox-test-plugin/bin && "
+        "printf '#!/bin/sh\\necho hook\\n' > /home/testuser/cogbox-test-plugin/bin/hook && "
+        "chmod 0755 /home/testuser/cogbox-test-plugin/bin/hook"
+    ))
     machine.succeed(as_user("""cat > """ + plug_flake + """ <<'NIX_EOF'
 {
     description = "cogbox test plugin";
@@ -752,10 +760,91 @@ NIX_EOF"""))
     };
 }
 NIX_EOF"""))
+    # Keep the pre-update composition lock: the heal case below restores it.
+    plug_icd = "/home/testuser/.config/cogbox/instances/plug"
+    plug_lock = f"{plug_icd}/plugins-flake/flake.lock"
+    machine.succeed(f"cp {plug_lock} /tmp/plug-stale-flake.lock")
     out = machine.succeed(as_user("cogbox plugin update --name plug"))
     assert "updated to" in out and "10.99.0.2/32" in out, out
     nar2 = machine.succeed(f"jq -r '.plugins[0].narHash' {plug_cfg}").strip()
     assert nar2 != nar and nar2.startswith("sha256-"), (nar, nar2)
+
+    # REGRESSION: the composition lock must pin the NEW materialized source.
+    # Plain `nix flake lock` kept a path: input's old narHash after its content
+    # changed, so a content-changing update was a silent false success (the
+    # guest kept the old plugin content on a warm store; a cold store failed
+    # with a narHash mismatch). locked == on-disk == config.json's pin.
+    def plug_lock_vs_disk():
+        locked = machine.succeed(
+            "jq -r '.nodes[.nodes.root.inputs[\"p-cogbox-test-plugin\"]].locked.narHash' "
+            + plug_lock
+        ).strip()
+        disk = machine.succeed(as_user(
+            "nix --extra-experimental-features 'nix-command flakes' "
+            f"hash path {plug_icd}/plugin-sources/cogbox-test-plugin"
+        )).strip()
+        return locked, disk
+
+    locked, disk = plug_lock_vs_disk()
+    assert locked == disk == nar2, (locked, disk, nar2)
+    plug_src = f"{plug_icd}/plugin-sources/cogbox-test-plugin"
+    machine.succeed(as_user(f"test -x {plug_src}/bin/hook"))
+
+    # Heal: a lock left stale by an older cogbox is re-pinned by a no-op update.
+    machine.succeed(f"cp /tmp/plug-stale-flake.lock {plug_lock} && chown testuser {plug_lock}")
+    locked, disk = plug_lock_vs_disk()
+    assert locked != disk, ("stale lock fixture did not take", locked, disk)
+    out = machine.succeed(as_user("cogbox plugin update --name plug 2>&1"))
+    assert "up to date" in out, out
+    assert "re-pinned composition lock" in out, out
+    locked, disk = plug_lock_vs_disk()
+    assert locked == disk == nar2, (locked, disk, nar2)
+
+    # Heal a tree that is not the pin: an older cogbox stripped exec bits while
+    # materializing, and a killed op can leave stray files. With the lock stale
+    # too, a no-op update re-copies the tree from the recorded store path and
+    # then re-pins it.
+    machine.succeed(f"cp /tmp/plug-stale-flake.lock {plug_lock} && chown testuser {plug_lock}")
+    machine.succeed(as_user(f"chmod a-x {plug_src}/bin/hook && touch {plug_src}/partial-copy"))
+    out = machine.succeed(as_user("cogbox plugin update --name plug 2>&1"))
+    assert "up to date" in out and "re-materialized its plugin source" in out, out
+    assert "re-pinned composition lock" in out, out
+    machine.succeed(as_user(f"test -x {plug_src}/bin/hook && test ! -e {plug_src}/partial-copy"))
+    locked, disk = plug_lock_vs_disk()
+    assert locked == disk == nar2, (locked, disk, nar2)
+
+    # Gate: the re-pin is never blind. A stale lock is NOT re-pinned onto a
+    # plugin-sources tree config.json never recorded (a half-finished copy, an
+    # update killed between materialize and config.save); the old, coherent pin
+    # is kept and the plugin is named, by every op that is not an update of it
+    # (here: add + del of a sibling module). Once the tree matches the record
+    # again, the next op heals it.
+    def plug_locked_pin():
+        return machine.succeed(
+            "jq -r '.nodes[.nodes.root.inputs[\"p-cogbox-test-plugin\"]].locked.narHash' "
+            + plug_lock
+        ).strip()
+
+    stale_pin = machine.succeed(
+        "jq -r '.nodes[.nodes.root.inputs[\"p-cogbox-test-plugin\"]].locked.narHash' "
+        "/tmp/plug-stale-flake.lock"
+    ).strip()
+    machine.succeed(f"cp /tmp/plug-stale-flake.lock {plug_lock} && chown testuser {plug_lock}")
+    machine.succeed(as_user(f"touch {plug_src}/partial-copy"))
+    out = machine.succeed(as_user(
+        "cogbox plugin add 'path:/home/testuser/cogbox-test-plugin#extra' -y --name plug 2>&1"
+    ))
+    assert "does not match the pin config.json records" in out, out
+    assert "re-pinned composition lock" not in out, out
+    assert plug_locked_pin() == stale_pin, (plug_locked_pin(), stale_pin)
+    out = machine.succeed(as_user("cogbox plugin del extra -y --name plug 2>&1"))
+    assert "does not match the pin config.json records" in out, out
+    assert plug_locked_pin() == stale_pin, (plug_locked_pin(), stale_pin)
+    machine.succeed(as_user(f"rm {plug_src}/partial-copy"))
+    out = machine.succeed(as_user("cogbox plugin update --name plug 2>&1"))
+    assert "re-pinned composition lock" in out, out
+    locked, disk = plug_lock_vs_disk()
+    assert locked == disk == nar2, (locked, disk, nar2)
     n = machine.succeed(
         f"jq -r '[.network.rules[] | select(.plugin == \"cogbox-test-plugin\")] | length' {plug_cfg}"
     ).strip()

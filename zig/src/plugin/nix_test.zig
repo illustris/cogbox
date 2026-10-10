@@ -156,3 +156,15 @@ test "dirParam: extracts ?dir= value, ignores absent/empty and path dir=" {
 	// Empty value -> null.
 	try t.expect(nix.dirParam("path:/p?dir=") == null);
 }
+
+test "flakeUpdateArgv: bounded fetches, only the given inputs, then --flake <url>" {
+	const argv = try nix.flakeUpdateArgv(t.allocator, "path:/x", &.{ "p-a", "user" });
+	defer t.allocator.free(argv);
+	const want = [_][]const u8{ "flake", "update", "--option", "connect-timeout", "5", "--option", "stalled-download-timeout", "20", "p-a", "user", "--flake", "path:/x" };
+	try t.expectEqual(want.len, argv.len);
+	for (want, argv) |w, g| try t.expectEqualStrings(w, g);
+}
+
+test "flakeUpdateArgv: zero inputs is refused (never an update-all)" {
+	try t.expectError(error.NoInputs, nix.flakeUpdateArgv(t.allocator, "path:/x", &.{}));
+}

@@ -513,7 +513,7 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 
 	try config.save(allocator, io, ctx.config_path, loaded.root().*);
 	try regenComposition(ctx, plugins_arr);
-	finalizeComposition(ctx);
+	finalizeComposition(ctx, plugins_arr, null);
 	if (merged) try rules_module.maybeReload(allocator, io, ctx.runtime_path, loaded);
 
 	try announce(ctx, "Plugin '{s}' added at {s}.", .{ plugin_name, pinLabel(&meta) });
@@ -784,7 +784,7 @@ fn cmdDel(ctx: *const Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 	try config.save(allocator, io, ctx.config_path, loaded.root().*);
 	try regenComposition(ctx, plugins_arr);
 	// No fetch needed: remaining inputs are local path: refs. Best-effort.
-	finalizeComposition(ctx);
+	finalizeComposition(ctx, plugins_arr, null);
 	if (removed > 0) try rules_module.maybeReload(allocator, io, ctx.runtime_path, loaded);
 
 	try announce(ctx, "Plugin '{s}' removed ({d} contributed entr(ies) dropped).", .{ d.plugin, removed });
@@ -833,6 +833,8 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 	var changed = false;
 	var rules_touched = false;
 	var failed = false;
+	// An up-to-date plugin whose on-disk source was re-copied (see below).
+	var healed = false;
 
 	// Versioning is per flake: resolve each distinct URL once per run and
 	// apply the same pin to every plugin that came from it, so siblings
@@ -895,6 +897,22 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 
 		if (std.mem.eql(u8, meta.nar_hash, old_hash)) {
 			try announce(ctx, "{s}: up to date ({s})", .{ n, pinLabel(meta) });
+			// The pin did not move, but the materialized copy may not BE the pin:
+			// an older cogbox stripped exec bits while copying (so the tree's
+			// NAR hash never equals the recorded narHash), or a killed op left a
+			// half-copied tree. The composition re-pin refuses such a tree
+			// (compose.repinVerdict -> .disagrees_with_record), so without this
+			// a stale lock entry for it could never heal. Re-copy it from the
+			// store path the resolve above just produced, which IS the recorded
+			// pin; finalizeComposition then re-pins it.
+			if (sourceTreeDiverges(ctx, n, meta.nar_hash)) {
+				if (materializeSource(ctx, n, meta, url)) |_| {
+					try announce(ctx, "{s}: re-materialized its plugin source (the on-disk copy did not match the recorded pin)", .{n});
+					healed = true;
+				} else |err| {
+					try warn(ctx, "{s}: on-disk source does not match the recorded pin and could not be re-materialized: {s}", .{ n, @errorName(err) });
+				}
+			}
 			continue;
 		}
 
@@ -1036,11 +1054,35 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 	}
 	// Regenerate even without changes: update doubles as the self-heal for
 	// a missing/stale composition flake (it is a pure function of config +
-	// on-disk sources).
+	// on-disk sources) AND for a stale lock (finalizeComposition re-pins every
+	// path: input). On a no-op update (nothing changed, nothing failed) the
+	// pre-regen flake.nix/flake.lock bytes are the baseline: when regen + the
+	// re-pin leave both byte-identical and the recorded container toplevel is
+	// current and seeded, finalizeComposition skips the brain/toplevel
+	// prebuild (the expensive part) instead of redoing it for nothing.
+	var baseline: NoopBaseline = .{ .flake_nix = null, .flake_lock = null };
+	defer baseline.deinit(allocator);
+	const noop = !changed and !failed;
+	if (noop) {
+		baseline.flake_nix = readCompositionFile(ctx, "flake.nix");
+		baseline.flake_lock = readCompositionLock(ctx);
+	}
 	try regenComposition(ctx, plugins_arr);
-	finalizeComposition(ctx);
-	if (changed) try printRestartHint(ctx, "to load the updated NixOS modules");
+	finalizeComposition(ctx, plugins_arr, if (noop) &baseline else null);
+	if (changed or healed) try printRestartHint(ctx, "to load the updated NixOS modules");
 	if (failed) std.process.exit(65);
+}
+
+/// True when plugin `name`'s materialized source (plugin-sources/<name>) is
+/// absent, unhashable, or hashes to something other than `nar_hash` (its
+/// recorded pin) -- i.e. re-copying it from the store would change it.
+fn sourceTreeDiverges(ctx: *const Ctx, name: []const u8, nar_hash: []const u8) bool {
+	const allocator = ctx.allocator;
+	const input = std.fmt.allocPrint(allocator, "p-{s}", .{name}) catch return false;
+	defer allocator.free(input);
+	const disk = hashInputTree(ctx, input) orelse return true;
+	defer allocator.free(disk);
+	return !std.mem.eql(u8, disk, nar_hash);
 }
 
 // --- shared helpers ------------------------------------------------------
@@ -1120,13 +1162,19 @@ fn materializeSource(ctx: *const Ctx, name: []const u8, meta: *const nix.Meta, u
 	// Recursive copy with writable reset. Coreutils are present in the pod
 	// image (the launcher already uses cp/mv/rm); a native walk would have to
 	// re-implement mode reset for read-only store trees. `cp -a SRC/. DEST`
-	// copies SRC's contents into DEST (DEST is the plugin's own dir);
-	// --no-preserve drops the store's read-only modes, and chmod then forces
-	// u+w across the tree so a later deleteTree/replace and nix's path: read
-	// both work.
+	// copies SRC's contents into DEST (DEST is the plugin's own dir), and chmod
+	// then forces u+w across the tree so a later deleteTree/replace and nix's
+	// path: read both work. The MODE is preserved (only ownership is dropped):
+	// the NAR serialisation records each file's executable bit, so a copy that
+	// strips it hashes differently from the store path whose narHash
+	// config.json records, and the composition re-pin (compose.repinVerdict),
+	// which gates on exactly that equality, would refuse every plugin shipping
+	// a script forever. Keeping the bit also leaves plugin scripts executable,
+	// as their authors shipped them (older cogbox stripped it; cmdUpdate
+	// re-materializes such a tree).
 	const src_dot = try std.fmt.allocPrint(allocator, "{s}/.", .{src});
 	defer allocator.free(src_dot);
-	try runTool(ctx, &.{ "cp", "-a", "--no-preserve=mode,ownership", src_dot, dest });
+	try runTool(ctx, &.{ "cp", "-a", "--no-preserve=ownership", src_dot, dest });
 	try runTool(ctx, &.{ "chmod", "-R", "u+rwX", dest });
 }
 
@@ -1148,12 +1196,35 @@ fn runTool(ctx: *const Ctx, argv: []const []const u8) !void {
 	if (res.term != .exited or res.term.exited != 0) return error.ToolFailed;
 }
 
-/// After regenerating the composition: reconcile its flake.lock and populate
-/// the launch-time binary cache. Both are best-effort (warn, never die): the
-/// lock makes launch deterministic (resolved from a coherent pin, offline for
-/// path: inputs), and the cache substitutes any transitive tarball/narHash
-/// input on a fresh store. Skipped when no composition exists (no plugins).
-fn finalizeComposition(ctx: *const Ctx) void {
+/// The pre-regen composition bytes of a no-op `update` (cmdUpdate), used by
+/// finalizeComposition to decide whether the brain/toplevel prebuild can be
+/// skipped. Null fields mean the file was absent/unreadable (never "equal").
+const NoopBaseline = struct {
+	flake_nix: ?[]const u8,
+	flake_lock: ?[]const u8,
+
+	fn deinit(self: *NoopBaseline, allocator: std.mem.Allocator) void {
+		if (self.flake_nix) |b| allocator.free(b);
+		if (self.flake_lock) |b| allocator.free(b);
+	}
+};
+
+/// After regenerating the composition: reconcile its flake.lock, re-pin its
+/// path: inputs, and populate the launch-time binary cache. All best-effort
+/// (warn, never die): the lock makes launch deterministic (resolved from a
+/// coherent pin, offline for path: inputs), and the cache substitutes any
+/// transitive tarball/narHash input on a fresh store. The re-pin exists
+/// because the materialized plugin sources and the `user` flake are path:
+/// inputs, and plain `nix flake lock` keeps their OLD narHash when their
+/// content changed (a content-changing update would otherwise be a silent
+/// false success on a warm store and a narHash mismatch on a cold one).
+/// Skipped when no composition exists (no plugins).
+///
+/// `noop` (cmdUpdate only, else null) carries the pre-regen flake.nix /
+/// flake.lock bytes of an update that changed nothing: when regen and the
+/// re-pin leave both byte-identical and the recorded toplevel is current and
+/// seeded (toplevelSeeded), the brain/toplevel prebuild is skipped.
+fn finalizeComposition(ctx: *const Ctx, plugins_arr: *const std.json.Array, noop: ?*const NoopBaseline) void {
 	const allocator = ctx.allocator;
 	const cwd = std.Io.Dir.cwd();
 
@@ -1172,6 +1243,19 @@ fn finalizeComposition(ctx: *const Ctx) void {
 		if (!o.ok) warn(ctx, "could not lock composition (launch may re-resolve inputs): {s}", .{nix.stderrTail(o.stderr)}) catch {};
 	} else |_| {}
 
+	// Re-pin the STALE path: inputs (plain lock above keeps a changed path:
+	// input's old narHash), gated on config.json's recorded pins. Before the
+	// archive so the cache holds the NEW content. A lock that moved is not yet
+	// proven: snapshot the pre-re-pin bytes (composition.lock.prev) so a boot
+	// can fall back to them if this op is killed before the prebuild below
+	// seeds the new content, or if that content fails to build.
+	const repinned = blk: {
+		const before = repinPathInputs(ctx, flake_url, plugins_arr) orelse break :blk false;
+		defer allocator.free(before);
+		savePrevLock(ctx, before);
+		break :blk true;
+	};
+
 	// Populate the file:// binary cache the launcher uses as a substituter.
 	const cache_url = std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return;
 	defer allocator.free(cache_url);
@@ -1186,20 +1270,338 @@ fn finalizeComposition(ctx: *const Ctx) void {
 	// Gated on cogworx opting in via env;
 	// best-effort throughout -- a failure here only means boot rebuilds, never a
 	// failed plugin verb.
-	prebuildAndPushRunner(ctx);
+	const runner = prebuildAndPushRunner(ctx);
+
+	// No-op update fast path: skip BOTH container prebuilds when nothing moved.
+	// The per-instance toplevel closure contains the per-instance brain, and the
+	// toplevel record is written only after a successful copy into the
+	// plugin-cache (doToplevelBuild), so a record that is current (image rev +
+	// composition hash) AND seeded (its narinfo is in the cache) proves both
+	// artifacts are already there for this image rev and composition. An image
+	// bump, a cache loss or a content re-pin all fail the predicate, so `update`
+	// stays the self-heal. The runner push above stays unconditional so the VM
+	// runner-push record is still rewritten.
+	if (noop) |b| {
+		if (!repinned and compositionUnchanged(ctx, b) and toplevelSeeded(ctx)) {
+			writeStderr(ctx.io, "cogbox plugin: composition unchanged and toplevel already seeded; skipping brain/toplevel prebuild\n") catch {};
+			// The seeded toplevel closure carries the brain for THIS lock.
+			clearPrevLock(ctx);
+			return;
+		}
+	}
 
 	// Container backend counterpart: pre-build cogbox-brain (which now carries the
 	// plugins' cogbox.packages as $out/bin) and copy its closure into the LOCAL
 	// per-instance plugin-cache, so the agent's egress-less boot substitutes it
 	// offline instead of failing to build the plugin tools. Gated on
 	// COGBOX_BRAIN_PUSH_LOCAL (the container backend); a no-op on the VM.
-	prebuildBrainLocal(ctx);
+	const brain = prebuildBrainLocal(ctx);
 
 	// Container full-module: pre-build the per-instance toplevel (the plugin's WHOLE
 	// NixOS module folded in), seed its closure into the plugin-cache, and record the
 	// out-path so agentInit boots it directly instead of the baked plugin-less base.
 	// Gated on COGBOX_TOPLEVEL_PUSH_LOCAL; a no-op on the VM and when disabled.
-	prebuildToplevelLocal(ctx);
+	const toplevel = prebuildToplevelLocal(ctx);
+
+	// The live lock is confirmed once a prebuild built from it (the VM runner
+	// push, or a container brain/toplevel) and none failed. None ran (a VM/GCE
+	// op without cogworx's runner push): keep the snapshot for the launcher,
+	// whose pre-exec build is then that path's confirmation -- confirming here
+	// instead spares the next boot that extra full eval.
+	const any_ok = runner == .ok or brain == .ok or toplevel == .ok;
+	const any_failed = runner == .failed or brain == .failed or toplevel == .failed;
+	if (any_ok and !any_failed) clearPrevLock(ctx);
+}
+
+/// Outcome of an env-gated container prebuild.
+const Prebuild = enum { skipped, ok, failed };
+
+/// Re-pin the composition's STALE path: inputs (materialized plugin sources and
+/// the `user` flake) so their locked narHash tracks their on-disk content; plain
+/// `nix flake lock` keeps the old one. Never blind (compose.repinVerdict):
+///   - an input whose locked narHash already equals `nix hash path` of its tree
+///     is left alone, so a current input's transitive inputs never float (an
+///     input without its own flake.lock re-resolves them on every update);
+///   - a stale `p-<name>` is re-pinned only when its on-disk tree IS the narHash
+///     config.json records for that plugin. materializeSource is not atomic
+///     (deleteTree, then cp) and a killed or failed op can leave plugin-sources
+///     at a rev config.json never recorded; pinning that would make the lock
+///     disagree with `cogbox plugin list` / the mirror, or pin a half-copied
+///     tree. Those keep their old, coherent pin and are warned about by name.
+/// The stale set is updated in one batched `nix flake update`, then (a single
+/// call is all-or-nothing) one retry per input, with ONE warning naming whatever
+/// still failed. Afterwards every re-pinned plugin input must lock exactly the
+/// hash checked above; if one does not, the pre-re-pin bytes are restored whole.
+/// Returns the pre-re-pin lock bytes (caller frees) iff the lock moved, else
+/// null. Best-effort: never dies, never changes the exit code; an unreadable
+/// lock is silently a no-op.
+fn repinPathInputs(ctx: *const Ctx, flake_url: []const u8, plugins_arr: *const std.json.Array) ?[]u8 {
+	const allocator = ctx.allocator;
+	const before = readCompositionLock(ctx) orelse return null;
+	var keep_before = false;
+	defer if (!keep_before) allocator.free(before);
+
+	const names = compose.pathInputsToRepin(allocator, before) catch return null;
+	defer compose.freeInputNames(allocator, names);
+	if (names.len == 0) return null;
+
+	// stale[i] (borrowed from names) is re-pinned expecting expected[i] (owned).
+	var stale: std.ArrayList([]const u8) = .empty;
+	defer stale.deinit(allocator);
+	var expected: std.ArrayList([]u8) = .empty;
+	defer {
+		for (expected.items) |e| allocator.free(e);
+		expected.deinit(allocator);
+	}
+	for (names) |n| {
+		const disk = hashInputTree(ctx, n);
+		defer if (disk) |d| allocator.free(d);
+		const locked = compose.lockedNarHash(allocator, before, n) catch null;
+		defer if (locked) |l| allocator.free(l);
+		const recorded = if (std.mem.startsWith(u8, n, "p-")) recordedNarHash(plugins_arr, n[2..]) else null;
+		switch (compose.repinVerdict(n, locked, disk, recorded)) {
+			.current => {},
+			.repin => {
+				const dup = allocator.dupe(u8, disk.?) catch return null;
+				expected.append(allocator, dup) catch {
+					allocator.free(dup);
+					return null;
+				};
+				stale.append(allocator, n) catch return null;
+			},
+			.disagrees_with_record => warn(ctx, "{s}: on-disk source {s} does not match the pin config.json records ({s}); keeping its locked narHash (the guest keeps serving the previously locked content until a successful update)", .{ n, disk.?, recorded orelse "none" }) catch {},
+			.unverifiable => warn(ctx, "{s}: could not hash its on-disk source; keeping its locked narHash", .{n}) catch {},
+		}
+	}
+	if (stale.items.len == 0) return null;
+
+	// ONE deadline for the batch and every retry (repin_budget_s): this runs
+	// inside the control plane's install budget, and a re-pin that needs the
+	// network (an input without its own flake.lock, unreachable substituters)
+	// must cost a bounded slice of it, not 120s per stale input.
+	const start = std.Io.Timestamp.now(ctx.io, .awake);
+	var last_err: ?[]u8 = null;
+	defer if (last_err) |e| allocator.free(e);
+	var timed_out = false;
+	if (!runRepin(ctx, flake_url, stale.items, repin_budget_s, &last_err, &timed_out)) {
+		var failed: std.ArrayList(u8) = .empty;
+		defer failed.deinit(allocator);
+		for (stale.items) |n| {
+			// A batch that TIMED OUT failed on the network, not on one bad
+			// input: per-input retries would only hang the same way.
+			const remaining: ?u32 = if (timed_out) null else repinRemaining(start.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).toMilliseconds(), repin_budget_s);
+			if (remaining) |secs| {
+				if (runRepin(ctx, flake_url, &.{n}, secs, &last_err, &timed_out)) continue;
+			} else if (last_err == null) {
+				setLastErr(allocator, &last_err, "re-pin time budget exhausted");
+			}
+			if (failed.items.len > 0) failed.appendSlice(allocator, ", ") catch {};
+			failed.appendSlice(allocator, n) catch {};
+		}
+		if (failed.items.len > 0) {
+			warn(ctx, "could not re-pin composition input(s) {s} (the guest may serve stale plugin content): {s}", .{ failed.items, last_err orelse "" }) catch {};
+		}
+	}
+
+	const after = readCompositionLock(ctx) orelse return null;
+	defer allocator.free(after);
+	if (std.mem.eql(u8, before, after)) return null;
+
+	// Post-check: each re-pinned plugin input must now lock either the tree
+	// hashed above or (its own re-pin failed, warned above) its old pin -- a tree
+	// that changed underneath us, or a nix that hashed it differently, would
+	// otherwise pin something nobody checked. `user` is not checked: it has no
+	// recorded pin to be coherent with.
+	for (stale.items, expected.items) |n, want| {
+		if (!std.mem.startsWith(u8, n, "p-")) continue;
+		const got = compose.lockedNarHash(allocator, after, n) catch null;
+		defer if (got) |g| allocator.free(g);
+		const old = compose.lockedNarHash(allocator, before, n) catch null;
+		defer if (old) |o| allocator.free(o);
+		if (got) |g| {
+			if (std.mem.eql(u8, g, want)) continue;
+			if (old != null and std.mem.eql(u8, g, old.?)) continue;
+		} else if (old == null) continue;
+		warn(ctx, "{s}: re-pinned lock entry does not match its checked source ({s}); restoring the previous composition lock", .{ n, want }) catch {};
+		if (!writeCompositionLock(ctx, before)) {
+			warn(ctx, "could not restore the previous composition lock", .{}) catch {};
+		}
+		return null;
+	}
+
+	const msg = std.fmt.allocPrint(allocator, "cogbox plugin: re-pinned composition lock ({d} of {d} path input(s) stale)\n", .{ stale.items.len, names.len }) catch null;
+	if (msg) |m| {
+		defer allocator.free(m);
+		writeStderr(ctx.io, m) catch {};
+	}
+	keep_before = true;
+	return before;
+}
+
+/// `nix hash path` of a composition input's source ROOT (for a `?dir=` plugin
+/// the root is the materialized repo, which is what its path: input locks):
+/// `user` -> the per-instance user flake dir, `p-<name>` -> plugin-sources/
+/// <name>. The trimmed SRI hash (caller frees), or null on any failure.
+fn hashInputTree(ctx: *const Ctx, input_name: []const u8) ?[]u8 {
+	const allocator = ctx.allocator;
+	const dir = if (std.mem.eql(u8, input_name, "user"))
+		allocator.dupe(u8, ctx.user_flake_dir) catch return null
+	else
+		std.fs.path.join(allocator, &.{ ctx.sources_dir, input_name[2..] }) catch return null;
+	defer allocator.free(dir);
+	var out = nix.hashPath(allocator, ctx.io, null, dir) catch return null;
+	defer out.deinit(allocator);
+	if (!out.ok) return null;
+	const h = std.mem.trim(u8, out.stdout, " \t\r\n");
+	if (h.len == 0) return null;
+	return allocator.dupe(u8, h) catch null;
+}
+
+/// config.json's recorded narHash for plugin `name` (borrowed), or null.
+fn recordedNarHash(plugins_arr: *const std.json.Array, name: []const u8) ?[]const u8 {
+	for (plugins_arr.items) |item| {
+		if (item != .object) continue;
+		const n = mutate.entryField(item.object, "name") orelse continue;
+		if (!std.mem.eql(u8, n, name)) continue;
+		return mutate.entryField(item.object, "narHash");
+	}
+	return null;
+}
+
+/// Atomically (tmp + rename) replace the composition flake.lock. False on any
+/// failure (the old file is left in place).
+fn writeCompositionLock(ctx: *const Ctx, bytes: []const u8) bool {
+	const path = std.fs.path.join(ctx.allocator, &.{ ctx.plugins_flake_dir, "flake.lock" }) catch return false;
+	defer ctx.allocator.free(path);
+	return writeFileAtomic(ctx, path, bytes);
+}
+
+/// Atomically (unique tmp + rename) write `bytes` to `path`. False on any
+/// failure. The tmp name carries a random nonce and is created exclusively
+/// (same as compose.writeCompositionFlake), so concurrent writers never share
+/// a tmp, and it is always removed: a stray tmp inside plugins-flake/ would
+/// change the composition's own source hash.
+fn writeFileAtomic(ctx: *const Ctx, path: []const u8, bytes: []const u8) bool {
+	const allocator = ctx.allocator;
+	const cwd = std.Io.Dir.cwd();
+	var nonce: [16]u8 = undefined;
+	ctx.io.random(&nonce);
+	const tmp_path = std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ path, nonce }) catch return false;
+	defer allocator.free(tmp_path);
+	defer cwd.deleteFile(ctx.io, tmp_path) catch {};
+	{
+		const f = cwd.createFile(ctx.io, tmp_path, .{ .exclusive = true }) catch return false;
+		defer f.close(ctx.io);
+		var write_buf: [4096]u8 = undefined;
+		var writer = f.writer(ctx.io, &write_buf);
+		writer.interface.writeAll(bytes) catch return false;
+		writer.flush() catch return false;
+		f.sync(ctx.io) catch {};
+	}
+	cwd.rename(tmp_path, cwd, path, ctx.io) catch return false;
+	return true;
+}
+
+/// The unconfirmed-re-pin snapshot: <instance_config_dir>/composition.lock.prev
+/// holds the composition flake.lock as it was BEFORE a re-pin whose new content
+/// has not yet been proven buildable/seeded. It is a sibling of plugins-flake/
+/// (inside it would change the composition's own source hash). Written when a
+/// re-pin moves the lock and no snapshot exists yet (so it always holds the
+/// last lock that booted, not an intermediate unconfirmed one), removed once
+/// the new lock is confirmed: by the container brain/toplevel prebuild or the
+/// boot reconcile (here), or by the VM/GCE launcher's pre-exec build. Readers:
+/// brainResolveContainer (flake.nix) retries the brain with it when the live
+/// lock fails offline; cogbox-launch.sh restores it when the re-pinned
+/// composition fails to build. Without it a re-pin that is killed (the CP's
+/// install budget) or fails to build turns a stale-but-working instance into
+/// a plugin-less (container) or restart-looping (GCE) one.
+fn prevLockPath(ctx: *const Ctx) ?[]u8 {
+	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse return null;
+	return std.fs.path.join(ctx.allocator, &.{ instance_config_dir, "composition.lock.prev" }) catch null;
+}
+
+/// Record `before` as the unconfirmed-re-pin snapshot unless one already exists.
+fn savePrevLock(ctx: *const Ctx, before: []const u8) void {
+	const path = prevLockPath(ctx) orelse return;
+	defer ctx.allocator.free(path);
+	if (std.Io.Dir.cwd().access(ctx.io, path, .{})) |_| return else |_| {}
+	if (!writeFileAtomic(ctx, path, before)) {
+		warn(ctx, "could not save the pre-re-pin composition lock (no fallback if the re-pinned content fails to build)", .{}) catch {};
+	}
+}
+
+/// Drop the unconfirmed-re-pin snapshot: the live lock is confirmed. Best-effort.
+fn clearPrevLock(ctx: *const Ctx) void {
+	const path = prevLockPath(ctx) orelse return;
+	defer ctx.allocator.free(path);
+	std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
+	clearPrevBootMarker(ctx);
+}
+
+/// Drop <instance_config_dir>/composition.lock.prev.boot. cogbox-launch.sh
+/// writes it next to a composition.lock.prev the LAUNCHER snapshotted (a boot
+/// re-pin), and it vouches that runner.path still names the runner booted
+/// under that snapshot -- so a failed confirmation may keep runner.path when it
+/// restores the snapshot. Any op invalidates that: regenComposition removes or
+/// rewrites runner.path (removeRunnerRecord) and clearPrevLock drops the
+/// snapshot itself, so both drop the marker. Best-effort.
+fn clearPrevBootMarker(ctx: *const Ctx) void {
+	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse return;
+	const path = std.fs.path.join(ctx.allocator, &.{ instance_config_dir, "composition.lock.prev.boot" }) catch return;
+	defer ctx.allocator.free(path);
+	std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
+}
+
+/// Total wall-clock budget, in seconds, for one op's composition re-pin (the
+/// batched `nix flake update` plus every per-input retry). Matches the
+/// launcher's (cogbox-launch.sh).
+const repin_budget_s: u32 = 120;
+
+/// Seconds left of a `budget_s` deadline after `elapsed_ms`, or null once
+/// less than one second remains (the caller then stops retrying). Pure.
+fn repinRemaining(elapsed_ms: i64, budget_s: u32) ?u32 {
+	const left_ms = @as(i64, budget_s) * 1000 - elapsed_ms;
+	if (left_ms < 1000) return null;
+	return @intCast(@divTrunc(left_ms, 1000));
+}
+
+/// One `nix flake update <names> --flake <url>`, killed after `timeout_s`. On
+/// failure stores the stderr tail (or a launch-failure / timeout note) in
+/// `last_err`, replacing any previous one, and sets `timed_out` when the
+/// timeout fired.
+fn runRepin(ctx: *const Ctx, flake_url: []const u8, names: []const []const u8, timeout_s: u32, last_err: *?[]u8, timed_out: *bool) bool {
+	const allocator = ctx.allocator;
+	var out = nix.flakeUpdateInputs(allocator, ctx.io, ctx.fetch_env, flake_url, names, timeout_s) catch {
+		setLastErr(allocator, last_err, "failed to run nix");
+		return false;
+	};
+	defer out.deinit(allocator);
+	if (out.ok) return true;
+	if (out.timed_out) {
+		timed_out.* = true;
+		setLastErr(allocator, last_err, "timed out (network unreachable?)");
+		return false;
+	}
+	setLastErr(allocator, last_err, nix.stderrTail(out.stderr));
+	return false;
+}
+
+fn setLastErr(allocator: std.mem.Allocator, last_err: *?[]u8, msg: []const u8) void {
+	if (last_err.*) |e| allocator.free(e);
+	last_err.* = allocator.dupe(u8, msg) catch null;
+}
+
+/// True iff the current composition flake.nix AND flake.lock are both present
+/// and byte-identical to the no-op baseline (which must have both too).
+fn compositionUnchanged(ctx: *const Ctx, b: *const NoopBaseline) bool {
+	const allocator = ctx.allocator;
+	const base_nix = b.flake_nix orelse return false;
+	const base_lock = b.flake_lock orelse return false;
+	const cur_nix = readCompositionFile(ctx, "flake.nix") orelse return false;
+	defer allocator.free(cur_nix);
+	const cur_lock = readCompositionLock(ctx) orelse return false;
+	defer allocator.free(cur_lock);
+	return std.mem.eql(u8, cur_nix, base_nix) and std.mem.eql(u8, cur_lock, base_lock);
 }
 
 /// The env-driven runner pre-build + push (Stage 1 of the offline-launch
@@ -1210,23 +1612,23 @@ fn finalizeComposition(ctx: *const Ctx) void {
 /// is in the closure -- hostname/ports/keys are launch-time sed rewrites on the
 /// OUTPUT), then pushes that out-path's closure to the cache so a fresh-store
 /// boot substitutes it. Every failure is logged and swallowed.
-fn prebuildAndPushRunner(ctx: *const Ctx) void {
+fn prebuildAndPushRunner(ctx: *const Ctx) Prebuild {
 	const allocator = ctx.allocator;
 	const env = ctx.parent_env;
 
-	const push = env.get("COGBOX_RUNNER_PUSH") orelse return;
-	if (!std.mem.eql(u8, push, "1")) return;
-	const push_config = env.get("COGBOX_PUSH_CONFIG") orelse return;
-	if (push_config.len == 0) return;
+	const push = env.get("COGBOX_RUNNER_PUSH") orelse return .skipped;
+	if (!std.mem.eql(u8, push, "1")) return .skipped;
+	const push_config = env.get("COGBOX_PUSH_CONFIG") orelse return .skipped;
+	if (push_config.len == 0) return .skipped;
 
 	// The cogbox flake + nixpkgs store paths, baked by mkCogbox (--set-default).
 	const flake_source = env.get("COGBOX_FLAKE_SOURCE") orelse {
 		warn(ctx, "runner push: COGBOX_FLAKE_SOURCE unset; skipping pre-build", .{}) catch {};
-		return;
+		return .failed;
 	};
 	const nixpkgs_source = env.get("COGBOX_NIXPKGS_SOURCE") orelse {
 		warn(ctx, "runner push: COGBOX_NIXPKGS_SOURCE unset; skipping pre-build", .{}) catch {};
-		return;
+		return .failed;
 	};
 
 	// The config-name suffix: cogbox-x86_64 / cogbox-aarch64. builtin.cpu.arch
@@ -1238,8 +1640,8 @@ fn prebuildAndPushRunner(ctx: *const Ctx) void {
 	// so the runner's transitive deps substitute rather than build from source.
 	const extra_subs = env.get("COGBOX_EXTRA_SUBSTITUTERS") orelse "";
 	const substituters = blk: {
-		if (extra_subs.len == 0) break :blk std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return;
-		break :blk std.fmt.allocPrint(allocator, "file://{s} {s}", .{ ctx.cache_dir, extra_subs }) catch return;
+		if (extra_subs.len == 0) break :blk std.fmt.allocPrint(allocator, "file://{s}", .{ctx.cache_dir}) catch return .failed;
+		break :blk std.fmt.allocPrint(allocator, "file://{s} {s}", .{ ctx.cache_dir, extra_subs }) catch return .failed;
 	};
 	defer allocator.free(substituters);
 
@@ -1253,20 +1655,20 @@ fn prebuildAndPushRunner(ctx: *const Ctx) void {
 		.netrc_file = env.get("COGBOX_NETRC_FILE") orelse "",
 	}) catch {
 		warn(ctx, "runner push: build failed to launch (boot will rebuild)", .{}) catch {};
-		return;
+		return .failed;
 	};
 	var o = out;
 	defer o.deinit(allocator);
 	if (!o.ok) {
 		warn(ctx, "runner push: build failed (boot will rebuild): {s}", .{nix.stderrTail(o.stderr)}) catch {};
-		return;
+		return .failed;
 	}
 	// --print-out-paths emits the store path(s), one per line; take the first.
 	const out_path = std.mem.trim(u8, o.stdout, " \t\r\n");
 	const first = if (std.mem.indexOfScalar(u8, out_path, '\n')) |i| out_path[0..i] else out_path;
 	if (first.len == 0) {
 		warn(ctx, "runner push: build produced no out-path (boot will rebuild)", .{}) catch {};
-		return;
+		return .failed;
 	}
 
 	const pushed = pushToCache(ctx, push_config, first);
@@ -1291,6 +1693,9 @@ fn prebuildAndPushRunner(ctx: *const Ctx) void {
 	// (either one fails the launcher's `[ "$FP_REV" = "$RUNNER_KEY" ]` guard and
 	// re-evals). See writeRunnerRecord for why the package attribute is in there.
 	if (pushed) writeRunnerRecord(ctx, flake_source, first);
+	// The composed runner BUILT from the live lock, which is all the launcher's
+	// pre-exec confirmation would prove (the push is only a cache optimization).
+	return .ok;
 }
 
 /// Resolve the node-shared CoW base store a container pre-build can substitute the
@@ -1347,22 +1752,22 @@ fn buildSubstituters(allocator: std.mem.Allocator, cache_dir: []const u8, extra_
 /// no worse than before this fix). Determinism mirrors the runner path: nothing
 /// instance-specific is in the brain closure, so the pre-built out-path is
 /// byte-identical to the one boot's brainResolveContainer evaluates.
-fn prebuildBrainLocal(ctx: *const Ctx) void {
+fn prebuildBrainLocal(ctx: *const Ctx) Prebuild {
 	const allocator = ctx.allocator;
 	const env = ctx.parent_env;
 
-	const local = env.get("COGBOX_BRAIN_PUSH_LOCAL") orelse return;
-	if (!std.mem.eql(u8, local, "1")) return;
+	const local = env.get("COGBOX_BRAIN_PUSH_LOCAL") orelse return .skipped;
+	if (!std.mem.eql(u8, local, "1")) return .skipped;
 
 	// The cogbox flake + nixpkgs store paths, baked by mkCogbox (--set-default)
 	// into the same cogbox image the container boot evaluates against.
 	const flake_source = env.get("COGBOX_FLAKE_SOURCE") orelse {
 		warn(ctx, "brain prebuild: COGBOX_FLAKE_SOURCE unset; skipping (boot rebuilds)", .{}) catch {};
-		return;
+		return .failed;
 	};
 	const nixpkgs_source = env.get("COGBOX_NIXPKGS_SOURCE") orelse {
 		warn(ctx, "brain prebuild: COGBOX_NIXPKGS_SOURCE unset; skipping (boot rebuilds)", .{}) catch {};
-		return;
+		return .failed;
 	};
 
 	// cogbox-x86_64 / cogbox-aarch64: the config-name suffix (compile-time arch,
@@ -1377,7 +1782,7 @@ fn prebuildBrainLocal(ctx: *const Ctx) void {
 	// null => today's shared-cache-only path (a cache miss, never a failure).
 	const base_root = baseStoreRoot(ctx);
 	const extra_subs = env.get("COGBOX_EXTRA_SUBSTITUTERS") orelse "";
-	const substituters = buildSubstituters(allocator, ctx.cache_dir, extra_subs, base_root) orelse return;
+	const substituters = buildSubstituters(allocator, ctx.cache_dir, extra_subs, base_root) orelse return .failed;
 	defer allocator.free(substituters);
 
 	const out = nix.buildBrain(allocator, ctx.io, env, .{
@@ -1391,20 +1796,20 @@ fn prebuildBrainLocal(ctx: *const Ctx) void {
 		.base_store_root = base_root orelse "",
 	}) catch {
 		warn(ctx, "brain prebuild: build failed to launch (boot rebuilds)", .{}) catch {};
-		return;
+		return .failed;
 	};
 	var o = out;
 	defer o.deinit(allocator);
 	if (!o.ok) {
 		warn(ctx, "brain prebuild: build failed (boot rebuilds): {s}", .{nix.stderrTail(o.stderr)}) catch {};
-		return;
+		return .failed;
 	}
 	// --print-out-paths emits the store path(s), one per line; take the first.
 	const out_path = std.mem.trim(u8, o.stdout, " \t\r\n");
 	const first = if (std.mem.indexOfScalar(u8, out_path, '\n')) |i| out_path[0..i] else out_path;
 	if (first.len == 0) {
 		warn(ctx, "brain prebuild: build produced no out-path (boot rebuilds)", .{}) catch {};
-		return;
+		return .failed;
 	}
 
 	// Seed the per-instance plugin-cache with the realized closure so boot
@@ -1417,14 +1822,19 @@ fn prebuildBrainLocal(ctx: *const Ctx) void {
 	// cost, and the boot reads the compression from each narinfo, so the read side
 	// needs no change. (A local single-node cache read once at boot; none/zstd both
 	// fine -- zstd keeps the PVC footprint down.)
-	const cache_url = std.fmt.allocPrint(allocator, "file://{s}?compression=zstd", .{ctx.cache_dir}) catch return;
+	const cache_url = std.fmt.allocPrint(allocator, "file://{s}?compression=zstd", .{ctx.cache_dir}) catch return .failed;
 	defer allocator.free(cache_url);
 	if (nix.copyClosureTo(allocator, ctx.io, env, cache_url, first)) |cp| {
 		var c = cp;
 		defer c.deinit(allocator);
-		if (!c.ok) warn(ctx, "brain prebuild: copy to plugin-cache failed (boot rebuilds): {s}", .{nix.stderrTail(c.stderr)}) catch {};
+		if (!c.ok) {
+			warn(ctx, "brain prebuild: copy to plugin-cache failed (boot rebuilds): {s}", .{nix.stderrTail(c.stderr)}) catch {};
+			return .failed;
+		}
+		return .ok;
 	} else |_| {
 		warn(ctx, "brain prebuild: copy to plugin-cache failed to launch (boot rebuilds)", .{}) catch {};
+		return .failed;
 	}
 }
 
@@ -1444,11 +1854,11 @@ fn prebuildBrainLocal(ctx: *const Ctx) void {
 /// nothing instance-specific is in the toplevel closure, so the pre-built out-path is
 /// byte-identical to the one agentInit would derive. v1 copies the WHOLE closure (base
 /// included); a delta-vs-baked-base copy is a follow-up space/latency optimization.
-fn prebuildToplevelLocal(ctx: *const Ctx) void {
+fn prebuildToplevelLocal(ctx: *const Ctx) Prebuild {
 	const env = ctx.parent_env;
-	const local = env.get("COGBOX_TOPLEVEL_PUSH_LOCAL") orelse return;
-	if (!std.mem.eql(u8, local, "1")) return;
-	_ = doToplevelBuild(ctx);
+	const local = env.get("COGBOX_TOPLEVEL_PUSH_LOCAL") orelse return .skipped;
+	if (!std.mem.eql(u8, local, "1")) return .skipped;
+	return if (doToplevelBuild(ctx)) .ok else .failed;
 }
 
 /// the delta-only copy: write narinfo STUBS for the node CoW base
@@ -1654,8 +2064,9 @@ fn cmdReconcile(ctx: *Ctx, loaded: *config.Loaded) !void {
 		return;
 	}
 	// Skip when the recorded toplevel is already current for this (image rev, composition).
-	if (toplevelRecordCurrent(ctx)) return;
-	_ = doToplevelBuild(ctx);
+	// Either way a current toplevel (whose closure carries this lock's brain) confirms
+	// the live composition lock, so the unconfirmed-re-pin snapshot is dropped.
+	if (toplevelRecordCurrent(ctx) or doToplevelBuild(ctx)) clearPrevLock(ctx);
 }
 
 /// Hash of the composition identity: the plugins-flake flake.lock, which pins the plugin set
@@ -1663,17 +2074,66 @@ fn cmdReconcile(ctx: *Ctx, loaded: *config.Loaded) !void {
 /// compares it against the record's stored hash to skip an unchanged rebuild. Null when the
 /// lock is unreadable (treated as "changed" -> rebuild, which is safe).
 fn compositionHash(ctx: *const Ctx) ?u64 {
+	const data = readCompositionLock(ctx) orelse return null;
+	defer ctx.allocator.free(data);
+	return std.hash.Wyhash.hash(0, data);
+}
+
+/// The composition flake.lock bytes (caller frees), or null when unreadable.
+fn readCompositionLock(ctx: *const Ctx) ?[]u8 {
+	return readCompositionFile(ctx, "flake.lock");
+}
+
+/// Read <plugins_flake_dir>/<name> (4 MiB cap; caller frees), or null.
+fn readCompositionFile(ctx: *const Ctx, name: []const u8) ?[]u8 {
 	const allocator = ctx.allocator;
-	const lock = std.fs.path.join(allocator, &.{ ctx.plugins_flake_dir, "flake.lock" }) catch return null;
-	defer allocator.free(lock);
+	const path = std.fs.path.join(allocator, &.{ ctx.plugins_flake_dir, name }) catch return null;
+	defer allocator.free(path);
 	const cwd = std.Io.Dir.cwd();
-	const file = cwd.openFile(ctx.io, lock, .{}) catch return null;
+	const file = cwd.openFile(ctx.io, path, .{}) catch return null;
 	defer file.close(ctx.io);
 	var buf: [4096]u8 = undefined;
 	var reader = file.reader(ctx.io, &buf);
-	const data = reader.interface.allocRemaining(allocator, .limited(4 << 20)) catch return null;
+	return reader.interface.allocRemaining(allocator, .limited(4 << 20)) catch return null;
+}
+
+/// True iff the toplevel record is current (toplevelRecordCurrent) AND the
+/// narinfo for its recorded out-path (line 2) exists in the plugin-cache --
+/// i.e. the closure the record names is actually seeded for the boot to
+/// substitute. Any read failure returns false (-> the prebuild runs).
+fn toplevelSeeded(ctx: *const Ctx) bool {
+	if (!toplevelRecordCurrent(ctx)) return false;
+	const allocator = ctx.allocator;
+	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse return false;
+	const path = std.fs.path.join(allocator, &.{ instance_config_dir, "toplevel.path" }) catch return false;
+	defer allocator.free(path);
+	const cwd = std.Io.Dir.cwd();
+	const file = cwd.openFile(ctx.io, path, .{}) catch return false;
+	defer file.close(ctx.io);
+	var buf: [1024]u8 = undefined;
+	var reader = file.reader(ctx.io, &buf);
+	const data = reader.interface.allocRemaining(allocator, .limited(64 << 10)) catch return false;
 	defer allocator.free(data);
-	return std.hash.Wyhash.hash(0, data);
+
+	var lines = std.mem.splitScalar(u8, data, '\n');
+	_ = lines.next() orelse return false; // rev (line 1)
+	const out = lines.next() orelse return false; // out-path (line 2)
+	var name_buf: [64]u8 = undefined;
+	const fname = narinfoName(&name_buf, out) orelse return false;
+	const narinfo = std.fs.path.join(allocator, &.{ ctx.cache_dir, fname }) catch return false;
+	defer allocator.free(narinfo);
+	cwd.access(ctx.io, narinfo, .{}) catch return false;
+	return true;
+}
+
+/// "<hash32>.narinfo" for a store out-path (surrounding whitespace trimmed),
+/// written into `buf` -- the same naming seedBaseNarinfos and nix's file://
+/// cache use. Null when the basename is shorter than the 32-char hash.
+fn narinfoName(buf: []u8, out_path: []const u8) ?[]const u8 {
+	const trimmed = std.mem.trim(u8, out_path, " \t\r\n");
+	const base = std.fs.path.basename(trimmed);
+	if (base.len < 32) return null;
+	return std.fmt.bufPrint(buf, "{s}.narinfo", .{base[0..32]}) catch null;
 }
 
 /// True iff toplevel.path exists AND line1 == COGBOX_FLAKE_SOURCE (image rev current) AND
@@ -1719,6 +2179,23 @@ fn removeRunnerRecord(ctx: *const Ctx) void {
 	const p = std.fs.path.join(allocator, &.{ instance_config_dir, "runner.path" }) catch return;
 	defer allocator.free(p);
 	std.Io.Dir.cwd().deleteFile(ctx.io, p) catch {};
+	// The launcher's snapshot marker vouches for the record just removed.
+	clearPrevBootMarker(ctx);
+	clearRepinFailed(ctx);
+}
+
+/// Drop <instance_config_dir>/composition.repin.failed: cogbox-launch.sh records
+/// there the plugin content whose boot re-pin failed its confirmation build, and
+/// skips re-pinning exactly that content on later launches (so `cogbox start`'s
+/// two launcher passes and every boot do not repeat one failing full eval). Any
+/// op changes the composition, so its verdict no longer holds and the next boot
+/// must retry. Best-effort: a stale file only keeps already-failed content at its
+/// previous pin until the next op, never pins anything.
+fn clearRepinFailed(ctx: *const Ctx) void {
+	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse return;
+	const path = std.fs.path.join(ctx.allocator, &.{ instance_config_dir, "composition.repin.failed" }) catch return;
+	defer ctx.allocator.free(path);
+	std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
 }
 
 /// Remove the toplevel record (+ its crash-loop attempt marker) so agentInit boots the baked
@@ -2107,6 +2584,9 @@ fn regenComposition(ctx: *const Ctx, plugins_arr: *std.json.Array) !void {
 
 	if (plugins_arr.items.len == 0) {
 		try compose.removeCompositionFlake(allocator, ctx.io, ctx.plugins_flake_dir);
+		// The lock is gone, so is any snapshot of it: a later re-add must never
+		// fall back to a composition from before the removal.
+		clearPrevLock(ctx);
 		return;
 	}
 
@@ -2349,6 +2829,22 @@ fn die(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args:
 // --- tests ---------------------------------------------------------------
 
 const t = std.testing;
+
+test "repinRemaining: one shared deadline, null once under a second is left" {
+	try t.expectEqual(@as(?u32, 120), repinRemaining(0, 120));
+	try t.expectEqual(@as(?u32, 70), repinRemaining(50_000, 120));
+	try t.expectEqual(@as(?u32, 1), repinRemaining(118_999, 120));
+	try t.expect(repinRemaining(119_001, 120) == null);
+	try t.expect(repinRemaining(400_000, 120) == null);
+}
+
+test "narinfoName derives <hash32>.narinfo from an out-path" {
+	var buf: [64]u8 = undefined;
+	try t.expectEqualStrings("0123456789abcdfghijklmnpqrsvwxyz.narinfo", narinfoName(&buf, "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-cogbox").?);
+	try t.expectEqualStrings("0123456789abcdfghijklmnpqrsvwxyz.narinfo", narinfoName(&buf, "  /nix/store/0123456789abcdfghijklmnpqrsvwxyz-x\r\n").?);
+	try t.expect(narinfoName(&buf, "/nix/store/short-name") == null);
+	try t.expect(narinfoName(&buf, "") == null);
+}
 
 test "renderDeferredJson emits one line with the validated rule shapes" {
 	const a = t.allocator;

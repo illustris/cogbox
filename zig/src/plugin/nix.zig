@@ -13,6 +13,8 @@ pub const RunOut = struct {
 	stdout: []u8,
 	stderr: []u8,
 	ok: bool,
+	/// runNixTimed only: the `timeout` wrapper killed nix (exit 124).
+	timed_out: bool = false,
 
 	pub fn deinit(self: *RunOut, allocator: std.mem.Allocator) void {
 		allocator.free(self.stdout);
@@ -35,6 +37,25 @@ pub fn runNix(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process
 	const res = try std.process.run(allocator, io, .{ .argv = argv.items, .environ_map = env });
 	const ok = res.term == .exited and res.term.exited == 0;
 	return .{ .stdout = res.stdout, .stderr = res.stderr, .ok = ok };
+}
+
+/// runNix under coreutils `timeout -k 10 <timeout_s>`: nix is sent SIGTERM
+/// after `timeout_s` seconds (SIGKILL 10s later), and the result carries
+/// `timed_out` so a caller can tell "the network hung" from "this input
+/// failed". For the calls that run inside the control plane's fixed install
+/// budget and must never eat it whole. `timeout_s` 0 is clamped to 1.
+pub fn runNixTimed(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, timeout_s: u32, args: []const []const u8) !RunOut {
+	var secs_buf: [16]u8 = undefined;
+	const secs = try std.fmt.bufPrint(&secs_buf, "{d}", .{@max(timeout_s, 1)});
+	var argv: std.ArrayList([]const u8) = .empty;
+	defer argv.deinit(allocator);
+	try argv.appendSlice(allocator, &.{ "timeout", "-k", "10", secs, "nix", "--extra-experimental-features", "nix-command flakes" });
+	try argv.appendSlice(allocator, args);
+
+	const res = try std.process.run(allocator, io, .{ .argv = argv.items, .environ_map = env });
+	const ok = res.term == .exited and res.term.exited == 0;
+	const timed_out = res.term == .exited and res.term.exited == 124;
+	return .{ .stdout = res.stdout, .stderr = res.stderr, .ok = ok, .timed_out = timed_out };
 }
 
 /// `refresh` adds `--refresh`, which bypasses nix's flake/tarball eval cache so
@@ -63,12 +84,62 @@ pub fn flakeArchiveTo(allocator: std.mem.Allocator, io: std.Io, env: ?*const std
 }
 
 /// `nix flake lock <url>`: reconcile the composition flake's lock against its
-/// current inputs, writing/updating flake.lock in place. Run after every
-/// regen so launch resolves from a coherent lock (path: inputs are read from
-/// disk; no fetch). Authenticated (the rewritten inputs are local path: refs,
-/// but a migration-fallback git+ input still needs the acting user's token).
+/// current inputs, writing/updating flake.lock in place. Run after every regen.
+/// Plain `nix flake lock` only ADDS missing inputs and DROPS removed ones: it
+/// does NOT re-hash an existing path: input whose on-disk content changed. The
+/// old narHash is kept, so a warm store silently serves the OLD content and a
+/// cold store fails with a narHash mismatch. Callers must follow it with
+/// flakeUpdateInputs for the STALE path: inputs. Authenticated (the rewritten inputs
+/// are local path: refs, but a migration-fallback git+ input still needs the
+/// acting user's token).
 pub fn flakeLock(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8) !RunOut {
 	return runNix(allocator, io, env, &.{ "flake", "lock", url });
+}
+
+/// Network bounds for the re-pin: a fetch that cannot connect, or stalls, fails
+/// fast instead of eating the caller's whole timeout (a path: re-pin is offline
+/// unless the input has no flake.lock of its own and nix re-resolves its
+/// transitive inputs).
+const repin_net_opts = [_][]const u8{ "--option", "connect-timeout", "5", "--option", "stalled-download-timeout", "20" };
+
+/// The argv (after `nix --extra-experimental-features ...`) for
+/// `nix flake update <net opts> <inputs...> --flake <url>`. Pure; the returned
+/// slice is owned by the caller (the strings are borrowed). Zero inputs is
+/// refused with error.NoInputs: nix treats an empty name list as update-ALL,
+/// which would re-resolve git+/tarball fallback inputs against the network.
+pub fn flakeUpdateArgv(allocator: std.mem.Allocator, url: []const u8, inputs: []const []const u8) ![]const []const u8 {
+	if (inputs.len == 0) return error.NoInputs;
+	const n_opts = repin_net_opts.len;
+	const argv = try allocator.alloc([]const u8, 2 + n_opts + inputs.len + 2);
+	argv[0] = "flake";
+	argv[1] = "update";
+	@memcpy(argv[2 .. 2 + n_opts], &repin_net_opts);
+	@memcpy(argv[2 + n_opts .. 2 + n_opts + inputs.len], inputs);
+	argv[2 + n_opts + inputs.len] = "--flake";
+	argv[3 + n_opts + inputs.len] = url;
+	return argv;
+}
+
+/// `nix flake update <inputs...> --flake <url>`: re-pin ONLY the named inputs
+/// (re-hashing a path: input's current on-disk content into the lock). Works
+/// offline for path: inputs whose own flake.lock pins their transitive inputs;
+/// an input WITHOUT its own flake.lock has its transitive inputs re-resolved
+/// (floated to upstream), which is why callers name only inputs that are
+/// actually stale (compose.repinVerdict), never every path: input. No inputs => refused (error.NoInputs), never an update-all.
+/// Bounded by `timeout_s` (runNixTimed): it runs inside the control plane's
+/// install budget.
+pub fn flakeUpdateInputs(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, url: []const u8, inputs: []const []const u8, timeout_s: u32) !RunOut {
+	const argv = try flakeUpdateArgv(allocator, url, inputs);
+	defer allocator.free(argv);
+	return runNixTimed(allocator, io, env, timeout_s, argv);
+}
+
+/// `nix hash path <path>`: the SRI NAR hash of an on-disk tree -- the same
+/// value a `path:` input of that tree locks as its narHash. Pure and offline
+/// (reads the tree; no store write, no fetch), so the re-pin can tell a stale
+/// lock entry from a current one without touching the network.
+pub fn hashPath(allocator: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, path: []const u8) !RunOut {
+	return runNix(allocator, io, env, &.{ "hash", "path", path });
 }
 
 /// Inputs for buildRunner. `flake_source`/`nixpkgs_source` are the cogbox

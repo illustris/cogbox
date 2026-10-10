@@ -230,6 +230,27 @@ class Lifecycle(unittest.TestCase):
         self.cli("stop")
         self.ended(fresh)
 
+    def test_start_daemon_pass_skips_repin_and_drops_marker(self):
+        # `cogbox start` runs the launcher twice: the foreground --init-only
+        # pass owns the boot-time plugin re-pin, the daemon pass (bound to
+        # start's 60s QEMU deadline) must skip it via COGBOX_SKIP_REPIN=1, and
+        # the launcher must not hand that marker on to QEMU.
+        passes = self.root / "passes"
+        wrapper = self.root / "launch-wrapper.sh"
+        self.executable(wrapper, f"#!{self.bash}\n"
+                        f"m=unset; [ -z \"${{COGBOX_SKIP_REPIN+x}}\" ] || m=\"$COGBOX_SKIP_REPIN\"\n"
+                        f"init=daemon; for a in \"$@\"; do [ \"$a\" != --init-only ] || init=init; done\n"
+                        f"echo \"$init $m\" >> {Q(str(passes))}\n"
+                        f"exec {Q(str(self.script))} \"$@\"\n")
+        self.env["COGBOX_LAUNCH_SCRIPT"] = str(wrapper)
+        identity = self.start()
+        self.assertEqual(passes.read_text().split("\n")[:2], ["init unset", "daemon 1"])
+        qemu = int((self.runtime / "qemu.pid").read_text())
+        environ = Path(f"/proc/{qemu}/environ").read_bytes().split(b"\0")
+        self.assertEqual([e for e in environ if e.startswith(b"COGBOX_SKIP_REPIN=")], [])
+        self.cli("stop")
+        self.ended(identity)
+
     def test_live_lock_blocks_cli_and_direct_launcher(self):
         before = self.start()
         # PID hints are not the lock, even while the owned child is still live.

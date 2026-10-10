@@ -16,6 +16,7 @@
 // source was materialized.
 
 const std = @import("std");
+const name_mod = @import("name.zig");
 
 pub const PluginRef = struct {
 	name: []const u8,
@@ -149,10 +150,12 @@ fn appendNixString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []c
 
 /// Atomically write `rendered` as <dir>/flake.nix (mkdir -p, .tmp + rename).
 /// An existing flake.lock is KEPT (not deleted): the caller reconciles it with
-/// `nix flake lock` after this write, so launch resolves from a coherent,
+/// `nix flake lock` plus a re-pin of every path: input (pathInputsToRepin +
+/// nix.flakeUpdateInputs) after this write, so launch resolves from a coherent,
 /// already-pinned lock instead of re-resolving every input (which a fresh-store
-/// launch can't do offline for a git+ input). The lock is dropped only when the
-/// last plugin is removed (removeCompositionFlake).
+/// launch can't do offline for a git+ input), while a path: input whose
+/// on-disk content changed still gets its new narHash. The lock is dropped only
+/// when the last plugin is removed (removeCompositionFlake).
 pub fn writeCompositionFlake(
 	allocator: std.mem.Allocator,
 	io: std.Io,
@@ -191,4 +194,135 @@ pub fn removeCompositionFlake(allocator: std.mem.Allocator, io: std.Io, dir: []c
 		defer allocator.free(path);
 		cwd.deleteFile(io, path) catch {};
 	}
+}
+
+/// The composition inputs to re-pin with `nix flake update`: every root input
+/// of the composition `lock_json` (a flake.lock) whose node's `original.type`
+/// is "path" (materialized plugin sources and the `user` flake). Plain
+/// `nix flake lock` keeps a path: input's old narHash even when its content
+/// changed, so these are the inputs that need an explicit re-pin; git+/tarball
+/// fallback inputs are skipped (re-resolving them needs the network).
+///
+/// Returns the input NAMES (the keys under nodes.root.inputs), not the node
+/// keys, which nix may suffix (`p-foo_2`). SAFETY FILTER: the lock lives on a
+/// sandbox-writable volume and the names become nix argv run with the acting
+/// user's fetch credentials, so only "user" and "p-<valid plugin name>" are
+/// accepted; anything else (including a name starting with '-') is silently
+/// dropped. A malformed/unexpected shape yields an empty list (only OOM is an
+/// error). Caller frees with freeInputNames.
+pub fn pathInputsToRepin(allocator: std.mem.Allocator, lock_json: []const u8) error{OutOfMemory}![][]const u8 {
+	var names: std.ArrayList([]const u8) = .empty;
+	errdefer {
+		for (names.items) |n| allocator.free(n);
+		names.deinit(allocator);
+	}
+
+	const parsed = std.json.parseFromSlice(std.json.Value, allocator, lock_json, .{}) catch |err| switch (err) {
+		error.OutOfMemory => return error.OutOfMemory,
+		else => return names.toOwnedSlice(allocator),
+	};
+	defer parsed.deinit();
+
+	collect: {
+		if (parsed.value != .object) break :collect;
+		const nodes = parsed.value.object.get("nodes") orelse break :collect;
+		if (nodes != .object) break :collect;
+		const root = nodes.object.get("root") orelse break :collect;
+		if (root != .object) break :collect;
+		const inputs = root.object.get("inputs") orelse break :collect;
+		if (inputs != .object) break :collect;
+
+		var it = inputs.object.iterator();
+		while (it.next()) |entry| {
+			const input_name = entry.key_ptr.*;
+			const node_key = entry.value_ptr.*;
+			// A `follows` input is an array path, not a node key: skip it.
+			if (node_key != .string) continue;
+			if (!isRepinnableName(input_name)) continue;
+			const node = nodes.object.get(node_key.string) orelse continue;
+			if (node != .object) continue;
+			const original = node.object.get("original") orelse continue;
+			if (original != .object) continue;
+			const ty = original.object.get("type") orelse continue;
+			if (ty != .string or !std.mem.eql(u8, ty.string, "path")) continue;
+			const dup = try allocator.dupe(u8, input_name);
+			errdefer allocator.free(dup);
+			try names.append(allocator, dup);
+		}
+	}
+	return names.toOwnedSlice(allocator);
+}
+
+/// Free a list returned by pathInputsToRepin.
+pub fn freeInputNames(allocator: std.mem.Allocator, names: [][]const u8) void {
+	for (names) |n| allocator.free(n);
+	allocator.free(names);
+}
+
+/// The pathInputsToRepin safety filter: exactly "user", or "p-" followed by a
+/// valid plugin name (the only input names render ever emits).
+fn isRepinnableName(n: []const u8) bool {
+	if (std.mem.eql(u8, n, "user")) return true;
+	if (!std.mem.startsWith(u8, n, "p-")) return false;
+	return name_mod.isValidPluginName(n[2..]);
+}
+
+/// The `locked.narHash` of root input `input_name`'s node in the composition
+/// `lock_json`, or null when the lock is malformed, the input is absent, is a
+/// `follows`, or carries no narHash. Caller frees. Only OOM is an error.
+pub fn lockedNarHash(allocator: std.mem.Allocator, lock_json: []const u8, input_name: []const u8) error{OutOfMemory}!?[]u8 {
+	const parsed = std.json.parseFromSlice(std.json.Value, allocator, lock_json, .{}) catch |err| switch (err) {
+		error.OutOfMemory => return error.OutOfMemory,
+		else => return null,
+	};
+	defer parsed.deinit();
+	if (parsed.value != .object) return null;
+	const nodes = parsed.value.object.get("nodes") orelse return null;
+	if (nodes != .object) return null;
+	const root = nodes.object.get("root") orelse return null;
+	if (root != .object) return null;
+	const inputs = root.object.get("inputs") orelse return null;
+	if (inputs != .object) return null;
+	const node_key = inputs.object.get(input_name) orelse return null;
+	if (node_key != .string) return null;
+	const node = nodes.object.get(node_key.string) orelse return null;
+	if (node != .object) return null;
+	const locked = node.object.get("locked") orelse return null;
+	if (locked != .object) return null;
+	const nh = locked.object.get("narHash") orelse return null;
+	if (nh != .string) return null;
+	return try allocator.dupe(u8, nh.string);
+}
+
+/// What to do with one path: input candidate (pathInputsToRepin) before any
+/// `nix flake update` runs. The re-pin must never be blind: an update-all of
+/// the path: inputs would pin whatever sits on disk, including a half-copied
+/// plugin-sources tree or one a killed op left at a rev config.json never
+/// recorded, and it would float an input's transitive inputs even when the
+/// input itself is current.
+pub const RepinVerdict = enum {
+	/// locked narHash == on-disk hash: leave the input alone.
+	current,
+	/// stale, and the on-disk tree is the recorded pin (or it is `user`,
+	/// which has no recorded pin): re-pin it.
+	repin,
+	/// stale, but the on-disk plugin tree is NOT what config.json records
+	/// (partial copy, interrupted update, missing narHash): keep the old pin.
+	disagrees_with_record,
+	/// the on-disk tree could not be hashed: keep the old pin.
+	unverifiable,
+};
+
+/// Pure decision for one candidate. `locked` is the lock's narHash for the
+/// input (lockedNarHash), `disk` the `nix hash path` of its source root,
+/// `recorded` config.json's .plugins[].narHash for a `p-<name>` input (ignored
+/// for `user`, which config.json does not pin).
+pub fn repinVerdict(input_name: []const u8, locked: ?[]const u8, disk: ?[]const u8, recorded: ?[]const u8) RepinVerdict {
+	const d = disk orelse return .unverifiable;
+	if (locked) |l| {
+		if (std.mem.eql(u8, l, d)) return .current;
+	}
+	if (std.mem.eql(u8, input_name, "user")) return .repin;
+	const r = recorded orelse return .disagrees_with_record;
+	return if (std.mem.eql(u8, r, d)) .repin else .disagrees_with_record;
 }

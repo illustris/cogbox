@@ -2144,12 +2144,33 @@
 						# cogboxModules -- has been fully dropped. Only nixpkgs and
 						# illustris-lib (both seeded in the baked agent image) are touched,
 						# so a cold fail-closed pod can rebuild the brain without network.
-						if out=$(${pkgs.nix}/bin/nix build --no-link --print-out-paths \
+						brain_build() {  # $1 = the composition flake dir to build against
+							${pkgs.nix}/bin/nix build --no-link --print-out-paths \
 								--extra-experimental-features "nix-command flakes" \
 								"''${subst[@]}" \
-								--override-input userExtensions "path:$icd/plugins-flake" \
+								--override-input userExtensions "path:$1" \
 								--override-input userExtensions/user/nixpkgs "path:${nixpkgs}" \
-								"path:${self}#nixosConfigurations.${configName system}-container.config.system.build.cogboxBrain"); then
+								"path:${self}#nixosConfigurations.${configName system}-container.config.system.build.cogboxBrain"
+						}
+						# UNCONFIRMED RE-PIN FALLBACK. composition.lock.prev is the lock as
+						# it was before a `cogbox plugin` op re-pinned stale path: inputs, and
+						# it exists only until a prebuild seeded the new pin (the op may have
+						# been killed by the control plane's install budget, or the new
+						# content may not build). When the live lock cannot be built offline,
+						# retry against a scratch copy of the composition carrying that
+						# snapshot: the previously locked content is still in this store, so
+						# the sandbox keeps the plugins it had instead of dropping to the
+						# plugin-less base. The live lock is left as is; the post-boot
+						# reconcile (with egress) seeds it and drops the snapshot.
+						prevdir=""
+						if out=$(brain_build "$icd/plugins-flake") || { [ -f "$icd/composition.lock.prev" ] \
+								&& echo "cogbox-brain: re-pinned composition did not build; retrying with the pre-re-pin lock" >&2 \
+								&& prevdir=$(mktemp -d) \
+								&& cp "$icd/plugins-flake/flake.nix" "$prevdir/flake.nix" \
+								&& cp "$icd/composition.lock.prev" "$prevdir/flake.lock" \
+								&& out=$(brain_build "$prevdir") \
+								&& echo "cogbox-brain: using the pre-re-pin lock; plugins stay at their previously locked content until the new pin is seeded" >&2; }; then
+							[ -z "$prevdir" ] || rm -rf "$prevdir"
 							first=$(printf '%s\n' "$out" | grep -m1 '^/nix/store/' || true)
 							if [ -n "$first" ] && [ -e "$first" ]; then
 								brain="$first"
@@ -2160,6 +2181,7 @@
 								printf 'time=%s reason=%s narinfos=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" no-out-path "$nnar" > "$icd/brain.fallback" || true
 							fi
 						else
+							[ -z "$prevdir" ] || rm -rf "$prevdir"
 							# WHY A SECOND EVAL ON THE FAILURE PATH. An unresolvable
 							# unit-name collision makes cogboxBrain THROW, so the build
 							# above fails and this branch keeps the image's plugin-less
@@ -5702,6 +5724,17 @@
 					echo "FAIL: brain-materialize rebuilds via the VM config (microvm force-fetch regression)" >&2
 					exit 1
 				fi
+				touch $out
+			'';
+
+			# The container brain resolve falls back to composition.lock.prev (the
+			# pre-re-pin lock of an unconfirmed `cogbox plugin` re-pin) before the
+			# plugin-less base brain. Driven against the REAL rendered materialize
+			# script with its nix stubbed (tests/test_brain_resolve.sh).
+			brain-resolve-prev-lock = pkgs.runCommand "cogbox-brain-resolve-prev-lock" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnused gnugrep findutils ];
+			} ''
+				bash ${./tests/test_brain_resolve.sh} ${self.nixosConfigurations."${configName system}-container".config.systemd.services.cogbox-brain-materialize.serviceConfig.ExecStart}
 				touch $out
 			'';
 
