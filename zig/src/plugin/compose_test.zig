@@ -135,3 +135,126 @@ test "hydrated subdir plugin carries ?dir= on the path: input" {
 	defer t.allocator.free(out);
 	try t.expect(std.mem.indexOf(u8, out, "\"p-sub\".url = \"path:/cfg/plugin-sources/sub?dir=flake\";") != null);
 }
+
+// --- pathInputsToRepin --------------------------------------------------
+
+fn expectRepin(lock: []const u8, want: []const []const u8) !void {
+	const got = try compose.pathInputsToRepin(t.allocator, lock);
+	defer compose.freeInputNames(t.allocator, got);
+	try t.expectEqual(want.len, got.len);
+	for (want) |w| {
+		var found = false;
+		for (got) |g| {
+			if (std.mem.eql(u8, w, g)) found = true;
+		}
+		if (!found) {
+			std.debug.print("missing input {s}\n", .{w});
+			return error.TestExpectedEqual;
+		}
+	}
+}
+
+test "pathInputsToRepin: plugin path input and the user path input" {
+	try expectRepin(
+		\\{"nodes":{
+		\\ "p-foo":{"locked":{"narHash":"sha256-A=","path":"/cfg/plugin-sources/foo","type":"path"},"original":{"path":"/cfg/plugin-sources/foo","type":"path"}},
+		\\ "user":{"locked":{"narHash":"sha256-B=","path":"/cfg/flake","type":"path"},"original":{"path":"/cfg/flake","type":"path"}},
+		\\ "root":{"inputs":{"p-foo":"p-foo","user":"user"}}},
+		\\ "root":"root","version":7}
+	, &.{ "p-foo", "user" });
+}
+
+test "pathInputsToRepin: subdir (dir=) path input is returned" {
+	try expectRepin(
+		\\{"nodes":{
+		\\ "p-bar":{"locked":{"dir":"sub","narHash":"sha256-A=","path":"/cfg/plugin-sources/bar","type":"path"},"original":{"dir":"sub","path":"/cfg/plugin-sources/bar","type":"path"}},
+		\\ "root":{"inputs":{"p-bar":"p-bar"}}},"root":"root","version":7}
+	, &.{"p-bar"});
+}
+
+test "pathInputsToRepin: git/github/tarball fallback inputs are skipped" {
+	try expectRepin(
+		\\{"nodes":{
+		\\ "p-git":{"locked":{"rev":"abc","type":"git","url":"https://git.example.com/acme/p"},"original":{"type":"git","url":"https://git.example.com/acme/p"}},
+		\\ "p-gh":{"locked":{"owner":"acme","repo":"p","type":"github"},"original":{"owner":"acme","repo":"p","type":"github"}},
+		\\ "p-tb":{"locked":{"type":"tarball","url":"https://api.example.com/p.tar.gz"},"original":{"type":"tarball","url":"https://api.example.com/p.tar.gz"}},
+		\\ "root":{"inputs":{"p-git":"p-git","p-gh":"p-gh","p-tb":"p-tb"}}},"root":"root","version":7}
+	, &.{});
+}
+
+test "pathInputsToRepin: follows arrays are skipped" {
+	try expectRepin(
+		\\{"nodes":{
+		\\ "user":{"locked":{"path":"/cfg/flake","type":"path"},"original":{"path":"/cfg/flake","type":"path"}},
+		\\ "root":{"inputs":{"p-foo":["user"],"user":"user"}}},"root":"root","version":7}
+	, &.{"user"});
+}
+
+test "pathInputsToRepin: returns the input NAME, not a suffixed node key" {
+	try expectRepin(
+		\\{"nodes":{
+		\\ "p-foo_2":{"locked":{"path":"/cfg/plugin-sources/foo","type":"path"},"original":{"path":"/cfg/plugin-sources/foo","type":"path"}},
+		\\ "root":{"inputs":{"p-foo":"p-foo_2"}}},"root":"root","version":7}
+	, &.{"p-foo"});
+}
+
+test "pathInputsToRepin: safety filter drops anything but user / p-<valid name>" {
+	try expectRepin(
+		\\{"nodes":{
+		\\ "n":{"original":{"path":"/x","type":"path"}},
+		\\ "root":{"inputs":{"--option":"n","p-":"n","p-Bad!":"n","p--x":"n","p-1abc":"n","nixpkgs":"n","p-ok":"n"}}},
+		\\ "root":"root","version":7}
+	, &.{"p-ok"});
+}
+
+test "pathInputsToRepin: malformed or unexpected shapes yield an empty list" {
+	try expectRepin("not json", &.{});
+	try expectRepin("", &.{});
+	try expectRepin("[]", &.{});
+	try expectRepin("{\"root\":\"root\"}", &.{});
+	try expectRepin("{\"nodes\":[]}", &.{});
+	try expectRepin("{\"nodes\":{\"root\":[]}}", &.{});
+	try expectRepin("{\"nodes\":{\"root\":{\"inputs\":\"x\"}}}", &.{});
+	try expectRepin("{\"nodes\":{\"root\":{\"inputs\":{\"p-foo\":\"missing\"}}}}", &.{});
+	try expectRepin("{\"nodes\":{\"p-foo\":{\"original\":{\"type\":7}},\"root\":{\"inputs\":{\"p-foo\":\"p-foo\"}}}}", &.{});
+}
+
+// --- lockedNarHash / repinVerdict ---------------------------------------
+
+test "lockedNarHash: reads the input's node (not a suffixed key), null otherwise" {
+	const lock =
+		\\{"nodes":{
+		\\ "p-foo_2":{"locked":{"narHash":"sha256-A=","path":"/cfg/plugin-sources/foo","type":"path"},"original":{"path":"/cfg/plugin-sources/foo","type":"path"}},
+		\\ "user":{"locked":{"path":"/cfg/flake","type":"path"},"original":{"path":"/cfg/flake","type":"path"}},
+		\\ "root":{"inputs":{"p-foo":"p-foo_2","user":"user","p-f":["user"]}}},"root":"root","version":7}
+	;
+	const h = (try compose.lockedNarHash(t.allocator, lock, "p-foo")).?;
+	defer t.allocator.free(h);
+	try t.expectEqualStrings("sha256-A=", h);
+	try t.expect((try compose.lockedNarHash(t.allocator, lock, "user")) == null);
+	try t.expect((try compose.lockedNarHash(t.allocator, lock, "p-f")) == null);
+	try t.expect((try compose.lockedNarHash(t.allocator, lock, "p-absent")) == null);
+	try t.expect((try compose.lockedNarHash(t.allocator, "not json", "p-foo")) == null);
+}
+
+test "repinVerdict: current input is left alone (no transitive float)" {
+	try t.expectEqual(compose.RepinVerdict.current, compose.repinVerdict("p-foo", "sha256-A=", "sha256-A=", "sha256-A="));
+	try t.expectEqual(compose.RepinVerdict.current, compose.repinVerdict("user", "sha256-A=", "sha256-A=", null));
+	// Current even when config.json disagrees: nothing to do, nothing to move.
+	try t.expectEqual(compose.RepinVerdict.current, compose.repinVerdict("p-foo", "sha256-A=", "sha256-A=", "sha256-B="));
+}
+
+test "repinVerdict: stale plugin re-pins only onto the recorded pin" {
+	try t.expectEqual(compose.RepinVerdict.repin, compose.repinVerdict("p-foo", "sha256-OLD=", "sha256-NEW=", "sha256-NEW="));
+	// A missing narHash in the lock is stale too.
+	try t.expectEqual(compose.RepinVerdict.repin, compose.repinVerdict("p-foo", null, "sha256-NEW=", "sha256-NEW="));
+	// Disk is a tree config.json never recorded (half copy, killed update).
+	try t.expectEqual(compose.RepinVerdict.disagrees_with_record, compose.repinVerdict("p-foo", "sha256-OLD=", "sha256-PART=", "sha256-NEW="));
+	try t.expectEqual(compose.RepinVerdict.disagrees_with_record, compose.repinVerdict("p-foo", "sha256-OLD=", "sha256-NEW=", null));
+	try t.expectEqual(compose.RepinVerdict.unverifiable, compose.repinVerdict("p-foo", "sha256-OLD=", null, "sha256-NEW="));
+}
+
+test "repinVerdict: stale user flake re-pins (config.json does not pin it)" {
+	try t.expectEqual(compose.RepinVerdict.repin, compose.repinVerdict("user", "sha256-OLD=", "sha256-NEW=", null));
+	try t.expectEqual(compose.RepinVerdict.unverifiable, compose.repinVerdict("user", "sha256-OLD=", null, null));
+}

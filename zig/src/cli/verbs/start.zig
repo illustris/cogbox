@@ -13,7 +13,8 @@
 //      prompts (harness selection, path creation) are interactive and any
 //      custom-flake runner build happens where the user can see it.
 //   4. fork(). Child: setsid, redirect stdio to <runtime>/cogbox.log, exec
-//      the launch script in full-launch mode (passt + QEMU). QEMU's serial
+//      the launch script in full-launch mode (passt + QEMU) with
+//      COGBOX_SKIP_REPIN=1 (step 3 already re-pinned). QEMU's serial
 //      console and HMP monitor are on <runtime>/{console,monitor}.sock.
 //   5. Parent: wait for <runtime>/qemu.pid (proof QEMU launched) or daemon
 //      death. Then, per the flags: probe the forwarded SSH port until sshd
@@ -40,6 +41,7 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
 extern "c" fn _exit(code: c_int) noreturn;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = if (@import("platform").darwin) 0x200 else 0o100;
@@ -134,6 +136,15 @@ pub fn run(
             _ = dup2(fd_log, 2);
             _ = close(fd_log);
         }
+
+        // The daemon pass must own a live QEMU within the 60s below, so it
+        // skips the launcher's boot-time plugin re-pin and its confirmation
+        // build (a fetch bounded at 120s, then an unbounded full eval): the
+        // init pass above already ran both, and the daemon just fast-paths
+        // whatever lock that pass left. Without this, a re-pin that keeps
+        // failing (host egress down) repeats here and a box that used to boot
+        // its stale runner never reaches QEMU in time. execv inherits environ.
+        if (setenv("COGBOX_SKIP_REPIN", "1", 1) != 0) _exit(70);
 
         const argv_z = allocator.alloc(?[*:0]const u8, launch_argv.len + 1) catch _exit(70);
         for (launch_argv, 0..) |a, i| {

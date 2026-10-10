@@ -612,6 +612,12 @@ if [ "$EXCLUSIVE_INIT" -eq 1 ] && [ -e "$INSTANCE_CONFIG_DIR" ]; then
 	die "instance '$EFFECTIVE_NAME' already exists (--exclusive)" 73
 fi
 release_config_lock() { exec {CONFIG_LOCK_FD}>&-; }
+# Retake the config lock after a release (the re-pin confirmation builds
+# without it). No other lock is held at that point, so the lock order holds.
+reacquire_config_lock() {
+	exec {CONFIG_LOCK_FD}>"$CONFIG_LOCK" || die "cannot reopen config lock" 70
+	$CONFIG_FLOCK -w 86400 "$CONFIG_LOCK_FD" || die "cannot reacquire config lock" 75
+}
 NEW_INSTANCE_CONFIG=0
 [ -e "$INSTANCE_CONFIG_DIR/config.json" ] || NEW_INSTANCE_CONFIG=1
 # The flake lives in its own subdir so unrelated edits to config.json /
@@ -1257,6 +1263,11 @@ RUNNER_PATH_FILE="$INSTANCE_CONFIG_DIR/runner.path"
 FAST_PATH=0
 
 if [ -z "${COGBOX_REEXECED:-}" ]; then
+	# Set by `cogbox start` on its daemon pass only (see the re-pin below).
+	# Read once and dropped, so passt/QEMU and the re-exec never inherit it.
+	SKIP_REPIN=0
+	[ "${COGBOX_SKIP_REPIN:-}" != 1 ] || SKIP_REPIN=1
+	unset COGBOX_SKIP_REPIN
 	PLUGIN_COUNT=0
 	if [ -f "$INSTANCE_CONFIG_DIR/config.json" ]; then
 		PLUGIN_COUNT=$(jq -r '(.plugins // []) | length' "$INSTANCE_CONFIG_DIR/config.json" 2>/dev/null || echo 0)
@@ -1287,6 +1298,275 @@ if [ -z "${COGBOX_REEXECED:-}" ]; then
 	fi
 	if [ -n "${COGBOX_NETRC_FILE:-}" ]; then
 		PLUGIN_SUBST_OPTS+=(--option netrc-file "$COGBOX_NETRC_FILE")
+	fi
+
+	# -- Re-pin the composition's STALE path: inputs (plugins only) ---
+	# The composition's plugin inputs are materialized path: sources (plus the
+	# per-instance `user` flake), and plain `nix flake lock` keeps a path:
+	# input's OLD narHash after its content changed -- so a lock written by an
+	# older cogbox (or a failed re-pin) makes the guest silently serve stale
+	# plugin content. Re-pin here, before the fast path, so a plain relaunch
+	# self-heals a stale lock whose tree is still the recorded pin. It does NOT
+	# heal a tree that an older cogbox materialized with its exec bits stripped:
+	# that tree never hashes to the narHash config.json records (the NAR keeps
+	# the executable bit), so the check below keeps its old pin with a warning
+	# and only `cogbox plugin update` (which re-copies it) heals it. Mirrors the
+	# Zig side (compose.repinVerdict), never blind:
+	#   - an input whose locked narHash already equals `nix hash path` of its
+	#     tree (pure, offline) is left alone, so a current input's transitive
+	#     inputs never float (an input without its own flake.lock re-resolves
+	#     them on every `flake update`) and a healthy boot does no fetch;
+	#   - a stale p-<name> is re-pinned only when its on-disk tree IS the
+	#     narHash config.json records (never a half-copied tree, or one an
+	#     interrupted update left at a rev config.json never recorded).
+	# The names come from a sandbox-writable file and become nix argv, so the
+	# jq filter admits only `user` and `p-<plugin name>` (the same filter as
+	# compose.pathInputsToRepin, incl. name.zig's reserved `user`/`git-grants`).
+	# It anchors with \A..\z, not ^..$: Oniguruma's `$` also matches before a
+	# trailing newline, so a key `p-foo<LF>` would pass and its embedded
+	# newline split the record into attacker-chosen names. Records go out via
+	# @tsv (a tab or newline inside a value is escaped, never a separator) and
+	# every name is re-checked in bash after the read. Batched `flake update`, then one retry per
+	# input (a single call is all-or-nothing, so one unfetchable input must not
+	# block the rest). Best-effort and BOUNDED, because it delays every boot
+	# and repeats while a re-pin keeps failing: one 120s deadline covers the
+	# batch and every retry, a batch that timed out (the network, not one bad
+	# input) skips the retries, and connect/stall timeouts fail a dead fetch
+	# fast. A failure only warns.
+	#
+	# The pre-re-pin lock is saved as composition.lock.prev BEFORE the update
+	# (unless an op's unconfirmed snapshot is already there -- that one is then
+	# still the last lock that booted), with composition.lock.prev.boot marking
+	# it as this launcher's own. A boot killed between the update and the
+	# confirmation below (Stop/Restart while Booting, the supervisor's stop
+	# timeout, preemption) thus leaves the snapshot for the next boot to
+	# confirm, instead of a moved lock that looks current while runner.path
+	# goes on booting the old runner.
+	#
+	# Then CONFIRM before exec: the re-exec below is an `exec`, so a composition
+	# that fails to evaluate or build there cannot be caught -- on GCE that is the
+	# restart loop, for content the stale lock had hidden and that was never
+	# built. Whenever composition.lock.prev exists (this boot or an op moved the
+	# lock and nothing confirmed it), build the re-exec package first. That build
+	# is a full eval and can take as long as a fresh instance's first boot, so
+	# it runs WITHOUT the config lock (every `cogbox plugin` verb takes it, and
+	# the control plane kills a verb after its install budget), against a
+	# scratch copy of the composition; the lock is then retaken and the outcome
+	# applied only if flake.lock still holds the bytes that were built (an op
+	# that moved it meanwhile owns the composition now). Success: drop the
+	# snapshot and runner.path (which may name a runner of the old lock).
+	# Failure: restore the snapshot, so the box keeps serving the previously
+	# locked content instead of failing -- loudly, and the next boot or op
+	# retries. runner.path survives that restore only when the marker says it
+	# names the runner that booted under the snapshot (the one fast path that
+	# still works even if GC collected the old sources); an op's snapshot drops
+	# it (the op may have recorded a runner of the new lock). Trade-off: a boot
+	# that confirms evaluates twice (here, then the re-exec's own eval:
+	# --override-input flakes skip the eval cache); only boots that follow an
+	# unconfirmed re-pin pay it.
+	#
+	# A failed confirmation is STICKY: composition.repin.failed records
+	# RUNNER_KEY plus the `name<TAB>narHash` pairs the failed lock pinned that
+	# the restored one did not. A candidate whose (name, on-disk hash) is listed
+	# is not re-pinned again while RUNNER_KEY matches -- otherwise every launcher
+	# pass that runs this block (a GCE boot has two: supervise.sh's `cogbox
+	# init`, then start's --init-only) and every boot would repeat the same
+	# failing full eval and its failure. Retried after any `cogbox plugin` op (regenComposition removes
+	# the file), an image change (RUNNER_KEY moves) or new content (the hash
+	# moves); dropped once a confirmation succeeds with nothing skipped.
+	#
+	# The whole block (re-pin AND confirmation) runs only OUTSIDE `cogbox
+	# start`'s daemon pass, which sets COGBOX_SKIP_REPIN=1 (SKIP_REPIN above).
+	# That pass must own a live QEMU within start's 60s, while this block can
+	# spend the 120s re-pin deadline and then a full eval; the init pass right
+	# before it already ran both, so the daemon just fast-paths whatever lock
+	# that pass left. Otherwise a re-pin that keeps failing (egress down, a
+	# stale input with no flake.lock of its own that must re-resolve its
+	# transitive inputs) would repeat in the daemon pass, miss the 60s and turn
+	# a GCE box that booted its stale runner into a restart loop; and a
+	# snapshot an op left mid-confirmation would cost the daemon an unbounded
+	# eval. A failed `flake update` is thus tried once per `cogbox start` and
+	# retried by the next one (no record: a transient outage must not pin
+	# stale content until the next op).
+	if [ "$PLUGIN_COUNT" -gt 0 ] && [ -f "$PLUGINS_FLAKE_DIR/flake.lock" ] && [ "$SKIP_REPIN" = 1 ]; then
+		echo "cogbox-launch: daemon pass: leaving the plugin composition re-pin to the init pass; booting the lock it left" >&2
+	elif [ "$PLUGIN_COUNT" -gt 0 ] && [ -f "$PLUGINS_FLAKE_DIR/flake.lock" ]; then
+		_nixx=(nix --extra-experimental-features "nix-command flakes")
+		_net=(--option connect-timeout 5 --option stalled-download-timeout 20)
+		_prev="$INSTANCE_CONFIG_DIR/composition.lock.prev"
+		_mark="$_prev.boot"
+		# A marker without its snapshot vouches for nothing.
+		[ -f "$_prev" ] || rm -f "$_mark"
+		_fail="$INSTANCE_CONFIG_DIR/composition.repin.failed"
+		_failpairs=() _skipped=0
+		if [ -f "$_fail" ]; then
+			if [ "$(head -n 1 "$_fail" 2>/dev/null)" = "$RUNNER_KEY" ]; then
+				mapfile -t _failpairs < <(tail -n +2 "$_fail" 2>/dev/null)
+			else
+				# Recorded under another image: its verdict no longer holds.
+				rm -f "$_fail"
+			fi
+		fi
+		_repin=() _want=()
+		while IFS=$'\t' read -r _repin_name _locked; do
+			[[ $_repin_name =~ ^(user|p-[A-Za-z][A-Za-z0-9-]{0,63})$ ]] || continue
+			case "$_repin_name" in p-user|p-git-grants) continue ;; esac
+			if [ "$_repin_name" = user ]; then
+				_src="$INSTANCE_FLAKE_DIR"
+			else
+				_src="$INSTANCE_CONFIG_DIR/plugin-sources/${_repin_name#p-}"
+			fi
+			# Capped per tree: a huge or wedged tree (a stalled mount) must not
+			# hold the boot; a timeout is "could not hash" like any failure.
+			_hrc=0
+			_disk=$(timeout -k 5 60 "${_nixx[@]}" hash path "$_src" 2>/dev/null) || _hrc=$?
+			if [ "$_hrc" -ne 0 ] || [ -z "$_disk" ]; then
+				_why=""
+				[ "$_hrc" -ne 124 ] || _why=" (timed out)"
+				echo "cogbox-launch: warning: $_repin_name: could not hash its source$_why; keeping its locked narHash" >&2
+				continue
+			fi
+			[ "$_disk" = "$_locked" ] && continue
+			if [ "$_repin_name" != user ]; then
+				_rec=$(jq -r --arg n "${_repin_name#p-}" 'first((.plugins // [])[] | select(.name == $n) | .narHash // empty) // empty' "$INSTANCE_CONFIG_DIR/config.json" 2>/dev/null || true)
+				if [ "$_rec" != "$_disk" ]; then
+					echo "cogbox-launch: warning: $_repin_name: on-disk source does not match the pin config.json records; keeping its locked narHash (\`cogbox plugin update\` re-copies it)" >&2
+					continue
+				fi
+			fi
+			_fp=0
+			for _p in "${_failpairs[@]}"; do
+				[ "$_p" = "$_repin_name"$'\t'"$_disk" ] && { _fp=1; break; }
+			done
+			if [ "$_fp" = 1 ]; then
+				echo "cogbox-launch: warning: $_repin_name: its current content failed the plugin composition's confirmation build on an earlier launch; keeping its locked narHash until a \`cogbox plugin\` op or an image change retries it" >&2
+				_skipped=1
+				continue
+			fi
+			_repin+=("$_repin_name")
+			_want+=("$_disk")
+		done < <(jq -r '.nodes as $n | .nodes.root.inputs | to_entries[] | select((.value|type)=="string") | select($n[.value].original.type=="path") | select(.key=="user" or ((.key|test("\\Ap-[A-Za-z][A-Za-z0-9-]{0,63}\\z")) and .key!="p-user" and .key!="p-git-grants")) | [.key, ($n[.value].locked.narHash // "" | tostring)] | @tsv' "$PLUGINS_FLAKE_DIR/flake.lock" 2>/dev/null || true)
+
+		if [ "${#_repin[@]}" -gt 0 ]; then
+			# The pre-update bytes for the post-check below, kept OUT of the
+			# instance config dir (a killed boot must not litter it).
+			_repin_snap=$(mktemp 2>/dev/null) || _repin_snap=""
+			_wrote_prev=0 _ready=0
+			if [ -n "$_repin_snap" ] && cp "$PLUGINS_FLAKE_DIR/flake.lock" "$_repin_snap" 2>/dev/null; then
+				if [ -f "$_prev" ]; then
+					_ready=1
+				elif cp "$_repin_snap" "$_prev.tmp" 2>/dev/null && mv -f "$_prev.tmp" "$_prev" 2>/dev/null; then
+					# Best-effort: a snapshot without its marker is treated as an
+					# op's (runner.path dropped on restore), the safe direction.
+					: > "$_mark" 2>/dev/null || true
+					_wrote_prev=1 _ready=1
+				else
+					rm -f "$_prev.tmp"
+				fi
+			fi
+			if [ "$_ready" != 1 ]; then
+				echo "cogbox-launch: warning: could not snapshot the plugin composition lock; not re-pinning ${_repin[*]} (plugins may be stale)" >&2
+			else
+				_deadline=$((SECONDS + 120))
+				_rc=0
+				timeout -k 10 120 "${_nixx[@]}" "${PLUGIN_SUBST_OPTS[@]}" "${_net[@]}" \
+					flake update "${_repin[@]}" --flake "path:$PLUGINS_FLAKE_DIR" >/dev/null 2>&1 || _rc=$?
+				if [ "$_rc" -ne 0 ]; then
+					_failed=()
+					for _n in "${_repin[@]}"; do
+						_left=$((_deadline - SECONDS))
+						if [ "$_rc" -eq 124 ] || [ "$_left" -lt 1 ]; then
+							_failed+=("$_n")
+							continue
+						fi
+						_r=0
+						timeout -k 10 "$_left" "${_nixx[@]}" "${PLUGIN_SUBST_OPTS[@]}" "${_net[@]}" \
+							flake update "$_n" --flake "path:$PLUGINS_FLAKE_DIR" >/dev/null 2>&1 || _r=$?
+						[ "$_r" -eq 0 ] && continue
+						_failed+=("$_n")
+						[ "$_r" -ne 124 ] || _rc=124
+					done
+					if [ "${#_failed[@]}" -gt 0 ]; then
+						_why=""
+						[ "$_rc" -ne 124 ] || _why=" (timed out; network unreachable?)"
+						echo "cogbox-launch: warning: could not re-pin plugin composition input(s) ${_failed[*]}$_why; plugins may be stale" >&2
+					fi
+				fi
+				# Each re-pinned plugin must now lock the tree checked above, or
+				# (its own re-pin failed) its old pin -- anything else pins a tree
+				# nobody checked, so put the whole snapshot back.
+				for _i in "${!_repin[@]}"; do
+					case "${_repin[$_i]}" in p-*) ;; *) continue ;; esac
+					_got=$(jq -r --arg k "${_repin[$_i]}" '.nodes[.nodes.root.inputs[$k]].locked.narHash // empty' "$PLUGINS_FLAKE_DIR/flake.lock" 2>/dev/null || true)
+					_old=$(jq -r --arg k "${_repin[$_i]}" '.nodes[.nodes.root.inputs[$k]].locked.narHash // empty' "$_repin_snap" 2>/dev/null || true)
+					if [ "$_got" != "${_want[$_i]}" ] && [ "$_got" != "$_old" ]; then
+						echo "cogbox-launch: warning: ${_repin[$_i]}: re-pinned lock entry does not match its checked source; restoring the previous plugin composition lock" >&2
+						cp "$_repin_snap" "$PLUGINS_FLAKE_DIR/flake.lock" 2>/dev/null || true
+						break
+					fi
+				done
+				if cmp -s "$_repin_snap" "$PLUGINS_FLAKE_DIR/flake.lock"; then
+					# Nothing moved: a snapshot this boot wrote vouches for nothing.
+					[ "$_wrote_prev" = 0 ] || rm -f "$_prev" "$_mark"
+				else
+					echo "cogbox-launch: re-pinned plugin composition input(s) ${_repin[*]}" >&2
+				fi
+			fi
+			[ -z "$_repin_snap" ] || rm -f "$_repin_snap"
+		fi
+
+		if [ -f "$_prev" ] && [ -f "$PLUGINS_FLAKE_DIR/flake.nix" ]; then
+			_scratch=$(mktemp -d 2>/dev/null) || _scratch=""
+			if [ -n "$_scratch" ] && cp "$PLUGINS_FLAKE_DIR/flake.nix" "$PLUGINS_FLAKE_DIR/flake.lock" "$_scratch/" 2>/dev/null; then
+				echo "cogbox-launch: confirming the re-pinned plugin composition builds before booting it" >&2
+				release_config_lock
+				_brc=0
+				"${_nixx[@]}" "${PLUGIN_SUBST_OPTS[@]}" \
+					build --no-link "path:@flakeSource@#@reexecPackage@" \
+					--override-input userExtensions "path:$_scratch" \
+					--override-input userExtensions/user/nixpkgs "path:@nixpkgsSource@" >/dev/null || _brc=$?
+				reacquire_config_lock
+				[ -f "$INSTANCE_CONFIG_DIR/config.json" ] \
+					|| die "instance '$EFFECTIVE_NAME' was deleted while its plugin composition was being confirmed" 66
+				if ! cmp -s "$_scratch/flake.lock" "$PLUGINS_FLAKE_DIR/flake.lock"; then
+					echo "cogbox-launch: the plugin composition changed during its confirmation build; leaving it to the cogbox plugin op that changed it" >&2
+				elif [ ! -f "$_prev" ]; then
+					: # an op confirmed this very lock meanwhile
+				elif [ "$_brc" -eq 0 ]; then
+					rm -f "$_prev" "$_mark" "$RUNNER_PATH_FILE"
+					[ "$_skipped" = 1 ] || rm -f "$_fail"
+					echo "cogbox-launch: re-pinned plugin composition lock confirmed" >&2
+				else
+					[ -f "$_mark" ] || rm -f "$RUNNER_PATH_FILE"
+					# What the failed lock pinned that the snapshot does not: the
+					# content proven not to build (same input filter as above).
+					_newpairs=$(jq -r --slurpfile p "$_prev" '.nodes as $n | (try ($p[0] | .nodes as $pn | .nodes.root.inputs | with_entries(.value = (try $pn[.value].locked.narHash catch null))) catch {}) as $old | .nodes.root.inputs | to_entries[] | select((.value|type)=="string") | select(.key=="user" or ((.key|test("\\Ap-[A-Za-z][A-Za-z0-9-]{0,63}\\z")) and .key!="p-user" and .key!="p-git-grants")) | [.key, ($n[.value].locked.narHash // "" | tostring)] | select(.[1] != "" and .[1] != ($old[.[0]] // "")) | @tsv' "$PLUGINS_FLAKE_DIR/flake.lock" 2>/dev/null || true)
+					if cp "$_prev" "$INSTANCE_CONFIG_DIR/flake.lock.restore" 2>/dev/null \
+						&& mv -f "$INSTANCE_CONFIG_DIR/flake.lock.restore" "$PLUGINS_FLAKE_DIR/flake.lock" 2>/dev/null; then
+						rm -f "$_prev" "$_mark"
+						if [ -n "$_newpairs" ]; then
+							if { printf '%s\n' "$RUNNER_KEY"; [ "${#_failpairs[@]}" -eq 0 ] || printf '%s\n' "${_failpairs[@]}"; printf '%s\n' "$_newpairs"; } > "$_fail.tmp" 2>/dev/null \
+								&& mv -f "$_fail.tmp" "$_fail" 2>/dev/null; then
+								echo "cogbox-launch: recorded the failed plugin composition content; later launches keep the previous lock until a cogbox plugin op or an image change" >&2
+							else
+								rm -f "$_fail.tmp"
+								echo "cogbox-launch: warning: could not record the failed plugin composition content; the next launch retries the same confirmation" >&2
+							fi
+						fi
+						echo "cogbox-launch: WARNING: the re-pinned plugin composition failed to build; restored the previous lock, so plugins stay at their previously locked content until an update succeeds" >&2
+					else
+						rm -f "$INSTANCE_CONFIG_DIR/flake.lock.restore"
+						echo "cogbox-launch: WARNING: the re-pinned plugin composition failed to build and the previous lock could not be restored" >&2
+					fi
+				fi
+				[ "$SUDO_INVOCATION" != 1 ] || chown "$REAL_USER" "$PLUGINS_FLAKE_DIR/flake.lock" 2>/dev/null || true
+			else
+				echo "cogbox-launch: warning: could not stage the plugin composition for its confirmation build; booting it unconfirmed" >&2
+			fi
+			[ -z "$_scratch" ] || rm -rf "$_scratch"
+		fi
+		[ "$SUDO_INVOCATION" != 1 ] || chown "$REAL_USER" "$_prev" "$_mark" "$_fail" 2>/dev/null || true
+		unset _nixx _net _prev _mark _fail _failpairs _skipped _fp _p _newpairs _repin _want _repin_name _locked _src _disk _rec _repin_snap _wrote_prev _ready _deadline _rc _failed _n _left _r _why _i _got _old _scratch _brc _hrc
 	fi
 
 	# -- Skip-eval fast path (plugins only) ---------------------------

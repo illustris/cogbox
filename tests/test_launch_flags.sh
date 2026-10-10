@@ -580,6 +580,390 @@ else
 	fi
 fi
 
+# --- 9. the plugin composition re-pin is gated, per-input, and confirmed ----
+# The launcher re-pins a STALE path: input of the plugin composition before its
+# fast path (plain `nix flake lock` keeps a changed path: input's old narHash).
+# Driven through the real --init-only flow with a stub `nix` on PATH: `hash
+# path` answers from a fixture file in the tree, `flake update` re-pins from
+# the same file (all-or-nothing per call, like nix), `build` is the pre-exec
+# confirmation, `run` is the re-exec. Pins: only stale inputs are named (a
+# current one never floats), a tree that disagrees with config.json keeps its
+# pin, one failing input does not block the others, and a re-pinned
+# composition that fails to build is rolled back to the last lock that booted.
+rp_stub="$WORK/rp-stub"
+mkdir -p "$rp_stub"
+# (No /usr/bin/env in the nix build sandbox: the shebang names this bash.)
+{ echo "#!$(command -v bash)"; cat <<'STUB_EOF'
+cmd=()
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--extra-experimental-features) shift 2 ;;
+		--option) shift 3 ;;
+		*) cmd+=("$1"); shift ;;
+	esac
+done
+echo "${cmd[*]}" >> "$RP_LOG"
+case "${cmd[0]}" in
+	hash) cat "${cmd[2]}/.stubhash" 2>/dev/null || exit 1 ;;
+	flake)
+		lock="${cmd[${#cmd[@]}-1]#path:}/flake.lock"
+		names=()
+		for n in "${cmd[@]:2}"; do [ "$n" = --flake ] && break; names+=("$n"); done
+		# A fetch that stalls (blackholed egress) before it fails.
+		[ -z "${RP_UPDATE_SLEEP:-}" ] || sleep "$RP_UPDATE_SLEEP"
+		[ -z "${RP_UPDATE_RC:-}" ] || exit "$RP_UPDATE_RC"
+		for n in "${names[@]}"; do [ "$n" = "${RP_UPDATE_FAIL:-}" ] && exit 1; done
+		for n in "${names[@]}"; do
+			src=$(jq -r --arg k "$n" '.nodes[.nodes.root.inputs[$k]].locked.path' "$lock")
+			h=$(cat "$src/.stubhash")
+			jq --arg k "$n" --arg h "$h" '.nodes[.nodes.root.inputs[$k]].locked.narHash = $h' "$lock" > "$lock.t" && mv "$lock.t" "$lock"
+		done ;;
+	build)
+		# Is the instance config lock free while the confirmation builds?
+		[ -z "${RP_LOCKFILE:-}" ] || { flock -n "$RP_LOCKFILE" true && echo "config-lock-free" >> "$RP_LOG"; }
+		# A `cogbox plugin` op moving the lock while the build runs.
+		[ -z "${RP_BUILD_OP:-}" ] || echo '{"op":"moved"}' > "$RP_BUILD_OP"
+		# The launcher killed mid-confirmation (Stop while Booting, preemption).
+		[ -z "${RP_BUILD_KILL:-}" ] || kill -KILL "$PPID"
+		exit "${RP_BUILD_RC:-0}" ;;
+	*) exit 0 ;;
+esac
+STUB_EOF
+} > "$rp_stub/nix"
+chmod +x "$rp_stub/nix"
+
+# rp_setup TAG LOCK_A LOCK_B: a fresh instance with plugins a and b recorded at
+# sha256-A2 / sha256-B1, their trees hashing to sha256-A2 / sha256-B1, and the
+# composition lock pinning a at LOCK_A and b at LOCK_B (user current).
+rp_setup() {
+	local tag="$1" la="$2" lb="$3"
+	rc=$(run_init "$tag" --name demo)
+	[ "$rc" = 0 ] || { bad "re-pin fixture init ($tag) exited $rc"; return 1; }
+	icd="$WORK/$tag/config/cogbox/instances/demo"
+	mkdir -p "$icd/plugin-sources/a" "$icd/plugin-sources/b" "$icd/plugins-flake"
+	printf 'sha256-A2' > "$icd/plugin-sources/a/.stubhash"
+	printf 'sha256-B1' > "$icd/plugin-sources/b/.stubhash"
+	printf 'sha256-U1' > "$icd/flake/.stubhash"
+	jq '.plugins = [{"name":"a","narHash":"sha256-A2"},{"name":"b","narHash":"sha256-B1"}]' "$icd/config.json" > "$icd/c.t" && mv "$icd/c.t" "$icd/config.json"
+	echo '{}' > "$icd/plugins-flake/flake.nix"
+	jq -n --arg d "$icd" --arg la "$la" --arg lb "$lb" '{nodes:{
+		"p-a":{locked:{narHash:$la,path:"\($d)/plugin-sources/a",type:"path"},original:{path:"\($d)/plugin-sources/a",type:"path"}},
+		"p-b":{locked:{narHash:$lb,path:"\($d)/plugin-sources/b",type:"path"},original:{path:"\($d)/plugin-sources/b",type:"path"}},
+		user:{locked:{narHash:"sha256-U1",path:"\($d)/flake",type:"path"},original:{path:"\($d)/flake",type:"path"}},
+		root:{inputs:{"p-a":"p-a","p-b":"p-b",user:"user"}}},root:"root",version:7}' > "$icd/plugins-flake/flake.lock"
+	cp "$icd/plugins-flake/flake.lock" "$WORK/$tag.lock0"
+	printf 'stale-key\n/nix/store/x-runner\n' > "$icd/runner.path"
+	: > "$WORK/$tag.nix.log"
+}
+rp_run() {
+	local tag="$1"
+	HOME="$WORK/$tag" COGBOX_DATA="$WORK/$tag/data" XDG_CONFIG_HOME="$WORK/$tag/config" \
+	PATH="$rp_stub:$PATH" RP_LOG="$WORK/$tag.nix.log" \
+		bash "$LAUNCH" --init-only --yes --name demo >"$WORK/$tag.log" 2>&1
+}
+rp_pin() { jq -r --arg k "$2" '.nodes[.nodes.root.inputs[$k]].locked.narHash' "$WORK/$1/config/cogbox/instances/demo/plugins-flake/flake.lock"; }
+
+# (a) one stale plugin whose tree is the recorded pin: ONLY it is updated, the
+# composition is built before exec, and the stale runner record is dropped
+if rp_setup rp-stale sha256-A1 sha256-B1; then
+	rp_run rp-stale
+	upd=$(grep '^flake update' "$WORK/rp-stale.nix.log")
+	if [ "$upd" = "flake update p-a --flake path:$icd/plugins-flake" ] \
+		&& [ "$(rp_pin rp-stale p-a)" = sha256-A2 ] && [ "$(rp_pin rp-stale p-b)" = sha256-B1 ] \
+		&& grep -q '^build --no-link' "$WORK/rp-stale.nix.log" && [ ! -e "$icd/runner.path" ] \
+		&& grep -q 're-pinned plugin composition lock' "$WORK/rp-stale.log"; then
+		ok "a stale plugin input alone is re-pinned, confirmed by a build, and the runner record dropped"
+	else
+		bad "stale re-pin (updates: '$upd', p-a=$(rp_pin rp-stale p-a), log: $(cat "$WORK/rp-stale.log"))"
+	fi
+fi
+
+# (b) nothing stale: no update, no build, the lock and runner record untouched
+if rp_setup rp-current sha256-A2 sha256-B1; then
+	rp_run rp-current
+	if ! grep -q '^flake update\|^build' "$WORK/rp-current.nix.log" \
+		&& cmp -s "$WORK/rp-current.lock0" "$icd/plugins-flake/flake.lock" && [ -e "$icd/runner.path" ]; then
+		ok "a current composition is not re-pinned or rebuilt (no transitive float, no fetch)"
+	else
+		bad "current composition was touched (nix calls: $(cat "$WORK/rp-current.nix.log"))"
+	fi
+fi
+
+# (c) a stale plugin whose tree is NOT the recorded pin keeps its old pin
+if rp_setup rp-diverge sha256-A1 sha256-B1; then
+	printf 'sha256-PARTIAL' > "$icd/plugin-sources/a/.stubhash"
+	rp_run rp-diverge
+	if ! grep -q '^flake update' "$WORK/rp-diverge.nix.log" \
+		&& cmp -s "$WORK/rp-diverge.lock0" "$icd/plugins-flake/flake.lock" \
+		&& grep -q 'p-a: on-disk source does not match the pin config.json records' "$WORK/rp-diverge.log"; then
+		ok "a plugin tree that disagrees with config.json keeps its locked pin, with a warning"
+	else
+		bad "diverged tree was re-pinned (nix calls: $(cat "$WORK/rp-diverge.nix.log"), log: $(cat "$WORK/rp-diverge.log"))"
+	fi
+fi
+
+# (d) the batched update fails on one input: the others still re-pin
+if rp_setup rp-onefail sha256-A1 sha256-B0; then
+	RP_UPDATE_FAIL=p-b rp_run rp-onefail
+	if [ "$(rp_pin rp-onefail p-a)" = sha256-A2 ] && [ "$(rp_pin rp-onefail p-b)" = sha256-B0 ] \
+		&& grep -q 'could not re-pin plugin composition input(s) p-b' "$WORK/rp-onefail.log"; then
+		ok "one input failing its re-pin does not block the others (per-input retry)"
+	else
+		bad "per-input retry (p-a=$(rp_pin rp-onefail p-a) p-b=$(rp_pin rp-onefail p-b), log: $(cat "$WORK/rp-onefail.log"))"
+	fi
+fi
+
+# (e) the re-pinned composition fails to build: roll back to the booted lock.
+# The boot's own snapshot is restored, so runner.path -- which names the runner
+# that booted under exactly that lock -- is KEPT: it is the one fast path that
+# still boots if GC has since collected the old sources.
+if rp_setup rp-buildfail sha256-A1 sha256-B1; then
+	RP_BUILD_RC=1 rp_run rp-buildfail
+	if cmp -s "$WORK/rp-buildfail.lock0" "$icd/plugins-flake/flake.lock" \
+		&& grep -q 'failed to build; restored the previous lock' "$WORK/rp-buildfail.log" \
+		&& [ -e "$icd/runner.path" ] && [ ! -e "$icd/composition.lock.prev" ] \
+		&& [ ! -e "$icd/composition.lock.prev.boot" ]; then
+		ok "a re-pinned composition that fails to build is rolled back, keeping the booted runner record"
+	else
+		bad "build-failure rollback (p-a=$(rp_pin rp-buildfail p-a), runner.path: $(ls "$icd"), log: $(cat "$WORK/rp-buildfail.log"))"
+	fi
+fi
+
+# (e2) a launcher killed between the re-pin and its confirmation leaves the
+# snapshot behind, so the NEXT boot still confirms (and drops the runner record
+# of the old lock) instead of fast-pathing the old runner forever
+if rp_setup rp-killed sha256-A1 sha256-B1; then
+	RP_BUILD_KILL=1 rp_run rp-killed
+	if [ "$(rp_pin rp-killed p-a)" = sha256-A2 ] && cmp -s "$WORK/rp-killed.lock0" "$icd/composition.lock.prev" \
+		&& [ -e "$icd/composition.lock.prev.boot" ] && [ -e "$icd/runner.path" ] \
+		&& [ -z "$(ls "$icd" | grep 'flake.lock.repin\|flake.lock.restore')" ]; then
+		: > "$WORK/rp-killed.nix.log"
+		rp_run rp-killed
+		if ! grep -q '^flake update' "$WORK/rp-killed.nix.log" && grep -q '^build --no-link' "$WORK/rp-killed.nix.log" \
+			&& [ ! -e "$icd/runner.path" ] && [ ! -e "$icd/composition.lock.prev" ] \
+			&& [ "$(rp_pin rp-killed p-a)" = sha256-A2 ]; then
+			ok "a boot killed mid-confirmation leaves the snapshot, and the next boot confirms and drops runner.path"
+		else
+			bad "post-kill boot (nix calls: $(cat "$WORK/rp-killed.nix.log"), files: $(ls "$icd"))"
+		fi
+	else
+		bad "killed confirmation state (p-a=$(rp_pin rp-killed p-a), files: $(ls "$icd"))"
+	fi
+fi
+
+# (e3) the confirmation build runs WITHOUT the config lock (a long build must
+# not block `cogbox plugin` verbs into the control plane's install budget), and
+# a lock an op moved during it is left to that op: no restore, no cleanup
+if rp_setup rp-unlocked sha256-A1 sha256-B1; then
+	RP_BUILD_RC=1 RP_LOCKFILE="$WORK/rp-unlocked/config/cogbox/.locks/demo.lock" \
+		RP_BUILD_OP="$icd/plugins-flake/flake.lock" rp_run rp-unlocked
+	if grep -q '^config-lock-free' "$WORK/rp-unlocked.nix.log" \
+		&& [ "$(cat "$icd/plugins-flake/flake.lock")" = '{"op":"moved"}' ] \
+		&& [ -e "$icd/composition.lock.prev" ] \
+		&& grep -q 'changed during its confirmation build' "$WORK/rp-unlocked.log"; then
+		ok "the confirmation build runs unlocked and never clobbers a lock an op moved meanwhile"
+	else
+		bad "unlocked confirmation (nix calls: $(cat "$WORK/rp-unlocked.nix.log"), lock: $(cat "$icd/plugins-flake/flake.lock"), log: $(cat "$WORK/rp-unlocked.log"))"
+	fi
+fi
+
+# (e4) a batched re-pin that TIMED OUT skips the per-input retries (the network
+# is the problem, not one input), and the boot's unused snapshot is dropped
+if rp_setup rp-timeout sha256-A1 sha256-B0; then
+	printf 'sha256-B0x' > "$icd/plugin-sources/b/.stubhash"
+	jq '.plugins[1].narHash = "sha256-B0x"' "$icd/config.json" > "$icd/c.t" && mv "$icd/c.t" "$icd/config.json"
+	RP_UPDATE_RC=124 rp_run rp-timeout
+	if [ "$(grep -c '^flake update' "$WORK/rp-timeout.nix.log")" = 1 ] \
+		&& grep -q 'could not re-pin plugin composition input(s) p-a p-b (timed out' "$WORK/rp-timeout.log" \
+		&& cmp -s "$WORK/rp-timeout.lock0" "$icd/plugins-flake/flake.lock" \
+		&& [ ! -e "$icd/composition.lock.prev" ] && ! grep -q '^build' "$WORK/rp-timeout.nix.log"; then
+		ok "a timed-out batched re-pin skips the per-input retries"
+	else
+		bad "timed-out re-pin (nix calls: $(cat "$WORK/rp-timeout.nix.log"), log: $(cat "$WORK/rp-timeout.log"))"
+	fi
+fi
+
+# (e5) a failed confirmation is STICKY: `cogbox start` runs the launcher twice
+# (--init-only, then the daemon, which must reach QEMU within 60s) and every
+# boot runs it again, so the next pass must NOT re-pin the same content and
+# repeat the failing full eval -- it boots the restored lock's runner on the
+# fast path. An image change (RUNNER_KEY), new content, or the record's removal
+# (every `cogbox plugin` op) retries.
+rp_rkey=$(sed -n 's/^RUNNER_KEY="\(.*\)"$/\1/p' "$LAUNCH")
+rp_fastpath() {
+	mkdir -p "$WORK/$1/fake-runner/bin" && : > "$WORK/$1/fake-runner/bin/microvm-run"
+	printf '%s\n%s\n' "$rp_rkey" "$WORK/$1/fake-runner" > "$icd/runner.path"
+}
+if rp_setup rp-sticky sha256-A1 sha256-B1; then
+	rp_fastpath rp-sticky
+	RP_BUILD_RC=1 rp_run rp-sticky
+	if cmp -s "$WORK/rp-sticky.lock0" "$icd/plugins-flake/flake.lock" && [ -e "$icd/runner.path" ] \
+		&& [ "$(cat "$icd/composition.repin.failed")" = "$rp_rkey"$'\n'"p-a"$'\t'"sha256-A2" ]; then
+		: > "$WORK/rp-sticky.nix.log"
+		RP_BUILD_RC=1 rp_run rp-sticky
+		if ! grep -q '^flake update\|^build\|^run' "$WORK/rp-sticky.nix.log" \
+			&& cmp -s "$WORK/rp-sticky.lock0" "$icd/plugins-flake/flake.lock" \
+			&& [ ! -e "$icd/composition.lock.prev" ] && [ -e "$icd/composition.repin.failed" ] \
+			&& grep -q 'p-a: its current content failed the plugin composition.s confirmation build' "$WORK/rp-sticky.log"; then
+			ok "a failed confirmation is not repeated by the next launcher pass, which fast-paths the restored lock"
+		else
+			bad "second pass after a failed confirmation (nix calls: $(cat "$WORK/rp-sticky.nix.log"), files: $(ls "$icd"), log: $(cat "$WORK/rp-sticky.log"))"
+		fi
+		# Another image: the verdict is dropped and the re-pin retried.
+		printf 'other-image-key\np-a\tsha256-A2\n' > "$icd/composition.repin.failed"
+		: > "$WORK/rp-sticky.nix.log"
+		rp_run rp-sticky
+		if grep -q '^flake update p-a' "$WORK/rp-sticky.nix.log" && grep -q '^build --no-link' "$WORK/rp-sticky.nix.log" \
+			&& [ "$(rp_pin rp-sticky p-a)" = sha256-A2 ] && [ ! -e "$icd/composition.repin.failed" ]; then
+			ok "a failure recorded under another image is retried, and a successful confirmation drops the record"
+		else
+			bad "image-change retry (nix calls: $(cat "$WORK/rp-sticky.nix.log"), files: $(ls "$icd"))"
+		fi
+	else
+		bad "failed confirmation record (lock p-a=$(rp_pin rp-sticky p-a), record: $(cat "$icd/composition.repin.failed" 2>&1), log: $(cat "$WORK/rp-sticky.log"))"
+	fi
+fi
+# ... new content for the same plugin (an op re-copied it) is retried, while a
+# still-failed sibling stays skipped and keeps the record alive
+if rp_setup rp-sticky-new sha256-A1 sha256-B0; then
+	printf '%s\np-a\tsha256-A2\np-b\tsha256-B1\n' "$rp_rkey" > "$icd/composition.repin.failed"
+	printf 'sha256-A3' > "$icd/plugin-sources/a/.stubhash"
+	jq '.plugins[0].narHash = "sha256-A3"' "$icd/config.json" > "$icd/c.t" && mv "$icd/c.t" "$icd/config.json"
+	rp_run rp-sticky-new
+	if [ "$(grep '^flake update' "$WORK/rp-sticky-new.nix.log")" = "flake update p-a --flake path:$icd/plugins-flake" ] \
+		&& [ "$(rp_pin rp-sticky-new p-a)" = sha256-A3 ] && [ "$(rp_pin rp-sticky-new p-b)" = sha256-B0 ] \
+		&& [ -e "$icd/composition.repin.failed" ] && grep -q 'p-b: its current content failed' "$WORK/rp-sticky-new.log"; then
+		ok "new content is re-pinned despite an old failure record; a still-failed sibling stays skipped"
+	else
+		bad "new-content retry (nix calls: $(cat "$WORK/rp-sticky-new.nix.log"), log: $(cat "$WORK/rp-sticky-new.log"))"
+	fi
+fi
+# ... and an op's snapshot that fails to confirm is sticky too: the restored
+# lock's stale input is not re-pinned straight back to the content that failed
+if rp_setup rp-sticky-op sha256-A2 sha256-B1; then
+	jq '.nodes["p-a"].locked.narHash = "sha256-A1"' "$icd/plugins-flake/flake.lock" > "$icd/composition.lock.prev"
+	RP_BUILD_RC=1 rp_run rp-sticky-op
+	: > "$WORK/rp-sticky-op.nix.log"
+	rp_run rp-sticky-op
+	if [ "$(rp_pin rp-sticky-op p-a)" = sha256-A1 ] && ! grep -q '^flake update\|^build' "$WORK/rp-sticky-op.nix.log" \
+		&& grep -q 'p-a: its current content failed' "$WORK/rp-sticky-op.log"; then
+		ok "an op's re-pin that failed to confirm is not re-pinned again by the next launch"
+	else
+		bad "op snapshot stickiness (p-a=$(rp_pin rp-sticky-op p-a), nix calls: $(cat "$WORK/rp-sticky-op.nix.log"), log: $(cat "$WORK/rp-sticky-op.log"))"
+	fi
+fi
+
+# (e6) `cogbox start`'s daemon pass (COGBOX_SKIP_REPIN=1) never re-pins or
+# confirms: it must own a live QEMU within start's 60s, so it fast-paths the
+# lock the init pass left. Init pass: the re-pin fetch fails and leaves the lock
+# alone; daemon pass, with a `flake update` that would now stall for 200s:
+# no hash, no update, no build, no re-exec, done in seconds. The failure is not
+# recorded, so the NEXT start's init pass retries it.
+if rp_setup rp-skip sha256-A1 sha256-B1; then
+	rp_fastpath rp-skip
+	RP_UPDATE_RC=1 rp_run rp-skip
+	if grep -q '^flake update p-a' "$WORK/rp-skip.nix.log" && cmp -s "$WORK/rp-skip.lock0" "$icd/plugins-flake/flake.lock" \
+		&& [ ! -e "$icd/composition.lock.prev" ] && [ ! -e "$icd/composition.repin.failed" ]; then
+		: > "$WORK/rp-skip.nix.log"
+		rp_t0=$SECONDS
+		COGBOX_SKIP_REPIN=1 RP_UPDATE_SLEEP=200 rp_run rp-skip
+		rp_dt=$((SECONDS - rp_t0))
+		if [ "$rp_dt" -lt 30 ] && ! grep -q '^hash\|^flake update\|^build\|^run' "$WORK/rp-skip.nix.log" \
+			&& cmp -s "$WORK/rp-skip.lock0" "$icd/plugins-flake/flake.lock" && [ -e "$icd/runner.path" ] \
+			&& grep -q 'daemon pass: leaving the plugin composition re-pin to the init pass' "$WORK/rp-skip.log"; then
+			ok "the daemon pass makes no re-pin (no flake update, no stall) and fast-paths the lock the init pass left"
+		else
+			bad "daemon pass after a failed re-pin (${rp_dt}s, nix calls: $(cat "$WORK/rp-skip.nix.log"), log: $(cat "$WORK/rp-skip.log"))"
+		fi
+		: > "$WORK/rp-skip.nix.log"
+		rp_run rp-skip
+		if grep -q '^flake update p-a' "$WORK/rp-skip.nix.log" && [ "$(rp_pin rp-skip p-a)" = sha256-A2 ]; then
+			ok "a failed re-pin fetch is retried by the next start's init pass (not recorded as sticky)"
+		else
+			bad "re-pin retry on the next start (nix calls: $(cat "$WORK/rp-skip.nix.log"))"
+		fi
+	else
+		bad "init pass with a failing re-pin fetch (nix calls: $(cat "$WORK/rp-skip.nix.log"), files: $(ls "$icd"))"
+	fi
+fi
+# ... and an op's unconfirmed snapshot (or one an init pass left when an op
+# moved the lock mid-confirmation) costs the daemon no confirmation eval: the
+# snapshot is left for the next init pass.
+if rp_setup rp-skip-prev sha256-A2 sha256-B1; then
+	rp_fastpath rp-skip-prev
+	echo '{"stale":"snapshot"}' > "$icd/composition.lock.prev"
+	COGBOX_SKIP_REPIN=1 rp_run rp-skip-prev
+	if ! grep -q '^build\|^run' "$WORK/rp-skip-prev.nix.log" && [ -e "$icd/composition.lock.prev" ] \
+		&& cmp -s "$WORK/rp-skip-prev.lock0" "$icd/plugins-flake/flake.lock"; then
+		ok "the daemon pass leaves an unconfirmed snapshot unbuilt and fast-paths"
+	else
+		bad "daemon pass with a snapshot (nix calls: $(cat "$WORK/rp-skip-prev.nix.log"))"
+	fi
+fi
+# A `nix hash path` that times out is "could not hash": the locked narHash is
+# kept and nothing is re-pinned. (A `timeout` shim stands in for the 60s cap.)
+if rp_setup rp-hash-timeout sha256-A1 sha256-B1; then
+	mkdir -p "$WORK/rp-hash-timeout/bin"
+	{ echo "#!$(command -v bash)"; cat <<'SHIM_EOF'
+for a in "$@"; do [ "$a" = hash ] && { echo "hash-capped $*" >> "$RP_LOG"; exit 124; }; done
+exec REALTIMEOUT "$@"
+SHIM_EOF
+	} | sed "s|REALTIMEOUT|$(command -v timeout)|" > "$WORK/rp-hash-timeout/bin/timeout"
+	chmod +x "$WORK/rp-hash-timeout/bin/timeout"
+	PATH="$WORK/rp-hash-timeout/bin:$PATH" rp_run rp-hash-timeout
+	if grep -q '^hash-capped -k 5 60 nix .* hash path' "$WORK/rp-hash-timeout.nix.log" \
+		&& ! grep -q '^flake update\|^build' "$WORK/rp-hash-timeout.nix.log" \
+		&& cmp -s "$WORK/rp-hash-timeout.lock0" "$icd/plugins-flake/flake.lock" \
+		&& grep -q 'p-a: could not hash its source (timed out); keeping its locked narHash' "$WORK/rp-hash-timeout.log"; then
+		ok "a timed-out nix hash path keeps the locked narHash (no re-pin)"
+	else
+		bad "hash timeout (nix calls: $(cat "$WORK/rp-hash-timeout.nix.log"), log: $(cat "$WORK/rp-hash-timeout.log"))"
+	fi
+fi
+
+# (f) an op left composition.lock.prev (unconfirmed re-pin): confirmed by a
+# successful build, rolled back to the snapshot by a failed one
+if rp_setup rp-prev-ok sha256-A2 sha256-B1; then
+	echo '{"stale":"snapshot"}' > "$icd/composition.lock.prev"
+	rp_run rp-prev-ok
+	if grep -q '^build --no-link' "$WORK/rp-prev-ok.nix.log" && [ ! -e "$icd/composition.lock.prev" ] \
+		&& cmp -s "$WORK/rp-prev-ok.lock0" "$icd/plugins-flake/flake.lock"; then
+		ok "an op's unconfirmed re-pin is confirmed by a successful pre-exec build"
+	else
+		bad "prev confirm (nix calls: $(cat "$WORK/rp-prev-ok.nix.log"))"
+	fi
+fi
+if rp_setup rp-prev-fail sha256-A2 sha256-B1; then
+	echo '{"stale":"snapshot"}' > "$icd/composition.lock.prev"
+	RP_BUILD_RC=1 rp_run rp-prev-fail
+	if [ "$(cat "$icd/plugins-flake/flake.lock")" = '{"stale":"snapshot"}' ] && [ ! -e "$icd/composition.lock.prev" ] \
+		&& [ ! -e "$icd/runner.path" ]; then
+		ok "an op's unconfirmed re-pin that fails to build is rolled back to its snapshot"
+	else
+		bad "prev rollback (lock: $(cat "$icd/plugins-flake/flake.lock"), log: $(cat "$WORK/rp-prev-fail.log"))"
+	fi
+fi
+
+# (g) the input-name filter cannot be bypassed: a key `p-a<LF>` (Oniguruma's
+# `$` matches before a trailing newline) whose narHash carries newline-split
+# "names", and the reserved `p-user` / `p-git-grants`, never reach nix argv --
+# not even `hash path` -- while the real stale input still re-pins
+if rp_setup rp-inject sha256-A1 sha256-B1; then
+	jq '.nodes.evil = {locked:{narHash:"--option\npost-build-hook\n/tmp/x",type:"path"},original:{type:"path"}}
+		| .nodes.root.inputs += {"p-a\n":"evil","p-user":"evil","p-git-grants":"evil"}' \
+		"$icd/plugins-flake/flake.lock" > "$icd/l.t" && mv "$icd/l.t" "$icd/plugins-flake/flake.lock"
+	rp_run rp-inject
+	upd=$(grep '^flake update' "$WORK/rp-inject.nix.log")
+	if [ "$(grep -c '^hash path' "$WORK/rp-inject.nix.log")" = 3 ] \
+		&& ! grep -q 'post-build-hook\|/tmp/x\|plugin-sources/user\|plugin-sources/git-grants\|plugin-sources/--option' "$WORK/rp-inject.nix.log" \
+		&& [ "$upd" = "flake update p-a --flake path:$icd/plugins-flake" ] \
+		&& [ "$(rp_pin rp-inject p-a)" = sha256-A2 ]; then
+		ok "newline-bearing and reserved composition input names are filtered before nix argv"
+	else
+		bad "input-name filter bypass (nix calls: $(cat "$WORK/rp-inject.nix.log"))"
+	fi
+fi
+
 if [ "$fails" -gt 0 ]; then
 	echo "$fails check(s) failed" >&2
 	exit 1
