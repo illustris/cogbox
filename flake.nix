@@ -343,7 +343,7 @@
 			inherit system;
 			modules = [
 				microvm.nixosModules.microvm
-				({ pkgs, ... }: {
+				({ pkgs, config, ... }: {
 					# `@cogbox-instance@` is a sentinel rewritten by
 					# cogbox-launch.sh to the active instance name, so
 					# systemd applies `cogbox-<instance>` as the hostname
@@ -373,7 +373,7 @@
 						# Prepend the plugin tools (cogbox.packages) the brain materialized.
 						# Redundant on the VM (they are in systemPackages already) but keeps
 						# parity with the container, where this is the only PATH surface.
-						[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"
+						[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"${lib.optionalString config.cogbox.runtimeEnvironment.enable "\nexport PATH=\"/root/work/.cogbox/runtime/current/bin:$PATH\""}
 					'';
 					microvm = {
 						hypervisor = "qemu";
@@ -418,7 +418,7 @@
 		mkContainer = system: name: { extraModules ? [] }: nixpkgs.lib.nixosSystem {
 			inherit system;
 			modules = [
-				({ pkgs, lib, ... }: {
+				({ pkgs, lib, config, ... }: {
 					# microvm.nixosModules.microvm is intentionally NOT imported for
 					# the container. The shared guest module still carries a
 					# `microvm = lib.mkIf isVm {...}` definition, so declare an inert,
@@ -450,7 +450,7 @@
 							# surface for plugin tools (the base image is plugin-less), so it
 							# is what makes `example-plugin-cli` et al. resolve in the
 							# interactive terminal (tmux spawns a login shell).
-							[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"
+							[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"${lib.optionalString config.cogbox.runtimeEnvironment.enable "\nexport PATH=\"/root/work/.cogbox/runtime/current/bin:$PATH\""}
 						'';
 						nix = {
 							nixPath = [ "nixpkgs=${pkgs.path}" ];
@@ -514,6 +514,7 @@
 		cogboxModules = system: { userExt ? inputs.userExtensions.nixosModules.default, target ? "vm" }: let
 			hasNixMcp = builtins.hasAttr system (nix-mcp.packages or {});
 		in [
+			./runtime/module.nix
 			# Declare the cogbox.* plugin-contribution option tree (the "brain"
 			# contract). Every plugin module fills in its slice; the base module
 			# below reads the merged config.cogbox and materializes it into each
@@ -1532,7 +1533,7 @@
 						flagsStr = lib.concatStringsSep " " (map lib.escapeShellArg h.launcher.flags);
 						unflaggedCommands = h.launcher.unflaggedCommands or [];
 						unflaggedPattern = lib.concatStringsSep "|" (map lib.escapeShellArg unflaggedCommands);
-						command = ''exec env PATH="/root/work/.cogbox/brain/bin:$PATH" ${envStr} ${lib.getExe h.package}'';
+						command = ''exec env PATH="${lib.optionalString cfg.runtimeEnvironment.enable "/root/work/.cogbox/runtime/current/bin:"}/root/work/.cogbox/brain/bin:$PATH" ${envStr} ${lib.getExe h.package}'';
 						unflaggedDispatch = lib.optionalString (unflaggedCommands != []) ''
 							case "''${1-}" in
 								${unflaggedPattern}) ${command} "$@" ;;
@@ -4304,6 +4305,7 @@
 		#   ).config.system.build.googleComputeImage'
 		lib.mkGceHost = mkGceHost;
 		nixosModules.gce-host = ./gce/cogbox-host.nix;
+		nixosModules.runtime-environment = ./runtime/module.nix;
 
 		packages = forAllSystems (system: if system == "aarch64-darwin" then
 			import ./darwin/packages.nix {
@@ -4562,6 +4564,7 @@
 				# bumps. To be submitted upstream to passt-dev.
 				patches = (old.patches or []) ++ [ ./patches/passt-ack-never-exceeds-seq-from-tap.patch ];
 			});
+			cogbox-env = pkgs.callPackage ./runtime/package.nix {};
 			cogbox = mkCogbox runner;
 			default = cogbox;
 
@@ -5545,6 +5548,33 @@
 			# and k8s backends untouched. Plus: no failure path echoes credential
 			# context, which matters wherever the launcher's stderr lands somewhere
 			# retained outside the machine.
+			runtime-environment = let
+				configs = [
+					self.nixosConfigurations.${configName system}
+					self.nixosConfigurations."${configName system}-container"
+				];
+				checkConfig = base: let
+					disabled = base.config;
+					enabled = (base.extendModules { modules = [ { cogbox.runtimeEnvironment.enable = true; } ]; }).config;
+					profile = "/root/work/.cogbox/runtime/current/bin";
+					package = self.packages.${system}.cogbox-env;
+					launcher = config: (lib.findFirst (p: p.name == "c") (throw "missing default harness launcher") config.environment.systemPackages).text;
+				in assert !disabled.cogbox.runtimeEnvironment.enable;
+					assert !(lib.hasInfix profile disabled.programs.bash.loginShellInit);
+					assert lib.hasInfix profile enabled.programs.bash.loginShellInit;
+					assert !(builtins.elem package disabled.environment.systemPackages);
+					assert builtins.elem package enabled.environment.systemPackages;
+					assert lib.hasInfix profile (launcher enabled);
+					assert lib.replaceStrings [ "${profile}:" ] [ "" ] (launcher enabled) == launcher disabled;
+					true;
+			in assert lib.all checkConfig configs;
+				pkgs.runCommand "cogbox-runtime-environment-tests" {
+					nativeBuildInputs = [ pkgs.python3 ];
+				} ''
+					python3 ${./tests/test_runtime_env.py} ${./runtime/cogbox-env.py} -v
+					touch $out
+				'';
+
 			native-app-module = let
 				configs = [
 					self.nixosConfigurations.${configName system}
