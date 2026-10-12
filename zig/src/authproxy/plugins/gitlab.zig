@@ -705,7 +705,15 @@ const RefView = struct {
 		return n >= min;
 	}
 
-	/// Component-wise equality against a `/`-joined path string.
+	/// Component-wise equality against a `/`-joined path string, ASCII
+	/// case-insensitive per component. GitLab resolves namespace and project
+	/// paths case-insensitively (and keeps them case-insensitively unique), and
+	/// the upstream here is always the configured GitLab host, so `GRP/Proj`
+	/// and `grp/proj` name the SAME project: folding admits nothing a grant
+	/// does not already cover. Component boundaries are unaffected. The safety
+	/// argument rests on that uniqueness: a legacy instance still carrying
+	/// case-colliding routes (`Grp/x` and `grp/x` as two projects) would have
+	/// both folded under one grant.
 	fn eqlPath(self: *const RefView, path: []const u8) bool {
 		var it = self.iter();
 		var pit = std.mem.splitScalar(u8, path, '/');
@@ -714,14 +722,17 @@ const RefView = struct {
 			const b = pit.next();
 			if (a == null and b == null) return true;
 			if (a == null or b == null) return false;
-			if (!std.mem.eql(u8, a.?, b.?)) return false;
+			if (!std.ascii.eqlIgnoreCase(a.?, b.?)) return false;
 		}
 	}
 
 	/// STRICTLY under the slash-terminated namespace prefix ("/grp/sub/"): all
 	/// prefix components match AND at least one more component follows, so
 	/// `grp-secret` stays excluded and the namespace path itself is not a
-	/// member of its own subtree.
+	/// member of its own subtree. Components compare ASCII case-insensitively,
+	/// as in eqlPath (GitLab paths are case-insensitive and case-insensitively
+	/// unique); a folded compare still matches whole components, so `GRP-secret`
+	/// is as excluded as `grp-secret`.
 	fn underPrefix(self: *const RefView, prefix: []const u8) bool {
 		const trimmed = std.mem.trim(u8, prefix, "/");
 		if (trimmed.len == 0) return false;
@@ -729,7 +740,7 @@ const RefView = struct {
 		var pit = std.mem.splitScalar(u8, trimmed, '/');
 		while (pit.next()) |want| {
 			const got = it.next() orelse return false;
-			if (!std.mem.eql(u8, got, want)) return false;
+			if (!std.ascii.eqlIgnoreCase(got, want)) return false;
 		}
 		return it.next() != null;
 	}
@@ -741,6 +752,7 @@ const RefView = struct {
 	/// list its OWN group as well as any subgroup, which strict underPrefix
 	/// would exclude. `grp-secret`, a sibling and a bare parent still fail --
 	/// a component that only shares a string prefix is a different component.
+	/// ASCII case-insensitive per component, for the same reason as eqlPath.
 	fn groupUnderOrEqualPrefix(self: *const RefView, prefix: []const u8) bool {
 		const trimmed = std.mem.trim(u8, prefix, "/");
 		if (trimmed.len == 0) return false;
@@ -748,7 +760,7 @@ const RefView = struct {
 		var pit = std.mem.splitScalar(u8, trimmed, '/');
 		while (pit.next()) |want| {
 			const got = it.next() orelse return false;
-			if (!std.mem.eql(u8, got, want)) return false;
+			if (!std.ascii.eqlIgnoreCase(got, want)) return false;
 		}
 		return true; // equal (no trailing component) or under (some follow)
 	}
@@ -1445,6 +1457,15 @@ test "RefView: component iteration spans embedded slashes" {
 	const secret = [_][]const u8{ "grp-secret", "x" };
 	const v3 = refView(&secret).?;
 	try t.expect(!v3.underPrefix("/grp/"));
+	// GitLab paths are case-insensitive: components fold, boundaries do not
+	try t.expect(v.eqlPath("GRP/Proj"));
+	try t.expect(!v.eqlPath("GRP/Proj2"));
+	try t.expect(v2.underPrefix("/GRP/"));
+	try t.expect(!v2.underPrefix("/Grp/PROJ/")); // still not strictly under itself
+	try t.expect(v2.groupUnderOrEqualPrefix("/Grp/PROJ/")); // ...but equal for enumeration
+	try t.expect(!v3.underPrefix("/GRP/"));
+	const mixed_secret = [_][]const u8{ "GRP-Secret", "x" };
+	try t.expect(!refView(&mixed_secret).?.underPrefix("/grp/"));
 }
 
 test "RefView: malformed references are not well-formed" {
@@ -1676,6 +1697,14 @@ test "gitlab: api-project is SCOPED, not ambient -- a non-granted project denies
 		.{ .segs = &.{ "api", "v4", "projects", "999" }, .want_allow = false },
 		.{ .segs = &.{ "api", "v4", "projects", "other/secret" }, .want_allow = false },
 		.{ .segs = &.{ "api", "v4", "projects", "grp/sub-secret/x" }, .want_allow = false },
+		// GitLab paths are case-insensitive: a mixed-case reference to a granted
+		// project/namespace names the same thing, while the component boundary
+		// and a non-granted project stay out whatever their case
+		.{ .segs = &.{ "api", "v4", "projects", "Grp/PROJ" }, .want_allow = true, .grant = "gg-p" },
+		.{ .segs = &.{ "api", "v4", "projects", "GRP/Sub/child" }, .want_allow = true, .grant = "gg-n" },
+		.{ .segs = &.{ "api", "v4", "projects", "GRP/SUB-secret/x" }, .want_allow = false },
+		.{ .segs = &.{ "api", "v4", "projects", "Other/Secret" }, .want_allow = false },
+		.{ .segs = &.{ "api", "v4", "projects", "GRP/SUB" }, .want_allow = false },
 	};
 	for (cases) |c| {
 		const req = mkReq(.GET, c.segs, &.{});
@@ -1775,6 +1804,13 @@ test "gitlab: api-group-projects is namespace-scoped, equals-or-under, path-form
 		.{ .group = "grp/other", .want_allow = false },
 		.{ .group = "grp", .want_allow = false },
 		.{ .group = "grp/sub-secret", .want_allow = false },
+		// GitLab group paths are case-insensitive: folded components still match
+		// whole components only
+		.{ .group = "Grp/SUB", .want_allow = true, .grant = "gg-0002" },
+		.{ .group = "GRP/sub/Team", .want_allow = true, .grant = "gg-0002" },
+		.{ .group = "GRP/Other", .want_allow = false },
+		.{ .group = "GRP", .want_allow = false },
+		.{ .group = "Grp/Sub-Secret", .want_allow = false },
 		// the numeric form fails closed even though 77 is in gg-0002's projects[]
 		// (those are project ids, never a group id)
 		.{ .group = "77", .want_allow = false },
@@ -2443,6 +2479,21 @@ test "gitlab: push rules are a UNION -- a rule-free covering grant admits what a
 		try t.expect(!commandAdmitted(grants, &route_ns, &cmd, splitRef(cmd.ref, &buf).?));
 	}
 
+	// GitLab resolves paths case-insensitively, so a mixed-case push names the
+	// same projects: GRP/Proj still rides the rule-free grant, and GRP/Other is
+	// still fenced by the namespace rules (folding never sheds them).
+	const covered_mc = [_][]const u8{ "GRP", "Proj.git", "git-receive-pack" };
+	const route_both_mc = pushRoute(g.entries[0].policy, &covered_mc);
+	const main_cmd = mkCmd("refs/heads/main", false);
+	try t.expect(commandAdmitted(grants, &route_both_mc, &main_cmd, splitRef(main_cmd.ref, &buf).?));
+	const ns_only_mc = [_][]const u8{ "Grp", "OTHER.git", "git-receive-pack" };
+	const route_ns_mc = pushRoute(g.entries[0].policy, &ns_only_mc);
+	try t.expect(commandAdmitted(grants, &route_ns_mc, &agent, splitRef(agent.ref, &buf).?));
+	try t.expect(!commandAdmitted(grants, &route_ns_mc, &main_cmd, splitRef(main_cmd.ref, &buf).?));
+	// a ref NAME is case-sensitive (git refnames are): Agent/ is not agent/
+	const agent_mc = mkCmd("refs/heads/Agent/x", false);
+	try t.expect(!commandAdmitted(grants, &route_ns_mc, &agent_mc, splitRef(agent_mc.ref, &buf).?));
+
 	// A grant WITHOUT git-write is not a candidate at all, however wide its
 	// scope: the fixture's namespace grant covers grp/sub but reads only.
 	const g2 = try testGen(conf.test_conf_v2_json);
@@ -2573,6 +2624,15 @@ test "gitlab: mediate is a pure passthrough unless a covering grant carries push
 		const fenced = [_][]const u8{ "grp", "proj.git", "git-receive-pack" };
 		try t.expect(try runMediate(g.entries[0].policy, &fenced, .POST, &body2, &refusing, &out2));
 		try t.expectEqualStrings("ref_denied", out2.deny.?);
+		try t.expectEqual(@as(usize, 0), refusing.calls);
+		// ...and so does the fenced project in another CASE: GitLab resolves
+		// GRP/Proj to grp/proj, so the rules must bind it too (a case-sensitive
+		// scan here would wave it through the fast path)
+		var body3: std.Io.Reader = .fixed(push_body);
+		var out3: plugin_mod.Response = .{};
+		const fenced_mc = [_][]const u8{ "GRP", "Proj.git", "git-receive-pack" };
+		try t.expect(try runMediate(g.entries[0].policy, &fenced_mc, .POST, &body3, &refusing, &out3));
+		try t.expectEqualStrings("ref_denied", out3.deny.?);
 		try t.expectEqual(@as(usize, 0), refusing.calls);
 	}
 }

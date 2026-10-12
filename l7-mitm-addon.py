@@ -1437,7 +1437,10 @@ def _enforce_and_inject(flow, path, query_service=None):
 
     # RETARGET: a host the auth proxy owns is steered to the loopback hop AFTER
     # the allow decision (the addon's rule set stays the outer gate -- an
-    # operator deny still denies before any retarget) and BEFORE the injection
+    # operator deny still denies before any retarget, but it matches paths
+    # case-SENSITIVELY while the auth proxy folds GitLab grant paths, so a deny
+    # on /grp/secret does not fence /GRP/secret.git under a grp/* grant:
+    # narrowing belongs in the grant) and BEFORE the injection
     # block, which it then bypasses entirely. This is the unconditional injection
     # skip: the auth proxy stamps the credential itself, so a stale gitlab-oauth
     # bind lingering through a mode flip must never let the addon double-stamp.
