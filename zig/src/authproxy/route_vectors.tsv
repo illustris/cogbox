@@ -213,6 +213,8 @@ route	GET	/api/v4/projects/1234%2Fpipelines/access_tokens	-	the all-digit-namesp
 #   v2-repo         project grp/proj#1234 [repo:read]        (NO git-read)
 #   v2-wiki-rw      project grp/proj#1234 [wiki:read,wiki:write]
 #   v1-coarse       instance [issues,mr]                     (the LEGACY dialect)
+#   ns-mixed        namespace /Acme/Ops/Infra/ [git-read,git-write]; project
+#                   Acme/Tools [git-read,git-write]  (MIXED-case grants, NO instance grant)
 
 # --- the git smart-HTTP tier: cap + scope ---
 authz	allow	full	GET	/grp/proj.git/info/refs?service=git-upload-pack	git-read on the concrete project
@@ -270,6 +272,37 @@ authz	deny	ns-mr	GET	/api/v4/groups/grp%2Fsub-secret/projects	grp-secret stays e
 authz	deny	ns-mr	GET	/api/v4/groups/77/projects	the numeric group form fails closed
 authz	deny	inst-read	GET	/api/v4/groups/grp%2Fsub/projects	instance git-read never enumerates (scope, not cap)
 authz	deny	issues-only	GET	/api/v4/groups/grp%2Fsub/projects	cap_missing: enumeration is a git-read capability
+
+# --- grant paths match ASCII case-INSENSITIVELY (GitLab resolves paths that way) ---
+# The upstream is always the configured GitLab host, which treats GRP/Proj and
+# grp/proj as the SAME project (paths are case-insensitively unique), so folding
+# admits nothing a grant does not already cover. Component boundaries still hold:
+# a mixed-case grp-secret sibling stays out. Each allow row is DISCRIMINATING --
+# no instance grant in its fixture carries the cap, so only the folded scope test
+# can admit it. Ref NAMES are not paths and stay case-sensitive (unit tests).
+authz	allow	full	POST	/GRP/Proj.git/git-receive-pack	project scope: git-write on grp/proj, mixed case
+authz	allow	full	POST	/grp/PROJ.git/git-receive-pack	project scope: the last component folds too
+authz	allow	full	POST	/Grp/SUB/a.git/git-receive-pack	namespace scope: strictly under /grp/sub/, mixed case
+authz	deny	full	POST	/GRP/Other.git/git-receive-pack	scope_mismatch: folding does not widen to a sibling project
+authz	deny	full	POST	/GRP/SUB-secret/x.git/git-receive-pack	scope_mismatch: a mixed-case grp-secret stays outside the boundary
+authz	allow	ns-mr	GET	/GRP/Sub/repo.git/info/refs?service=git-upload-pack	namespace git-read clone, mixed case
+authz	allow	ns-mr	GET	/api/v4/projects/GRP%2FSub%2Fchild/merge_requests	path-form :id under /grp/sub/, mixed case
+authz	deny	ns-mr	GET	/api/v4/projects/GRP%2FSUB-secret%2Fchild/merge_requests	grp-secret stays EXCLUDED whatever its case
+authz	deny	ns-mr	GET	/api/v4/projects/GRP%2FSUB/merge_requests	the namespace itself is still not under its own subtree
+authz	allow	ns-mr	GET	/api/v4/groups/Grp%2FSUB/projects	enumeration: the namespace node itself, mixed case
+authz	allow	ns-mr	GET	/api/v4/groups/GRP%2Fsub%2FTeam/projects	enumeration: a subgroup, mixed case
+authz	deny	ns-mr	GET	/api/v4/groups/GRP%2FSub-Secret/projects	enumeration: a mixed-case string-prefix sibling stays OUT
+authz	deny	ns-mr	GET	/api/v4/groups/GRP/projects	enumeration: the parent group is still OUT
+authz	allow	proj-issues	GET	/api/v4/projects/Grp%2FProj	api-project: the granted project, mixed case
+authz	deny	proj-issues	GET	/api/v4/projects/Other%2FSecret	api-project: a non-granted project stays denied
+# ...and the other direction: grants typed in mixed case, lowercase requests.
+authz	allow	ns-mixed	GET	/acme/ops/infra/tools/x.git/info/refs?service=git-upload-pack	mixed-case 3-component prefix covers a lowercase nested project
+authz	allow	ns-mixed	POST	/acme/ops/infra/x.git/git-receive-pack	...and a direct child, for push
+authz	allow	ns-mixed	GET	/api/v4/groups/acme%2Fops%2Finfra/projects	enumeration of the mixed-case namespace node, lowercase
+authz	allow	ns-mixed	POST	/acme/tools.git/git-receive-pack	a mixed-case concrete project grant, lowercase request
+authz	deny	ns-mixed	GET	/acme/ops/infra-secret/x.git/info/refs?service=git-upload-pack	a string-prefix sibling of the mixed-case prefix stays OUT
+authz	deny	ns-mixed	POST	/acme/ops/x.git/git-receive-pack	the parent of the prefix is OUT
+authz	deny	ns-mixed	GET	/acme/ops/infra/info/refs?service=git-upload-pack	the namespace path itself is not a repo under its own subtree
 
 # --- the local self-discovery route: GET/HEAD authorize on method ALONE ---
 # It reflects THIS sandbox's grants (an empty sandbox still gets a 200

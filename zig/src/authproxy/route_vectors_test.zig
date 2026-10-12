@@ -76,6 +76,15 @@ const fixtures = [_]struct { name: []const u8, json: []const u8 }{
 	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
 	\\"grants":[{"id":"gg-v1","scope":"instance","caps":["issues","mr"]}]}]}
 	},
+	// Grant paths typed in MIXED case (as a user may type them), matched against
+	// lowercase requests: a three-component namespace prefix (nested projects
+	// below it) and a concrete project. No instance grant, so only the folded
+	// scope test can admit.
+	.{ .name = "ns-mixed", .json =
+	\\{"version":1,"providers":[{"host":"git.example.com","plugin":"gitlab","scheme":"http","cred_file":"/x","git_user":"oauth2",
+	\\"grants":[{"id":"gg-nm","scope":"namespace","repo":"Acme/Ops/Infra/*","prefix":"/Acme/Ops/Infra/","caps":["git-read","git-write"]},
+	\\{"id":"gg-pm","scope":"project","repo":"Acme/Tools","caps":["git-read","git-write"]}]}]}
+	},
 };
 
 const Row = struct {
