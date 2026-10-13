@@ -71,6 +71,7 @@ Each enabled harness ships a full-auto launcher inside the VM: `c` for `claude-c
 | [Plugins](docs/plugins.md) | Installable, versioned extensions: the flake contract, pinning, plugin-supplied firewall rules, the generated composition flake |
 | [Harnesses](docs/harnesses.md) | The harness model, per-harness full-auto wiring, adding a harness |
 | [Internals](docs/internals.md) | Directory layout, runtime dir + 9p shares, fw_cfg injection, launch-time patching, re-exec mechanism, host path overrides |
+| [Runtime tool environments](docs/runtime-environment.md) | `cogbox-env`: select, roll back and restore guest tool bundles at runtime without a restart; enabled on the hosted (GCE) guest; protocol, boot restore, retention, recovery |
 
 ## Named instances
 

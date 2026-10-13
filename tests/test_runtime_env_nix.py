@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Real Nix acceptance; uses an explicit helper and a materialized tiny fixture.
+"""Real Nix acceptance for protocol v2; uses an explicit helper and a materialized tiny fixture.
 
-No shared store paths are deleted. Actual store loss is a disposable guest test.
+No shared store paths are deleted, so this never exercises an actual import:
+store-loss recovery belongs to the runtime-boot-restore VM test and the stage
+matrix. It does cover the restore fast path and the boot-restore record.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,24 +20,49 @@ p.add_argument("fixture", type=Path)
 p.add_argument("--evidence", type=Path)
 a = p.parse_args()
 measurements = []
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 with tempfile.TemporaryDirectory(prefix="cogbox-env-acceptance-") as temporary:
     root = Path(temporary)
-    state = root / "state"
-    def rpc(action, expected_ok=True, **fields):
-        req = {"version": 1, "action": action, **fields}
+    work = root / "work"
+    state = work / ".cogbox" / "runtime"
+
+    def run(argv, request=None):
+        return subprocess.run([a.helper, *argv, "--state-dir", str(state), "--timeout", "120"],
+                              input=request, capture_output=True, text=True, timeout=125)
+
+    def rpc(action, expected_ok=True, version=2, **fields):
         started = time.monotonic()
-        proc = subprocess.run([a.helper, "rpc", "--state-dir", str(state), "--timeout", "120"],
-                              input=json.dumps(req), capture_output=True, text=True, timeout=125)
+        proc = run(["rpc"], json.dumps({"version": version, "action": action, **fields}))
         result = json.loads(proc.stdout)
-        assert result["ok"] == expected_ok and (proc.returncode == 0) == expected_ok, (result, proc.stderr)
+        assert result["version"] == 2 and result["ok"] == expected_ok and (proc.returncode == 0) == expected_ok, (result, proc.stderr)
         measurements.append({"action": action, "seconds": round(time.monotonic() - started, 4),
-                             "ok": result["ok"], "changed": result["changed"], "generation": result["generation"]})
+                             "ok": result["ok"], "changed": result["changed"], "generation": result["generation"],
+                             "code": result["error"]["code"] if result["error"] else None})
         return result
+
     def prepare(attr, expected_ok=True):
         return rpc("prepare", expected_ok, flake="path:" + str(a.fixture.resolve()), attribute="packages.x86_64-linux." + attr)
 
+    caps = rpc("capabilities", version=1)["capabilities"]
+    assert caps["protocol_versions"] == [2] and caps["state_formats"] == [1] and caps["helper_version"] == "0.2.0", caps
+    # Before brain-materialize: nothing exists, and nothing may be created.
+    assert rpc("status", False)["error"]["code"] == "not_ready"
+    work.mkdir()
+    assert rpc("status", False)["error"]["code"] == "not_ready" and list(work.iterdir()) == []
+    (work / ".cogbox").mkdir()
+    empty = rpc("status")["status"]
+    assert empty["selection"] is None and empty["generations"] == [] and not state.exists(), empty
+    assert rpc("prepare", False, flake="git+https://user:secret@git.example.com/acme/tools",
+               attribute="default")["error"]["code"] == "invalid_request"
+    assert rpc("apply", False, version=1, generation="0" * 64, expected_selection="none")["error"]["code"] == "unsupported_version"
+
     first = prepare("a")
-    assert first["status"]["active_generation"] is None
+    assert first["status"]["active_generation"] is None and first["changed"]
     ga = first["generation"]
     selected = rpc("apply", generation=ga, expected_selection="none")
     ta = selected["status"]["selection"]
@@ -48,7 +76,7 @@ with tempfile.TemporaryDirectory(prefix="cogbox-env-acceptance-") as temporary:
       while read -r request; do
         hash -r
         case "$request" in
-          probe) runtime-probe ;;
+          probe) if command -v runtime-probe >/dev/null; then runtime-probe; else echo none; fi ;;
           only) if command -v runtime-a-only >/dev/null; then echo present; else echo absent; fi ;;
         esac
       done
@@ -78,34 +106,56 @@ with tempfile.TemporaryDirectory(prefix="cogbox-env-acceptance-") as temporary:
         assert stale["error"]["code"] == "stale_selection" and stale["status"]["selection"] == tc
         failed = prepare("collision", False)
         assert failed["error"]["code"] == "prepare_failed" and failed["status"]["selection"] == tc
+        reserved = prepare("reserved", False)
+        assert reserved["error"] == {"code": "prepare_failed", "message": "bundle must not provide cogbox-env"}, reserved
+        assert reserved["status"]["selection"] == tc and len(reserved["status"]["generations"]) == 2
         warm = prepare("a")
         assert warm["generation"] == ga and not warm["changed"]
-        # Checksum failure is real; it must not import or change the pointer.
+        # A damaged or missing retained archive is repaired from the local closure.
         archive = state / "generations" / ga / "closure.nar"
+        manifest = json.loads((state / "generations" / ga / "manifest.json").read_text())
+        good = sha256(archive)
         with archive.open("r+b") as stream:
             byte = stream.read(1)
             stream.seek(0)
             stream.write(bytes([byte[0] ^ 1]))
-        repeated = prepare("a", False)
-        assert repeated["error"]["code"] == "invalid_archive" and repeated["status"]["selection"] == tc
-        corrupt = rpc("restore", False, generation=ga)
-        assert corrupt["error"]["code"] == "invalid_archive" and corrupt["status"]["selection"] == tc
-        with archive.open("r+b") as stream:
-            stream.write(byte)
-        hidden = archive.with_suffix(".saved")
-        archive.rename(hidden)
-        missing = prepare("a", False)
-        assert missing["error"]["code"] == "invalid_archive" and missing["status"]["selection"] == tc
-        hidden.rename(archive)
-        # This verifies/re-roots an existing closure. It does NOT prove recovery
-        # from actual store loss; the stage acceptance separately does that.
+        repaired = prepare("a")
+        assert repaired["generation"] == ga and repaired["changed"] and sha256(archive) == good, repaired
+        archive.unlink()
+        repaired = prepare("a")
+        assert repaired["changed"] and sha256(archive) == good and repaired["status"]["selection"] == tc
+        assert json.loads((state / "generations" / ga / "manifest.json").read_text())["identity"] == manifest["identity"]
+        # Present closure: restore is the fast path, no import and no change.
         restored = rpc("restore")
-        assert restored["status"]["output"] == selected["status"]["output"]
+        assert not restored["changed"] and restored["status"]["active_generation"] == ga
         assert ask("probe") == "v1"
-        report = {"tests": "prepare/apply/live replacement/removal/rollback/noop/ABA/collision/reuse/checksum/restore-existing",
-                  "measurements": measurements, "archive_bytes": sum(g["archive_bytes"] for g in restored["status"]["generations"]),
+        boot = run(["restore", "--boot"])
+        assert boot.returncode == 0, boot.stderr
+        assert boot.stderr.startswith("cogbox-runtime-restore: outcome=active code=- generation=" + ga + " duration_ms="), boot.stderr
+        record = rpc("status")["status"]["boot_restore"]
+        assert record["outcome"] == "active" and record["generation"] == ga and record["code"] is None, record
+        cleared = rpc("clear", expected_selection=tc)
+        assert cleared["changed"] and cleared["status"]["selection"] is None and ask("probe") == "none"
+        assert sorted(g["id"] for g in cleared["status"]["generations"]) == sorted([ga, gb])
+        again = rpc("apply", generation=ga, expected_selection="none")
+        assert again["status"]["previous_generation"] is None and ask("probe") == "v1"
+        pruned = rpc("prune", generation=gb)
+        assert pruned["changed"] and [g["id"] for g in pruned["status"]["generations"]] == [ga]
+        assert not (state / "roots" / gb).exists()
+        refused = rpc("prune", False, generation=ga)
+        assert refused["error"]["code"] == "invalid_request"
+        final = rpc("prune")["status"]
+        limits = final["limits"]
+        assert limits["max_generations"] == 4 and limits["max_path_nar_bytes"] == 1 << 30, limits
+        leftovers = sorted(str(p.relative_to(state)) for p in state.rglob(".*"))
+        assert leftovers == [], leftovers
+        report = {"tests": "capabilities/not_ready/no-create/userinfo/v1-reject/prepare/apply/live replacement/removal/"
+                           "rollback/noop/ABA/collision/reserved/reuse/archive repair/restore fast path/boot record/clear/prune",
+                  "measurements": measurements,
+                  "archive_bytes": limits["archive_bytes_total"], "limits": limits,
                   "shell_pid": shell.pid, "shell_starttime": starttime,
-                  "store_loss_tested": False, "store_loss_note": "No shared host store deletion; disposable guest acceptance required."}
+                  "store_loss_tested": False,
+                  "store_loss_note": "No shared host store deletion; import paths are covered by the VM test and stage matrix."}
         print(json.dumps(report, indent=2))
         if a.evidence:
             a.evidence.write_text(json.dumps(report, indent=2) + "\n")

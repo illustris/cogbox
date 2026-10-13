@@ -1,0 +1,1 @@
+{"action":"apply","capabilities":null,"changed":true,"error":{"code":"status_unavailable","message":"selection committed; run cogbox-env status"},"generation":null,"ok":false,"status":null,"version":2}

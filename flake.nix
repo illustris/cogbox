@@ -335,6 +335,20 @@
 			b = i: builtins.substring (i * 2) 2 hash;
 		in "02:${b 0}:${b 1}:${b 2}:${b 3}:${b 4}";
 
+		# The login-shell half of runtime tool generations (runtime/module.nix),
+		# spliced into BOTH guests' loginShellInit when the option is on. Inline
+		# because loginShellInit is mkForce'd below, so a module cannot append to
+		# it. The PATH entry goes in even before anything is selected (a missing
+		# directory is harmless). The warning is for interactive shells only, and
+		# fires when a generation is selected but its bin no longer resolves: the
+		# boot restore is still running, has failed, or was skipped by the kill switch.
+		runtimeLoginShellInit = lib.concatStrings [
+			"\nexport PATH=\"/root/work/.cogbox/runtime/current/bin:$PATH\""
+			"\nif [[ $- == *i* ]] && [ -L /root/work/.cogbox/runtime/current ] && [ ! -d /root/work/.cogbox/runtime/current/bin/ ]; then"
+			"\n\techo \"cogbox: the selected runtime tools are not active (boot restore pending, failed or disabled); run 'cogbox-env status' and 'systemctl status cogbox-runtime-restore'\" >&2"
+			"\nfi"
+		];
+
 		mkMicrovm = system: name: {
 			vcpu ? 2,
 			mem ? 2048,
@@ -373,7 +387,7 @@
 						# Prepend the plugin tools (cogbox.packages) the brain materialized.
 						# Redundant on the VM (they are in systemPackages already) but keeps
 						# parity with the container, where this is the only PATH surface.
-						[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"${lib.optionalString config.cogbox.runtimeEnvironment.enable "\nexport PATH=\"/root/work/.cogbox/runtime/current/bin:$PATH\""}
+						[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"${lib.optionalString config.cogbox.runtimeEnvironment.enable runtimeLoginShellInit}
 					'';
 					microvm = {
 						hypervisor = "qemu";
@@ -450,7 +464,7 @@
 							# surface for plugin tools (the base image is plugin-less), so it
 							# is what makes `example-plugin-cli` et al. resolve in the
 							# interactive terminal (tmux spawns a login shell).
-							[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"${lib.optionalString config.cogbox.runtimeEnvironment.enable "\nexport PATH=\"/root/work/.cogbox/runtime/current/bin:$PATH\""}
+							[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"${lib.optionalString config.cogbox.runtimeEnvironment.enable runtimeLoginShellInit}
 						'';
 						nix = {
 							nixPath = [ "nixpkgs=${pkgs.path}" ];
@@ -504,6 +518,36 @@
 				"${nixpkgs}/nixos/modules/virtualisation/google-compute-image.nix"
 				./gce/cogbox-host.nix
 			] ++ extraModules;
+		};
+
+		# What makes a guest the HOSTED one (the nixosConfigurations
+		# `-hosted` entry below, which the GCE image runs). One binding so
+		# checks.runtime-environment composes plugin modules against exactly the
+		# shipped config instead of a copy that can drift.
+		#
+		# Runtime tool generations (runtime/module.nix) are on by default here
+		# and nowhere else. GCE is the only backend where they are both safe and
+		# stage-testable: the hosted writable store is a block volume, and the
+		# guest store database resets on every boot, so a boot import can always
+		# re-register what it restores. The container cow store can keep paths
+		# the database calls valid but whose files are gone, which an import can
+		# never repair, and the workstation profile's writable store is a
+		# 50%-RAM tmpfs, so every boot would restore into memory. Enabling it on
+		# those profiles is unsupported (docs/runtime-environment.md).
+		#
+		# mkDefault, not a plain true: plugin modules are full NixOS modules, and
+		# a plugin setting `enable = false` against a plain true is a conflicting
+		# definition that fails the whole plugin compose. Against mkDefault it
+		# cleanly turns the feature off for that box.
+		#
+		# Product decision D1 is still open: a dark launch is this one line
+		# changed to `false`. checks.runtime-environment and
+		# cogbox-guest-pool-degradable follow it, so they stay green and keep
+		# testing the hosted unit graph (forced on) either way.
+		hostedRuntimeDefault = true;
+		hostedGuestModule = { lib, ... }: {
+			cogbox.storage.profile = "hosted";
+			cogbox.runtimeEnvironment.enable = lib.mkDefault hostedRuntimeDefault;
 		};
 
 		# `userExt` defaults to the no-op userExtensions input but can be
@@ -5548,30 +5592,201 @@
 			# and k8s backends untouched. Plus: no failure path echoes credential
 			# context, which matters wherever the launcher's stderr lands somewhere
 			# retained outside the machine.
+
+			# Runtime tool generations (runtime/module.nix, hostedGuestModule).
+			# Three things are pinned here, on the evaluated options AND on the
+			# realized unit file:
+			#   - the hosted guest's default is hostedRuntimeDefault (on), and the
+			#     workstation and container guests are off (forcing it on there,
+			#     test-only, still wires PATH/launcher/helper/unit but never the
+			#     pool-mount gate). Under a dark launch the hosted assertions run on
+			#     the hosted guest forced on, as a plugin would turn it on;
+			#   - cogbox-runtime-restore stays a background unit: wanted by and
+			#     ordered after multi-user.target, Wants=+After= (never Requires= or
+			#     RequiresMountsFor=) on the pool-backed work mount, no Before=, and
+			#     nothing else -- sshd and brain-materialize included -- depends on it;
+			#   - a plugin-composed hosted guest (the nested _file shape the
+			#     composition flake emits, re-evaluated through cogbox-hosted) keeps
+			#     the feature and its skill next to the plugin's own, and a plugin
+			#     setting enable = false evaluates cleanly and drops the unit, the
+			#     skill and the helper. Built from hostedGuestModule itself, so this
+			#     cannot drift from the shipped config.
+			# The helper's unit tests run under python3Minimal, the interpreter the
+			# guest ships, and under python3.
 			runtime-environment = let
-				configs = [
-					self.nixosConfigurations.${configName system}
-					self.nixosConfigurations."${configName system}-container"
-				];
-				checkConfig = base: let
+				profile = "/root/work/.cogbox/runtime/current/bin";
+				warning = "systemctl status cogbox-runtime-restore";
+				unitName = "cogbox-runtime-restore";
+				work = "/var/lib/cogbox/work";
+				workMount = "var-lib-cogbox-work.mount";
+				launcher = config: (lib.findFirst (p: p.name == "c") (throw "missing default harness launcher") config.environment.systemPackages).text;
+				hasPackage = config: builtins.elem config.cogbox.runtimeEnvironment.package config.environment.systemPackages;
+				skillsOf = config: config.system.build.cogboxBrainUnits.skills;
+				dependsOnRestore = svc: lib.elem "${unitName}.service" (svc.after ++ svc.requires ++ svc.wants ++ svc.bindsTo ++ svc.requisite);
+				checkDefaultOff = base: let
 					disabled = base.config;
 					enabled = (base.extendModules { modules = [ { cogbox.runtimeEnvironment.enable = true; } ]; }).config;
-					profile = "/root/work/.cogbox/runtime/current/bin";
-					package = self.packages.${system}.cogbox-env;
-					launcher = config: (lib.findFirst (p: p.name == "c") (throw "missing default harness launcher") config.environment.systemPackages).text;
+					unit = enabled.systemd.services.${unitName};
 				in assert !disabled.cogbox.runtimeEnvironment.enable;
 					assert !(lib.hasInfix profile disabled.programs.bash.loginShellInit);
 					assert lib.hasInfix profile enabled.programs.bash.loginShellInit;
-					assert !(builtins.elem package disabled.environment.systemPackages);
-					assert builtins.elem package enabled.environment.systemPackages;
+					assert lib.hasInfix warning enabled.programs.bash.loginShellInit;
+					assert !(hasPackage disabled);
+					assert hasPackage enabled;
 					assert lib.hasInfix profile (launcher enabled);
 					assert lib.replaceStrings [ "${profile}:" ] [ "" ] (launcher enabled) == launcher disabled;
+					assert !(disabled.systemd.services ? ${unitName});
+					assert !((skillsOf disabled) ? cogbox-runtime);
+					assert (skillsOf enabled).cogbox-runtime == ./skills/cogbox-runtime;
+					# The gate is the fileSystems entry, not the profile name.
+					assert !(enabled.fileSystems ? ${work});
+					assert unit.wants == [ ];
+					assert !(lib.elem workMount unit.after);
+					assert !(unit.unitConfig ? ConditionPathIsMountPoint);
 					true;
-			in assert lib.all checkConfig configs;
+				# The hosted unit graph, shared by the shipped hosted guest and the
+				# plugin-composed one.
+				checkHostedUnit = config: let
+					unit = config.systemd.services.${unitName};
+				in assert config.cogbox.runtimeEnvironment.enable;
+					assert hasPackage config;
+					assert lib.hasInfix profile config.programs.bash.loginShellInit;
+					assert lib.hasInfix warning config.programs.bash.loginShellInit;
+					assert lib.hasInfix profile (launcher config);
+					assert (skillsOf config).cogbox-runtime == ./skills/cogbox-runtime;
+					assert config.fileSystems ? ${work};
+					assert unit.wantedBy == [ "multi-user.target" ];
+					assert lib.all (u: lib.elem u unit.after) [ "multi-user.target" "cogbox-brain-materialize.service" workMount ];
+					assert unit.wants == [ workMount ];
+					assert unit.before == [ ];
+					assert unit.requires == [ ];
+					assert unit.bindsTo == [ ];
+					assert unit.requisite == [ ];
+					assert unit.requiredBy == [ ];
+					assert !(unit.unitConfig ? RequiresMountsFor);
+					assert unit.unitConfig.ConditionPathIsMountPoint == work;
+					assert unit.unitConfig.ConditionPathIsSymbolicLink == "${work}/.cogbox/runtime/current";
+					assert unit.unitConfig.ConditionPathExists == "!${work}/.cogbox/runtime/disable-boot-restore";
+					assert !(unit.serviceConfig ? Restart);
+					assert unit.serviceConfig.OOMScoreAdjust == 500;
+					assert unit.serviceConfig.ExecStart == "${config.cogbox.runtimeEnvironment.package}/bin/cogbox-env restore --boot --state-dir ${work}/.cogbox/runtime --timeout 900";
+					assert !(dependsOnRestore config.systemd.services.sshd);
+					assert !(dependsOnRestore config.systemd.services.cogbox-brain-materialize);
+					true;
+				hostedBase = self.nixosConfigurations."${configName system}-hosted";
+				hosted = if hostedRuntimeDefault then hostedBase.config
+					else (hostedBase.extendModules { modules = [ { cogbox.runtimeEnvironment.enable = true; } ]; }).config;
+				pluginHosted = plugins: (mkMicrovm system "cogbox" {
+					extraModules = cogboxModules system {
+						userExt = { imports = plugins ++ [ { _file = "cogbox-user"; imports = [ ({ pkgs, lib, ... }: { }) ]; } ]; };
+					} ++ [ hostedGuestModule ];
+				}).config;
+				pluginSkill = "runtime-plugin-overview";
+				withPlugin = pluginHosted ([
+					{ _file = "p-testhello"; imports = [ ({ pkgs, ... }: {
+						environment.systemPackages = [ pkgs.hello ];
+					}) ]; }
+					{ _file = "p-testskill"; imports = [ ({ ... }: {
+						cogbox.skills.${pluginSkill} = ./tests/fixtures/brain-plugin/contents/skills/demo-overview;
+					}) ]; }
+				] ++ lib.optional (!hostedRuntimeDefault) { _file = "p-runtime-on"; imports = [ ({ ... }: {
+					cogbox.runtimeEnvironment.enable = true;
+				}) ]; });
+				pluginOff = pluginHosted [
+					{ _file = "p-runtime-off"; imports = [ ({ ... }: {
+						cogbox.runtimeEnvironment.enable = false;
+					}) ]; }
+				];
+				restoreUnit = "${hosted.systemd.units."${unitName}.service".unit}/${unitName}.service";
+				# The service units of the guest that carries the restore: the shipped
+				# hosted guest, or after a dark-launch flip that guest forced on, so
+				# the "nothing else depends on it" scan below keeps its coverage.
+				restoreScanUnits = if hostedRuntimeDefault then hostedServiceUnits
+					else serviceUnitsOf "hosted-runtime-on-service-units" hosted;
+			in assert lib.all checkDefaultOff [
+					self.nixosConfigurations.${configName system}
+					self.nixosConfigurations."${configName system}-container"
+				];
+				# The shipped default; after a dark-launch flip `hosted` and `withPlugin`
+				# are the hosted guest turned on, by an override and by a plugin.
+				assert hostedBase.config.cogbox.runtimeEnvironment.enable == hostedRuntimeDefault;
+				assert checkHostedUnit hosted;
+				assert checkHostedUnit withPlugin;
+				assert (skillsOf withPlugin) ? ${pluginSkill};
+				assert !pluginOff.cogbox.runtimeEnvironment.enable;
+				assert !(pluginOff.systemd.services ? ${unitName});
+				assert !((skillsOf pluginOff) ? cogbox-runtime);
+				assert !(hasPackage pluginOff);
+				assert !(lib.hasInfix profile pluginOff.programs.bash.loginShellInit);
 				pkgs.runCommand "cogbox-runtime-environment-tests" {
-					nativeBuildInputs = [ pkgs.python3 ];
+					nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
 				} ''
-					python3 ${./tests/test_runtime_env.py} ${./runtime/cogbox-env.py} -v
+					fails=0
+					fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+
+					# The realized hosted unit: what systemd actually reads.
+					unit=${restoreUnit}
+					for line in 'Type=oneshot' 'RemainAfterExit=true' \
+						'Wants=${workMount}' \
+						'ConditionPathIsMountPoint=${work}' \
+						'ConditionPathIsSymbolicLink=${work}/.cogbox/runtime/current' \
+						'ConditionPathExists=!${work}/.cogbox/runtime/disable-boot-restore' \
+						'TimeoutStartSec=960' 'TimeoutStopSec=30' 'Nice=10' \
+						'IOSchedulingClass=best-effort' 'IOSchedulingPriority=7' 'OOMScoreAdjust=500' \
+						'WantedBy=multi-user.target'
+					do
+						grep -qxF "$line" "$unit" || fail "the realized ${unitName}.service lacks '$line'"
+					done
+					after=$(sed -n 's/^After=//p' "$unit")
+					for dep in multi-user.target cogbox-brain-materialize.service ${workMount}; do
+						case " $after " in *" $dep "*) ;; *) fail "${unitName}.service is not After= $dep ($after)" ;; esac
+					done
+					if grep -qE '^(Before|Requires|RequiresMountsFor|BindsTo|Requisite|PartOf|Restart)=' "$unit"; then
+						fail "${unitName}.service carries a forbidden dependency or restart: $(grep -E '^(Before|Requires|RequiresMountsFor|BindsTo|Requisite|PartOf|Restart)=' "$unit")"
+					fi
+					grep -qE '^ExecStart=/nix/store/[^ ]+/bin/cogbox-env restore --boot --state-dir ${work}/\.cogbox/runtime --timeout 900$' "$unit" \
+						|| fail "${unitName}.service ExecStart is not the boot restore of the literal work path: $(grep '^ExecStart=' "$unit")"
+					if grep -qF /root/work "$unit"; then
+						fail "${unitName}.service names /root/work, which exists only after brain-materialize"
+					fi
+					# Nothing else may depend on, or be ordered against, the restore.
+					[ -e ${restoreScanUnits}/${unitName}.service ] \
+						|| fail "the scanned unit set lacks ${unitName}.service, so the scan below would prove nothing"
+					for f in ${restoreScanUnits}/*.service; do
+						[ "$(basename "$f")" = ${unitName}.service ] && continue
+						if grep -qF ${unitName} "$f"; then
+							fail "$(basename "$f") references ${unitName}; the restore must never gate another unit"
+						fi
+					done
+
+					# The helper the hosted guest ships: python3Minimal, the guest's Nix.
+					wrapper=${hosted.cogbox.runtimeEnvironment.package}/bin/cogbox-env
+					grep -qF '${pkgs.python3Minimal}/bin/python3' "$wrapper" || fail "cogbox-env does not run on python3Minimal"
+					grep -qF '${lib.getBin hosted.nix.package}/bin' "$wrapper" || fail "cogbox-env does not put the guest's own nix on PATH"
+
+					# The login warning, run for real against a scratch work tree.
+					scratch=$TMPDIR/work
+					mkdir -p "$scratch/.cogbox/runtime/selections/t"
+					sed "s|/root/work|$scratch|g" ${pkgs.writeText "hosted-login.sh" hosted.programs.bash.loginShellInit} > login.sh
+					bash -n login.sh || fail "the hosted loginShellInit is not valid bash"
+					warns() { HOME=$TMPDIR bash --norc --noprofile -i -c '. ./login.sh' 2>&1 >/dev/null </dev/null | grep -c 'cogbox-env status' || true; }
+					quiet() { HOME=$TMPDIR bash --norc --noprofile -c '. ./login.sh' 2>&1 >/dev/null </dev/null | grep -c 'cogbox-env status' || true; }
+					[ "$(warns)" = 0 ] || fail "login warns with nothing selected"
+					ln -s selections/t "$scratch/.cogbox/runtime/current"
+					ln -s /nonexistent/bin "$scratch/.cogbox/runtime/selections/t/bin"
+					[ "$(warns)" = 1 ] || fail "login does not warn exactly once when the selected bin is gone"
+					[ "$(quiet)" = 0 ] || fail "a non-interactive login shell warns"
+					rm "$scratch/.cogbox/runtime/selections/t/bin"
+					mkdir "$scratch/.cogbox/runtime/selections/t/bin"
+					[ "$(warns)" = 0 ] || fail "login warns although the selected bin resolves"
+					HOME=$TMPDIR bash --norc --noprofile -c '. ./login.sh; echo "$PATH"' | grep -q "^$scratch/.cogbox/runtime/current/bin:" \
+						|| fail "the runtime profile is not first on the login PATH"
+
+					[ "$fails" -eq 0 ] || exit 1
+
+					export COGBOX_ENV_FIXTURES=${./tests/fixtures/runtime-env}
+					${pkgs.python3Minimal}/bin/python3 ${./tests/test_runtime_env.py} ${./runtime/cogbox-env.py} -v
+					${pkgs.python3}/bin/python3 ${./tests/test_runtime_env.py} ${./runtime/cogbox-env.py} -v
 					touch $out
 				'';
 
@@ -6012,6 +6227,15 @@
 				inherit self pkgs;
 			});
 		} // lib.optionalAttrs (system == "x86_64-linux") {
+			# Runtime tool generations are enabled on the hosted (GCE) guest only,
+			# so their boot-restore lifecycle is tested on x86_64 only: a NixOS VM
+			# with the hosted storage shape (tmpfs root, persisted writable-store
+			# disk, `nofail` work mount) through guest-only reboot, store loss, a
+			# damaged archive, the kill switch and a pool-absent boot. Needs KVM.
+			runtime-boot-restore = pkgs.testers.runNixOSTest (import ./tests/runtime-boot-restore.nix {
+				inherit self pkgs;
+			});
+
 			# --- GCE backend image checks -------------------------------------
 			#
 			# The image itself is an operator bake. What the gce-image-* checks
@@ -7028,9 +7252,15 @@
 				# these units run before the overlay they write through is mounted -- the
 				# shadowed-write failure this whole file exists to prevent, arriving from
 				# the opposite side. Pinned by name for the two known pairs (hosted keeps
-				# Wants= + After=, workstation keeps its Requires=)...
+				# Wants= + After=, workstation keeps its Requires=)... plus the runtime
+				# boot restore, which was soft from the start: it reads and writes the
+				# work tree, so it must keep both halves, and the class scan above is
+				# what keeps it from ever growing a RequiresMountsFor= instead. Only
+				# while the hosted guest ships it (hostedRuntimeDefault); a dark launch
+				# leaves checks.runtime-environment pinning it on the guest forced on.
 				for pair in 'cogbox-brain-materialize.service:root-.hermes.mount' \
-					'cogbox-claude-stub.service:root-.claude.mount'
+					'cogbox-claude-stub.service:root-.claude.mount' \
+					${lib.optionalString hostedRuntimeDefault "'cogbox-runtime-restore.service:var-lib-cogbox-work.mount'"}
 				do
 					svc=''${pair%%:*}
 					mnt=''${pair#*:}
@@ -9549,8 +9779,9 @@
 				extraModules = cogboxModules system {};
 			};
 		}) linuxSystems)
-		# The HOSTED-profile guest: identical modules, cogbox.storage.profile =
-		# "hosted". It has to be a separate nixosConfiguration rather than a
+		# The HOSTED-profile guest: identical modules plus hostedGuestModule
+		# (cogbox.storage.profile = "hosted", runtime tool generations on by
+		# default). It has to be a separate nixosConfiguration rather than a
 		# host-side or launch-time switch, because packages.cogbox bakes the guest
 		# runner and the GCE image bakes packages.cogbox -- mkGceHost's extraModules
 		# configure the HOST system and cannot reach the guest config at all. The
@@ -9561,7 +9792,7 @@
 			value = mkMicrovm system "cogbox" {
 				vcpu = 16;
 				mem = 32768;
-				extraModules = cogboxModules system {} ++ [ { cogbox.storage.profile = "hosted"; } ];
+				extraModules = cogboxModules system {} ++ [ hostedGuestModule ];
 			};
 		}) linuxSystems)
 		# The CONTAINER config exposed as a buildable nixosConfiguration so the

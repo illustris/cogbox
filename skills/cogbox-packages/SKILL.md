@@ -31,6 +31,8 @@ the fetch fails outright, and in `rules` mode it depends on the host's policy.
 Read the actual error instead of guessing which applies. If the tool has to be
 there reliably, extend the sandbox rather than re-running `nix shell`.
 
+If `command -v cogbox-env` finds the helper, this sandbox can also keep tools across restarts without a plugin or a restart, as the `cogbox-runtime` skill describes.
+
 To make a tool permanent and reproducible, extend the sandbox. Read
 `/run/cogbox/environment.json` first, as `cogbox-environment` describes, and
 choose the route for the reported mode:
