@@ -71,6 +71,13 @@ in {
           IOSchedulingPriority = 7;
           # A pathological import is killed before user processes are.
           OOMScoreAdjust = 500;
+          # The journal gets stderr only: the outcome summary and, on failure,
+          # the error line (plus Nix's own stderr), never the JSON envelope
+          # (status included) printed on stdout for interactive callers.
+          # StandardError is named because its default, inherit, would follow
+          # stdout to /dev/null.
+          StandardOutput = "null";
+          StandardError = "journal";
         };
       };
     }

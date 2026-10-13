@@ -18,16 +18,42 @@
 # deleted emptyDiskImages qcow2 blank on the next start (qemu-vm.nix cds into
 # the machine's state dir and creates empty<N>.qcow2 only if it is missing).
 #
+# It also runs the skill's lock and stale-lock update recipes and a flake
+# prepare on the guest's own Nix with no network: nixpkgs.flake.source, the
+# option that maps the hosted guest's nixpkgs in /etc/nix/registry.json, maps a
+# stand-in here.
+#
 # Needs KVM: `nix build .#checks.x86_64-linux.runtime-boot-restore`.
 { self, pkgs }:
+let
+	# The image's nixpkgs, as far as tests/fixtures/runtime-env/indirect needs
+	# it: a flake source exposing bash, coreutils and system, with path context
+	# so the bundle's derivation takes both as inputs. nixpkgs.flake.source
+	# wants a store path named `source`. Referenced by the registry file, so
+	# it and both tools are in the guest's registered closure.
+	context = path: ''builtins.appendContext "${path}" { "${path}" = { path = true; }; }'';
+	registryNixpkgs = pkgs.writeTextFile {
+		name = "source";
+		destination = "/flake.nix";
+		text = ''
+			{ outputs = { self }: { bash = ${context pkgs.bash}; coreutils = ${context pkgs.coreutils}; system = "${pkgs.stdenv.hostPlatform.system}"; }; }
+		'';
+	};
+in
 {
 	name = "cogbox-runtime-boot-restore";
 
 	nodes.machine = { config, lib, pkgs, ... }: {
 		imports = [ ../runtime/module.nix ];
 		cogbox.runtimeEnvironment.enable = true;
-		# prepare --import-store-path asks `nix eval` for the system.
-		nix.settings.experimental-features = [ "nix-command" ];
+		# prepare --import-store-path asks `nix eval` for the system; the
+		# skill's recipe needs flakes.
+		nix.settings.experimental-features = [ "nix-command" "flakes" ];
+		nixpkgs.flake.source = "${registryNixpkgs}";
+		# No network: a flake prepare builds locally without first waiting on
+		# an unreachable binary cache.
+		nix.settings.substituters = lib.mkForce [ ];
+		environment.etc."runtime-test/indirect/flake.nix".source = ./fixtures/runtime-env/indirect/flake.nix;
 
 		boot.initrd.systemd.enable = true;
 		virtualisation = {

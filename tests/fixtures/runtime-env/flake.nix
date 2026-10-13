@@ -24,6 +24,23 @@
       printf '#!${tools.bash}/bin/bash\necho shadow\n' > "$out/bin/cogbox-env"
       ${tools.coreutils}/bin/chmod +x "$out/bin/cogbox-env"
     '';
+    # A raw __structuredAttrs derivation, the shape pkgs.buildEnv (and much of
+    # current nixpkgs) produces: its environment keeps only `out`, so its
+    # system is in `nix derivation show` but is no environment binding.
+    # Structured attrs reach the builder as $NIX_ATTRS_SH_FILE.
+    structured = builtins.derivation {
+      name = "runtime-bundle-structured";
+      inherit system;
+      __structuredAttrs = true;
+      builder = "${tools.bash}/bin/bash";
+      args = [ "-euc" ''
+        . "$NIX_ATTRS_SH_FILE"
+        out="''${outputs[out]}"
+        ${tools.coreutils}/bin/mkdir -p "$out/bin"
+        printf '#!${tools.bash}/bin/bash\necho structured\n' > "$out/bin/runtime-structured"
+        ${tools.coreutils}/bin/chmod +x "$out/bin/runtime-structured"
+      '' ];
+    };
     # Minimal bin-only merge to keep the offline stage fixture's build inputs
     # tiny. Real projects can use pkgs.buildEnv with ignoreCollisions = false.
     bundle = name: paths: mk name (''
@@ -44,6 +61,7 @@
       b = bundle "runtime-bundle-b" [ (probe "v2") ];
       collision = bundle "runtime-bundle-collision" [ (probe "v1") (probe "v2") ];
       reserved = bundle "runtime-bundle-reserved" [ (probe "v1") shadow ];
+      inherit structured;
     };
   };
 }

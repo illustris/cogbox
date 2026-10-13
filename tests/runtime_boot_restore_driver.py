@@ -1,7 +1,8 @@
 # Driver for tests/runtime-boot-restore.nix. Steps follow the hosted guest's
 # lifecycle: a guest-only reboot, a store-loss boot, a slow restore that boot
 # must not wait for, a damaged archive, the kill switch, and last (because it
-# discards the work disk) a pool-absent boot.
+# discards the work disk) a pool-absent boot. Step 1b runs the skill's offline
+# lock and stale-lock update recipes and a flake prepare on the guest's own Nix.
 import json
 
 STATE = "/var/lib/cogbox/work/.cogbox/runtime"
@@ -78,6 +79,16 @@ def rooted(bundle, generation):
     machine.fail(f"nix-store --delete {bundle}")
 
 
+def journal_summary_only(generation, outcome, error=None):
+    # The unit discards the JSON envelope on stdout; the summary on stderr
+    # stays, followed on failure by the message no persisted record carries.
+    log = machine.succeed(f"journalctl -b -u {UNIT} -o cat")
+    assert f"cogbox-runtime-restore: outcome={outcome} " in log and f"generation={generation} " in log, log
+    assert '"version"' not in log and '"status"' not in log, log
+    errors = [line for line in log.splitlines() if line.startswith("cogbox-runtime-restore: error: ")]
+    assert errors == ([f"cogbox-runtime-restore: error: {error}"] if error else []), log
+
+
 def restored_this_boot(generation, outcome):
     s = status()
     record = s["boot_restore"]
@@ -115,6 +126,58 @@ with subtest("1: prepare, apply and run a bundle"):
     assert applied["status"]["active_generation"] == generation, applied
     tool_works()
 
+with subtest("1b: the skill's lock and stale-lock recipes and a structured-attrs flake bundle, offline"):
+    # The recipe the baked skill teaches, on the guest's own Nix: the indirect
+    # `nixpkgs` input locks through /etc/nix/registry.json to exactly the path
+    # that file maps, `original` stays indirect, and prepare (which reads no
+    # registry) accepts the lock and reads the system of a derivation whose
+    # environment has no `system` binding.
+    machine.succeed(
+        "mkdir -p /root/work/tools",
+        "cp /etc/runtime-test/indirect/flake.nix /root/work/tools/flake.nix",
+        'nix flake lock --flake-registry /etc/nix/registry.json "path:$(realpath ~/work/tools)"',
+    )
+    registry = json.loads(machine.succeed("cat /etc/nix/registry.json"))
+    mapped = [f["to"] for f in registry["flakes"] if f["from"] == {"id": "nixpkgs", "type": "indirect"}]
+    assert len(mapped) == 1 and mapped[0]["type"] == "path", registry
+    node = json.loads(machine.succeed("cat /var/lib/cogbox/work/tools/flake.lock"))["nodes"]["nixpkgs"]
+    assert node["locked"]["type"] == "path" and node["locked"]["path"] == mapped[0]["path"], node
+    assert node["original"] == {"id": "nixpkgs", "type": "indirect"}, node
+    flaked = envelope('prepare --flake "path:$(realpath ~/work/tools)" --attribute packages.x86_64-linux.default')
+    listed = next(g for g in flaked["status"]["generations"] if g["id"] == flaked["generation"])
+    assert listed["system"] == "x86_64-linux" and listed["provenance"]["kind"] == "flake", listed
+    machine.fail(f"nix-store --query --binding system {listed['derivation']}")
+    assert flaked["status"]["selected_generation"] == generation, flaked
+    envelope(f"prune --generation {flaked['generation']}")
+    # The skill's stale-lock recipe: a flake.lock written against another
+    # nixpkgs (another sandbox's image, or this one before an upgrade) survives
+    # `nix flake lock`, and `nix flake update nixpkgs --flake-registry` moves it
+    # back, offline, to exactly the entry the first lock wrote.
+    machine.succeed(
+        "mkdir /tmp/other-nixpkgs /tmp/elsewhere",
+        f"cat {mapped[0]['path']}/flake.nix > /tmp/other-nixpkgs/flake.nix",
+        "echo '# another image' >> /tmp/other-nixpkgs/flake.nix",
+    )
+    other = json.loads(machine.succeed("nix flake archive --json path:/tmp/other-nixpkgs"))["path"]
+    assert other != mapped[0]["path"], other
+    other_registry = {"flakes": [{"exact": True, "from": {"id": "nixpkgs", "type": "indirect"},
+                                  "to": {"path": other, "type": "path"}}], "version": 2}
+    machine.succeed(
+        f"echo '{json.dumps(other_registry)}' > /tmp/other-registry.json",
+        "cp /etc/runtime-test/indirect/flake.nix /tmp/elsewhere/flake.nix",
+        "nix flake lock --flake-registry /tmp/other-registry.json path:/tmp/elsewhere",
+        "cp /tmp/elsewhere/flake.lock /root/work/tools/flake.lock",
+        'nix flake lock --flake-registry /etc/nix/registry.json "path:$(realpath ~/work/tools)"',
+    )
+    stale = json.loads(machine.succeed("cat /var/lib/cogbox/work/tools/flake.lock"))["nodes"]["nixpkgs"]
+    assert stale["locked"]["path"] == other, stale
+    machine.succeed('nix flake update nixpkgs --flake-registry /etc/nix/registry.json --flake "path:$(realpath ~/work/tools)"')
+    updated = json.loads(machine.succeed("cat /var/lib/cogbox/work/tools/flake.lock"))["nodes"]["nixpkgs"]
+    assert updated == node, (updated, node)
+    again = envelope('prepare --flake "path:$(realpath ~/work/tools)" --attribute packages.x86_64-linux.default')
+    envelope(f"prune --generation {again['generation']}")
+    machine.succeed("rm -r /root/work/tools /tmp/other-nixpkgs /tmp/elsewhere /tmp/other-registry.json")
+
 with subtest("2: guest-only reboot restores present-but-invalid paths"):
     reboot()
     assert pre_restore() == ["present", "invalid"], pre_restore()
@@ -122,6 +185,7 @@ with subtest("2: guest-only reboot restores present-but-invalid paths"):
     assert u["ActiveState"] == "active" and u["Result"] == "success", u
     s = restored_this_boot(generation, "restored")
     assert s["active_generation"] == generation, s
+    journal_summary_only(generation, "restored")
     machine.succeed(f"nix-store --check-validity {bundle}")
     rooted(bundle, generation)
     tool_works()
@@ -168,6 +232,8 @@ with subtest("5: a damaged archive fails the unit, not the boot"):
     machine.succeed(
         f"journalctl -b -u {UNIT} | grep -F 'cogbox-runtime-restore: outcome=failed code=invalid_archive generation={generation}'"
     )
+    journal_summary_only(generation, "failed",
+                         "invalid_archive: missing or corrupt retained closure archive; run prepare again to repair it")
     failed_boot = boot_id()
     # Recovery as documented: prepare again (it repairs the archive from the
     # re-delivered closure), then restore.

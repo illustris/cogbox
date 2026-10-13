@@ -22,4 +22,7 @@ def store_context(path):
 (a.destination / "tools" / "flake.nix").write_text("{ outputs = { self }: { bash = " + store_context(a.bash) + "; coreutils = " + store_context(a.coreutils) + "; system = " + json.dumps(a.system) + "; }; }\n")
 
 subprocess.run(["nix", "flake", "lock", "path:" + str(a.destination.resolve())], check=True)
+# Left unlocked: the acceptance test locks a copy with the skill's recipe.
+(a.destination / "indirect").mkdir()
+shutil.copyfile(Path(__file__).with_name("indirect") / "flake.nix", a.destination / "indirect" / "flake.nix")
 print(a.destination.resolve())

@@ -5623,6 +5623,7 @@
 				hasPackage = config: builtins.elem config.cogbox.runtimeEnvironment.package config.environment.systemPackages;
 				skillsOf = config: config.system.build.cogboxBrainUnits.skills;
 				dependsOnRestore = svc: lib.elem "${unitName}.service" (svc.after ++ svc.requires ++ svc.wants ++ svc.bindsTo ++ svc.requisite);
+				nixpkgsSource = config: builtins.unsafeDiscardStringContext (toString config.nixpkgs.flake.source);
 				checkDefaultOff = base: let
 					disabled = base.config;
 					enabled = (base.extendModules { modules = [ { cogbox.runtimeEnvironment.enable = true; } ]; }).config;
@@ -5669,9 +5670,25 @@
 					assert unit.unitConfig.ConditionPathExists == "!${work}/.cogbox/runtime/disable-boot-restore";
 					assert !(unit.serviceConfig ? Restart);
 					assert unit.serviceConfig.OOMScoreAdjust == 500;
+					# The journal gets stderr only (the summary and, on failure, the error
+					# line), never the envelope on stdout.
+					assert unit.serviceConfig.StandardOutput == "null";
+					assert unit.serviceConfig.StandardError == "journal";
 					assert unit.serviceConfig.ExecStart == "${config.cogbox.runtimeEnvironment.package}/bin/cogbox-env restore --boot --state-dir ${work}/.cogbox/runtime --timeout 900";
 					assert !(dependsOnRestore config.systemd.services.sshd);
 					assert !(dependsOnRestore config.systemd.services.cogbox-brain-materialize);
+					# The skill locks bundles with --flake-registry /etc/nix/registry.json,
+					# so the file Nix reads must map nixpkgs to a path entry for the
+					# image's own nixpkgs, and its string context must carry that source
+					# into the closure: offline locking depends on both.
+					# checks.runtime-boot-restore runs the lock itself against a file
+					# rendered by the same nixpkgs.flake.source option.
+					assert config.environment.etc ? "nix/registry.json";
+					assert config.nix.registry.nixpkgs.to.type == "path";
+					assert toString config.nix.registry.nixpkgs.to.path == toString config.nixpkgs.flake.source;
+					assert lib.any (f: f.from == { id = "nixpkgs"; type = "indirect"; } && f.to.type or null == "path" && f.to.path or null == nixpkgsSource config)
+						(builtins.fromJSON (builtins.unsafeDiscardStringContext config.environment.etc."nix/registry.json".text)).flakes;
+					assert builtins.getContext config.environment.etc."nix/registry.json".text ? ${nixpkgsSource config};
 					true;
 				hostedBase = self.nixosConfigurations."${configName system}-hosted";
 				hosted = if hostedRuntimeDefault then hostedBase.config
@@ -5733,6 +5750,7 @@
 						'ConditionPathExists=!${work}/.cogbox/runtime/disable-boot-restore' \
 						'TimeoutStartSec=960' 'TimeoutStopSec=30' 'Nice=10' \
 						'IOSchedulingClass=best-effort' 'IOSchedulingPriority=7' 'OOMScoreAdjust=500' \
+						'StandardOutput=null' 'StandardError=journal' \
 						'WantedBy=multi-user.target'
 					do
 						grep -qxF "$line" "$unit" || fail "the realized ${unitName}.service lacks '$line'"

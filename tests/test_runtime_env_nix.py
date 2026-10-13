@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -40,6 +41,8 @@ with tempfile.TemporaryDirectory(prefix="cogbox-env-acceptance-") as temporary:
         proc = run(["rpc"], json.dumps({"version": version, "action": action, **fields}))
         result = json.loads(proc.stdout)
         assert result["version"] == 2 and result["ok"] == expected_ok and (proc.returncode == 0) == expected_ok, (result, proc.stderr)
+        # Any Nix deprecation warning would print on every call (as --no-registries did).
+        assert not [line for line in proc.stderr.splitlines() if "is deprecated" in line], proc.stderr
         measurements.append({"action": action, "seconds": round(time.monotonic() - started, 4),
                              "ok": result["ok"], "changed": result["changed"], "generation": result["generation"],
                              "code": result["error"]["code"] if result["error"] else None})
@@ -109,6 +112,75 @@ with tempfile.TemporaryDirectory(prefix="cogbox-env-acceptance-") as temporary:
         reserved = prepare("reserved", False)
         assert reserved["error"] == {"code": "prepare_failed", "message": "bundle must not provide cogbox-env"}, reserved
         assert reserved["status"]["selection"] == tc and len(reserved["status"]["generations"]) == 2
+        # A __structuredAttrs bundle, the pkgs.buildEnv shape: its environment has no
+        # `system` binding (so the binding query fails), and prepare still reads it.
+        structured = prepare("structured")
+        gs = structured["generation"]
+        listed = next(g for g in structured["status"]["generations"] if g["id"] == gs)
+        assert structured["changed"] and listed["system"] == "x86_64-linux" and listed["provenance"]["kind"] == "flake", structured
+        shown = json.loads(subprocess.run(["nix", "derivation", "show", listed["derivation"]], capture_output=True, check=True, text=True).stdout)
+        entry = next(iter(shown.get("derivations", shown).values()))
+        assert "structuredAttrs" in entry and "system" not in entry["env"], entry
+        binding = subprocess.run(["nix-store", "--query", "--binding", "system", listed["derivation"]], capture_output=True, text=True)
+        assert binding.returncode != 0 and "no environment binding" in binding.stderr, binding
+        assert rpc("prune", generation=gs)["changed"]
+
+        def nix(*argv):
+            proc = subprocess.run(["nix", *argv], capture_output=True, text=True, timeout=120)
+            assert proc.returncode == 0, (argv, proc.stderr)
+            return proc.stdout
+
+        def registry_for(name, path):
+            registry = root / name
+            registry.write_text(json.dumps({"flakes": [{"exact": True, "from": {"id": "nixpkgs", "type": "indirect"},
+                                                        "to": {"path": path, "type": "path"}}], "version": 2}))
+            return str(registry)
+
+        def nixpkgs_node(directory):
+            return json.loads((directory / "flake.lock").read_text())["nodes"]["nixpkgs"]
+
+        def prepare_indirect(directory):
+            recipe = rpc("prepare", flake="path:" + str(directory.resolve()), attribute="packages.x86_64-linux.default")
+            listed = next(g for g in recipe["status"]["generations"] if g["id"] == recipe["generation"])
+            assert recipe["changed"] and listed["system"] == "x86_64-linux" and listed["provenance"]["kind"] == "flake", recipe
+            assert rpc("prune", generation=recipe["generation"])["changed"]
+
+        # The skill's lock recipe. Nix resolves an indirect input such as
+        # `nixpkgs` through the global registry only; --flake-registry makes a
+        # file that maps it to a store path (the image's nixpkgs on a guest, the
+        # archived tools flake here) that registry, so the input locks offline
+        # to exactly that path with `original` still indirect, and prepare
+        # (--no-use-registries) accepts the lock. Without the flag the lock
+        # downloads the default global registry and lands on a nixpkgs tarball.
+        stand_in = json.loads(nix("flake", "archive", "--json", "path:" + str((a.fixture / "tools").resolve())))["path"]
+        registry = registry_for("registry.json", stand_in)
+        indirect = root / "indirect"
+        shutil.copytree(a.fixture / "indirect", indirect)
+        nix("flake", "lock", "--flake-registry", registry, "path:" + str(indirect.resolve()))
+        node = nixpkgs_node(indirect)
+        assert node["locked"]["type"] == "path" and node["locked"]["path"] == stand_in, node
+        assert node["original"] == {"id": "nixpkgs", "type": "indirect"}, node
+        prepare_indirect(indirect)
+        # The skill's stale-lock recipe. A flake.lock written against another
+        # nixpkgs (another sandbox's image, or this image before an upgrade):
+        # `nix flake lock` keeps that entry whatever registry it is given, and
+        # `nix flake update nixpkgs --flake-registry FILE --flake REF`
+        # re-resolves it, offline, to the path FILE maps. Without the flag the
+        # update needs the network and locks the global nixpkgs-unstable.
+        other_source = root / "other-nixpkgs"
+        other_source.mkdir()
+        (other_source / "flake.nix").write_text((a.fixture / "tools" / "flake.nix").read_text() + "# another image's nixpkgs\n")
+        other = json.loads(nix("flake", "archive", "--json", "path:" + str(other_source.resolve())))["path"]
+        assert other != stand_in, other
+        elsewhere = root / "elsewhere"
+        shutil.copytree(a.fixture / "indirect", elsewhere)
+        nix("flake", "lock", "--flake-registry", registry_for("other-registry.json", other), "path:" + str(elsewhere.resolve()))
+        shutil.copyfile(elsewhere / "flake.lock", indirect / "flake.lock")
+        nix("flake", "lock", "--flake-registry", registry, "path:" + str(indirect.resolve()))
+        assert nixpkgs_node(indirect)["locked"]["path"] == other, nixpkgs_node(indirect)
+        nix("flake", "update", "nixpkgs", "--flake-registry", registry, "--flake", "path:" + str(indirect.resolve()))
+        assert nixpkgs_node(indirect) == node, (nixpkgs_node(indirect), node)
+        prepare_indirect(indirect)
         warm = prepare("a")
         assert warm["generation"] == ga and not warm["changed"]
         # A damaged or missing retained archive is repaired from the local closure.
@@ -150,7 +222,9 @@ with tempfile.TemporaryDirectory(prefix="cogbox-env-acceptance-") as temporary:
         leftovers = sorted(str(p.relative_to(state)) for p in state.rglob(".*"))
         assert leftovers == [], leftovers
         report = {"tests": "capabilities/not_ready/no-create/userinfo/v1-reject/prepare/apply/live replacement/removal/"
-                           "rollback/noop/ABA/collision/reserved/reuse/archive repair/restore fast path/boot record/clear/prune",
+                           "rollback/noop/ABA/collision/reserved/structured attrs/registry lock recipe/stale lock update recipe/"
+                           "reuse/archive repair/"
+                           "restore fast path/boot record/clear/prune",
                   "measurements": measurements,
                   "archive_bytes": limits["archive_bytes_total"], "limits": limits,
                   "shell_pid": shell.pid, "shell_starttime": starttime,
