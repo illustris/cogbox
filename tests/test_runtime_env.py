@@ -34,6 +34,7 @@ S = "/nix/store/"
 DEP = S + "j" * 32 + "-tool-dependency"
 SOURCE = S + "g" * 32 + "-source"
 SYSTEM = S + "s" * 32 + "-nixos-system-cogbox"
+BUNDLE_DRV = S + "h" * 32 + "-bundle.drv"
 BOOT_ID = "0b0b0b0b-0000-4000-8000-000000000001"
 ENVELOPE = {"version", "ok", "action", "changed", "generation", "status", "error", "capabilities"}
 STATUS = {"selection", "selected_generation", "active_generation", "previous_generation", "output", "generations",
@@ -132,6 +133,9 @@ class Store(runtime.Commands):
         self.files = set()         # other store files, e.g. a bundle's bin/cogbox-env
         self.no_bin = set()
         self.closures, self.nar, self.builds = {}, {}, {}
+        self.derivations = {}      # drv -> (system, structured attrs); others are plain x86_64-linux
+        self.show_wrapped = True   # Nix 2.34's derivation show shape; False is 2.31's
+        self.show_override = None  # a raw derivation show reply, verbatim
         self.hooks = []            # (argv token, exception)
         self.free = 64 * GIB
         self.import_registers = True
@@ -166,6 +170,31 @@ class Store(runtime.Commands):
             self.paths.discard(path)
             self.unregistered.add(path)
 
+    def show(self, drv):
+        """`nix derivation show DRV` as Nix prints it.
+
+        2.34 wraps the map and keys it by base name, with most store paths inside
+        reduced to base names too; 2.31 prints the bare map keyed by the full path.
+        A __structuredAttrs derivation keeps only its outputs in `env`.
+        """
+        if self.show_override is not None:
+            return self.show_override
+        system, structured = self.derivations.get(drv, ("x86_64-linux", False))
+        name = Path(drv).name[33:-4]
+        output = "w" * 32 + "-" + name
+        builder = S + "b" * 32 + "-bash-5.3p15/bin/bash"
+        entry = {"args": ["-e", S + "x" * 32 + "-default-builder.sh"], "builder": builder,
+                 "env": {"out": S + output}, "inputs": {"drvs": {}, "srcs": ["x" * 32 + "-default-builder.sh"]},
+                 "name": name, "outputs": {"out": {"path": output}}, "system": system, "version": 4}
+        attrs = {"builder": builder, "name": name, "outputs": {"out": S + output}, "pathsToLink": ["/bin"], "system": system}
+        if structured:
+            entry["structuredAttrs"] = attrs
+        else:
+            entry["env"].update({k: v for k, v in attrs.items() if isinstance(v, str)})
+        if not self.show_wrapped:
+            return {drv: entry}
+        return {"derivations": {Path(drv).name: entry}, "version": 4}
+
     def run(self, args, *, stdin=None, stdout=None):
         self.calls.append(tuple(args))
         for token, exc in self.hooks:
@@ -195,7 +224,13 @@ class Store(runtime.Commands):
         if args[:3] == ["nix-store", "--query", "--deriver"]:
             return b"unknown-deriver\n"
         if args[:3] == ["nix-store", "--query", "--binding"]:
-            return b"x86_64-linux\n"
+            # As Nix: a structured-attrs environment has no `system` binding.
+            system, structured = self.derivations.get(args[-1], ("x86_64-linux", False))
+            if structured:
+                raise runtime.Failure("internal_error", "Nix command failed (exit 1)")
+            return (system + "\n").encode()
+        if args[:3] == ["nix", "derivation", "show"]:
+            return json.dumps(self.show(args[3])).encode()
         if args[:2] == ["nix-store", "--realise"]:
             if args[2] not in self.paths:
                 raise runtime.Failure("internal_error", "Nix command failed (exit 1)")
@@ -211,7 +246,7 @@ class Store(runtime.Commands):
         if args[:2] == ["nix", "build"]:
             output = self.builds[args[-1].split("#", 1)[1]]
             Path(args[args.index("--out-link") + 1]).symlink_to(output)
-            return json.dumps([{"drvPath": S + "h" * 32 + "-bundle.drv", "outputs": {"out": output}}]).encode()
+            return json.dumps([{"drvPath": BUNDLE_DRV, "outputs": {"out": output}}]).encode()
         raise runtime.Failure("internal_error", "unexpected command")
 
 
@@ -778,6 +813,69 @@ class RuntimeTest(Base):
         again = self.call("prepare", flake="path:/root/work/tools", attribute="packages.x86_64-linux.default")
         self.assertEqual((again["generation"], again["changed"]), (generation, False))
         self.assertEqual(self.h.leftovers(), [])
+        # Locked input only, no registry lookup, and not the deprecated alias that warns on every call.
+        for call in self.store.calls:
+            if call[:3] == ("nix", "flake", "archive") or call[:2] == ("nix", "build"):
+                self.assertIn("--no-use-registries", call)
+                self.assertNotIn("--no-registries", call)
+
+    def test_prepare_flake_reads_the_system_of_a_structured_attrs_derivation(self):
+        # pkgs.buildEnv: its environment holds only `out`, so a binding query fails the
+        # way Nix 2.34 does, while derivation show still names the system.
+        self.store.derivations[BUNDLE_DRV] = ("x86_64-linux", True)
+        with self.assertRaises(runtime.Failure):
+            self.store.run(["nix-store", "--query", "--binding", "system", BUNDLE_DRV])
+        self.store.builds["packages.x86_64-linux.default"] = self.h.offer("c")
+        result = self.call("prepare", flake="path:/root/work/tools", attribute="packages.x86_64-linux.default")
+        self.assertTrue(result["ok"], result)
+        listed = next(g for g in result["status"]["generations"] if g["id"] == result["generation"])
+        self.assertEqual((listed["system"], listed["derivation"], listed["provenance"]["kind"]), ("x86_64-linux", BUNDLE_DRV, "flake"))
+        self.assertIn(("nix", "derivation", "show", BUNDLE_DRV), self.store.calls)
+
+    def test_prepare_flake_reads_the_bare_derivation_show_map_of_older_nix(self):
+        self.store.show_wrapped = False
+        self.store.derivations[BUNDLE_DRV] = ("aarch64-linux", False)
+        self.store.builds["default"] = self.h.offer("c")
+        result = self.call("prepare", flake="path:/root/work/tools", attribute="default")
+        self.assertTrue(result["ok"], result)
+        listed = next(g for g in result["status"]["generations"] if g["id"] == result["generation"])
+        self.assertEqual(listed["system"], "aarch64-linux")
+
+    def test_prepare_flake_refuses_an_unreadable_or_invalid_system(self):
+        self.store.builds["default"] = self.h.offer("c")
+        before = self.h.generations()
+        entry = {"system": "x86_64-linux"}
+        other = "z" * 32 + "-other.drv"
+        replies = [{"derivations": {}, "version": 4}, {"derivations": {other: entry}, "version": 4},
+                   {"derivations": {Path(BUNDLE_DRV).name: entry, other: entry}, "version": 4},
+                   {S + other: entry}, [entry], {"derivations": {Path(BUNDLE_DRV).name: {}}, "version": 4}]
+        for reply in replies:
+            with self.subTest(reply=reply):
+                self.store.show_override = reply
+                result = self.call("prepare", flake="path:/root/work/tools", attribute="default")
+                self.assertEqual(result["error"], {"code": "prepare_failed", "message": "unexpected nix derivation show output"})
+        self.store.show_override = None
+        for system in ("", "x86_64", "x86_64-linux\n", "../x-y", "X86_64-linux", None, 1):
+            with self.subTest(system=system):
+                self.store.derivations[BUNDLE_DRV] = (system, True)
+                result = self.call("prepare", flake="path:/root/work/tools", attribute="default")
+                self.assertEqual(result["error"]["code"], "prepare_failed")
+        self.assertEqual(self.h.generations(), before)
+        self.assertEqual(self.h.leftovers(), [])
+        self.assertEqual(sorted(p.name for p in (self.h.state / "roots").iterdir()), [])
+
+    def test_a_failing_nix_step_is_named_without_its_arguments(self):
+        commands = runtime.Commands(10)
+        with self.assertRaises(runtime.Failure) as raised:
+            commands.run(["false", "--query", S + "a" * 32 + "-secret-looking-path"])
+        self.assertEqual(str(raised.exception), "Nix command failed (exit 1): false --query")
+        # The restore's import argv: its settings are not part of the step.
+        with self.assertRaises(runtime.Failure) as raised:
+            commands.run(["false", "--import", "--option", "substitute", "false", "--option", "substituters", ""])
+        self.assertEqual(str(raised.exception), "Nix command failed (exit 1): false --import")
+        with self.assertRaises(runtime.Failure) as raised:
+            commands.run([sys.executable, "-c", "raise SystemExit(3)"])
+        self.assertEqual(str(raised.exception), "Nix command failed (exit 3)")
 
     def test_failed_prepare_never_selects_publishes_or_leaks_a_root(self):
         token = self.h.apply(self.a)
@@ -824,12 +922,69 @@ class RuntimeTest(Base):
         self.store.wipe(*self.h.closure(self.a))
         self.assertTrue(self.call("restore")["changed"])
 
+    def test_import_repair_needs_the_output_registered_after_any_restart(self):
+        # As the skill says: after a reboot inside the guest the files are still
+        # there but unregistered, after a stop and start they are gone; either way
+        # the import prepare cannot repair the archive until the output is back.
+        archive = self.h.state / "generations" / self.a / "closure.nar"
+        for restart, files_left in ((self.store.reset_db, True), (self.store.wipe, False)):
+            flip_byte(archive)
+            damaged = archive.read_bytes()
+            restart(*self.h.closure(self.a))
+            self.assertEqual(self.store.lexists(out("a")), files_left)
+            result = self.call("prepare", import_store_path=out("a"))
+            self.assertEqual(result["error"]["code"], "unavailable_closure", result)
+            self.assertEqual(archive.read_bytes(), damaged)
+            self.store.paths.update(self.h.closure(self.a))
+            self.store.unregistered.clear()
+            self.assertTrue(self.call("prepare", import_store_path=out("a"))["changed"])
+
     def test_reprepare_repairs_a_corrupt_manifest(self):
         (self.h.state / "generations" / self.a / "manifest.json").write_text("{")
         self.assertEqual(self.call("status")["status"]["corrupt_generations"], [self.a])
         result = self.call("prepare", import_store_path=out("a"))
         self.assertEqual((result["ok"], result["generation"], result["changed"]), (True, self.a, True))
         self.assertEqual(result["status"]["corrupt_generations"], [])
+
+    def test_archive_repair_keeps_created_at_and_the_retention_order(self):
+        c, d = self.h.seed("c", created_at=3000), self.h.seed("d", created_at=4000)
+        flip_byte(self.h.state / "generations" / self.a / "closure.nar")
+        repaired = self.call("prepare", import_store_path=out("a"))
+        self.assertEqual((repaired["generation"], repaired["changed"]), (self.a, True), repaired)
+        created = {g["id"]: g["created_at"] for g in repaired["status"]["generations"]}
+        self.assertEqual(created, {self.a: 1000, self.b: 2000, c: 3000, d: 4000})
+        # Still the oldest, so the next prepare that needs room drops it rather than b.
+        result = self.call("prepare", import_store_path=self.h.offer("f"))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.h.generations(), sorted([self.b, c, d, result["generation"]]))
+        # With the manifest gone there is no original time to keep; the repair still works.
+        (self.h.state / "generations" / c / "manifest.json").unlink()
+        rebuilt = self.call("prepare", import_store_path=out("c"))
+        self.assertEqual((rebuilt["ok"], rebuilt["generation"], rebuilt["changed"]), (True, c, True), rebuilt)
+
+    def test_archive_repair_replaces_a_damaged_manifest_entry(self):
+        directory = self.h.state / "generations" / self.a
+        manifest = directory / "manifest.json"
+        # A symlink loop: every follow fails with ELOOP, so the generation reads as corrupt
+        # and the repair must replace the entry rather than stumble over it.
+        manifest.unlink()
+        os.symlink("manifest.json", manifest)
+        self.assertEqual(self.call("status")["status"]["corrupt_generations"], [self.a])
+        repaired = self.call("prepare", import_store_path=out("a"))
+        self.assertEqual((repaired["ok"], repaired["generation"], repaired["changed"]), (True, self.a, True), repaired)
+        self.assertFalse(manifest.is_symlink())
+        self.assertEqual(repaired["status"]["corrupt_generations"], [])
+        # A link to an unrelated file lends the repair none of that file's times.
+        elsewhere = self.h.root / "elsewhere.json"
+        elsewhere.write_text("{}")
+        os.utime(elsewhere, (500, 500))
+        manifest.unlink()
+        os.symlink(elsewhere, manifest)
+        repaired = self.call("prepare", import_store_path=out("a"))
+        self.assertEqual((repaired["ok"], repaired["changed"]), (True, True), repaired)
+        created = {g["id"]: g["created_at"] for g in repaired["status"]["generations"]}
+        self.assertGreater(created[self.a], 500)
+        self.assertEqual(elsewhere.read_text(), "{}")
 
     def test_an_interrupted_archive_repair_leaves_no_partial_files(self):
         token = self.h.apply(self.a)
@@ -1157,13 +1312,66 @@ class RuntimeTest(Base):
         self.assertEqual((status["selected_generation"], status["active_generation"], status["boot_restore"]), (self.b, None, record))
         self.assertEqual(runtime.summary_line(record).split()[1:4], ["outcome=failed", "code=invalid_archive", "generation=" + self.b])
         self.assertEqual([p.name for p in self.h.state.iterdir() if p.name.startswith(".")], [])
-        # The real entrypoint: one summary line on stderr and an exit status that follows the outcome.
+        # The real entrypoint: the summary line, then the message the unit's journal
+        # has nowhere else (stdout is discarded), and an exit status that follows the outcome.
         selection = self.h.state / "selections" / status["selection"]
         proc = subprocess.run([sys.executable, helper, "restore", "--boot", "--state-dir", str(self.h.state)],
                               capture_output=True, text=True, timeout=10)
         self.assertEqual(proc.returncode, 1)
-        self.assertRegex(proc.stderr, r"\Acogbox-runtime-restore: outcome=failed code=(restore_failed|invalid_archive|internal_error) generation=%s duration_ms=\d+\n\Z" % self.b)
+        self.assertRegex(proc.stderr, r"\Acogbox-runtime-restore: outcome=failed code=(restore_failed|invalid_archive|internal_error) generation=%s duration_ms=\d+\n"
+                                      r"cogbox-runtime-restore: error: \1: \S[^\n]*\n\Z" % self.b)
+        self.assertEqual(proc.stderr.splitlines()[1], "cogbox-runtime-restore: error: %s: %s" % (
+            json.loads(proc.stdout)["error"]["code"], json.loads(proc.stdout)["error"]["message"]))
         self.assertTrue(selection.is_dir())
+
+    def test_boot_restore_failure_message_reaches_stderr(self):
+        # The unit sends stdout to /dev/null, so stderr is the journal's only copy of the message.
+        self.h.apply(self.a)
+        self.store.wipe(out("a"))
+        self.store.free = 400_000_000
+        envelope, record = runtime.boot_restore(str(self.h.state), self.store)
+        self.assertEqual((record["outcome"], record["code"]), ("failed", "insufficient_space"))
+        self.assertNotIn("message", record)
+        self.assertEqual(runtime.error_line(envelope["error"]),
+                         "cogbox-runtime-restore: error: insufficient_space: " + envelope["error"]["message"])
+        self.assertTrue(envelope["error"]["message"].endswith("; 400000000 are free"), envelope)
+        # One bounded line, whatever the message holds.
+        line = runtime.error_line({"code": "internal_error", "message": "a\nb\tc  " + "x" * 5000})
+        self.assertNotIn("\n", line)
+        self.assertTrue(line.startswith("cogbox-runtime-restore: error: internal_error: a b c x"), line)
+        self.assertLessEqual(len(line), 1100)
+        # An error that escapes the boot restore before it has an outcome still reaches it.
+        bad = self.h.root / "not-a-directory"
+        bad.write_text("")
+        proc = subprocess.run([sys.executable, helper, "restore", "--boot", "--state-dir", str(bad)],
+                              capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["error"]["code"], "corrupt_state")
+        self.assertEqual(proc.stderr, "cogbox-runtime-restore: error: corrupt_state: state-dir is not a directory\n")
+        # Outside boot mode stderr stays as it was.
+        proc = subprocess.run([sys.executable, helper, "restore", "--state-dir", str(bad)], capture_output=True, text=True, timeout=10)
+        self.assertEqual((proc.returncode, proc.stderr), (1, ""))
+
+    def test_boot_error_line_keeps_the_restore_failure_past_the_size_fallback(self):
+        # An envelope over the response limit is replaced on stdout, but the journal
+        # line must still name the restore's own failure, which nothing else keeps.
+        self.h.apply(self.a)
+        self.store.wipe(out("a"))
+        self.store.free = 400_000_000
+        stdout, stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8"), io.StringIO()
+        self.addCleanup(signal.signal, signal.SIGALRM, signal.getsignal(signal.SIGALRM))
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        argv = ["cogbox-env", "restore", "--boot", "--state-dir", str(self.h.state)]
+        with patch.object(runtime, "Commands", lambda timeout: self.store), patch.object(runtime, "OUTPUT_LIMIT", 64), \
+                patch.object(sys, "argv", argv), patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+            code = runtime.main()
+        self.assertEqual(code, 1)
+        replaced = json.loads(stdout.buffer.getvalue())
+        self.assertEqual(replaced["error"], {"code": "internal_error", "message": "response exceeds 4 MiB"})
+        summary, error = stderr.getvalue().splitlines()
+        self.assertTrue(summary.startswith("cogbox-runtime-restore: outcome=failed code=insufficient_space generation=" + self.a), summary)
+        self.assertTrue(error.startswith("cogbox-runtime-restore: error: insufficient_space: "), error)
+        self.assertTrue(error.endswith("; 400000000 are free"), error)
 
     def test_boot_restore_after_a_guest_reboot_registers_the_root_again(self):
         # The files survived and roots/<gen> still points at them, but the fresh database

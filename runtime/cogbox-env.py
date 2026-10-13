@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import re
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -39,7 +41,10 @@ GEN = re.compile(r"[0-9a-f]{64}\Z")
 TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 STORE = re.compile(r"/nix/store/[0-9a-df-np-sv-z]{32}-[A-Za-z0-9+._?=-]+\Z")
 USERINFO = re.compile(r"://[^/@]*@")
-LOCK_FLAGS = ["--no-update-lock-file", "--no-write-lock-file", "--no-registries"]
+SYSTEM = re.compile(r"[a-z0-9_]+-[a-z0-9_]+\Z")
+# --no-use-registries is the setting's own flag; --no-registries is its
+# deprecated alias and warns on every call (both since at least Nix 2.13).
+LOCK_FLAGS = ["--no-update-lock-file", "--no-write-lock-file", "--no-use-registries"]
 SUBDIRS = ("generations", "selections", "roots")
 # What an archive repair writes beside a published generation before renaming.
 REPAIR_FILES = ("closure.nar.new", "manifest.json.new")
@@ -161,10 +166,13 @@ def remove_tree(path):
         path.unlink(missing_ok=True)
 
 
-def write_json(path, value):
+def write_json(path, value, times=None):
+    """Write a new file durably; times=(atime_ns, mtime_ns) sets its timestamps before the sync."""
     with open(path, "xb") as stream:
         stream.write(canonical(value) + b"\n")
         stream.flush()
+        if times is not None:
+            os.utime(stream.fileno(), ns=times)
         os.fsync(stream.fileno())
 
 
@@ -250,7 +258,11 @@ class Commands:
                 sys.stderr.buffer.write(err)
                 sys.stderr.buffer.flush()
             if proc.returncode:
-                raise Failure("internal_error", "Nix command failed (exit %s)" % proc.returncode)
+                # Name the step by its leading words, never a path or reference;
+                # Nix's own error is already on stderr. `--option NAME VALUE` only
+                # sets a Nix setting, and without its values reads as a truncated command.
+                step = " ".join(itertools.takewhile(lambda t: t != "--option" and re.fullmatch(r"(--)?[a-z][a-z-]*", t), args[:3]))
+                raise Failure("internal_error", "Nix command failed (exit %s)%s" % (proc.returncode, ": " + step if step else ""))
             return bytes(out)
         finally:
             if proc.poll() is None:
@@ -262,6 +274,26 @@ class Commands:
 
     def json(self, args):
         return strict_json(self.run(args))
+
+    def derivation_system(self, drv):
+        """The system a store derivation builds for.
+
+        `nix-store --query --binding system` reads the environment only, which a
+        __structuredAttrs derivation (pkgs.buildEnv, even pkgs.hello in current
+        nixpkgs) leaves holding just its outputs. `nix derivation show` reports
+        the derivation's own system for both kinds. Nix 2.34 wraps the map as
+        {"derivations": {"HASH-NAME.drv": ...}, "version": N}; older releases
+        (2.31 checked) print the bare map keyed by the full path.
+        """
+        shown = self.json(["nix", "derivation", "show", drv])
+        if isinstance(shown, dict) and isinstance(shown.get("derivations"), dict):
+            shown = shown["derivations"]
+        if not isinstance(shown, dict) or len(shown) != 1:
+            raise Failure("internal_error", "unexpected nix derivation show output")
+        (name, value), = shown.items()
+        if name not in (drv, os.path.basename(drv)) or not isinstance(value, dict) or not isinstance(value.get("system"), str):
+            raise Failure("internal_error", "unexpected nix derivation show output")
+        return value["system"]
 
     def lexists(self, path):
         return os.path.lexists(path)
@@ -428,7 +460,7 @@ class Environment:
             drv = identity["derivation"]
             if drv is not None and (not isinstance(drv, str) or not STORE.fullmatch(drv) or not drv.endswith(".drv")):
                 raise ValueError("invalid derivation")
-            if not isinstance(identity["system"], str) or not re.fullmatch(r"[a-z0-9_]+-[a-z0-9_]+", identity["system"]):
+            if not isinstance(identity["system"], str) or not SYSTEM.fullmatch(identity["system"]):
                 raise ValueError("invalid system")
             provenance = identity["provenance"]
             if not isinstance(provenance, dict) or set(provenance) != {"kind", "source", "attribute", "inputs_digest"}:
@@ -606,7 +638,7 @@ class Environment:
         sync_dir(self.path / "roots")
         remove_tree(trash)
 
-    def write_generation(self, directory, identity, closure, metadata, suffix=""):
+    def write_generation(self, directory, identity, closure, metadata, suffix="", times=None):
         archive = directory / ("closure.nar" + suffix)
         with open(archive, "xb") as stream:
             self.commands.run(["nix-store", "--export", *closure], stdout=stream)
@@ -615,7 +647,7 @@ class Environment:
         manifest = {"identity": identity, "closure": closure, "source_archive": metadata,
                     "archive_sha256": file_digest(archive), "archive_bytes": archive.stat().st_size}
         manifest["manifest_sha256"] = digest(manifest)
-        write_json(directory / ("manifest.json" + suffix), manifest)
+        write_json(directory / ("manifest.json" + suffix), manifest, times)
 
     def reuse(self, generation, identity, closure, metadata, output):
         """Reuse a published generation; repair a missing or corrupt archive or manifest from the local closure."""
@@ -631,8 +663,18 @@ class Environment:
         self.make_room(closure, generation)
         for stale in REPAIR_FILES:
             (directory / stale).unlink(missing_ok=True)
+        # created_at is the manifest's mtime and orders retention, so a repair
+        # keeps the original one instead of making the generation the newest.
+        # Only a regular file has one to keep: never follow a link, and never
+        # let a damaged entry (a symlink loop, say) stop the repair that
+        # replaces it.
         try:
-            self.write_generation(directory, identity, closure, metadata, ".new")
+            st = os.lstat(directory / "manifest.json")
+            times = (st.st_atime_ns, st.st_mtime_ns) if stat.S_ISREG(st.st_mode) else None
+        except OSError:
+            times = None
+        try:
+            self.write_generation(directory, identity, closure, metadata, ".new", times)
             # A crash between the renames leaves manifest.json.new beside the new
             # archive and the old manifest, a pair restore refuses unless they
             # already match; the next repair or prune removes the leftover.
@@ -675,8 +717,11 @@ class Environment:
                 if len(result) != 1 or set(result[0]["outputs"]) != {"out"}:
                     raise Failure("prepare_failed", "bundle must produce exactly one out output")
                 output, drv = result[0]["outputs"]["out"], result[0]["drvPath"]
-                system = self.commands.run(["nix-store", "--query", "--binding", "system", drv]).decode().strip()
+                system = self.commands.derivation_system(drv)
                 provenance = {"kind": "flake", "source": source, "attribute": req["attribute"], "inputs_digest": digest(metadata)}
+            # Checked before publishing: manifest() would read it back as corrupt.
+            if not SYSTEM.fullmatch(system):
+                raise Failure("prepare_failed", "the bundle names an invalid system")
             if not self.commands.isdir(output + "/bin"):
                 raise Failure("prepare_failed", "bundle must contain a bin directory")
             # The bundle's bin leads PATH; a bundled helper would shadow this one.
@@ -962,6 +1007,12 @@ def summary_line(record):
         record["outcome"], record["code"] or "-", record["generation"] or "-", record["duration_ms"])
 
 
+def error_line(error):
+    """A failed boot restore's message, which neither its record nor status carries, as one bounded line."""
+    message = " ".join(str(error.get("message") or "").split())[:1024]
+    return "cogbox-runtime-restore: error: %s: %s" % (error.get("code") or "-", message)
+
+
 def boot_restore(directory, commands):
     """`restore --boot`: restore the selected generation offline and record the outcome.
 
@@ -1078,18 +1129,29 @@ def main():
     except Exception as exc:
         result = envelope(error=failure_of(exc))
     signal.setitimer(signal.ITIMER_REAL, 0)
+    # Kept before any size fallback below replaces the envelope.
+    error = result["error"]
     encoded = encode(result)
     if len(encoded) > OUTPUT_LIMIT:
         result = unavailable(result["action"]) if result["changed"] else envelope(result["action"], error={"code": "internal_error", "message": "response exceeds 4 MiB"})
         encoded = encode(result)
     sys.stdout.buffer.write(encoded)
     sys.stdout.buffer.flush()
+    # The boot unit discards stdout, so its journal gets only stderr: the
+    # summary line and, on failure, the message, which is on no other
+    # persisted surface.
     if booted:
         # The boot unit's status follows the restore outcome; no selection is success.
         if record is None:
             return 0
         sys.stderr.write(summary_line(record) + "\n")
-        return 1 if record["outcome"] == "failed" else 0
+        if record["outcome"] == "failed":
+            sys.stderr.write(error_line(error) + "\n")
+            return 1
+        return 0
+    if args.boot and error is not None:
+        # An exception escaped the boot restore before it had an outcome.
+        sys.stderr.write(error_line(error) + "\n")
     return 0 if result["ok"] else 1
 
 
