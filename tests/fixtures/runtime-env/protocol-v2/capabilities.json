@@ -1,0 +1,1 @@
+{"action":"capabilities","capabilities":{"actions":["apply","capabilities","clear","prepare","prune","restore","rollback","status"],"helper_version":"0.2.0","protocol_versions":[2],"state_formats":[1]},"changed":false,"error":null,"generation":null,"ok":true,"status":null,"version":2}

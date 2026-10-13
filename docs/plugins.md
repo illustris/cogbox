@@ -134,6 +134,14 @@ At build, the base folds every plugin's merged `config.cogbox` into **one deriva
 
 The base drops only **child** symlinks into real writable dirs (never a whole-dir or whole-file link), so the harness can scaffold session state alongside and peers coexist. A single base oneshot pre-accepts Claude Code workspace trust for `~/work`.
 
+## Plugins and runtime tool environments
+
+On the hosted guest, [runtime tool environments](runtime-environment.md) offer a second way to get tools: `cogbox-env` selects a Nix-built bundle of executables at runtime, with no restart and one level of rollback, and restores it offline after a restart. It is per sandbox and only touches `PATH`. A plugin is the route for anything shared or reviewed, and for anything beyond executables (services, skills, MCP, network or credential policy), and it loads on the next restart.
+
+Precedence: a selected bundle's `bin` comes first in login shells and harness launchers, ahead of plugin tools (the brain's `bin`) and the base system. That order is base-owned: the contract gives a plugin no `loginShellInit` surface.
+
+The hosted guest enables the feature with `lib.mkDefault`, so a plugin module may set `cogbox.runtimeEnvironment.enable = false` to turn it off for the sandboxes that install it; the composition still evaluates. Setting it to `true` from a plugin on any other profile (workstation, container) is unsupported: there every boot would restore into a RAM-backed store (workstation), or into a copy-on-write store whose stale database an import cannot repair (container).
+
 ## Harness-agnostic → native mapping
 
 One neutral unit → each enabled harness's native layout (gated on which harnesses the instance uses):

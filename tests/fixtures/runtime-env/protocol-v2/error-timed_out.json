@@ -1,0 +1,1 @@
+{"action":"status","capabilities":null,"changed":false,"error":{"code":"timed_out","message":"another cogbox-env operation holds the state lock (prepare or boot restore in progress)"},"generation":null,"ok":false,"status":null,"version":2}

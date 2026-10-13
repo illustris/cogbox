@@ -18,6 +18,12 @@
       printf '#!${tools.bash}/bin/bash\necho a-only\n' > "$out/bin/runtime-a-only"
       ${tools.coreutils}/bin/chmod +x "$out/bin/runtime-a-only"
     '';
+    # A bundle may not provide the helper itself (prepare refuses it).
+    shadow = mk "cogbox-env-shadow" ''
+      ${tools.coreutils}/bin/mkdir -p "$out/bin"
+      printf '#!${tools.bash}/bin/bash\necho shadow\n' > "$out/bin/cogbox-env"
+      ${tools.coreutils}/bin/chmod +x "$out/bin/cogbox-env"
+    '';
     # Minimal bin-only merge to keep the offline stage fixture's build inputs
     # tiny. Real projects can use pkgs.buildEnv with ignoreCollisions = false.
     bundle = name: paths: mk name (''
@@ -37,6 +43,7 @@
       a = bundle "runtime-bundle-a" [ (probe "v1") aOnly ];
       b = bundle "runtime-bundle-b" [ (probe "v2") ];
       collision = bundle "runtime-bundle-collision" [ (probe "v1") (probe "v2") ];
+      reserved = bundle "runtime-bundle-reserved" [ (probe "v1") shadow ];
     };
   };
 }

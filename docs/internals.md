@@ -107,6 +107,12 @@ The base module declares the `cogbox.*` option tree and folds the merged `config
 
 The workdir/cwd is base-owned: `programs.bash.loginShellInit` and the harness launchers (`c`/`oc`/`om`/`cx`/`h`/`p`) `cd ~/work` (the launcher also exports `OPENCODE_CONFIG` and merges `cogbox.env`). The contract has no `loginShellInit`/`cwd` surface, so a plugin cannot fight over cwd. See [plugins](plugins.md) for the full contract.
 
+## Runtime tool environments
+
+Where `cogbox.runtimeEnvironment.enable` is on (by default only the hosted guest the GCE image runs), [`cogbox-env`](runtime-environment.md) selects a tool bundle at runtime. Two pieces of the guest wiring live outside `runtime/module.nix`, because `programs.bash.loginShellInit` is `mkForce`d and the launchers are generated in `flake.nix`: both guests' login init prepend `/root/work/.cogbox/runtime/current/bin` after the plugin tool bin (so it ends up first) and print a one-line warning in interactive shells when the selected bin no longer resolves, and every harness launcher puts the runtime bin first in its `PATH`.
+
+`cogbox-runtime-restore.service` restores the selected bundle offline after a restart. It is a background unit: wanted by `multi-user.target`, ordered `After=` it and `cogbox-brain-materialize`, and never `Before=` anything, so sshd, brain materialization and readiness never wait for it. On the hosted guest it also `Wants=` and is `After=` the `nofail` work bind `var-lib-cogbox-work.mount` with `ConditionPathIsMountPoint=/var/lib/cogbox/work`, so a pool-absent boot skips it instead of letting it write under the unmounted path. `checks.runtime-environment` and `cogbox-guest-pool-degradable` assert that graph on the realized units, and `checks.runtime-boot-restore` boots it.
+
 ## Guest environment and non-Nix binaries
 
 The L7 CA-trust env (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, …, all pointing at the assembled `/run/cogbox/ca-bundle.crt`) is set both as `environment.variables` (login shells) and `environment.sessionVariables`. The latter matters because the container sshd runs `UsePAM yes`, so `pam_env` delivers `sessionVariables` to *non-interactive* `ssh host cmd` execs — which source no login shell. That is the path VS Code Remote-SSH uses, so its server and tools see the CA bundle.

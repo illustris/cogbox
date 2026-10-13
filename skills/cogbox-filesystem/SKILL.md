@@ -25,6 +25,8 @@ survives a restart, but a reschedule onto another node loses it. Treat neither
 as storage: if a tool has to be there next time, extend the sandbox, as
 `cogbox-packages` describes.
 
+If `command -v cogbox-env` finds the helper, the tools it selects are the one exception: their closure is archived under `~/work/.cogbox/runtime` (never edit that directory by hand) and restored after a restart, as the `cogbox-runtime` skill describes.
+
 Paths under `/root` are not uniformly one or the other, and they differ between
 sandboxes rather than only between paths. `/root/.cache`, `/root/.config` and
 `/root/.local` are symlinked onto the state volume on the container backend, and

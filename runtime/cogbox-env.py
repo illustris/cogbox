@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guest-owned immutable tool generations. Protocol and durability: docs/runtime-environment-poc.md."""
+"""Guest-owned immutable tool generations. Protocol and durability: docs/runtime-environment.md."""
 import argparse
 import contextlib
 import fcntl
@@ -17,13 +17,41 @@ import tempfile
 import time
 import uuid
 
-VERSION = 1
+# Guest image pins are write-once, so the wire protocol and the on-disk state
+# format are frozen per image and versioned separately. STATE_FORMAT is the
+# generation identity version; keeping it at 1 keeps POC generation ids valid.
+PROTOCOL_VERSION = 2
+STATE_FORMAT = 1
+HELPER_VERSION = "0.2.0"
+ACTIONS = ("apply", "capabilities", "clear", "prepare", "prune", "restore", "rollback", "status")
 INPUT_LIMIT = 65536
 OUTPUT_LIMIT = 4 * 1024 * 1024
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+# Retention limits, also frozen per image. nix-store --import buffers each NAR
+# in memory, hence the per-path cap.
+MAX_GENERATIONS = 4
+MAX_PATH_NAR = GIB
+PATH_OVERHEAD = 4096
+RESTORE_HEADROOM = 512 * MIB
+STATUS_LOCK_TIMEOUT = 15
 GEN = re.compile(r"[0-9a-f]{64}\Z")
 TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 STORE = re.compile(r"/nix/store/[0-9a-df-np-sv-z]{32}-[A-Za-z0-9+._?=-]+\Z")
+USERINFO = re.compile(r"://[^/@]*@")
 LOCK_FLAGS = ["--no-update-lock-file", "--no-write-lock-file", "--no-registries"]
+SUBDIRS = ("generations", "selections", "roots")
+# What an archive repair writes beside a published generation before renaming.
+REPAIR_FILES = ("closure.nar.new", "manifest.json.new")
+BOOT_FIELDS = {"boot_id", "outcome", "code", "generation", "finished_at", "duration_ms"}
+LOCK_BUSY = "another cogbox-env operation holds the state lock (prepare or boot restore in progress)"
+NOT_READY = "the work directory is not ready yet; retry once the sandbox has finished starting"
+UNCOMMITTED = object()
+FIELDS = {"capabilities": (set(), set()), "status": (set(), set()),
+          "prepare": (set(), {"flake", "attribute", "import_store_path"}),
+          "apply": ({"generation", "expected_selection"}, set()),
+          "rollback": ({"expected_selection"}, set()), "clear": ({"expected_selection"}, set()),
+          "restore": (set(), {"generation"}), "prune": (set(), {"generation"})}
 
 
 class Failure(Exception):
@@ -34,15 +62,31 @@ class Failure(Exception):
 
 class Deadline(Failure):
     def __init__(self, message):
-        super().__init__("internal_error", message)
+        super().__init__("timed_out", message)
+
+
+def archive_budget(fs_bytes):
+    return min(8 * GIB, fs_bytes // 4)
+
+
+def reserve_bytes(fs_bytes):
+    return max(2 * GIB, fs_bytes // 10)
 
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
+def encode(result):
+    return canonical(result) + b"\n"
+
+
 def digest(value):
     return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def new_token():
+    return uuid.uuid4().hex
 
 
 def strict_json(data):
@@ -59,32 +103,31 @@ def strict_json(data):
 def validate_request(req):
     if not isinstance(req, dict):
         raise Failure("invalid_request", "request must be an object")
-    if type(req.get("version")) is not int or req["version"] != VERSION:
-        raise Failure("unsupported_version", "version must be 1")
-    action = req.get("action")
-    fields = {"status": set(), "prepare": {"flake", "attribute", "import_store_path"},
-              "apply": {"generation", "expected_selection"}, "rollback": {"expected_selection"},
-              "restore": {"generation"}}
-    if not isinstance(action, str) or action not in fields or set(req) - fields[action] - {"version", "action"}:
-        raise Failure("invalid_request", "unknown action or unexpected field")
+    version, action = req.get("version"), req.get("action")
+    # capabilities is the skew probe, so it answers any client version.
+    if type(version) is not int or not (version >= 1 if action == "capabilities" else version == PROTOCOL_VERSION):
+        raise Failure("unsupported_version", "version must be 2")
+    if not isinstance(action, str) or action not in FIELDS:
+        raise Failure("invalid_request", "unknown action")
+    required, optional = FIELDS[action]
+    supplied = set(req) - {"version", "action"}
+    if supplied - required - optional or required - supplied:
+        raise Failure("invalid_request", "missing or unexpected field")
     if any(not isinstance(v, str) or not v or len(v) > 8192 or "\0" in v for k, v in req.items() if k != "version"):
         raise Failure("invalid_request", "fields must be nonempty bounded strings")
     if action == "prepare":
-        supplied = set(req) - {"version", "action"}
         if supplied not in ({"flake", "attribute"}, {"import_store_path"}):
             raise Failure("invalid_request", "prepare requires flake and attribute, or import_store_path")
         if "import_store_path" in req and (not STORE.fullmatch(req["import_store_path"]) or req["import_store_path"].endswith(".drv")):
             raise Failure("invalid_request", "import requires a canonical store output")
         if "flake" in req and (req["flake"].startswith("-") or "#" in req["flake"] or not re.fullmatch(r"[A-Za-z0-9_.-]+", req["attribute"])):
             raise Failure("invalid_request", "invalid flake reference or package attribute")
-    if action == "apply" and "generation" not in req:
-        raise Failure("invalid_request", "apply requires generation")
+        if "flake" in req and USERINFO.search(req["flake"]):
+            raise Failure("invalid_request", "flake references must not embed credentials")
     if "generation" in req and not GEN.fullmatch(req["generation"]):
         raise Failure("invalid_request", "invalid generation")
-    if action in ("apply", "rollback"):
-        token = req.get("expected_selection", "")
-        if token != "none" and not TOKEN.fullmatch(token):
-            raise Failure("invalid_request", "expected_selection must be none or a selection token")
+    if "expected_selection" in req and req["expected_selection"] != "none" and not TOKEN.fullmatch(req["expected_selection"]):
+        raise Failure("invalid_request", "expected_selection must be none or a selection token")
     return req
 
 
@@ -97,26 +140,25 @@ def sync_dir(path):
 
 
 def durable_mkdir(path):
-    """Commit each newly created directory entry, including a new work subtree."""
-    missing = []
-    cursor = path
-    while not cursor.exists():
-        missing.append(cursor)
-        cursor = cursor.parent
-    for directory in reversed(missing):
-        try:
-            directory.mkdir(mode=0o700)
-        except FileExistsError:
-            if not directory.is_dir():
-                raise
-    # A concurrent/interrupted creator may have made an existing ancestor
-    # visible without syncing its entry. Commit that boundary as well.
-    cursor = path
-    while True:
-        sync_dir(cursor)
-        if cursor.parent == cursor:
-            break
-        cursor = cursor.parent
+    """Create one directory under an existing parent and commit both entries.
+
+    Syncing even when it already exists also commits an entry an interrupted
+    creator made visible without syncing.
+    """
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        if not path.is_dir():
+            raise
+    sync_dir(path)
+    sync_dir(path.parent)
+
+
+def remove_tree(path):
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def write_json(path, value):
@@ -142,12 +184,40 @@ def file_digest(path):
     return h.hexdigest()
 
 
+def filesystem(path):
+    """Size and free bytes of the filesystem holding the state (the pool on hosted guests)."""
+    while not path.is_dir():
+        path = path.parent
+    st = os.statvfs(path)
+    return st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+
+
+def guest_identity():
+    system = os.path.realpath("/run/current-system") if os.path.exists("/run/current-system") else None
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        boot_id = None
+    return system, boot_id
+
+
+def capabilities():
+    return {"helper_version": HELPER_VERSION, "protocol_versions": [PROTOCOL_VERSION],
+            "state_formats": [STATE_FORMAT], "actions": sorted(ACTIONS)}
+
+
 class Commands:
-    """Bound stdout, retain only a bounded diagnostic tail, and kill the process group on timeout."""
+    """Bound stdout, retain only a bounded diagnostic tail, and kill the process group on timeout.
+
+    Every observation of /nix/store goes through this class, so tests can model
+    a damaged store without one.
+    """
     def __init__(self, timeout):
         self.deadline = time.monotonic() + timeout
 
     def run(self, args, *, stdin=None, stdout=None):
+        if time.monotonic() >= self.deadline:
+            raise Deadline("Nix operation timed out")
         proc = subprocess.Popen(args, stdin=stdin or subprocess.DEVNULL, stdout=stdout or subprocess.PIPE,
                                 stderr=subprocess.PIPE, start_new_session=True)
         out, err = bytearray(), bytearray()
@@ -171,7 +241,11 @@ class Commands:
                             out.extend(chunk)
                             if len(out) > OUTPUT_LIMIT:
                                 raise Failure("internal_error", "Nix output exceeds limit")
-            proc.wait(timeout=max(0.01, self.deadline - time.monotonic()))
+            try:
+                proc.wait(timeout=max(0.01, self.deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                # Its pipes closed but it outlived the deadline; finally kills the group.
+                raise Deadline("Nix operation timed out") from None
             if err:
                 sys.stderr.buffer.write(err)
                 sys.stderr.buffer.flush()
@@ -189,18 +263,49 @@ class Commands:
     def json(self, args):
         return strict_json(self.run(args))
 
-    def available(self, paths, verify=False):
-        if not paths or any(not Path(p).exists() for p in paths):
-            return False
+    def lexists(self, path):
+        return os.path.lexists(path)
+
+    def isdir(self, path):
+        return os.path.isdir(path)
+
+    def missing(self, paths):
+        return [p for p in paths if not self.lexists(p)]
+
+    def invalid(self, paths):
+        """Paths the Nix database does not register, whether or not they exist on disk."""
+        return set(self.run(["nix-store", "--check-validity", "--print-invalid", *paths]).decode().split())
+
+    def verify(self, paths):
         try:
-            self.run(["nix-store", "--check-validity", *paths])
-            if verify:
-                self.run(["nix-store", "--verify-path", *paths])
+            self.run(["nix-store", "--verify-path", *paths])
             return True
         except Deadline:
             raise
         except Failure:
             return False
+
+    def available(self, paths, verify=False):
+        if not paths or self.missing(paths):
+            return False
+        try:
+            if self.invalid(paths):
+                return False
+        except Deadline:
+            raise
+        except Failure:
+            return False
+        return not verify or self.verify(paths)
+
+    def sizes(self, paths):
+        values = self.run(["nix-store", "--query", "--size", *paths]).split()
+        if len(values) != len(paths) or not all(v.isdigit() for v in values):
+            raise Failure("internal_error", "unexpected nix-store size output")
+        return [int(v) for v in values]
+
+    def store_free(self):
+        st = os.statvfs("/nix/store")
+        return st.f_bavail * st.f_frsize
 
     def root(self, output, link):
         # Only a verified existing output, never a derivation; substitution is disabled.
@@ -210,30 +315,98 @@ class Commands:
 
 
 class Environment:
-    def __init__(self, directory, commands):
+    def __init__(self, directory, commands, create=False):
         if not os.path.isabs(directory):
             raise Failure("invalid_request", "state-dir must be absolute")
         # /root/work is intentionally a durable symlink in guests. Resolve it once;
         # records use relative pointers, so moving a retained work volume is supported.
         self.path = Path(directory).resolve()
-        durable_mkdir(self.path)
-        os.chmod(self.path, 0o700)
-        for name in ("generations", "selections", "roots"):
-            durable_mkdir(self.path / name)
         self.commands = commands
+        self.commit_target = UNCOMMITTED
+        self.alarm_mask = None
+        # The parent (<work>/.cogbox) belongs to brain-materialize and is never
+        # created here: before materialization, or over an unmounted nofail pool,
+        # it would land on the wrong filesystem. Callers fail not_ready instead.
+        self.ready = self.path.parent.is_dir()
+        if create and self.ready:
+            durable_mkdir(self.path)
+            os.chmod(self.path, 0o700)
+            for name in SUBDIRS:
+                durable_mkdir(self.path / name)
+        if os.path.lexists(self.path) and not self.path.is_dir():
+            raise Failure("corrupt_state", "state-dir is not a directory")
+        # Only prepare creates state. A missing state dir is an empty state.
+        self.present = self.path.is_dir()
 
     @contextlib.contextmanager
-    def locked(self):
+    def locked(self, timeout=None):
+        self.present = self.path.is_dir()
+        if not self.present:
+            # Nothing to protect, and nothing (not even the lock file) is created.
+            yield
+            return
+        limit = self.commands.deadline if timeout is None else min(self.commands.deadline, time.monotonic() + timeout)
         with open(self.path / "lock", "a+b") as lock:
             while True:
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
-                    if time.monotonic() >= self.commands.deadline:
-                        raise Deadline("state lock timed out")
+                    if time.monotonic() >= limit:
+                        raise Deadline(LOCK_BUSY)
                     time.sleep(0.05)
             yield
+
+    @contextlib.contextmanager
+    def commit(self, target):
+        """Defer the async deadline from the selection change through its sync.
+
+        SIGALRM stays blocked for the rest of the request; later work relies on
+        the cooperative Commands deadline. committed() then reports truthfully
+        whether the pointer moved, whatever fails afterwards.
+        """
+        if self.alarm_mask is None:
+            self.alarm_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+        self.commit_target = target
+        yield
+
+    def committed(self):
+        if self.commit_target is UNCOMMITTED:
+            return False
+        try:
+            target = os.readlink(self.path / "current")
+        except FileNotFoundError:
+            target = None
+        except OSError:
+            return True
+        return target == self.commit_target
+
+    def release(self):
+        """Discard an alarm deferred by a commit: the request already has its answer."""
+        if self.alarm_mask is None:
+            return
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        handler = signal.signal(signal.SIGALRM, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_SETMASK, self.alarm_mask)
+        if handler is not None:
+            signal.signal(signal.SIGALRM, handler)
+        self.alarm_mask = None
+
+    def entries(self, name):
+        directory = self.path / name
+        if not self.present or not directory.is_dir():
+            return []
+        return sorted(directory.iterdir())
+
+    def has_generation(self, generation):
+        return self.present and (self.path / "generations" / generation).is_dir()
+
+    def archive_size(self, generation):
+        archive = self.path / "generations" / generation / "closure.nar"
+        return archive.stat().st_size if archive.is_file() else 0
+
+    def created_at(self, generation):
+        return int((self.path / "generations" / generation / "manifest.json").stat().st_mtime)
 
     def manifest(self, generation):
         if not GEN.fullmatch(generation):
@@ -248,7 +421,7 @@ class Environment:
             identity = m["identity"]
             if not isinstance(identity, dict) or set(identity) != {"version", "output", "derivation", "system", "provenance"}:
                 raise ValueError("invalid identity object")
-            if digest(identity) != generation or type(identity["version"]) is not int or identity["version"] != VERSION:
+            if digest(identity) != generation or type(identity["version"]) is not int or identity["version"] != STATE_FORMAT:
                 raise ValueError("identity mismatch")
             if not isinstance(identity["output"], str) or not STORE.fullmatch(identity["output"]) or identity["output"].endswith(".drv"):
                 raise ValueError("invalid output")
@@ -276,13 +449,41 @@ class Environment:
             if not GEN.fullmatch(m["archive_sha256"]) or type(m["archive_bytes"]) is not int or m["archive_bytes"] < 1:
                 raise ValueError("invalid archive metadata")
             return m
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        # RecursionError: JSON nested deeper than the decoder's stack allows.
+        except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
             raise Failure("corrupt_state", "missing or corrupt generation manifest") from exc
 
-    def selected(self):
+    def valid_manifest(self, generation):
+        try:
+            return self.manifest(generation)
+        except Failure:
+            return None
+
+    def scan(self):
+        """Valid manifests by id, corrupt generation ids, and the count of foreign entries.
+
+        One damaged or stray entry never fails a verb; it is reported instead.
+        """
+        valid, corrupt, ignored = {}, [], 0
+        for entry in self.entries("generations"):
+            if entry.name.startswith("."):
+                continue
+            if not GEN.fullmatch(entry.name):
+                ignored += 1
+                continue
+            m = self.valid_manifest(entry.name)
+            if m is None:
+                corrupt.append(entry.name)
+            else:
+                valid[entry.name] = m
+        return valid, corrupt, ignored
+
+    def selected(self, manifests=None):
+        if not self.present:
+            return None, None
         pointer = self.path / "current"
         if not pointer.is_symlink():
-            if pointer.exists():
+            if os.path.lexists(pointer):
                 raise Failure("corrupt_state", "current is not a symlink")
             return None, None
         target = os.readlink(pointer)
@@ -292,44 +493,166 @@ class Environment:
             record = read_json_file(self.path / target / "selection.json", INPUT_LIMIT)
             if not isinstance(record, dict) or set(record) != {"generation", "previous"} or not GEN.fullmatch(record["generation"]) or (record["previous"] is not None and not GEN.fullmatch(record["previous"])):
                 raise ValueError("invalid selection record")
-            m = self.manifest(record["generation"])
-            if os.readlink(self.path / target / "bin") != m["identity"]["output"] + "/bin":
+            link = os.readlink(self.path / target / "bin")
+            if not link.endswith("/bin") or not STORE.fullmatch(link[:-4]):
+                raise ValueError("invalid selection bin")
+            # A corrupt selected manifest is reported by status, not fatal here;
+            # the previous generation is not validated at all.
+            m = manifests.get(record["generation"]) if manifests is not None else self.valid_manifest(record["generation"])
+            if m is not None and link != m["identity"]["output"] + "/bin":
                 raise ValueError("selection bin mismatch")
-            if record["previous"]:
-                self.manifest(record["previous"])
             return target.split("/")[1], record
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
             raise Failure("corrupt_state", "missing or corrupt selection") from exc
 
+    def previous(self, record, valid):
+        previous = record["previous"] if record else None
+        return previous if previous in valid and previous != record["generation"] else None
+
+    def boot_record(self):
+        if not self.present:
+            return None
+        try:
+            record = read_json_file(self.path / "boot-restore.json", INPUT_LIMIT)
+        except (OSError, ValueError, RecursionError):
+            return None
+        if not isinstance(record, dict) or set(record) != BOOT_FIELDS or record["outcome"] not in ("active", "restored", "failed"):
+            return None
+        if any(record[k] is not None and not isinstance(record[k], str) for k in ("boot_id", "code")):
+            return None
+        if record["generation"] is not None and not (isinstance(record["generation"], str) and GEN.fullmatch(record["generation"])):
+            return None
+        if any(type(record[k]) is not int for k in ("finished_at", "duration_ms")):
+            return None
+        return record
+
+    def write_boot_record(self, record):
+        temporary = self.path / (".boot-restore-" + uuid.uuid4().hex)
+        write_json(temporary, record)
+        os.replace(temporary, self.path / "boot-restore.json")
+        sync_dir(self.path)
+
     def status(self):
-        token, record = self.selected()
+        valid, corrupt, ignored = self.scan()
+        token, record = self.selected(valid)
         generations = []
-        for directory in sorted((self.path / "generations").iterdir()):
-            if directory.name.startswith("."):
-                continue
-            m = self.manifest(directory.name)
+        for generation, m in valid.items():
             ident = m["identity"]
-            archive = directory / "closure.nar"
-            generations.append({"id": directory.name, **{k: ident[k] for k in ("output", "derivation", "system", "provenance")},
+            archive = self.path / "generations" / generation / "closure.nar"
+            present = archive.is_file()
+            generations.append({"id": generation, **{k: ident[k] for k in ("output", "derivation", "system", "provenance")},
                                 "closure_available": self.commands.available(m["closure"]),
-                                "archive_present": archive.is_file(), "archive_valid": None,
-                                "archive_bytes": archive.stat().st_size if archive.is_file() else 0})
+                                "archive_present": present, "archive_valid": None,
+                                "archive_bytes": archive.stat().st_size if present else 0,
+                                "created_at": self.created_at(generation)})
         selected = record["generation"] if record else None
         current = next((g for g in generations if g["id"] == selected), None)
-        system = os.path.realpath("/run/current-system") if os.path.exists("/run/current-system") else None
-        try:
-            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        except OSError:
-            boot_id = None
+        fs_bytes, free = filesystem(self.path)
+        system, boot_id = guest_identity()
         return {"selection": token, "selected_generation": selected,
                 "active_generation": selected if current and current["closure_available"] else None,
-                "previous_generation": record["previous"] if record else None,
+                "previous_generation": self.previous(record, valid),
                 "output": current["output"] if current else None, "generations": generations,
+                "corrupt_generations": corrupt, "ignored_entries": ignored,
+                "boot_restore": self.boot_record(),
+                "limits": {"max_generations": MAX_GENERATIONS, "archive_budget_bytes": archive_budget(fs_bytes),
+                           "archive_bytes_total": sum(self.archive_size(g) for g in [*valid, *corrupt]),
+                           "free_bytes": free, "reserve_bytes": reserve_bytes(fs_bytes),
+                           "max_path_nar_bytes": MAX_PATH_NAR},
                 "guest_system": system, "boot_id": boot_id}
+
+    def make_room(self, closure, generation):
+        """Prepare preflight: refuse before writing anything, then drop the oldest unprotected generations."""
+        sizes = self.commands.sizes(closure)
+        for path, size in zip(closure, sizes):
+            if size > MAX_PATH_NAR:
+                raise Failure("insufficient_space", "%s is %d bytes; a single store path may not exceed %d bytes" % (path, size, MAX_PATH_NAR))
+        projected = sum(sizes) + PATH_OVERHEAD * len(closure)
+        fs_bytes, free = filesystem(self.path)
+        budget, reserve = archive_budget(fs_bytes), reserve_bytes(fs_bytes)
+        if projected > budget:
+            raise Failure("insufficient_space", "the bundle archive needs about %d bytes; the archive budget is %d bytes" % (projected, budget))
+        valid, corrupt, _ = self.scan()
+        _, record = self.selected(valid)
+        selected = record["generation"] if record else None
+        protected = {selected, self.previous(record, valid), generation}
+        retained = {g: self.archive_size(g) for g in [*valid, *corrupt] if g != generation}
+        candidates = [g for g in corrupt if g not in protected]
+        candidates += sorted((g for g in valid if g not in protected), key=lambda g: (self.created_at(g), g))
+        drops = []
+        def fits():
+            kept = [g for g in retained if g not in drops]
+            return sum(retained[g] for g in kept) + projected <= budget and len(kept) + 1 <= MAX_GENERATIONS
+        for candidate in candidates:
+            if fits():
+                break
+            drops.append(candidate)
+        if not fits():
+            raise Failure("insufficient_space", "no room within %d generations and %d archive bytes; the selected (%s) and previous (%s) generations are never dropped automatically: run cogbox-env prune --generation ID, or cogbox-env clear" % (MAX_GENERATIONS, budget, selected or "none", self.previous(record, valid) or "none"))
+        if free + sum(retained[g] for g in drops) - projected < reserve:
+            raise Failure("insufficient_space", "the bundle archive needs about %d bytes and %d bytes must stay free; %d bytes are free" % (projected, reserve, free))
+        for candidate in drops:
+            self.drop_generation(candidate, selected)
+
+    def drop_generation(self, generation, selected):
+        # The closure itself stays in the store; the guest's GC reclaims it once unrooted.
+        if generation == selected:
+            raise Failure("invalid_request", "the selected generation cannot be pruned; apply another generation or clear first")
+        generations = self.path / "generations"
+        trash = generations / (".trash-%s-%s" % (generation, uuid.uuid4().hex))
+        os.rename(generations / generation, trash)
+        sync_dir(generations)
+        (self.path / "roots" / generation).unlink(missing_ok=True)
+        sync_dir(self.path / "roots")
+        remove_tree(trash)
+
+    def write_generation(self, directory, identity, closure, metadata, suffix=""):
+        archive = directory / ("closure.nar" + suffix)
+        with open(archive, "xb") as stream:
+            self.commands.run(["nix-store", "--export", *closure], stdout=stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        manifest = {"identity": identity, "closure": closure, "source_archive": metadata,
+                    "archive_sha256": file_digest(archive), "archive_bytes": archive.stat().st_size}
+        manifest["manifest_sha256"] = digest(manifest)
+        write_json(directory / ("manifest.json" + suffix), manifest)
+
+    def reuse(self, generation, identity, closure, metadata, output):
+        """Reuse a published generation; repair a missing or corrupt archive or manifest from the local closure."""
+        directory = self.path / "generations" / generation
+        if not directory.is_dir():
+            raise Failure("corrupt_state", "generation entry is not a directory; run cogbox-env prune --generation " + generation)
+        old = self.valid_manifest(generation)
+        if old is not None:
+            # The directory name is the identity digest, so a valid manifest already matches.
+            archive = directory / "closure.nar"
+            if archive.is_file() and archive.stat().st_size == old["archive_bytes"] and file_digest(archive) == old["archive_sha256"]:
+                return False
+        self.make_room(closure, generation)
+        for stale in REPAIR_FILES:
+            (directory / stale).unlink(missing_ok=True)
+        try:
+            self.write_generation(directory, identity, closure, metadata, ".new")
+            # A crash between the renames leaves manifest.json.new beside the new
+            # archive and the old manifest, a pair restore refuses unless they
+            # already match; the next repair or prune removes the leftover.
+            os.rename(directory / "closure.nar.new", directory / "closure.nar")
+            os.rename(directory / "manifest.json.new", directory / "manifest.json")
+        except BaseException:
+            # Best effort, so the caller still sees the original error.
+            for stale in REPAIR_FILES:
+                with contextlib.suppress(OSError):
+                    (directory / stale).unlink(missing_ok=True)
+            raise
+        if not os.path.lexists(directory / "root"):
+            os.symlink(output, directory / "root")
+        sync_dir(directory)
+        return True
 
     def prepare(self, req):
         staging = Path(tempfile.mkdtemp(prefix=".prepare-", dir=self.path / "generations"))
         protection = self.path / "roots" / (".preparing-" + uuid.uuid4().hex)
+        root, root_created, destination = None, False, None
         try:
             metadata = None
             if "import_store_path" in req:
@@ -354,102 +677,210 @@ class Environment:
                 output, drv = result[0]["outputs"]["out"], result[0]["drvPath"]
                 system = self.commands.run(["nix-store", "--query", "--binding", "system", drv]).decode().strip()
                 provenance = {"kind": "flake", "source": source, "attribute": req["attribute"], "inputs_digest": digest(metadata)}
-            if not (Path(output) / "bin").is_dir():
+            if not self.commands.isdir(output + "/bin"):
                 raise Failure("prepare_failed", "bundle must contain a bin directory")
+            # The bundle's bin leads PATH; a bundled helper would shadow this one.
+            if self.commands.lexists(output + "/bin/cogbox-env"):
+                raise Failure("prepare_failed", "bundle must not provide cogbox-env")
             closure = sorted(set(self.commands.run(["nix-store", "--query", "--requisites", output]).decode().splitlines()))
             if not self.commands.available(closure, verify=True):
                 raise Failure("unavailable_closure", "complete bundle closure is unavailable")
-            identity = {"version": VERSION, "output": output, "derivation": drv, "system": system, "provenance": provenance}
+            identity = {"version": STATE_FORMAT, "output": output, "derivation": drv, "system": system, "provenance": provenance}
             generation = digest(identity)
             destination = self.path / "generations" / generation
-            if destination.exists():
-                old = self.manifest(generation)
-                if old["identity"] != identity:
-                    raise Failure("corrupt_state", "generation identity mismatch")
-                retained = destination / "closure.nar"
-                if not retained.is_file() or retained.stat().st_size != old["archive_bytes"] or file_digest(retained) != old["archive_sha256"]:
-                    raise Failure("invalid_archive", "existing generation has a missing or corrupt retained archive")
-                self.commands.root(output, self.path / "roots" / generation)
-                return generation, False
-            self.commands.root(output, self.path / "roots" / generation)
+            root = self.path / "roots" / generation
+            if os.path.lexists(destination):
+                changed = self.reuse(generation, identity, closure, metadata, output)
+                self.commands.root(output, root)
+                return generation, changed
+            self.make_room(closure, generation)
+            root_created = not os.path.lexists(root)
+            self.commands.root(output, root)
             os.symlink(output, staging / "root")
-            archive = staging / "closure.nar"
-            with open(archive, "xb") as stream:
-                self.commands.run(["nix-store", "--export", *closure], stdout=stream)
-                stream.flush()
-                os.fsync(stream.fileno())
-            manifest = {"identity": identity, "closure": closure, "source_archive": metadata,
-                        "archive_sha256": file_digest(archive), "archive_bytes": archive.stat().st_size}
-            manifest["manifest_sha256"] = digest(manifest)
-            write_json(staging / "manifest.json", manifest)
+            self.write_generation(staging, identity, closure, metadata)
             sync_dir(staging)
             os.rename(staging, destination)
             sync_dir(destination.parent)
             return generation, True
         except Failure as exc:
-            if exc.code in ("unavailable_closure", "corrupt_state", "invalid_archive"):
+            if exc.code in ("unavailable_closure", "corrupt_state", "invalid_archive", "timed_out", "not_ready", "insufficient_space"):
                 raise
             raise Failure("prepare_failed", str(exc)) from exc
         finally:
             protection.unlink(missing_ok=True)
+            # A root for a generation this call never published would pin its closure forever.
+            if root_created and not os.path.lexists(destination):
+                root.unlink(missing_ok=True)
             if staging.exists():
                 shutil.rmtree(staging)
+
+    def restore_generation(self, generation, boot=False):
+        """Make a generation's closure usable offline: 'active' if it already was, else 'restored'."""
+        if not self.has_generation(generation):
+            raise Failure("invalid_generation", "generation is not prepared")
+        m = self.manifest(generation)
+        closure, output = m["closure"], m["identity"]["output"]
+        root = self.path / "roots" / generation
+        missing = self.commands.missing(closure)
+        invalid = self.commands.invalid(closure)
+        if not missing and not invalid:
+            self.commands.root(output, root)
+            return "active"
+        # The import adds only unregistered paths (NoRepair), so a registered but
+        # absent path would never come back.
+        registered = [p for p in missing if p not in invalid]
+        if registered:
+            raise Failure("store_inconsistent", "%d closure paths are registered but missing from the store (first: %s); importing cannot repair them" % (len(registered), registered[0]))
+        # A present but unregistered path is deleted and rewritten in place, so
+        # it costs about nothing. Per-path sizes are not recorded, so any missing
+        # path counts the whole archive.
+        needed = RESTORE_HEADROOM + (m["archive_bytes"] if missing else 0)
+        free = self.commands.store_free()
+        if free < needed:
+            raise Failure("insufficient_space", "restoring needs %d free bytes in the Nix store; %d are free" % (needed, free))
+        archive = self.path / "generations" / generation / "closure.nar"
+        if not archive.is_file() or archive.stat().st_size != m["archive_bytes"] or file_digest(archive) != m["archive_sha256"]:
+            raise Failure("invalid_archive", "missing or corrupt retained closure archive; run prepare again to repair it")
+        try:
+            with open(archive, "rb") as stream:
+                self.commands.run(["nix-store", "--import", "--option", "substitute", "false", "--option", "substituters", ""], stdin=stream)
+            if self.commands.missing(closure) or self.commands.invalid(closure):
+                raise Failure("restore_failed", "import did not restore the exact complete closure")
+            if not boot and not self.commands.verify(closure):
+                raise Failure("restore_failed", "restored closure failed content verification")
+            # Re-register even if a stale symlink survived a store DB reset.
+            self.commands.root(output, root)
+        except Deadline:
+            raise
+        except Failure as exc:
+            raise Failure("restore_failed", str(exc)) from exc
+        return "restored"
+
+    def ensure_closure(self, generation, m):
+        """apply/rollback: import the target offline when its closure is gone (after a restart)."""
+        if self.commands.available(m["closure"], verify=True):
+            return False
+        if self.restore_generation(generation) == "active":
+            # Present and registered but failing verification: an import cannot fix that.
+            raise Failure("unavailable_closure", "closure content failed verification")
+        return True
 
     def select(self, req, rollback=False):
         token, record = self.selected()
         if (token or "none") != req["expected_selection"]:
             raise Failure("stale_selection", "selection changed; inspect status before retrying")
-        generation = req.get("generation")
         if rollback:
-            if not record or not record["previous"]:
+            generation = record["previous"] if record else None
+            if not generation or not self.has_generation(generation) or self.valid_manifest(generation) is None:
                 raise Failure("no_previous", "no previous generation")
-            generation = record["previous"]
-        if not (self.path / "generations" / generation).is_dir():
+        else:
+            generation = req["generation"]
+        if not self.has_generation(generation):
             raise Failure("invalid_generation", "generation is not prepared")
         m = self.manifest(generation)
-        if not self.commands.available(m["closure"], verify=True):
-            raise Failure("unavailable_closure", "restore the exact closure before selecting")
+        imported = self.ensure_closure(generation, m)
         self.commands.root(m["identity"]["output"], self.path / "roots" / generation)
         if record and record["generation"] == generation:
-            return False
-        selection = uuid.uuid4().hex
+            return imported
+        selection = new_token()
         directory = self.path / "selections" / selection
         directory.mkdir(mode=0o700)
         write_json(directory / "selection.json", {"generation": generation, "previous": record["generation"] if record else None})
         os.symlink(m["identity"]["output"] + "/bin", directory / "bin")
         sync_dir(directory)
         sync_dir(directory.parent)
-        temporary = self.path / (".current-" + selection)
-        os.symlink("selections/" + selection, temporary)
-        os.replace(temporary, self.path / "current")
-        sync_dir(self.path)
+        with self.commit("selections/" + selection):
+            temporary = self.path / (".current-" + selection)
+            os.symlink("selections/" + selection, temporary)
+            os.replace(temporary, self.path / "current")
+            sync_dir(self.path)
+        return True
+
+    def clear(self, req):
+        token, _ = self.selected()
+        if (token or "none") != req["expected_selection"]:
+            raise Failure("stale_selection", "selection changed; inspect status before retrying")
+        if token is None:
+            return False
+        # Selections and generations stay; only the pointer goes.
+        with self.commit(None):
+            os.unlink(self.path / "current")
+            sync_dir(self.path)
         return True
 
     def restore(self, req):
         _, record = self.selected()
-        wanted = [req["generation"]] if "generation" in req else ([record["generation"], record["previous"]] if record else [])
-        changed = False
-        for generation in dict.fromkeys(g for g in wanted if g):
-            if not (self.path / "generations" / generation).is_dir():
+        generation = req.get("generation") or (record["generation"] if record else None)
+        if generation is None:
+            return False
+        return self.restore_generation(generation) == "restored"
+
+    def sweep(self, token):
+        """Remove leftovers of interrupted operations. Callers hold the lock, so none are in flight."""
+        removed = False
+        generations = self.path / "generations"
+        for entry in self.entries("generations"):
+            if entry.name.startswith((".prepare-", ".trash-")):
+                remove_tree(entry)
+                removed = True
+            elif GEN.fullmatch(entry.name) and entry.is_dir() and not entry.is_symlink():
+                # An archive repair interrupted before or between its renames.
+                stale = [entry / name for name in REPAIR_FILES if os.path.lexists(entry / name)]
+                for path in stale:
+                    remove_tree(path)
+                if stale:
+                    sync_dir(entry)
+                    removed = True
+        for entry in self.entries("."):
+            if entry.name.startswith((".current-", ".boot-restore-")):
+                entry.unlink()
+                removed = True
+        for entry in self.entries("roots"):
+            if entry.name.startswith(".preparing-") or (GEN.fullmatch(entry.name) and not os.path.lexists(generations / entry.name)):
+                entry.unlink()
+                removed = True
+        for entry in self.entries("selections"):
+            if TOKEN.fullmatch(entry.name) and entry.name != token:
+                remove_tree(entry)
+                removed = True
+        if removed:
+            for directory in (self.path, generations, self.path / "roots", self.path / "selections"):
+                if directory.is_dir():
+                    sync_dir(directory)
+        return removed
+
+    def prune(self, req):
+        valid, corrupt, _ = self.scan()
+        token, record = self.selected(valid)
+        selected = record["generation"] if record else None
+        if "generation" in req:
+            generation = req["generation"]
+            if generation == selected:
+                raise Failure("invalid_request", "the selected generation cannot be pruned; apply another generation or clear first")
+            if not self.present or not os.path.lexists(self.path / "generations" / generation):
                 raise Failure("invalid_generation", "generation is not prepared")
-            m = self.manifest(generation)
-            archive = self.path / "generations" / generation / "closure.nar"
-            if not archive.is_file() or archive.stat().st_size != m["archive_bytes"] or file_digest(archive) != m["archive_sha256"]:
-                raise Failure("invalid_archive", "missing or corrupt retained closure archive")
-            try:
-                if not self.commands.available(m["closure"], verify=True):
-                    with open(archive, "rb") as stream:
-                        self.commands.run(["nix-store", "--import", "--option", "substitute", "false", "--option", "substituters", ""], stdin=stream)
-                    changed = True
-                if not self.commands.available(m["closure"], verify=True):
-                    raise Failure("restore_failed", "import did not restore the exact complete closure")
-                root = self.path / "roots" / generation
-                # Re-register even if a stale symlink survived a store DB reset.
-                self.commands.root(m["identity"]["output"], root)
+            self.drop_generation(generation, selected)
+            return True
+        protected = {selected, self.previous(record, valid)}
+        changed = False
+        for generation in corrupt:
+            if generation not in protected:
+                self.drop_generation(generation, selected)
                 changed = True
-            except Failure as exc:
-                raise Failure("restore_failed", str(exc)) from exc
-        return changed
+        count = len(valid) + sum(1 for g in corrupt if g in protected)
+        for generation in sorted((g for g in valid if g not in protected), key=lambda g: (self.created_at(g), g)):
+            if count <= MAX_GENERATIONS:
+                break
+            self.drop_generation(generation, selected)
+            count -= 1
+            changed = True
+        return self.sweep(token) or changed
+
+    def auto_prune(self):
+        try:
+            self.prune({})
+        except Exception as exc:  # best effort: the commit already happened
+            sys.stderr.write("cogbox-env: automatic prune failed: %s\n" % exc)
 
     def perform(self, req):
         action = req["action"]
@@ -458,40 +889,125 @@ class Environment:
             generation, changed = self.prepare(req)
         elif action in ("apply", "rollback"):
             changed = self.select(req, action == "rollback")
+        elif action == "clear":
+            changed = self.clear(req)
         elif action == "restore":
             changed = self.restore(req)
+        elif action == "prune":
+            changed = self.prune(req)
+        if self.commit_target is not UNCOMMITTED:
+            self.auto_prune()
         return changed, generation
 
 
-def envelope(action=None, *, ok=False, changed=False, generation=None, status=None, error=None):
-    return {"version": VERSION, "ok": ok, "action": action, "changed": changed,
-            "generation": generation, "status": status, "error": error}
+def envelope(action=None, *, ok=False, changed=False, generation=None, status=None, error=None, capabilities=None):
+    return {"version": PROTOCOL_VERSION, "ok": ok, "action": action, "changed": changed,
+            "generation": generation, "status": status, "error": error, "capabilities": capabilities}
+
+
+def unavailable(action, message="selection committed; run cogbox-env status"):
+    # The one error envelope with changed:true: the change happened, observing it failed.
+    return envelope(action, changed=True, error={"code": "status_unavailable", "message": message})
+
+
+def failure_of(exc):
+    if isinstance(exc, Failure):
+        return {"code": exc.code, "message": str(exc)}
+    return {"code": "internal_error", "message": str(exc)}
 
 
 def dispatch(req, directory, commands):
-    action = req.get("action") if isinstance(req, dict) and req.get("action") in ("status", "prepare", "apply", "rollback", "restore") else None
+    action = req.get("action") if isinstance(req, dict) and req.get("action") in ACTIONS else None
     env = None
     try:
         validate_request(req)
-        env = Environment(directory, commands)
-        with env.locked():
+        if action == "capabilities":
+            # Answered before any state is opened, created or locked.
+            return envelope(action, ok=True, capabilities=capabilities())
+        env = Environment(directory, commands, create=action == "prepare")
+        if not env.ready:
+            raise Failure("not_ready", NOT_READY)
+        with env.locked(STATUS_LOCK_TIMEOUT if action == "status" else None):
             try:
-                # Validate every retained record before any selection commit, so
-                # unrelated pre-existing corruption cannot first surface afterward.
-                before = env.status()
-                if len(canonical(envelope(action, ok=True, status=before))) + 128 > OUTPUT_LIMIT:
-                    raise Failure("internal_error", "retained state exceeds response limit")
                 changed, generation = env.perform(req)
-                return envelope(action, ok=True, changed=changed, generation=generation,
-                                status=before if action == "status" else env.status())
-            except Failure as exc:
-                try:
-                    status = env.status()
-                except (Failure, OSError, ValueError, TypeError):
-                    status = None
-                return envelope(action, status=status, error={"code": exc.code, "message": str(exc)})
-    except (Failure, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
-        return envelope(action, error={"code": exc.code if isinstance(exc, Failure) else "internal_error", "message": str(exc)})
+                result = envelope(action, ok=True, changed=changed, generation=generation, status=env.status())
+            except Exception as exc:
+                if env.committed():
+                    return unavailable(action)
+                status = None
+                if action != "status":
+                    try:
+                        status = env.status()
+                    except Exception:
+                        status = None
+                result = envelope(action, status=status, error=failure_of(exc))
+            if len(encode(result)) > OUTPUT_LIMIT:
+                if env.committed():
+                    return unavailable(action)
+                if result["ok"]:
+                    return envelope(action, error={"code": "internal_error", "message": "retained state exceeds the response limit"})
+                result["status"] = None
+            return result
+    except Exception as exc:
+        if env is not None and env.committed():
+            return unavailable(action)
+        return envelope(action, error=failure_of(exc))
+    finally:
+        if env is not None:
+            env.release()
+
+
+def summary_line(record):
+    return "cogbox-runtime-restore: outcome=%s code=%s generation=%s duration_ms=%d" % (
+        record["outcome"], record["code"] or "-", record["generation"] or "-", record["duration_ms"])
+
+
+def boot_restore(directory, commands):
+    """`restore --boot`: restore the selected generation offline and record the outcome.
+
+    Returns (envelope, record); record is None when there was nothing to restore.
+    """
+    started = time.monotonic()
+    env = Environment(directory, commands)
+    if not (env.ready and env.present and (env.path / "current").is_symlink()):
+        # Nothing selected, nothing to restore: a no-op that succeeds and writes
+        # nothing, whatever the status read says (the unit's condition skips it).
+        try:
+            with env.locked(STATUS_LOCK_TIMEOUT):
+                return envelope("restore", ok=True, status=env.status()), None
+        except Exception as exc:
+            return envelope("restore", error=failure_of(exc)), None
+    outcome, code, message, generation, status = "failed", None, None, None, None
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(env.locked())
+            _, selection = env.selected()
+            if selection is None:
+                return envelope("restore", ok=True, status=env.status()), None
+            generation = selection["generation"]
+            outcome = env.restore_generation(generation, boot=True)
+        except Failure as exc:
+            code, message = exc.code, str(exc)
+        except (OSError, ValueError, TypeError) as exc:
+            code, message = "internal_error", str(exc)
+        record = {"boot_id": guest_identity()[1], "outcome": outcome, "code": code, "generation": generation,
+                  "finished_at": int(time.time()), "duration_ms": int((time.monotonic() - started) * 1000)}
+        try:
+            env.write_boot_record(record)
+        except OSError as exc:
+            # The outcome still reaches the journal and the exit status.
+            sys.stderr.write("cogbox-env: could not record the boot restore: %s\n" % exc)
+        try:
+            status = env.status()
+        except Exception:
+            status = None
+    if outcome == "failed":
+        return envelope("restore", status=status, error={"code": code, "message": message}), record
+    if status is None:
+        if outcome == "restored":
+            return unavailable("restore", "restore finished; run cogbox-env status"), record
+        return envelope("restore", error={"code": "internal_error", "message": "status unavailable after boot restore"}), record
+    return envelope("restore", ok=True, changed=outcome == "restored", status=status), record
 
 
 def read_request(timeout):
@@ -513,10 +1029,11 @@ def read_request(timeout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["rpc", "status", "prepare", "apply", "rollback", "restore", "exec"])
+    parser.add_argument("action", choices=["rpc", *ACTIONS, "exec"])
     parser.add_argument("--state-dir", default="/root/work/.cogbox/runtime")
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--json", action="store_true", help="emit the protocol envelope (also the default)")
+    parser.add_argument("--boot", action="store_true", help="restore only: the boot unit's offline restore of the selected generation")
     parser.add_argument("--flake")
     parser.add_argument("--attribute")
     parser.add_argument("--import-store-path")
@@ -531,6 +1048,8 @@ def main():
     args = parser.parse_args(argv)
     if not 0 < args.timeout <= 86400:
         parser.error("timeout must be finite and between 0 and 86400 seconds")
+    if args.boot and (args.action != "restore" or args.generation is not None):
+        parser.error("--boot is only valid for restore, which then restores the selected generation")
     if args.action == "exec":
         if not command or not os.path.isabs(args.state_dir):
             parser.error("exec requires an absolute state-dir and -- COMMAND")
@@ -540,23 +1059,37 @@ def main():
         raise Deadline("operation timed out; inspect status before retrying")
     signal.signal(signal.SIGALRM, timed_out)
     signal.setitimer(signal.ITIMER_REAL, args.timeout)
+    record, booted = None, False
     try:
         if command:
             raise Failure("invalid_request", "unexpected command arguments")
-        if args.action == "rpc":
-            req = read_request(args.timeout)
+        if args.boot:
+            result, record = boot_restore(args.state_dir, Commands(args.timeout))
+            booted = True
         else:
-            req = {"version": VERSION, "action": args.action}
-            req.update({k: getattr(args, k) for k in ("flake", "attribute", "import_store_path", "generation", "expected_selection") if getattr(args, k) is not None})
-        result = dispatch(req, args.state_dir, Commands(args.timeout))
-    except (ValueError, UnicodeError, Failure) as exc:
-        result = envelope(error={"code": exc.code if isinstance(exc, Failure) else "invalid_request", "message": str(exc)})
+            if args.action == "rpc":
+                req = read_request(args.timeout)
+            else:
+                req = {"version": PROTOCOL_VERSION, "action": args.action}
+                req.update({k: getattr(args, k) for k in ("flake", "attribute", "import_store_path", "generation", "expected_selection") if getattr(args, k) is not None})
+            result = dispatch(req, args.state_dir, Commands(args.timeout))
+    except (ValueError, UnicodeError) as exc:
+        result = envelope(error={"code": "invalid_request", "message": str(exc)})
+    except Exception as exc:
+        result = envelope(error=failure_of(exc))
     signal.setitimer(signal.ITIMER_REAL, 0)
-    encoded = canonical(result) + b"\n"
+    encoded = encode(result)
     if len(encoded) > OUTPUT_LIMIT:
-        result = envelope(result["action"], error={"code": "internal_error", "message": "response exceeds 4 MiB; selection outcome requires inspection"})
-        encoded = canonical(result) + b"\n"
+        result = unavailable(result["action"]) if result["changed"] else envelope(result["action"], error={"code": "internal_error", "message": "response exceeds 4 MiB"})
+        encoded = encode(result)
     sys.stdout.buffer.write(encoded)
+    sys.stdout.buffer.flush()
+    if booted:
+        # The boot unit's status follows the restore outcome; no selection is success.
+        if record is None:
+            return 0
+        sys.stderr.write(summary_line(record) + "\n")
+        return 1 if record["outcome"] == "failed" else 0
     return 0 if result["ok"] else 1
 
 
