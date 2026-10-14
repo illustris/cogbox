@@ -4,6 +4,7 @@ Protocol-v2 envelopes are pinned by golden fixtures in tests/fixtures/runtime-en
 compared byte for byte. Regenerate them with COGBOX_ENV_REGENERATE=1. COGBOX_ENV_FIXTURES
 overrides tests/fixtures/runtime-env (needed when this file is copied into the store alone).
 """
+import copy
 import fcntl
 import importlib.util
 import io
@@ -35,6 +36,19 @@ DEP = S + "j" * 32 + "-tool-dependency"
 SOURCE = S + "g" * 32 + "-source"
 SYSTEM = S + "s" * 32 + "-nixos-system-cogbox"
 BUNDLE_DRV = S + "h" * 32 + "-bundle.drv"
+# nixpkgs as the skill's recipe locks it. NARHASH is a real one, whose `+`, `/`
+# and `=` need URL encoding; Nix 2.34.8's dry-run archive reports it as
+# ARCHIVED. NIXPKGS stands in for an input-addressed store path named
+# "source", as in the runtime-boot-restore VM test.
+NIXPKGS = S + "n" * 32 + "-source"
+NARHASH = "sha256-H83yz/do+hjOO0uujHyH8RgtIQP2v7Mw+cLwcZK/xKc="
+ARCHIVED = S + "2010s04mqpq7q1kch0ddc9b429s2vh9v-source"
+RECIPE = {"lastModified": 0, "narHash": NARHASH, "path": NIXPKGS, "type": "path"}
+REV = "e7439b6b14ad3cc35d05608ebca9bce01a25f5f8"
+# What prepare passes Nix for RECIPE, and what it prints when it keeps the plain evaluation.
+OVERRIDE = ("--override-input", "nixpkgs",
+            "path:" + NIXPKGS + "?lastModified=0&narHash=sha256-H83yz%2Fdo%2BhjOO0uujHyH8RgtIQP2v7Mw%2BcLwcZK%2FxKc%3D")
+SLOW = "cogbox-env: prepare: no store-path override for nixpkgs, so Nix hashes the locked source again\n"
 BOOT_ID = "0b0b0b0b-0000-4000-8000-000000000001"
 ENVELOPE = {"version", "ok", "action", "changed", "generation", "status", "error", "capabilities"}
 STATUS = {"selection", "selected_generation", "active_generation", "previous_generation", "output", "generations",
@@ -47,6 +61,12 @@ LIMITS = {"max_generations", "archive_budget_bytes", "archive_bytes_total", "fre
 def out(name):
     # One character from Nix's base32 alphabet (no e, o, t or u).
     return S + name * 32 + "-bundle-" + name
+
+
+def lock(**inputs):
+    """A flake.lock whose root inputs are locked as given, each an indirect reference to its own name."""
+    nodes = {name: {"locked": locked, "original": {"id": name, "type": "indirect"}} for name, locked in inputs.items()}
+    return {"nodes": {"root": {"inputs": {name: name for name in inputs}}, **nodes}, "root": "root", "version": 7}
 
 
 def expect(condition, message):
@@ -142,6 +162,10 @@ class Store(runtime.Commands):
         self.imports = 0
         self.calls = []
         self.roots = {}            # indirect GC roots Nix knows (gcroots/auto): link -> output
+        self.locks = {}            # archived source -> its flake.lock
+        self.archived = {}         # the inputs `nix flake archive --json` reports
+        self.evaluated = {}        # archived source -> the lock Nix computes, when it re-locks in memory
+        self.overridden = {}       # archived source -> the lock Nix computes with --override-input, when it differs
 
     def lexists(self, path):
         return path in self.paths or path in self.unregistered or path in self.files or self.isdir(path)
@@ -152,6 +176,9 @@ class Store(runtime.Commands):
 
     def store_free(self):
         return self.free
+
+    def read_lock(self, source):
+        return copy.deepcopy(self.locks.get(source))
 
     def wipe(self, *paths):
         """Store loss (CP Stop/Start): gone from disk and from the DB.
@@ -242,7 +269,14 @@ class Store(runtime.Commands):
         if args[:2] == ["nix", "eval"]:
             return b"x86_64-linux"
         if args[:3] == ["nix", "flake", "archive"]:
-            return json.dumps({"inputs": {}, "path": SOURCE}).encode()
+            return json.dumps({"inputs": self.archived, "path": SOURCE}).encode()
+        if args[:3] == ["nix", "flake", "metadata"]:
+            source = args[-1][len("path:"):]
+            if "--override-input" in args and source in self.overridden:
+                locks = self.overridden[source]
+            else:
+                locks = self.evaluated[source] if source in self.evaluated else self.locks.get(source)
+            return json.dumps({"locks": locks, "path": source}).encode()
         if args[:2] == ["nix", "build"]:
             output = self.builds[args[-1].split("#", 1)[1]]
             Path(args[args.index("--out-link") + 1]).symlink_to(output)
@@ -818,6 +852,247 @@ class RuntimeTest(Base):
             if call[:3] == ("nix", "flake", "archive") or call[:2] == ("nix", "build"):
                 self.assertIn("--no-use-registries", call)
                 self.assertNotIn("--no-registries", call)
+
+    def lock_source(self, **inputs):
+        """Model the archived source's flake.lock and the archive's record of each input, every path valid."""
+        self.store.locks[SOURCE] = lock(**inputs)
+        self.store.archived = {name: {"inputs": {}, "path": ARCHIVED} for name in inputs}
+        self.store.paths.update(locked["path"] for locked in inputs.values() if "path" in locked)
+
+    def prepare_build(self, harness=None):
+        """Prepare a flake bundle; return the generation and the `nix build` argv. Its stderr lands in self.noted."""
+        harness = harness or self.h
+        harness.store.builds["default"] = harness.offer("c")
+        stderr = io.StringIO()
+        with patch.object(sys, "stderr", stderr):
+            result = harness.call("prepare", flake="path:/root/work/tools", attribute="default")
+        self.noted = stderr.getvalue()
+        self.assertTrue(result["ok"], result)
+        build = [c for c in harness.store.calls if c[:2] == ("nix", "build")][-1]
+        self.assertEqual((build[-3], build[-1]), ("--out-link", "path:" + SOURCE + "#default"))
+        return result["generation"], build
+
+    def test_prepare_flake_archive_fetches_no_input(self):
+        # A full archive copies every locked input into the store, which for a
+        # `path` input means NAR-hashing the whole tree again.
+        self.lock_source(nixpkgs=RECIPE)
+        self.prepare_build()
+        archives = [c for c in self.store.calls if c[:3] == ("nix", "flake", "archive")]
+        self.assertEqual(archives, [("nix", "flake", "archive", "--dry-run", "--json", *runtime.LOCK_FLAGS, "path:/root/work/tools")])
+
+    def test_prepare_flake_overrides_a_valid_store_source_input(self):
+        self.lock_source(nixpkgs=RECIPE)
+        generation, build = self.prepare_build()
+        query = "lastModified=0&narHash=sha256-H83yz%2Fdo%2BhjOO0uujHyH8RgtIQP2v7Mw%2BcLwcZK%2FxKc%3D"
+        self.assertEqual(build[:-3], ("nix", "build", "--json", *runtime.LOCK_FLAGS,
+                                      "--override-input", "nixpkgs", "path:" + NIXPKGS + "?" + query))
+        self.assertEqual(self.noted, "")
+        # The identity never depends on the overrides: the same prepare without a
+        # readable lock (so without overrides) publishes the same generation.
+        plain = Harness(self)
+        plain.store.archived = copy.deepcopy(self.store.archived)
+        plain_generation, plain_build = self.prepare_build(plain)
+        self.assertNotIn("--override-input", plain_build)
+        self.assertEqual(plain_generation, generation)
+
+    def test_prepare_flake_override_repeats_every_locked_attribute(self):
+        self.lock_source(nixpkgs=dict(RECIPE, lastModified=1791456040, rev=REV, revCount=7))
+        _, build = self.prepare_build()
+        self.assertEqual(build[build.index("--override-input"):-3],
+                         ("--override-input", "nixpkgs", "path:" + NIXPKGS + "?lastModified=1791456040&narHash="
+                          "sha256-H83yz%2Fdo%2BhjOO0uujHyH8RgtIQP2v7Mw%2BcLwcZK%2FxKc%3D&rev=" + REV + "&revCount=7"))
+
+    def test_prepare_flake_skips_inputs_it_cannot_override_exactly(self):
+        def entry(**changes):
+            # None removes an attribute.
+            return {k: v for k, v in dict(RECIPE, **changes).items() if v is not None}
+        github = {"lastModified": 1791456040, "narHash": NARHASH, "owner": "acme", "repo": "nixpkgs", "rev": REV, "type": "github"}
+        tarball = {"lastModified": 0, "narHash": NARHASH, "type": "tarball", "url": "https://git.example.com/acme/nixpkgs.tar.gz"}
+        git = {"lastModified": 0, "narHash": NARHASH, "rev": REV, "revCount": 7, "type": "git", "url": "https://git.example.com/acme/nixpkgs"}
+        nested = lock(nixpkgs=RECIPE, inner=RECIPE)
+        nested["nodes"]["root"]["inputs"] = {"nixpkgs": "nixpkgs"}
+        nested["nodes"]["nixpkgs"]["inputs"] = {"inner": "inner"}
+        follows = lock(nixpkgs=RECIPE)
+        follows["nodes"]["root"]["inputs"] = {"nixpkgs": ["tools", "nixpkgs"]}
+        recorded = {"nixpkgs": {"inputs": {}, "path": ARCHIVED}}
+        # (case, the archived flake.lock, the archive's inputs, whether NIXPKGS is valid). Each
+        # case breaks one condition only, so each check is exercised on its own.
+        cases = [(kind, lock(nixpkgs=locked), recorded, True) for kind, locked in (
+            ("github", github), ("tarball", tarball), ("git", git),
+            ("a store path not named source", entry(path=S + "n" * 32 + "-nixpkgs")),
+            ("a path outside the store", entry(path="/root/src/nixpkgs")),
+            ("an extra attribute", entry(dir="sub")),
+            ("a sha512 narHash", entry(narHash="sha512-" + "A" * 86 + "==")),
+            ("a nix32 narHash", entry(narHash="sha256:" + "1" * 52)),
+            ("no narHash", entry(narHash=None)),
+            ("no lastModified", entry(lastModified=None)),
+            ("a string lastModified", entry(lastModified="0")),
+            ("a boolean lastModified", entry(lastModified=True)),
+            ("a negative revCount", entry(revCount=-1)),
+            ("an integer rev", entry(rev=1)))]
+        cases += [(kind, lock(**{name: RECIPE}), {name: recorded["nixpkgs"]}, True) for kind, name in (
+            ("a name starting with a dash", "-x"), ("a dotted name", "a.b"), ("a name with a slash", "a/b"))]
+        cases += [
+            ("an input with inputs of its own", nested, recorded, True),
+            ("a root input that follows another", follows, recorded, True),
+            ("a path the store does not register", lock(nixpkgs=RECIPE), recorded, False),
+            ("an archive recording another path", lock(nixpkgs=RECIPE), {"nixpkgs": {"inputs": {}, "path": S + "q" * 32 + "-source"}}, True),
+            ("an archive recording nested inputs", lock(nixpkgs=RECIPE), {"nixpkgs": {"inputs": recorded, "path": ARCHIVED}}, True),
+            ("an input the archive did not record", lock(nixpkgs=RECIPE), {}, True),
+            ("no lock", None, recorded, True), ("an empty lock", {}, recorded, True),
+            ("a list of nodes", {"nodes": [], "root": "root"}, recorded, True),
+            ("no root node", {"nodes": {"nixpkgs": {"locked": RECIPE}}, "root": "root"}, recorded, True),
+            ("root inputs as a list", {"nodes": {"root": {"inputs": ["nixpkgs"]}, "nixpkgs": {"locked": RECIPE}}, "root": "root"}, recorded, True),
+        ]
+        # The control: the same setup with the recipe entry does override.
+        for kind, source_lock, archived, valid in [("the recipe", lock(nixpkgs=RECIPE), recorded, True), *cases]:
+            with self.subTest(kind):
+                self.store.locks[SOURCE], self.store.archived = source_lock, archived
+                (self.store.paths.add if valid else self.store.paths.discard)(NIXPKGS)
+                _, build = self.prepare_build()
+                self.assertEqual("--override-input" in build, kind == "the recipe", build)
+
+    def test_prepare_flake_overrides_each_qualifying_input_in_name_order(self):
+        alpha, zeta = S + "a" * 32 + "-source", S + "z" * 32 + "-source"
+        github = {"lastModified": 0, "narHash": NARHASH, "owner": "acme", "repo": "mid", "rev": REV, "type": "github"}
+        self.lock_source(zeta=dict(RECIPE, path=zeta), alpha=dict(RECIPE, path=alpha), mid=github)
+        # A root input that follows another is skipped without dropping the rest.
+        self.store.locks[SOURCE]["nodes"]["root"]["inputs"]["follower"] = ["alpha"]
+        _, build = self.prepare_build()
+        overrides = build[len(("nix", "build", "--json", *runtime.LOCK_FLAGS)):-3]
+        query = "?lastModified=0&narHash=sha256-H83yz%2Fdo%2BhjOO0uujHyH8RgtIQP2v7Mw%2BcLwcZK%2FxKc%3D"
+        self.assertEqual(overrides, ("--override-input", "alpha", "path:" + alpha + query,
+                                     "--override-input", "zeta", "path:" + zeta + query))
+
+    def test_prepare_flake_validity_query_failure_only_drops_overrides(self):
+        self.lock_source(nixpkgs=RECIPE)
+        # Only the validity query names NIXPKGS as a whole argument.
+        self.store.hooks.append((NIXPKGS, runtime.Failure("internal_error", "Nix command failed (exit 1)")))
+        _, build = self.prepare_build()
+        self.assertNotIn("--override-input", build)
+        self.assertIn(("nix-store", "--check-validity", "--print-invalid", NIXPKGS), self.store.calls)
+        self.assertFalse([c for c in self.store.calls if c[:3] == ("nix", "flake", "metadata")], self.store.calls)
+        self.assertEqual(self.noted, SLOW)
+        self.store.hooks[:] = [(NIXPKGS, runtime.Deadline("Nix operation timed out"))]
+        before = self.h.generations()
+        result = self.call("prepare", flake="path:/root/work/tools", attribute="default")
+        self.assertEqual(result["error"], {"code": "timed_out", "message": "Nix operation timed out"})
+        self.assertEqual(self.h.generations(), before)
+        self.assertEqual(self.h.leftovers(), [])
+
+    def test_prepare_flake_keeps_the_plain_evaluation_of_an_input_nix_relocks_in_memory(self):
+        # flake.nix changed nixpkgs' URL without a new lock: Nix re-locks it in memory,
+        # possibly to the same narHash (so the archive records the same path) with
+        # another lastModified or rev. An override would evaluate the stale entry.
+        def evaluated(**nodes):
+            relocked = lock(nixpkgs=RECIPE)
+            relocked["nodes"].update(nodes)
+            return relocked
+        renamed = lock(nixpkgs=RECIPE)
+        renamed["nodes"]["nixpkgs_2"] = renamed["nodes"].pop("nixpkgs")
+        renamed["nodes"]["root"]["inputs"]["nixpkgs"] = "nixpkgs_2"
+        follows = lock(nixpkgs=RECIPE)
+        follows["nodes"]["root"]["inputs"]["nixpkgs"] = ["tools", "nixpkgs"]
+        github = {"lastModified": 0, "narHash": NARHASH, "owner": "acme", "repo": "tools", "rev": REV, "type": "github"}
+        indirect = {"id": "nixpkgs", "type": "indirect"}
+        cases = [
+            ("another lastModified", evaluated(nixpkgs={"locked": dict(RECIPE, lastModified=1700000000), "original": indirect}), False),
+            ("a rev added", evaluated(nixpkgs={"locked": dict(RECIPE, rev=REV), "original": indirect}), False),
+            ("another original", evaluated(nixpkgs={"locked": RECIPE, "original": {"path": NIXPKGS, "type": "path"}}), False),
+            ("now a follows", follows, False),
+            ("gone", lock(), False),
+            ("no locks", None, False), ("locks as a list", [], False), ("an empty lock", {}, False),
+            # Controls: only nixpkgs' own entry matters, not node keys or other inputs.
+            ("the file's lock", lock(nixpkgs=RECIPE), True),
+            ("renamed node keys", renamed, True),
+            ("another input locked in memory", lock(nixpkgs=RECIPE, tools=github), True),
+        ]
+        for kind, locks, overridden in cases:
+            with self.subTest(kind):
+                self.lock_source(nixpkgs=RECIPE)
+                self.store.evaluated[SOURCE] = locks
+                self.store.calls.clear()
+                _, build = self.prepare_build()
+                self.assertEqual("--override-input" in build, overridden, build)
+                self.assertIn(("nix", "flake", "metadata", "--json", *runtime.LOCK_FLAGS, *OVERRIDE, "path:" + SOURCE), self.store.calls)
+                self.assertEqual(self.noted, "" if overridden else SLOW)
+        # Nothing qualifies, or nothing is in the store: no metadata query at all,
+        # and no note, since Nix has nothing local to hash again.
+        self.store.evaluated.clear()
+        for kind, locked in (("github", github), ("unregistered", dict(RECIPE, path=S + "u" * 32 + "-source"))):
+            with self.subTest(kind):
+                self.lock_source(nixpkgs=locked)
+                self.store.paths.discard(S + "u" * 32 + "-source")
+                self.store.calls.clear()
+                _, build = self.prepare_build()
+                self.assertNotIn("--override-input", build)
+                self.assertFalse([c for c in self.store.calls if c[:3] == ("nix", "flake", "metadata")], self.store.calls)
+                self.assertEqual(self.noted, "")
+
+    def test_prepare_flake_keeps_the_plain_evaluation_when_flake_nix_changed_the_flake_flag(self):
+        # flake.nix toggled `flake = false` on nixpkgs without a new lock. Nix keeps
+        # a lock entry whose reference did not change, with the entry's own flag, so
+        # without overrides it computes flake.lock itself. An override takes the
+        # flag from flake.nix: it would evaluate nixpkgs as the other kind.
+        indirect = {"id": "nixpkgs", "type": "indirect"}
+        source_tree = {"flake": False, "locked": RECIPE, "original": indirect}
+        as_flake = {"locked": RECIPE, "original": indirect}
+        for kind, locked, computed, overridden in (
+                ("flake = false removed", source_tree, as_flake, False),
+                ("flake = false added", as_flake, source_tree, False),
+                # The control: a current non-flake entry keeps its override.
+                ("flake = false unchanged", source_tree, source_tree, True)):
+            with self.subTest(kind):
+                self.lock_source(nixpkgs=RECIPE)
+                self.store.locks[SOURCE]["nodes"]["nixpkgs"] = copy.deepcopy(locked)
+                self.store.overridden[SOURCE] = lock(nixpkgs=RECIPE)
+                self.store.overridden[SOURCE]["nodes"]["nixpkgs"] = copy.deepcopy(computed)
+                self.store.calls.clear()
+                _, build = self.prepare_build()
+                self.assertEqual(build[len(("nix", "build", "--json", *runtime.LOCK_FLAGS)):-3], OVERRIDE if overridden else ())
+                # The lock that decides is the one Nix computes with the override, not without.
+                self.assertIn(("nix", "flake", "metadata", "--json", *runtime.LOCK_FLAGS, *OVERRIDE, "path:" + SOURCE), self.store.calls)
+                self.assertEqual(self.noted, "" if overridden else SLOW)
+
+    def test_prepare_flake_metadata_failure_only_drops_overrides(self):
+        self.lock_source(nixpkgs=RECIPE)
+        for exc in (runtime.Failure("internal_error", "Nix command failed (exit 1)"), ValueError("duplicate JSON field")):
+            with self.subTest(exc=exc):
+                self.store.hooks[:] = [("metadata", exc)]
+                self.store.calls.clear()
+                _, build = self.prepare_build()
+                self.assertNotIn("--override-input", build)
+                # A path the store does not register would fail the metadata query, so validity comes first.
+                metadata = ("nix", "flake", "metadata", "--json", *runtime.LOCK_FLAGS, *OVERRIDE, "path:" + SOURCE)
+                validity = ("nix-store", "--check-validity", "--print-invalid", NIXPKGS)
+                self.assertLess(self.store.calls.index(validity), self.store.calls.index(metadata), self.store.calls)
+                # A self-inconsistent lock fails here (NAR hash mismatch), so prepare
+                # builds what plain Nix builds, and says why it is slow.
+                self.assertEqual(self.noted, SLOW)
+        self.store.hooks[:] = [("metadata", runtime.Deadline("Nix operation timed out"))]
+        before = self.h.generations()
+        result = self.call("prepare", flake="path:/root/work/tools", attribute="default")
+        self.assertEqual(result["error"], {"code": "timed_out", "message": "Nix operation timed out"})
+        self.assertEqual(self.h.generations(), before)
+        self.assertEqual(self.h.leftovers(), [])
+
+    def test_read_lock_parses_only_a_bounded_well_formed_lock(self):
+        commands = runtime.Commands(30)
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            self.assertIsNone(commands.read_lock(source))
+            for raw, expected in ((json.dumps(lock(nixpkgs=RECIPE)), lock(nixpkgs=RECIPE)), ("{not json", None),
+                                  ('{"nodes": {}, "nodes": {}}', None), (b"\xff\xfe", None),
+                                  ('{"pad": "' + "x" * runtime.OUTPUT_LIMIT + '"}', None)):
+                with self.subTest(raw=raw[:16]):
+                    (source / "flake.lock").write_bytes(raw if isinstance(raw, bytes) else raw.encode())
+                    self.assertEqual(commands.read_lock(source), expected)
+
+    def test_source_store_path_is_the_path_nix_computes_from_the_nar_hash(self):
+        # Both pairs as Nix 2.34.8's `nix flake archive --json` reported them.
+        self.assertEqual(runtime.source_store_path(NARHASH), ARCHIVED)
+        self.assertEqual(runtime.source_store_path("sha256-SJuvju6Bz/28CKz80yi7m2lGu3g20iUaPA8b7Ui5sJs="),
+                         S + "fy4p29z9q0i3q5fsszlvkam3834rxgr3-source")
 
     def test_prepare_flake_reads_the_system_of_a_structured_attrs_derivation(self):
         # pkgs.buildEnv: its environment holds only `out`, so a binding query fails the

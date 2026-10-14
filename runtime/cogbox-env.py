@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Guest-owned immutable tool generations. Protocol and durability: docs/runtime-environment.md."""
 import argparse
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 
 # Guest image pins are write-once, so the wire protocol and the on-disk state
@@ -45,6 +47,13 @@ SYSTEM = re.compile(r"[a-z0-9_]+-[a-z0-9_]+\Z")
 # --no-use-registries is the setting's own flag; --no-registries is its
 # deprecated alias and warns on every call (both since at least Nix 2.13).
 LOCK_FLAGS = ["--no-update-lock-file", "--no-write-lock-file", "--no-use-registries"]
+# The root lock entries prepare repeats to `nix build` as overrides (see
+# Environment.store_overrides): `path` entries naming a "source" store path.
+LOCKED_PATH_ATTRS = frozenset({"type", "path", "narHash", "lastModified", "rev", "revCount"})
+SOURCE_PATH = re.compile(r"/nix/store/[0-9a-df-np-sv-z]{32}-source\Z")
+SRI_SHA256 = re.compile(r"sha256-[A-Za-z0-9+/]{43}=\Z")
+INPUT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
+NIX_BASE32 = "0123456789abcdfghijklmnpqrsvwxyz"
 SUBDIRS = ("generations", "selections", "roots")
 # What an archive repair writes beside a published generation before renaming.
 REPAIR_FILES = ("closure.nar.new", "manifest.json.new")
@@ -92,6 +101,57 @@ def digest(value):
 
 def new_token():
     return uuid.uuid4().hex
+
+
+def source_store_path(nar_hash):
+    """The store path Nix gives a flake source with this SRI sha256 NAR hash.
+
+    It is what `nix flake archive --dry-run` reports for a locked input: a
+    content-addressed path named "source" without references.
+    """
+    fingerprint = "source:sha256:%s:/nix/store:source" % base64.b64decode(nar_hash[len("sha256-"):]).hex()
+    folded = bytearray(20)
+    for i, byte in enumerate(hashlib.sha256(fingerprint.encode()).digest()):
+        folded[i % 20] ^= byte
+    number = int.from_bytes(folded, "little")
+    return "/nix/store/" + "".join(NIX_BASE32[(number >> 5 * k) & 31] for k in range(31, -1, -1)) + "-source"
+
+
+def root_input_nodes(lock):
+    """Each root input of a parsed flake.lock with the node it names (None for a follows); {} when malformed."""
+    try:
+        nodes = lock["nodes"]
+        return {name: nodes[key] if isinstance(key, str) else None for name, key in nodes[lock["root"]].get("inputs", {}).items()}
+    except (TypeError, KeyError, IndexError, AttributeError):
+        return {}
+
+
+def overridable(name, node, archived):
+    """Whether `--override-input NAME path:PATH?ATTRS` reproduces this root lock entry exactly.
+
+    Three kinds keep the plain evaluation, because an override would change
+    what Nix evaluates: an entry with inputs of its own (an override resolves
+    them again from that input's own flake.lock), one without lastModified (Nix
+    would add it), and one whose reference or `flake` flag in flake.nix no
+    longer matches the lock (an override takes both from flake.nix). This
+    checks the first two and the archive's record. A changed reference can keep
+    the narHash, and so that record, and a changed flag keeps the whole entry,
+    so store_overrides checks the third against the lock Nix computes with the
+    override.
+    """
+    locked = node.get("locked") if isinstance(node, dict) else None
+    if not (INPUT_NAME.fullmatch(name) and isinstance(locked, dict) and node.get("inputs", {}) == {}
+            and locked.get("type") == "path" and locked.keys() <= LOCKED_PATH_ATTRS and "lastModified" in locked):
+        return False
+    path, nar_hash = locked.get("path"), locked.get("narHash")
+    if not (isinstance(path, str) and SOURCE_PATH.fullmatch(path) and isinstance(nar_hash, str) and SRI_SHA256.fullmatch(nar_hash)):
+        return False
+    if any(type(locked[k]) is not int or locked[k] < 0 for k in ("lastModified", "revCount") if k in locked):
+        return False
+    if "rev" in locked and not isinstance(locked["rev"], str):
+        return False
+    # What the archive (the provenance) recorded: the same narHash, nothing nested.
+    return archived == {"inputs": {}, "path": source_store_path(nar_hash)}
 
 
 def strict_json(data):
@@ -334,6 +394,13 @@ class Commands:
         if len(values) != len(paths) or not all(v.isdigit() for v in values):
             raise Failure("internal_error", "unexpected nix-store size output")
         return [int(v) for v in values]
+
+    def read_lock(self, source):
+        """The archived source's flake.lock, or None when it has none or it does not parse."""
+        try:
+            return read_json_file(Path(source) / "flake.lock")
+        except (OSError, ValueError, RecursionError):
+            return None
 
     def store_free(self):
         st = os.statvfs("/nix/store")
@@ -691,6 +758,57 @@ class Environment:
         sync_dir(directory)
         return True
 
+    def store_overrides(self, metadata):
+        """`--override-input` arguments repeating each root input locked to a valid "source" store path.
+
+        Nix 2.34 gives a lock-file `path` input no fetcher-cache fingerprint, so
+        every evaluation NAR-hashes the whole tree again: minutes for the
+        image's nixpkgs over the guest's 9p store. The same locked reference
+        passed as an override is used in place and cached, and Nix checks its
+        narHash. An override takes the input's reference and `flake` flag from
+        flake.nix, where plain Nix keeps the lock entry's flag while the
+        reference is unchanged and re-locks the input in memory when it
+        changed. So an input keeps its override only when the lock Nix computes
+        with the overrides holds its flake.lock entry unchanged: that entry is
+        then also the one Nix evaluates without them, and the evaluation,
+        derivation and output do not change. Every other input, and every input
+        when Nix cannot compute that lock, keeps the plain evaluation.
+        """
+        try:
+            archived = metadata["inputs"]
+            wanted = {name: node for name, node in sorted(root_input_nodes(self.commands.read_lock(metadata["path"])).items())
+                      if overridable(name, node, archived.get(name))}
+        except (TypeError, KeyError, AttributeError):
+            return []
+        overrides, evaluated, invalid = {}, {}, set()
+        try:
+            if wanted:
+                invalid = self.commands.invalid(sorted({node["locked"]["path"] for node in wanted.values()}))
+            for name, node in wanted.items():
+                locked = node["locked"]
+                if locked["path"] not in invalid:
+                    query = urllib.parse.urlencode(sorted((k, v) for k, v in locked.items() if k not in ("type", "path")))
+                    overrides[name] = ["--override-input", name, "path:" + locked["path"] + "?" + query]
+            if overrides:
+                # The lock Nix evaluates the snapshot with under these overrides;
+                # computing it fetches only what Nix re-locks, as the build would.
+                # Nix locks each root input on its own, so dropping one override
+                # changes no other entry.
+                shown = self.commands.json(["nix", "flake", "metadata", "--json", *LOCK_FLAGS,
+                                            *itertools.chain.from_iterable(overrides.values()), "path:" + metadata["path"]])
+                evaluated = root_input_nodes(shown.get("locks") if isinstance(shown, dict) else None)
+        except Deadline:
+            raise
+        except (Failure, ValueError, RecursionError):
+            pass
+        kept = [name for name in overrides if evaluated.get(name) == wanted[name]]
+        # A store path the database does not register is not N1: Nix fetches or refuses it.
+        slow = [name for name in wanted if name not in kept and wanted[name]["locked"]["path"] not in invalid]
+        if slow:
+            sys.stderr.write("cogbox-env: prepare: no store-path override for %s, so Nix hashes the locked source again\n"
+                             % ", ".join(slow))
+        return [arg for name in kept for arg in overrides[name]]
+
     def prepare(self, req):
         staging = Path(tempfile.mkdtemp(prefix=".prepare-", dir=self.path / "generations"))
         protection = self.path / "roots" / (".preparing-" + uuid.uuid4().hex)
@@ -707,13 +825,15 @@ class Environment:
                 system = self.commands.run(["nix", "eval", "--impure", "--raw", "--expr", "builtins.currentSystem"]).decode()
                 provenance = {"kind": "import", "source": None, "attribute": None, "inputs_digest": None}
             else:
-                metadata = self.commands.json(["nix", "flake", "archive", "--json", *LOCK_FLAGS, req["flake"]])
+                # --dry-run records each locked input's store path from its narHash
+                # without fetching it; only the source itself is copied.
+                metadata = self.commands.json(["nix", "flake", "archive", "--dry-run", "--json", *LOCK_FLAGS, req["flake"]])
                 source = metadata["path"]
                 if not STORE.fullmatch(source):
                     raise Failure("prepare_failed", "flake archive did not produce an immutable snapshot")
                 # Evaluate/build the archived source, never the original mutable checkout.
-                result = self.commands.json(["nix", "build", "--json", *LOCK_FLAGS, "--out-link", str(protection),
-                                             "path:" + source + "#" + req["attribute"]])
+                result = self.commands.json(["nix", "build", "--json", *LOCK_FLAGS, *self.store_overrides(metadata),
+                                             "--out-link", str(protection), "path:" + source + "#" + req["attribute"]])
                 if len(result) != 1 or set(result[0]["outputs"]) != {"out"}:
                     raise Failure("prepare_failed", "bundle must produce exactly one out output")
                 output, drv = result[0]["outputs"]["out"], result[0]["drvPath"]
