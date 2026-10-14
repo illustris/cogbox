@@ -2,18 +2,20 @@
 # lifecycle: a guest-only reboot, a store-loss boot, a slow restore that boot
 # must not wait for, a damaged archive, the kill switch, and last (because it
 # discards the work disk) a pool-absent boot. Step 1b runs the skill's offline
-# lock and stale-lock update recipes and a flake prepare on the guest's own Nix.
+# lock and stale-lock update recipes and a flake prepare on the guest's own Nix,
+# a prepare that must not hash the locked nixpkgs stand-in again.
 import json
 
 STATE = "/var/lib/cogbox/work/.cogbox/runtime"
 UNIT = "cogbox-runtime-restore.service"
 STORE_DISK = "empty0.qcow2"
 WORK_DISK = "empty1.qcow2"
+BARF = "_NIX_TEST_BARF_ON_UNCACHEABLE=1 "
 
 
-def envelope(command, ok=True):
-    """Run one cogbox-env command and return its JSON envelope."""
-    code, out = machine.execute(f"cogbox-env {command} 2>/dev/null")
+def envelope(command, ok=True, env=""):
+    """Run one cogbox-env command, after env (assignments ending in a space), and return its JSON envelope."""
+    code, out = machine.execute(f"{env}cogbox-env {command} 2>/dev/null")
     result = json.loads(out)
     assert result["ok"] == ok, (command, result)
     assert (code == 0) == ok, (command, code, result)
@@ -143,7 +145,9 @@ with subtest("1b: the skill's lock and stale-lock recipes and a structured-attrs
     node = json.loads(machine.succeed("cat /var/lib/cogbox/work/tools/flake.lock"))["nodes"]["nixpkgs"]
     assert node["locked"]["type"] == "path" and node["locked"]["path"] == mapped[0]["path"], node
     assert node["original"] == {"id": "nixpkgs", "type": "indirect"}, node
-    flaked = envelope('prepare --flake "path:$(realpath ~/work/tools)" --attribute packages.x86_64-linux.default')
+    # Nix then throws where it would hash the locked nixpkgs again into the
+    # store, which prepare must never do (minutes for the image's nixpkgs).
+    flaked = envelope('prepare --flake "path:$(realpath ~/work/tools)" --attribute packages.x86_64-linux.default', env=BARF)
     listed = next(g for g in flaked["status"]["generations"] if g["id"] == flaked["generation"])
     assert listed["system"] == "x86_64-linux" and listed["provenance"]["kind"] == "flake", listed
     machine.fail(f"nix-store --query --binding system {listed['derivation']}")
@@ -174,7 +178,7 @@ with subtest("1b: the skill's lock and stale-lock recipes and a structured-attrs
     machine.succeed('nix flake update nixpkgs --flake-registry /etc/nix/registry.json --flake "path:$(realpath ~/work/tools)"')
     updated = json.loads(machine.succeed("cat /var/lib/cogbox/work/tools/flake.lock"))["nodes"]["nixpkgs"]
     assert updated == node, (updated, node)
-    again = envelope('prepare --flake "path:$(realpath ~/work/tools)" --attribute packages.x86_64-linux.default')
+    again = envelope('prepare --flake "path:$(realpath ~/work/tools)" --attribute packages.x86_64-linux.default', env=BARF)
     envelope(f"prune --generation {again['generation']}")
     machine.succeed("rm -r /root/work/tools /tmp/other-nixpkgs /tmp/elsewhere /tmp/other-registry.json")
 
