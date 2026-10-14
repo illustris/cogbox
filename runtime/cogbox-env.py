@@ -791,7 +791,7 @@ class Environment:
                     overrides[name] = ["--override-input", name, "path:" + locked["path"] + "?" + query]
             if overrides:
                 # The lock Nix evaluates the snapshot with under these overrides;
-                # computing it fetches only what Nix re-locks, as the build would.
+                # computing it fetches nothing the build would not.
                 # Nix locks each root input on its own, so dropping one override
                 # changes no other entry.
                 shown = self.commands.json(["nix", "flake", "metadata", "--json", *LOCK_FLAGS,
@@ -826,7 +826,8 @@ class Environment:
                 provenance = {"kind": "import", "source": None, "attribute": None, "inputs_digest": None}
             else:
                 # --dry-run records each locked input's store path from its narHash
-                # without fetching it; only the source itself is copied.
+                # and copies the source itself; Nix fetches only an input it
+                # re-locks in memory or must re-read for a follows (see the doc).
                 metadata = self.commands.json(["nix", "flake", "archive", "--dry-run", "--json", *LOCK_FLAGS, req["flake"]])
                 source = metadata["path"]
                 if not STORE.fullmatch(source):
