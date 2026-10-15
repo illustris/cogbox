@@ -1,0 +1,647 @@
+{
+  "schema": "cogworx-pve-bootcfg-v1-vectors",
+  "notes": [
+    "Shared byte-for-byte by the cogbox emulator (pve/metadata/cogworx_pve_metadata.py) and the cogworx Go encoder/decoder; the decode rules and reject reasons are documented in the emulator's module docstring.",
+    "bootconfig != null: an encode vector. Encoding bootconfig with owner_uuid must reproduce serial_blob and smbios1 exactly (keys sorted by byte value, form-encoded with quote_plus / url.Values.Encode, v=1 always present, absent/false/empty fields omitted, maintenance=true as M=).",
+    "bootconfig == null: a decode-only vector (the blob is not something the encoder emits).",
+    "Every vector: decoding smbios1 (or serial_blob, in either the raw or the standard-base64 SMBIOS serial form) yields expect_attrs, or rejects the whole blob with expect_reject.",
+    "An empty serial_blob is NO blob (the Provision-time owner-only smbios1), not a rejection.",
+    "All values are fictional. The worst case uses 255.255.255.255 and a nine-digit VMID only because they are the longest values the grammars admit."
+  ],
+  "smbios1_max_len": 512,
+  "attributes": {
+    "K": "cogworx-ssh-ca-pub",
+    "M": "cogworx-maintenance",
+    "c": "cogworx-vcpu",
+    "g": "cogworx-guest-resolver",
+    "h": "cogworx-hostname",
+    "i": "cogworx-instance",
+    "m": "cogworx-mem-mb",
+    "n": "cogworx-start-nonce",
+    "p": "cogworx-ssh-principal",
+    "w": "cogworx-network"
+  },
+  "bootconfig_fields": {
+    "nonce": "n",
+    "instance": "i",
+    "principal": "p",
+    "ssh_ca_pub": "K",
+    "hostname": "h",
+    "vcpu": "c",
+    "mem_mb": "m",
+    "network": "w",
+    "guest_resolver": "g",
+    "maintenance": "M"
+  },
+  "reject_reasons": [
+    "parse-error",
+    "too-many-fields",
+    "duplicate-key",
+    "missing-version",
+    "bad-version",
+    "invalid-value:K",
+    "invalid-value:M",
+    "invalid-value:c",
+    "invalid-value:g",
+    "invalid-value:h",
+    "invalid-value:i",
+    "invalid-value:m",
+    "invalid-value:n",
+    "invalid-value:p",
+    "invalid-value:w"
+  ],
+  "cases": [
+    {
+      "name": "typical",
+      "bootconfig": {
+        "nonce": "6f1d2c3b-4a59-4e68-8a77-0b1c2d3e4f50",
+        "instance": "demo",
+        "principal": "alice-demo",
+        "ssh_ca_pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBFeq5vpOHkwkwxHhZ6uV36ejNVgpmjJkMkrDkNR82Wy",
+        "hostname": "cwx-5010",
+        "vcpu": 2,
+        "mem_mb": 8192,
+        "network": "rules",
+        "guest_resolver": "192.0.2.53",
+        "maintenance": false
+      },
+      "owner_uuid": "00000000-0000-4000-8000-000000005010",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005010,base64=1,serial=Sz1BQUFBQzNOemFDMWxaREkxTlRFNUFBQUFJQkZlcTV2cE9Ia3drd3hIaFo2dVYzNmVqTlZncG1qSmtNa3JEa05SODJXeSZjPTImZz0xOTIuMC4yLjUzJmg9Y3d4LTUwMTAmaT1kZW1vJm09ODE5MiZuPTZmMWQyYzNiLTRhNTktNGU2OC04YTc3LTBiMWMyZDNlNGY1MCZwPWFsaWNlLWRlbW8mdj0xJnc9cnVsZXM=",
+      "serial_blob": "K=AAAAC3NzaC1lZDI1NTE5AAAAIBFeq5vpOHkwkwxHhZ6uV36ejNVgpmjJkMkrDkNR82Wy&c=2&g=192.0.2.53&h=cwx-5010&i=demo&m=8192&n=6f1d2c3b-4a59-4e68-8a77-0b1c2d3e4f50&p=alice-demo&v=1&w=rules",
+      "expect_attrs": {
+        "cogworx-guest-resolver": "192.0.2.53",
+        "cogworx-hostname": "cwx-5010",
+        "cogworx-instance": "demo",
+        "cogworx-mem-mb": "8192",
+        "cogworx-network": "rules",
+        "cogworx-ssh-ca-pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBFeq5vpOHkwkwxHhZ6uV36ejNVgpmjJkMkrDkNR82Wy",
+        "cogworx-ssh-principal": "alice-demo",
+        "cogworx-start-nonce": "6f1d2c3b-4a59-4e68-8a77-0b1c2d3e4f50",
+        "cogworx-vcpu": "2"
+      }
+    },
+    {
+      "name": "gateway-off-omits-K",
+      "bootconfig": {
+        "nonce": "0d9c8b7a-6f5e-4d3c-9b2a-190807060504",
+        "instance": "build-box",
+        "principal": "alice-build-box",
+        "hostname": "cwx-5011",
+        "vcpu": 4,
+        "mem_mb": 16384,
+        "network": "none",
+        "guest_resolver": "192.0.2.53",
+        "maintenance": false
+      },
+      "owner_uuid": "00000000-0000-4000-8000-000000005011",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005011,base64=1,serial=Yz00Jmc9MTkyLjAuMi41MyZoPWN3eC01MDExJmk9YnVpbGQtYm94Jm09MTYzODQmbj0wZDljOGI3YS02ZjVlLTRkM2MtOWIyYS0xOTA4MDcwNjA1MDQmcD1hbGljZS1idWlsZC1ib3gmdj0xJnc9bm9uZQ==",
+      "serial_blob": "c=4&g=192.0.2.53&h=cwx-5011&i=build-box&m=16384&n=0d9c8b7a-6f5e-4d3c-9b2a-190807060504&p=alice-build-box&v=1&w=none",
+      "expect_attrs": {
+        "cogworx-guest-resolver": "192.0.2.53",
+        "cogworx-hostname": "cwx-5011",
+        "cogworx-instance": "build-box",
+        "cogworx-mem-mb": "16384",
+        "cogworx-network": "none",
+        "cogworx-ssh-principal": "alice-build-box",
+        "cogworx-start-nonce": "0d9c8b7a-6f5e-4d3c-9b2a-190807060504",
+        "cogworx-vcpu": "4"
+      }
+    },
+    {
+      "name": "maintenance-flag",
+      "bootconfig": {
+        "nonce": "1a2b3c4d-5e6f-4a7b-8c9d-aebfc0d1e2f3",
+        "instance": "demo",
+        "principal": "alice-demo",
+        "ssh_ca_pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBFeq5vpOHkwkwxHhZ6uV36ejNVgpmjJkMkrDkNR82Wy",
+        "hostname": "cwx-5012",
+        "vcpu": 2,
+        "mem_mb": 8192,
+        "network": "rules",
+        "guest_resolver": "192.0.2.53",
+        "maintenance": true
+      },
+      "owner_uuid": "00000000-0000-4000-8000-000000005012",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005012,base64=1,serial=Sz1BQUFBQzNOemFDMWxaREkxTlRFNUFBQUFJQkZlcTV2cE9Ia3drd3hIaFo2dVYzNmVqTlZncG1qSmtNa3JEa05SODJXeSZNPSZjPTImZz0xOTIuMC4yLjUzJmg9Y3d4LTUwMTImaT1kZW1vJm09ODE5MiZuPTFhMmIzYzRkLTVlNmYtNGE3Yi04YzlkLWFlYmZjMGQxZTJmMyZwPWFsaWNlLWRlbW8mdj0xJnc9cnVsZXM=",
+      "serial_blob": "K=AAAAC3NzaC1lZDI1NTE5AAAAIBFeq5vpOHkwkwxHhZ6uV36ejNVgpmjJkMkrDkNR82Wy&M=&c=2&g=192.0.2.53&h=cwx-5012&i=demo&m=8192&n=1a2b3c4d-5e6f-4a7b-8c9d-aebfc0d1e2f3&p=alice-demo&v=1&w=rules",
+      "expect_attrs": {
+        "cogworx-guest-resolver": "192.0.2.53",
+        "cogworx-hostname": "cwx-5012",
+        "cogworx-instance": "demo",
+        "cogworx-maintenance": "",
+        "cogworx-mem-mb": "8192",
+        "cogworx-network": "rules",
+        "cogworx-ssh-ca-pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBFeq5vpOHkwkwxHhZ6uV36ejNVgpmjJkMkrDkNR82Wy",
+        "cogworx-ssh-principal": "alice-demo",
+        "cogworx-start-nonce": "1a2b3c4d-5e6f-4a7b-8c9d-aebfc0d1e2f3",
+        "cogworx-vcpu": "2"
+      }
+    },
+    {
+      "name": "K-reprefixed-as-standard-base64",
+      "bootconfig": {
+        "nonce": "2b3c4d5e-6f70-4182-93a4-b5c6d7e8f901",
+        "instance": "keys",
+        "principal": "bob-keys",
+        "ssh_ca_pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAP++++++++++++++++++++////////////////////",
+        "hostname": "cwx-5013",
+        "vcpu": 1,
+        "mem_mb": 4096,
+        "network": "rules",
+        "guest_resolver": "198.51.100.53",
+        "maintenance": false
+      },
+      "owner_uuid": "00000000-0000-4000-8000-000000005013",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005013,base64=1,serial=Sz1BQUFBQzNOemFDMWxaREkxTlRFNUFBQUFJQUFQLS0tLS0tLS0tLS0tLS0tLS0tLS1fX19fX19fX19fX19fX19fX19fXyZjPTEmZz0xOTguNTEuMTAwLjUzJmg9Y3d4LTUwMTMmaT1rZXlzJm09NDA5NiZuPTJiM2M0ZDVlLTZmNzAtNDE4Mi05M2E0LWI1YzZkN2U4ZjkwMSZwPWJvYi1rZXlzJnY9MSZ3PXJ1bGVz",
+      "serial_blob": "K=AAAAC3NzaC1lZDI1NTE5AAAAIAAP--------------------____________________&c=1&g=198.51.100.53&h=cwx-5013&i=keys&m=4096&n=2b3c4d5e-6f70-4182-93a4-b5c6d7e8f901&p=bob-keys&v=1&w=rules",
+      "expect_attrs": {
+        "cogworx-guest-resolver": "198.51.100.53",
+        "cogworx-hostname": "cwx-5013",
+        "cogworx-instance": "keys",
+        "cogworx-mem-mb": "4096",
+        "cogworx-network": "rules",
+        "cogworx-ssh-ca-pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAP++++++++++++++++++++////////////////////",
+        "cogworx-ssh-principal": "bob-keys",
+        "cogworx-start-nonce": "2b3c4d5e-6f70-4182-93a4-b5c6d7e8f901",
+        "cogworx-vcpu": "1"
+      }
+    },
+    {
+      "name": "hostname-custom-prefix",
+      "bootconfig": {
+        "nonce": "3c4d5e6f-7081-4293-a4b5-c6d7e8f90a1b",
+        "instance": "Mixed-Case-01",
+        "principal": "0123456789abcdef-Mixed-Case-01",
+        "ssh_ca_pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBFeq5vpOHkwkwxHhZ6uV36ejNVgpmjJkMkrDkNR82Wy",
+        "hostname": "sbx-5099",
+        "vcpu": 16,
+        "mem_mb": 65536,
+        "network": "none",
+        "guest_resolver": "192.0.2.53",
+        "maintenance": false
+      },
+      "owner_uuid": "00000000-0000-4000-8000-000000005099",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005099,base64=1,serial=Sz1BQUFBQzNOemFDMWxaREkxTlRFNUFBQUFJQkZlcTV2cE9Ia3drd3hIaFo2dVYzNmVqTlZncG1qSmtNa3JEa05SODJXeSZjPTE2Jmc9MTkyLjAuMi41MyZoPXNieC01MDk5Jmk9TWl4ZWQtQ2FzZS0wMSZtPTY1NTM2Jm49M2M0ZDVlNmYtNzA4MS00MjkzLWE0YjUtYzZkN2U4ZjkwYTFiJnA9MDEyMzQ1Njc4OWFiY2RlZi1NaXhlZC1DYXNlLTAxJnY9MSZ3PW5vbmU=",
+      "serial_blob": "K=AAAAC3NzaC1lZDI1NTE5AAAAIBFeq5vpOHkwkwxHhZ6uV36ejNVgpmjJkMkrDkNR82Wy&c=16&g=192.0.2.53&h=sbx-5099&i=Mixed-Case-01&m=65536&n=3c4d5e6f-7081-4293-a4b5-c6d7e8f90a1b&p=0123456789abcdef-Mixed-Case-01&v=1&w=none",
+      "expect_attrs": {
+        "cogworx-guest-resolver": "192.0.2.53",
+        "cogworx-hostname": "sbx-5099",
+        "cogworx-instance": "Mixed-Case-01",
+        "cogworx-mem-mb": "65536",
+        "cogworx-network": "none",
+        "cogworx-ssh-ca-pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBFeq5vpOHkwkwxHhZ6uV36ejNVgpmjJkMkrDkNR82Wy",
+        "cogworx-ssh-principal": "0123456789abcdef-Mixed-Case-01",
+        "cogworx-start-nonce": "3c4d5e6f-7081-4293-a4b5-c6d7e8f90a1b",
+        "cogworx-vcpu": "16"
+      }
+    },
+    {
+      "name": "worst-case-498",
+      "bootconfig": {
+        "nonce": "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        "instance": "Max-length-instance-name-for-the-smbios1-budget-0123456789-ABCDE",
+        "principal": "0123456789abcdef-Max-length-instance-name-for-the-smbios1-budget-0123456789-ABCDE",
+        "ssh_ca_pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJUPfDLF8MA9lydHNj/vjJEk/eWVfH0lA/06Kdsk/1k0",
+        "hostname": "cogworx-999999999",
+        "vcpu": 999,
+        "mem_mb": 9999999,
+        "network": "rules",
+        "guest_resolver": "255.255.255.255",
+        "maintenance": true
+      },
+      "owner_uuid": "00000000-0000-4000-8000-000000005014",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005014,base64=1,serial=Sz1BQUFBQzNOemFDMWxaREkxTlRFNUFBQUFJSlVQZkRMRjhNQTlseWRITmpfdmpKRWtfZVdWZkgwbEFfMDZLZHNrXzFrMCZNPSZjPTk5OSZnPTI1NS4yNTUuMjU1LjI1NSZoPWNvZ3dvcngtOTk5OTk5OTk5Jmk9TWF4LWxlbmd0aC1pbnN0YW5jZS1uYW1lLWZvci10aGUtc21iaW9zMS1idWRnZXQtMDEyMzQ1Njc4OS1BQkNERSZtPTk5OTk5OTkmbj1mZmZmZmZmZi1mZmZmLTRmZmYtYmZmZi1mZmZmZmZmZmZmZmYmcD0wMTIzNDU2Nzg5YWJjZGVmLU1heC1sZW5ndGgtaW5zdGFuY2UtbmFtZS1mb3ItdGhlLXNtYmlvczEtYnVkZ2V0LTAxMjM0NTY3ODktQUJDREUmdj0xJnc9cnVsZXM=",
+      "serial_blob": "K=AAAAC3NzaC1lZDI1NTE5AAAAIJUPfDLF8MA9lydHNj_vjJEk_eWVfH0lA_06Kdsk_1k0&M=&c=999&g=255.255.255.255&h=cogworx-999999999&i=Max-length-instance-name-for-the-smbios1-budget-0123456789-ABCDE&m=9999999&n=ffffffff-ffff-4fff-bfff-ffffffffffff&p=0123456789abcdef-Max-length-instance-name-for-the-smbios1-budget-0123456789-ABCDE&v=1&w=rules",
+      "expect_attrs": {
+        "cogworx-guest-resolver": "255.255.255.255",
+        "cogworx-hostname": "cogworx-999999999",
+        "cogworx-instance": "Max-length-instance-name-for-the-smbios1-budget-0123456789-ABCDE",
+        "cogworx-maintenance": "",
+        "cogworx-mem-mb": "9999999",
+        "cogworx-network": "rules",
+        "cogworx-ssh-ca-pub": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJUPfDLF8MA9lydHNj/vjJEk/eWVfH0lA/06Kdsk/1k0",
+        "cogworx-ssh-principal": "0123456789abcdef-Max-length-instance-name-for-the-smbios1-budget-0123456789-ABCDE",
+        "cogworx-start-nonce": "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        "cogworx-vcpu": "999"
+      }
+    },
+    {
+      "name": "owner-only-no-blob",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005015",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005015",
+      "serial_blob": "",
+      "expect_attrs": {}
+    },
+    {
+      "name": "version-only",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0x",
+      "serial_blob": "v=1",
+      "expect_attrs": {}
+    },
+    {
+      "name": "unknown-keys-ignored",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Yz0yJnY9MSZ4PTEmeno9",
+      "serial_blob": "c=2&v=1&x=1&zz=",
+      "expect_attrs": {
+        "cogworx-vcpu": "2"
+      }
+    },
+    {
+      "name": "reserved-resolver-keys-ignored",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=RD02MDAmUj0mcz0xOTIuMC4yLjEmdj0xJnc9bm9uZQ==",
+      "serial_blob": "D=600&R=&s=192.0.2.1&v=1&w=none",
+      "expect_attrs": {
+        "cogworx-network": "none"
+      }
+    },
+    {
+      "name": "unsorted-fields-accepted",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dz1ub25lJnY9MSZjPTI=",
+      "serial_blob": "w=none&v=1&c=2",
+      "expect_attrs": {
+        "cogworx-network": "none",
+        "cogworx-vcpu": "2"
+      }
+    },
+    {
+      "name": "percent-escapes-decoded",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=aT0lNDRlbW8mcD1hbGljZS1kJTY1bW8mdj0x",
+      "serial_blob": "i=%44emo&p=alice-d%65mo&v=1",
+      "expect_attrs": {
+        "cogworx-instance": "Demo",
+        "cogworx-ssh-principal": "alice-demo"
+      }
+    },
+    {
+      "name": "thirty-two-fields-accepted",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJngwMD0meDAxPSZ4MDI9JngwMz0meDA0PSZ4MDU9JngwNj0meDA3PSZ4MDg9JngwOT0meDEwPSZ4MTE9JngxMj0meDEzPSZ4MTQ9JngxNT0meDE2PSZ4MTc9JngxOD0meDE5PSZ4MjA9JngyMT0meDIyPSZ4MjM9JngyND0meDI1PSZ4MjY9JngyNz0meDI4PSZ4Mjk9JngzMD0=",
+      "serial_blob": "v=1&x00=&x01=&x02=&x03=&x04=&x05=&x06=&x07=&x08=&x09=&x10=&x11=&x12=&x13=&x14=&x15=&x16=&x17=&x18=&x19=&x20=&x21=&x22=&x23=&x24=&x25=&x26=&x27=&x28=&x29=&x30=",
+      "expect_attrs": {}
+    },
+    {
+      "name": "illegal-character-semicolon",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xO3c9bm9uZQ==",
+      "serial_blob": "v=1;w=none",
+      "expect_reject": "parse-error"
+    },
+    {
+      "name": "illegal-character-slash",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=cz0xOTIuMC4yLjAvMjQmdj0x",
+      "serial_blob": "s=192.0.2.0/24&v=1",
+      "expect_reject": "parse-error"
+    },
+    {
+      "name": "malformed-percent-escape",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJng9JXp6",
+      "serial_blob": "v=1&x=%zz",
+      "expect_reject": "parse-error"
+    },
+    {
+      "name": "truncated-percent-escape",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJng9JTQ=",
+      "serial_blob": "v=1&x=%4",
+      "expect_reject": "parse-error"
+    },
+    {
+      "name": "percent-escape-not-utf8",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJng9JWZm",
+      "serial_blob": "v=1&x=%ff",
+      "expect_reject": "parse-error"
+    },
+    {
+      "name": "field-without-equals",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJnc=",
+      "serial_blob": "v=1&w",
+      "expect_reject": "parse-error"
+    },
+    {
+      "name": "empty-field",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJiZ3PW5vbmU=",
+      "serial_blob": "v=1&&w=none",
+      "expect_reject": "parse-error"
+    },
+    {
+      "name": "leading-ampersand",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=JnY9MQ==",
+      "serial_blob": "&v=1",
+      "expect_reject": "parse-error"
+    },
+    {
+      "name": "trailing-ampersand",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJg==",
+      "serial_blob": "v=1&",
+      "expect_reject": "parse-error"
+    },
+    {
+      "name": "empty-key",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=PXgmdj0x",
+      "serial_blob": "=x&v=1",
+      "expect_reject": "parse-error"
+    },
+    {
+      "name": "thirty-three-fields",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJngwMD0meDAxPSZ4MDI9JngwMz0meDA0PSZ4MDU9JngwNj0meDA3PSZ4MDg9JngwOT0meDEwPSZ4MTE9JngxMj0meDEzPSZ4MTQ9JngxNT0meDE2PSZ4MTc9JngxOD0meDE5PSZ4MjA9JngyMT0meDIyPSZ4MjM9JngyND0meDI1PSZ4MjY9JngyNz0meDI4PSZ4Mjk9JngzMD0meDMxPQ==",
+      "serial_blob": "v=1&x00=&x01=&x02=&x03=&x04=&x05=&x06=&x07=&x08=&x09=&x10=&x11=&x12=&x13=&x14=&x15=&x16=&x17=&x18=&x19=&x20=&x21=&x22=&x23=&x24=&x25=&x26=&x27=&x28=&x29=&x30=&x31=",
+      "expect_reject": "too-many-fields"
+    },
+    {
+      "name": "duplicate-key",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJnc9bm9uZSZ3PXJ1bGVz",
+      "serial_blob": "v=1&w=none&w=rules",
+      "expect_reject": "duplicate-key"
+    },
+    {
+      "name": "duplicate-key-same-value",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJnY9MQ==",
+      "serial_blob": "v=1&v=1",
+      "expect_reject": "duplicate-key"
+    },
+    {
+      "name": "duplicate-key-after-percent-decoding",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=JTc2PTEmdj0x",
+      "serial_blob": "%76=1&v=1",
+      "expect_reject": "duplicate-key"
+    },
+    {
+      "name": "missing-version",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Yz0yJnc9bm9uZQ==",
+      "serial_blob": "c=2&w=none",
+      "expect_reject": "missing-version"
+    },
+    {
+      "name": "version-key-is-case-sensitive",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Vj0xJnc9bm9uZQ==",
+      "serial_blob": "V=1&w=none",
+      "expect_reject": "missing-version"
+    },
+    {
+      "name": "version-2",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0yJnc9bm9uZQ==",
+      "serial_blob": "v=2&w=none",
+      "expect_reject": "bad-version"
+    },
+    {
+      "name": "version-empty",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0=",
+      "serial_blob": "v=",
+      "expect_reject": "bad-version"
+    },
+    {
+      "name": "version-leading-zero",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0wMQ==",
+      "serial_blob": "v=01",
+      "expect_reject": "bad-version"
+    },
+    {
+      "name": "K-wrong-length",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Sz1BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBJnY9MQ==",
+      "serial_blob": "K=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&v=1",
+      "expect_reject": "invalid-value:K"
+    },
+    {
+      "name": "K-not-ed25519-wire",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Sz1BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSZ2PTE=",
+      "serial_blob": "K=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&v=1",
+      "expect_reject": "invalid-value:K"
+    },
+    {
+      "name": "K-standard-alphabet",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Sz1BQUFBQzNOemFDMWxaREkxTlRFNUFBQUFJQUFQKysrKysrKysrKysrKysrKysrKytfX19fX19fX19fX19fX19fX19fXyZ2PTE=",
+      "serial_blob": "K=AAAAC3NzaC1lZDI1NTE5AAAAIAAP++++++++++++++++++++____________________&v=1",
+      "expect_reject": "invalid-value:K"
+    },
+    {
+      "name": "M-with-value",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=TT0xJnY9MQ==",
+      "serial_blob": "M=1&v=1",
+      "expect_reject": "invalid-value:M"
+    },
+    {
+      "name": "c-zero",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Yz0wJnY9MQ==",
+      "serial_blob": "c=0&v=1",
+      "expect_reject": "invalid-value:c"
+    },
+    {
+      "name": "c-leading-zero",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Yz0wMiZ2PTE=",
+      "serial_blob": "c=02&v=1",
+      "expect_reject": "invalid-value:c"
+    },
+    {
+      "name": "c-four-digits",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Yz0xMDI0JnY9MQ==",
+      "serial_blob": "c=1024&v=1",
+      "expect_reject": "invalid-value:c"
+    },
+    {
+      "name": "g-leading-zero-octet",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Zz0xOTIuMC4yLjA1MyZ2PTE=",
+      "serial_blob": "g=192.0.2.053&v=1",
+      "expect_reject": "invalid-value:g"
+    },
+    {
+      "name": "g-octet-over-255",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Zz0xOTIuMC4yLjI1NiZ2PTE=",
+      "serial_blob": "g=192.0.2.256&v=1",
+      "expect_reject": "invalid-value:g"
+    },
+    {
+      "name": "g-three-octets",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=Zz0xOTIuMC4yJnY9MQ==",
+      "serial_blob": "g=192.0.2&v=1",
+      "expect_reject": "invalid-value:g"
+    },
+    {
+      "name": "h-uppercase",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=aD1DV1gtNTAxMCZ2PTE=",
+      "serial_blob": "h=CWX-5010&v=1",
+      "expect_reject": "invalid-value:h"
+    },
+    {
+      "name": "h-no-digits",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=aD1jd3gtJnY9MQ==",
+      "serial_blob": "h=cwx-&v=1",
+      "expect_reject": "invalid-value:h"
+    },
+    {
+      "name": "h-prefix-too-long",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=aD1jb2d3b3J4LXg1MDEwJnY9MQ==",
+      "serial_blob": "h=cogworx-x5010&v=1",
+      "expect_reject": "invalid-value:h"
+    },
+    {
+      "name": "h-18-chars",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=aD1jb2d3b3J4LTEyMzQ1Njc4OTAmdj0x",
+      "serial_blob": "h=cogworx-1234567890&v=1",
+      "expect_reject": "invalid-value:h"
+    },
+    {
+      "name": "i-leading-digit",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=aT0xZGVtbyZ2PTE=",
+      "serial_blob": "i=1demo&v=1",
+      "expect_reject": "invalid-value:i"
+    },
+    {
+      "name": "i-65-chars",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=aT1NYXgtbGVuZ3RoLWluc3RhbmNlLW5hbWUtZm9yLXRoZS1zbWJpb3MxLWJ1ZGdldC0wMTIzNDU2Nzg5LUFCQ0RFWCZ2PTE=",
+      "serial_blob": "i=Max-length-instance-name-for-the-smbios1-budget-0123456789-ABCDEX&v=1",
+      "expect_reject": "invalid-value:i"
+    },
+    {
+      "name": "m-zero",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=bT0wJnY9MQ==",
+      "serial_blob": "m=0&v=1",
+      "expect_reject": "invalid-value:m"
+    },
+    {
+      "name": "m-eight-digits",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=bT0xMjM0NTY3OCZ2PTE=",
+      "serial_blob": "m=12345678&v=1",
+      "expect_reject": "invalid-value:m"
+    },
+    {
+      "name": "n-not-a-uuid",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=bj1ub3QtYS1ub25jZSZ2PTE=",
+      "serial_blob": "n=not-a-nonce&v=1",
+      "expect_reject": "invalid-value:n"
+    },
+    {
+      "name": "n-uppercase",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=bj02RjFEMkMzQi00QTU5LTRFNjgtOEE3Ny0wQjFDMkQzRTRGNTAmdj0x",
+      "serial_blob": "n=6F1D2C3B-4A59-4E68-8A77-0B1C2D3E4F50&v=1",
+      "expect_reject": "invalid-value:n"
+    },
+    {
+      "name": "p-82-chars",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=cD0wMTIzNDU2Nzg5YWJjZGVmLU1heC1sZW5ndGgtaW5zdGFuY2UtbmFtZS1mb3ItdGhlLXNtYmlvczEtYnVkZ2V0LTAxMjM0NTY3ODktQUJDREVYJnY9MQ==",
+      "serial_blob": "p=0123456789abcdef-Max-length-instance-name-for-the-smbios1-budget-0123456789-ABCDEX&v=1",
+      "expect_reject": "invalid-value:p"
+    },
+    {
+      "name": "p-tilde",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=cD1hbGljZX5kZW1vJnY9MQ==",
+      "serial_blob": "p=alice~demo&v=1",
+      "expect_reject": "invalid-value:p"
+    },
+    {
+      "name": "w-full-refused",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJnc9ZnVsbA==",
+      "serial_blob": "v=1&w=full",
+      "expect_reject": "invalid-value:w"
+    },
+    {
+      "name": "w-unknown-mode",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=dj0xJnc9b3Blbg==",
+      "serial_blob": "v=1&w=open",
+      "expect_reject": "invalid-value:w"
+    },
+    {
+      "name": "value-with-plus-is-a-space",
+      "bootconfig": null,
+      "owner_uuid": "00000000-0000-4000-8000-000000005000",
+      "smbios1": "uuid=00000000-0000-4000-8000-000000005000,base64=1,serial=aT1teStib3gmdj0x",
+      "serial_blob": "i=my+box&v=1",
+      "expect_reject": "invalid-value:i"
+    }
+  ]
+}
