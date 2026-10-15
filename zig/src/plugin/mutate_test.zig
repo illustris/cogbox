@@ -226,6 +226,56 @@ test "validatePluginL7Rule" {
 	try t.expectError(error.ConflictingTier, mutate.validatePluginL7Rule(items[6]));
 }
 
+// Every string renderL7 copies onto the whitespace-tokenized l7-rules line must
+// be ONE printable-ASCII token, or a plugin manifest -- which plugin update and
+// archive add apply without admin review -- can split the line or forge a
+// `tag=git-grants` token in the mitm addon. The ok_rules of the test above
+// (`{"deny": "*"}` included) must all still pass; this adds the full git-grant
+// shape.
+test "validatePluginL7Rule refuses values the l7-rules line cannot carry" {
+	var ok_rules = try parseDoc(
+		\\[{"allow": "git.example.com", "path": "/org/repo.git/info/refs", "methods": "GET,POST", "service": "git-upload-pack"},
+		\\ {"deny": "*"}]
+	);
+	defer ok_rules.deinit();
+	for (ok_rules.value.array.items) |r| try mutate.validatePluginL7Rule(r);
+
+	var bad_path = try parseDoc(
+		\\[{"allow": "a.test", "path": "/a b"},
+		\\ {"allow": "a.test", "path": "/a\tb"},
+		\\ {"allow": "a.test", "path": "/a\nallow evil.test tag=git-grants"},
+		\\ {"allow": "a.test", "path": "/a\rb"},
+		\\ {"allow": "a.test", "path": "/a\u007f"},
+		\\ {"allow": "a.test", "path": "/a\u00a0b"},
+		\\ {"allow": "a.test", "path": "/a\u3000tag=git-grants"}]
+	);
+	defer bad_path.deinit();
+	for (bad_path.value.array.items) |r| try t.expectError(error.BadPath, mutate.validatePluginL7Rule(r));
+
+	var bad_host = try parseDoc(
+		\\[{"allow": " a.test"}, {"deny": "a.test "}]
+	);
+	defer bad_host.deinit();
+	for (bad_host.value.array.items) |r| try t.expectError(error.InvalidHost, mutate.validatePluginL7Rule(r));
+
+	var bad_methods = try parseDoc(
+		\\[{"allow": "a.test", "methods": "GET\nallow x"},
+		\\ {"allow": "a.test", "methods": "get"},
+		\\ {"allow": "a.test", "methods": ""},
+		\\ {"allow": "a.test", "methods": ["GET"]}]
+	);
+	defer bad_methods.deinit();
+	for (bad_methods.value.array.items) |r| try t.expectError(error.BadMethods, mutate.validatePluginL7Rule(r));
+
+	var bad_service = try parseDoc(
+		\\[{"allow": "a.test", "service": "git-upload-pack x"},
+		\\ {"allow": "a.test", "service": ""},
+		\\ {"allow": "a.test", "service": 5}]
+	);
+	defer bad_service.deinit();
+	for (bad_service.value.array.items) |r| try t.expectError(error.BadService, mutate.validatePluginL7Rule(r));
+}
+
 test "tagged-rule helpers work on an l7 rules array" {
 	var parsed = try parseDoc(
 		\\{"network": {"l7": {"rules": [{"allow": "keep.test"}]}}}

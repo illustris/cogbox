@@ -61,6 +61,18 @@
 #     the sandbox comes up healthy and resolves nothing -- which is why they
 #     refuse the boot rather than warn.
 #   - a canary in the cogbox runtime log never reaches the serial sink.
+#   - leg (j) records an UNREQUESTED inner exit: a 0700 ring of 0600 records on
+#     the STATE DISK (leg, stop-result, meminfo, the kernel's kill lines, the
+#     guest console tail), bounded to 20, plus a nonce-stamped per-epoch count
+#     in cogworx/inner-exit. Serial gets a one-line pointer and never the
+#     console text; a stop requested through ExecStop is not recorded; and a
+#     record that cannot be written never blocks the restart.
+#   - an OOM kill of any process in the unit -- a helper while QEMU keeps
+#     running, or QEMU itself -- ends the sandbox through leg (j) as `oom-kill`.
+#     Under OOMPolicy=continue nothing else restarts a dead passt or L7 proxy.
+#     A helper's kill first drains the still-live guest with `cogbox stop`
+#     (readiness deleted before it, the record and the exit after it), since
+#     leg (j)'s exit skips ExecStop; a drain that fails is only noted.
 #
 # Usage: test_supervise.sh <path-to-supervise.sh>
 # Needs: bash, coreutils, gawk, gnugrep. NOT curl/cogbox/GCE -- both are stubs.
@@ -180,12 +192,40 @@ case "${1:-}" in
 			mkdir -p "$(dirname "$STUB_GUEST_KEY")"
 			printf 'ssh-ed25519 AAAAguestkey guest\n' > "$STUB_GUEST_KEY"
 		fi
+		# What the real launcher leaves in its runtime dir for leg (j) to read:
+		# the guest's serial console and the launcher's own stop-result. Written
+		# here, i.e. after the supervisor's leg (e) cleared the runtime.
+		if [ -n "${STUB_CONSOLE:-}" ]; then
+			mkdir -p "$XDG_RUNTIME_DIR/cogbox-demo"
+			printf '%s\n' "$STUB_CONSOLE" > "$XDG_RUNTIME_DIR/cogbox-demo/console.log"
+			printf 'run-1 exited\n' > "$XDG_RUNTIME_DIR/cogbox-demo/stop-result"
+		fi
 		exit "${STUB_START_RC:-0}" ;;
+	stop)
+		# The supervisor's own guest drain (leg (i), after a helper's OOM kill).
+		# The event line above orders it against the metadata calls; the stdout
+		# line orders it against the supervisor's journal. Like the real
+		# launcher, a finished requested stop leaves its outcome in stop-result.
+		echo "cogbox-stub: $*"
+		mkdir -p "$XDG_RUNTIME_DIR/cogbox-demo"
+		printf 'run-1 graceful\n' > "$XDG_RUNTIME_DIR/cogbox-demo/stop-result"
+		exit "${STUB_STOP_RC:-0}" ;;
 	status)
 		n=0
 		[ -f "$FAKEMD/statusn" ] && n=$(cat "$FAKEMD/statusn")
 		n=$((n + 1)); echo "$n" > "$FAKEMD/statusn"
+		# The kernel OOM-killing a process of the unit, as the supervisor sees
+		# it: its cgroup's memory.events `oom_kill` count goes up. Whether
+		# QEMU was the victim is what the status answer below says.
+		if [ -n "${STUB_OOM_AT:-}" ] && [ "$n" = "$STUB_OOM_AT" ]; then
+			printf 'oom 1\noom_kill 1\noom_group_kill 0\n' > "$COGWORX_UNIT_MEMORY_EVENTS"
+		fi
 		[ "$n" -le "${STUB_STATUS_OK:-2}" ] && exit 0
+		# A REQUESTED stop: ExecStop (gce/stop-supervisor.sh) drops this marker
+		# before it stops the guest the supervisor is polling.
+		if [ -n "${STUB_STOPPING:-}" ]; then
+			: > "$XDG_RUNTIME_DIR/cogworx-supervisor-stopping"
+		fi
 		exit 1 ;;
 esac
 exit 0
@@ -196,6 +236,14 @@ STUB
 # is an iteration count for exactly this reason.
 { shebang; printf 'exit 0\n'; } > "$BIN/sleep"
 { shebang; printf 'exit 0\n'; } > "$BIN/mountpoint"
+# The kernel ring, as leg (j) reads it: one OOM kill it must keep and one
+# unrelated line its filter must drop. Stubbed so the case is deterministic and
+# does not depend on the build sandbox being allowed to read the real one.
+{ shebang; cat <<'STUB'
+echo '[  797.1] Out of memory: Killed process 988 (qemu-system-x86) shmem-rss:1kB'
+echo '[  797.2] unrelated-dmesg-line'
+STUB
+} > "$BIN/dmesg"
 chmod 0755 "$BIN"/*
 
 # --- harness ----------------------------------------------------------------
@@ -230,6 +278,12 @@ run_boot() {
 	# A case can override the nameserver it names (SEED_RESOLV_NS) to exercise
 	# the refusal; the default is the healthy shape.
 	printf 'nameserver %s\n' "${SEED_RESOLV_NS:-127.0.0.53}" > "$home/resolv.conf"
+	# The unit cgroup's memory.events, with no OOM kill yet. Seeded on every
+	# case so none depends on the build sandbox's own cgroup; a case opts out
+	# (SEED_NO_MEM_EVENTS) to exercise the unreadable-counter warning.
+	rm -f "$home/memory.events"
+	[ -n "${SEED_NO_MEM_EVENTS:-}" ] \
+		|| printf 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n' > "$home/memory.events"
 	local kv
 	for kv in "$@"; do
 		printf '%s' "${kv#*=}" > "$FAKEMD/attrs/${kv%%=*}"
@@ -238,7 +292,7 @@ run_boot() {
 	FAKEMD="$FAKEMD" \
 	COGBOX_HOST_RESOLVER="${SEED_HOST_RESOLVER-127.0.0.53}" \
 	COGWORX_RESOLV_CONF="$home/resolv.conf" \
-	STUB_GUEST_KEY="$home/state/data/cogbox/instances/demo/ssh/ssh_host_ed25519_key.pub" \
+	STUB_GUEST_KEY="${SEED_GUEST_KEY-$home/state/data/cogbox/instances/demo/ssh/ssh_host_ed25519_key.pub}" \
 	COGWORX_MD_BASE="http://metadata.invalid/computeMetadata/v1" \
 	COGWORX_SERIAL="$home/serial.log" \
 	COGWORX_STATE_DIR="$home/state" \
@@ -248,6 +302,12 @@ run_boot() {
 	COGWORX_GUEST_VOLUMES="${SEED_GUEST_VOLUMES-}" \
 	STUB_INIT_RC="${STUB_INIT_RC:-0}" \
 	STUB_INIT_OUT="${STUB_INIT_OUT:-}" \
+	STUB_CONSOLE="${STUB_CONSOLE:-}" \
+	STUB_STOPPING="${STUB_STOPPING:-}" \
+	STUB_STATUS_OK="${STUB_STATUS_OK:-2}" \
+	STUB_OOM_AT="${STUB_OOM_AT:-}" \
+	STUB_STOP_RC="${STUB_STOP_RC:-0}" \
+	COGWORX_UNIT_MEMORY_EVENTS="$home/memory.events" \
 	XDG_CONFIG_HOME="${SEED_XDG_CONFIG_HOME-$home/state/config}" \
 	COGBOX_DATA="$home/state/data/cogbox" \
 	XDG_RUNTIME_DIR="$home/run" \
@@ -353,11 +413,20 @@ else
 fi
 
 # Level-held, not latched: leg (j) unpublishes BEFORE the exit so Status drops
-# out of Running the way the kubelet makes a pod not-ready.
-last=$(tail -1 "$md/events")
-case "$last" in
-	"DELETE instance/guest-attributes/cogworx/ready"*) ok "the readiness delete is the last act before the non-zero exit" ;;
-	*) bad "expected the readiness DELETE last, got: $last" ;;
+# out of Running the way the kubelet makes a pod not-ready. And FIRST: the
+# inner-exit record that follows is best-effort and must never stand between a
+# dead sandbox and its readiness delete.
+last_ready=$(grep -n -- 'guest-attributes/cogworx/ready' "$md/events" | tail -1)
+last_ready_n=${last_ready%%:*}
+inner_put=$(evline "$md" 'PUT instance/guest-attributes/cogworx/inner-exit')
+case "${last_ready#*:}" in
+	"DELETE instance/guest-attributes/cogworx/ready"*)
+		if [ -n "$ready" ] && [ -n "$inner_put" ] && [ "$last_ready_n" -gt "$ready" ] && [ "$last_ready_n" -lt "$inner_put" ]; then
+			ok "the readiness delete follows the publish and precedes the inner-exit record"
+		else
+			bad "readiness delete ($last_ready_n) is not between the readiness PUT ($ready) and the inner-exit PUT ($inner_put); events: $(cat "$md/events")"
+		fi ;;
+	*) bad "expected the last readiness event to be the DELETE, got: $last_ready" ;;
 esac
 
 # --- 2. the cogbox runtime log never reaches serial -------------------------
@@ -961,6 +1030,238 @@ else
 	bad "the backoff was not reset by a successful start: $(delay_of "$ROOT/backoff/out.log")s"
 fi
 unset STUB_INIT_RC STUB_INIT_OUT
+
+# --- 10. inner-exit forensics -----------------------------------------------
+#
+# THE FAILURE MODE THIS REPLACES. Inner VMs died on real boxes and left nothing:
+# leg (j) said "sandbox exited" and restarted, the next start's leg (e) deleted
+# the runtime dir holding the guest console and the launcher's stop-result,
+# and an image Upgrade recreates the boot disk and its journal. So the cause of
+# three deaths stayed unproven. Leg (j) now keeps a bounded record on the STATE
+# DISK and publishes a per-epoch count, and serial -- provider-retained, see
+# case 2 -- carries only a pointer.
+
+# 10a. capture + pointer.
+CONSOLE_CANARY="console-canary-do-not-serialize"
+STUB_CONSOLE="$CONSOLE_CANARY"
+rc=$(run_boot innerexit "${BASE_ATTRS[@]}")
+unset STUB_CONSOLE
+ie="$ROOT/innerexit/state/inner-exit"
+recs=( "$ie"/*.log )
+[ "$rc" != 0 ] || bad "an inner exit exited 0; Restart=always would never re-run the sequence"
+if [ -e "${recs[0]}" ] && [ "${#recs[@]}" = 1 ]; then
+	ok "an inner exit leaves exactly one record on the state disk"
+else
+	bad "expected exactly one inner-exit record: $(ls -la "$ie" 2>&1)"
+fi
+rec="${recs[0]}"
+for want in 'leg: exited' 'stop-result: run-1 exited' 'MemTotal' "$CONSOLE_CANARY" 'Killed process 988 (qemu-system-x86)'; do
+	if grep -qF -- "$want" "$rec" 2>/dev/null; then
+		ok "the inner-exit record carries '$want'"
+	else
+		bad "the inner-exit record lacks '$want': $(cat "$rec" 2>/dev/null)"
+	fi
+done
+if grep -q 'unrelated-dmesg-line' "$rec" 2>/dev/null; then
+	bad "the inner-exit record kept an unrelated kernel line; the dmesg filter is not filtering"
+else
+	ok "the record keeps only the kernel's oom/kill/segfault/qemu lines"
+fi
+if grep -Eq '^n0nce-aaaa 1 [0-9]+ exited$' "$ROOT/innerexit/md/ga/cogworx_inner-exit" 2>/dev/null; then
+	ok "cogworx/inner-exit is '<nonce> 1 <epoch> exited'"
+else
+	bad "cogworx/inner-exit is not '<nonce> 1 <epoch> exited': $(cat "$ROOT/innerexit/md/ga/cogworx_inner-exit" 2>/dev/null)"
+fi
+if grep -q '^cogworx: inner exit 1 under this start (exited); evidence on the state disk at inner-exit/' "$ROOT/innerexit/serial.log" 2>/dev/null; then
+	ok "serial gets a one-line pointer to the record"
+else
+	bad "no inner-exit pointer on serial: $(cat "$ROOT/innerexit/serial.log" 2>/dev/null)"
+fi
+# The console tail is guest/tenant output: it may sit on the state disk, never
+# on the provider-retained serial port.
+if grep -q "$CONSOLE_CANARY" "$ROOT/innerexit/serial.log" 2>/dev/null; then
+	bad "the guest console tail reached the serial sink"
+else
+	ok "the guest console tail never reaches the serial sink"
+fi
+if [ "$(stat -c %a "$ie" 2>/dev/null)" = 700 ] && [ "$(stat -c %a "$rec" 2>/dev/null)" = 600 ]; then
+	ok "the inner-exit ring is 0700 and its record 0600"
+else
+	bad "inner-exit modes: dir $(stat -c %a "$ie" 2>/dev/null), record $(stat -c %a "$rec" 2>/dev/null); expected 700/600"
+fi
+
+# 10b. the count is per start nonce, and survives a rerun. Same tag, so the
+# same state disk -- the restart the unit performs, or a whole VM reboot.
+rm -f "$ROOT/innerexit/md/statusn"
+rc=$(run_boot innerexit "${BASE_ATTRS[@]}")
+if grep -Eq '^n0nce-aaaa 2 [0-9]+ exited$' "$ROOT/innerexit/md/ga/cogworx_inner-exit" 2>/dev/null; then
+	ok "a second inner exit under the same start nonce counts 2"
+else
+	bad "the inner-exit count did not survive a rerun: $(cat "$ROOT/innerexit/md/ga/cogworx_inner-exit" 2>/dev/null)"
+fi
+rm -f "$ROOT/innerexit/md/statusn"
+rc=$(run_boot innerexit "${BASE_ATTRS[@]}" "cogworx-start-nonce=n0nce-bbbb")
+if grep -Eq '^n0nce-bbbb 1 [0-9]+ exited$' "$ROOT/innerexit/md/ga/cogworx_inner-exit" 2>/dev/null; then
+	ok "a new start nonce resets the inner-exit count to 1"
+else
+	bad "a new start nonce did not reset the count: $(cat "$ROOT/innerexit/md/ga/cogworx_inner-exit" 2>/dev/null)"
+fi
+
+# 10c. the ring is bounded. A crash-looping guest must not fill the state disk.
+mkdir -p "$ROOT/innering/state/inner-exit"
+for i in $(seq -w 1 25); do
+	printf 'old\n' > "$ROOT/innering/state/inner-exit/20000101T0000${i}Z-1.log"
+done
+rc=$(run_boot innering "${BASE_ATTRS[@]}")
+ie="$ROOT/innering/state/inner-exit"
+recs=( "$ie"/*.log )
+# The new record is the one whose timestamp is not the seeded year-2000 one.
+newrec=$(ls "$ie" 2>/dev/null | grep '\.log$' | grep -vc '^20000101' || true)
+if [ "${#recs[@]}" = 20 ] && [ ! -e "$ie/20000101T000001Z-1.log" ] && [ ! -e "$ie/20000101T000006Z-1.log" ] \
+	&& [ -e "$ie/20000101T000007Z-1.log" ] && [ -e "$ie/20000101T000025Z-1.log" ] && [ "$newrec" = 1 ]; then
+	ok "the inner-exit ring keeps the newest 20 records and drops the oldest"
+else
+	bad "inner-exit ring not bounded to the newest 20: $(ls "$ie" 2>&1 | tr '\n' ' ')"
+fi
+if [ -s "$ie/count" ]; then
+	ok "pruning the ring never deletes the count"
+else
+	bad "the inner-exit count file is gone after pruning"
+fi
+
+# 10d. the readiness-timeout leg is recorded as such. The guest never writes its
+# host key, but cogbox status keeps answering, so the loop times out.
+SEED_GUEST_KEY="" STUB_STATUS_OK=100
+rc=$(run_boot innertimeout "${BASE_ATTRS[@]}")
+unset SEED_GUEST_KEY STUB_STATUS_OK
+recs=( "$ROOT/innertimeout/state/inner-exit"/*.log )
+if grep -q '^leg: ready-timeout$' "${recs[0]}" 2>/dev/null \
+	&& grep -Eq ' ready-timeout$' "$ROOT/innertimeout/md/ga/cogworx_inner-exit" 2>/dev/null \
+	&& grep -q 'did not become ready' "$ROOT/innertimeout/serial.log" 2>/dev/null; then
+	ok "a readiness timeout is recorded with leg ready-timeout"
+else
+	bad "readiness timeout not recorded as such: record=$(cat "${recs[0]}" 2>/dev/null | head -3) ga=$(cat "$ROOT/innertimeout/md/ga/cogworx_inner-exit" 2>/dev/null)"
+fi
+
+# 10e. a REQUESTED stop is not an inner exit. The control plane's Stop and
+# Restart go through ExecStop, which drops the stopping marker first; counting
+# those would make the count meaningless.
+STUB_STOPPING=1
+rc=$(run_boot innerstop "${BASE_ATTRS[@]}")
+unset STUB_STOPPING
+md="$ROOT/innerstop/md"
+recs=( "$ROOT/innerstop/state/inner-exit"/*.log )
+if [ "$rc" != 0 ] && [ ! -e "${recs[0]}" ] && [ "$(evcount "$md" 'PUT instance/guest-attributes/cogworx/inner-exit')" = 0 ] \
+	&& [ -n "$(evline "$md" 'DELETE instance/guest-attributes/cogworx/ready')" ]; then
+	ok "a requested stop deletes readiness and records no inner exit"
+else
+	bad "requested stop: rc=$rc, records: $(ls "$ROOT/innerstop/state/inner-exit" 2>&1), events: $(cat "$md/events")"
+fi
+
+# 10f. best-effort. A state disk that cannot take the record must not change
+# what leg (j) does: readiness is still deleted and the unit still restarts.
+mkdir -p "$ROOT/innerbroken/state"
+: > "$ROOT/innerbroken/state/inner-exit"
+rc=$(run_boot innerbroken "${BASE_ATTRS[@]}")
+md="$ROOT/innerbroken/md"
+if [ "$rc" != 0 ] && [ -n "$(evline "$md" 'DELETE instance/guest-attributes/cogworx/ready')" ] \
+	&& grep -q 'sandbox is no longer running' "$ROOT/innerbroken/out.log" 2>/dev/null \
+	&& [ "$(evcount "$md" 'PUT instance/guest-attributes/cogworx/inner-exit')" = 0 ]; then
+	ok "an unwritable inner-exit ring never blocks leg (j)"
+else
+	bad "unwritable inner-exit ring: rc=$rc, out: $(cat "$ROOT/innerbroken/out.log" 2>/dev/null); events: $(cat "$md/events")"
+fi
+
+# 10g. an OOM kill of a HELPER while QEMU keeps running. The unit is
+# OOMPolicy=continue, so systemd no longer stops it for this, and `cogbox
+# status` only checks QEMU: before the unit OOM-kill watch the sandbox stayed
+# Running with its network or L7 tier dead until the status poll happened to
+# fail. Status here keeps answering for 100 polls; the counter rises at poll 3.
+STUB_STATUS_OK=100 STUB_OOM_AT=3
+rc=$(run_boot inneroom "${BASE_ATTRS[@]}")
+unset STUB_STATUS_OK STUB_OOM_AT
+md="$ROOT/inneroom/md"
+recs=( "$ROOT/inneroom/state/inner-exit"/*.log )
+put=$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')
+del=$(evline "$md" 'DELETE instance/guest-attributes/cogworx/ready')
+if [ "$rc" != 0 ] && [ "$(cat "$md/statusn" 2>/dev/null)" = 3 ] \
+	&& [ -n "$put" ] && [ -n "$del" ] && [ "$put" -lt "$del" ] \
+	&& grep -q '^leg: oom-kill$' "${recs[0]}" 2>/dev/null \
+	&& grep -Eq '^n0nce-aaaa 1 [0-9]+ oom-kill$' "$md/ga/cogworx_inner-exit" 2>/dev/null \
+	&& grep -q '^cogworx: a process of the sandbox unit was OOM-killed; restarting the sandbox$' "$ROOT/inneroom/serial.log" 2>/dev/null; then
+	ok "an OOM kill of a helper ends a running sandbox at the next poll, recorded as oom-kill"
+else
+	bad "helper OOM kill: rc=$rc polls=$(cat "$md/statusn" 2>/dev/null) record=$(head -1 "${recs[0]}" 2>/dev/null) ga=$(cat "$md/ga/cogworx_inner-exit" 2>/dev/null) serial: $(cat "$ROOT/inneroom/serial.log" 2>/dev/null)"
+fi
+# ...and QEMU is still alive at that poll, while leg (j)'s non-zero exit makes
+# systemd skip ExecStop and TERM the whole cgroup. So the guest must be drained
+# with `cogbox stop` (the CLI ExecStop runs) BEFORE the exit: after the
+# readiness delete, before the record and the exit, and exactly once.
+stop=$(evline "$md" 'cogbox stop --name demo')
+ieput=$(evline "$md" 'PUT instance/guest-attributes/cogworx/inner-exit')
+out="$ROOT/inneroom/out.log"
+stopj=$(grep -n '^cogbox-stub: stop --name demo$' "$out" 2>/dev/null | head -1 | cut -d: -f1)
+exitj=$(grep -n 'sandbox is no longer running; exiting so the unit restarts' "$out" 2>/dev/null | head -1 | cut -d: -f1)
+if [ -n "$stop" ] && [ -n "$del" ] && [ -n "$ieput" ] && [ "$del" -lt "$stop" ] && [ "$stop" -lt "$ieput" ] \
+	&& [ "$(evcount "$md" '^cogbox stop ')" = 1 ] \
+	&& [ -n "$stopj" ] && [ -n "$exitj" ] && [ "$stopj" -lt "$exitj" ] \
+	&& grep -q '^stop-result: run-1 graceful$' "${recs[0]}" 2>/dev/null \
+	&& ! grep -q 'warning: the guest drain' "$out" 2>/dev/null; then
+	ok "a helper's OOM kill drains the live guest with cogbox stop before leg (j) records it and exits"
+else
+	bad "helper OOM kill drain: del=$del stop=$stop inner-exit-put=$ieput journal stop=$stopj exit=$exitj; events: $(cat "$md/events"); out: $(cat "$out" 2>/dev/null)"
+fi
+
+# 10h. QEMU itself OOM-killed: status fails at the same poll the counter rises,
+# and the record names the cause rather than the generic `exited`.
+STUB_OOM_AT=3
+rc=$(run_boot inneroomqemu "${BASE_ATTRS[@]}")
+unset STUB_OOM_AT
+recs=( "$ROOT/inneroomqemu/state/inner-exit"/*.log )
+if [ "$rc" != 0 ] && grep -q '^leg: oom-kill$' "${recs[0]}" 2>/dev/null \
+	&& grep -q '^cogworx: sandbox exited$' "$ROOT/inneroomqemu/serial.log" 2>/dev/null \
+	&& grep -Eq ' oom-kill$' "$ROOT/inneroomqemu/md/ga/cogworx_inner-exit" 2>/dev/null; then
+	ok "an OOM kill of QEMU is recorded as oom-kill"
+else
+	bad "QEMU OOM kill not recorded as oom-kill: record=$(head -1 "${recs[0]}" 2>/dev/null) ga=$(cat "$ROOT/inneroomqemu/md/ga/cogworx_inner-exit" 2>/dev/null)"
+fi
+# With QEMU already gone there is no guest left to drain.
+if [ "$(evcount "$ROOT/inneroomqemu/md" '^cogbox stop ')" = 0 ]; then
+	ok "an OOM kill of QEMU itself runs no guest drain"
+else
+	bad "an OOM kill of QEMU itself ran cogbox stop; events: $(cat "$ROOT/inneroomqemu/md/events")"
+fi
+
+# 10i. a counter that cannot be read is said so in the journal, and changes
+# nothing else: the sandbox runs and exits exactly as before.
+SEED_NO_MEM_EVENTS=1
+rc=$(run_boot inneroomnone "${BASE_ATTRS[@]}")
+unset SEED_NO_MEM_EVENTS
+recs=( "$ROOT/inneroomnone/state/inner-exit"/*.log )
+if [ "$rc" != 0 ] && grep -q "warning: cannot read this unit's OOM-kill count" "$ROOT/inneroomnone/out.log" 2>/dev/null \
+	&& grep -q '^leg: exited$' "${recs[0]}" 2>/dev/null; then
+	ok "an unreadable OOM-kill count warns and leaves leg (i) as it was"
+else
+	bad "unreadable OOM-kill count: rc=$rc record=$(head -1 "${recs[0]}" 2>/dev/null) out: $(cat "$ROOT/inneroomnone/out.log" 2>/dev/null)"
+fi
+
+# 10j. a guest drain that fails after a helper's OOM kill is only noted: leg (j)
+# still records the death as oom-kill and exits non-zero, so the unit restarts
+# and its cgroup TERM is the backstop.
+STUB_STATUS_OK=100 STUB_OOM_AT=3 STUB_STOP_RC=1
+rc=$(run_boot inneroomdrainfail "${BASE_ATTRS[@]}")
+unset STUB_STATUS_OK STUB_OOM_AT STUB_STOP_RC
+md="$ROOT/inneroomdrainfail/md"
+recs=( "$ROOT/inneroomdrainfail/state/inner-exit"/*.log )
+if [ "$rc" != 0 ] && [ "$(evcount "$md" '^cogbox stop ')" = 1 ] \
+	&& grep -q 'warning: the guest drain after the OOM kill did not complete (exit 1)' "$ROOT/inneroomdrainfail/out.log" 2>/dev/null \
+	&& grep -q '^leg: oom-kill$' "${recs[0]}" 2>/dev/null \
+	&& grep -Eq ' oom-kill$' "$md/ga/cogworx_inner-exit" 2>/dev/null \
+	&& grep -q 'sandbox is no longer running' "$ROOT/inneroomdrainfail/out.log" 2>/dev/null; then
+	ok "a failed guest drain is noted and leg (j) still records oom-kill and restarts"
+else
+	bad "failed guest drain: rc=$rc record=$(head -1 "${recs[0]}" 2>/dev/null) out: $(cat "$ROOT/inneroomdrainfail/out.log" 2>/dev/null)"
+fi
 
 if [ "$fails" -gt 0 ]; then
 	echo "$fails check(s) failed" >&2
