@@ -5893,7 +5893,10 @@
 			# each is restarted INDEPENDENTLY by the wait -n loop -- the auth-proxy
 			# arm is the correctness obligation of the whole auth-proxy change --
 			# terminate() kills all three, and the two COGBOX_L7_AUTH_* vars reach
-			# mitmdump even when l7-auth-hosts does not exist.
+			# mitmdump even when l7-auth-hosts does not exist. It also asserts
+			# that a present-but-unrenderable config is moved to config.json.bad
+			# and the supervisor stays up on the existing runtime wire files
+			# (section 6), and that a good config is left in place (section 7).
 			enforce-tests = pkgs.runCommand "cogbox-enforce-tests" {
 				nativeBuildInputs = with pkgs; [ bash coreutils gawk gnugrep ];
 			} ''
@@ -9205,6 +9208,48 @@
 				[ "$fails" -eq 0 ] || exit 1
 				touch $out
 			'';
+
+			# Host memory pressure. The supervisor unit (QEMU, passt and the L7
+			# proxies with it) runs at OOMScoreAdjust=-900 with OOMPolicy=continue,
+			# and the host has a small zram swap. Each setting has a tempting wrong
+			# neighbour: -1000 makes QEMU unkillable (a host panic instead of a lost
+			# guest), the default OOMPolicy=stop turns a kernel OOM kill of QEMU
+			# into a requested-looking stop that supervise.sh never records, and a
+			# MemoryMin (or, best-effort, a MemoryLow) would exempt the guest's
+			# shmem from reclaim and defeat the zram. Asserted on the config AND on
+			# the realized unit/generator files.
+			gce-image-memory-pressure =
+				assert gceCfg.systemd.services.cogworx-supervisor.serviceConfig.OOMScoreAdjust == -900;
+				assert gceCfg.systemd.services.cogworx-supervisor.serviceConfig.OOMPolicy == "continue";
+				assert !(gceCfg.systemd.services.cogworx-supervisor.serviceConfig ? MemoryMin);
+				assert !(gceCfg.systemd.services.cogworx-supervisor.serviceConfig ? MemoryLow);
+				assert gceCfg.zramSwap.enable && gceCfg.zramSwap.memoryPercent <= 25;
+				pkgs.runCommand "gce-image-memory-pressure" { } ''
+					fails=0
+					sup=${gceUnits}/cogworx-supervisor.service
+					if ! grep -qx 'OOMScoreAdjust=-900' "$sup"; then
+						echo "FAIL: cogworx-supervisor is not OOMScoreAdjust=-900; unprotected, a host OOM takes QEMU before a nix build, and at -1000 QEMU is unkillable so the host panics instead" >&2
+						fails=$((fails + 1))
+					fi
+					if ! grep -qx 'OOMPolicy=continue' "$sup"; then
+						echo "FAIL: cogworx-supervisor is not OOMPolicy=continue; under stop, a kernel OOM kill of QEMU stops the whole unit through ExecStop and supervise.sh drops the inner-exit forensics for exactly that death" >&2
+						fails=$((fails + 1))
+					fi
+					if grep -q '^MemoryMin=' "$sup"; then
+						echo "FAIL: cogworx-supervisor sets MemoryMin; memory.min exempts the guest's shmem from reclaim, which defeats the host zram swap" >&2
+						fails=$((fails + 1))
+					fi
+					if grep -q '^MemoryLow=' "$sup"; then
+						echo "FAIL: cogworx-supervisor sets MemoryLow; memory.low shields the guest's shmem from reclaim (best-effort), which works against the host zram swap" >&2
+						fails=$((fails + 1))
+					fi
+					if ! grep -q '^\[zram0\]' ${gceToplevel}/etc/systemd/zram-generator.conf; then
+						echo "FAIL: the realized image has no zram0 device; guest shmem has no reclaim target but an OOM kill or a file-page thrash" >&2
+						fails=$((fails + 1))
+					fi
+					[ "$fails" -eq 0 ] || exit 1
+					touch $out
+				'';
 
 			# Serial classification. On GCE `console` is ttyS0, the port
 			# Backend.Log reads: provider-retained state outside the VM boundary,
