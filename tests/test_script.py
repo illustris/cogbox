@@ -1865,8 +1865,10 @@ with subtest("Phase S: cred-inject default-on (init seeding + auto conf + token 
         "cogbox ssh --name injauto 'test -e /root/.claude/settings.json'"))
     # No ANTHROPIC_AUTH_TOKEN env stub: it would shadow the on-disk file (break
     # /rc and in-guest login). The guest relies on the present redacted file.
+    # Match the ASSIGNMENT: the launcher's connect hint only READS the variable
+    # (`${ANTHROPIC_AUTH_TOKEN-}`) to stay silent for env-authenticated runs.
     machine.fail(as_user("cogbox ssh --name injauto " + shlex.quote(
-        'grep -q ANTHROPIC_AUTH_TOKEN "$(command -v c)"')))
+        'grep -q ANTHROPIC_AUTH_TOKEN= "$(command -v c)"')))
     # The host-side mirror exists under the cogbox data root (host-only, NOT in
     # the guest-shared instances/<name>/ dir) and holds the REDACTED file (stub,
     # not the real token); the non-secret marker is preserved.

@@ -132,7 +132,7 @@ At build, the base folds every plugin's merged `config.cogbox` into **one deriva
 ~/work/.agents/skills/...                        (codex skills)
 ```
 
-The base drops only **child** symlinks into real writable dirs (never a whole-dir or whole-file link), so the harness can scaffold session state alongside and peers coexist. A single base oneshot pre-accepts Claude Code workspace trust for `~/work`.
+The base drops only **child** symlinks into real writable dirs (never a whole-dir or whole-file link), so the harness can scaffold session state alongside and peers coexist. At boot the materializer first removes every link whose store entry is an earlier `*-cogbox-brain` (in the harness leaf dirs, plus `.claude/settings.json`, `.mcp.json` and `.omp/mcp.json`), so a removed plugin's skills, agents, commands, rules and MCP config stop loading; user files, dirs and other links are never touched. A single base oneshot pre-accepts Claude Code workspace trust for `~/work`.
 
 ## Plugins and runtime tool environments
 
