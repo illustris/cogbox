@@ -8,6 +8,16 @@ The NixOS module is `runtime/module.nix`. Every guest configuration imports it (
 
 It is enabled by default in the **hosted** guest only, the configuration the GCE image runs. `hostedGuestModule` in `flake.nix` sets `cogbox.runtimeEnvironment.enable = lib.mkDefault hostedRuntimeDefault`, and `hostedRuntimeDefault = true` is the one line a dark launch changes to `false` (the checks follow it). Plugin-composed GCE guests re-execute through the `cogbox-hosted` package, which re-evaluates the same hosted configuration with the plugin modules merged in, so they get the feature too. Because it is `mkDefault`, a plugin module may set `cogbox.runtimeEnvironment.enable = false` to turn it off for that sandbox; against a plain `true` the same setting would be a conflicting definition and fail the whole plugin composition. `checks.runtime-environment` evaluates a plugin-composed hosted guest in both directions.
 
+Only images that ship `runtime/module.nix` declare the option, so a plugin that sets it unguarded fails composition on an older image ("The option `cogbox.runtimeEnvironment' does not exist"). A plugin meant for both should guard on the option existing; `lib.mkIf` cannot do that, because the module system checks a definition's path even when its condition is false:
+
+```nix
+{ options, lib, ... }: {
+  config = lib.optionalAttrs (options ? cogbox && options.cogbox ? runtimeEnvironment) {
+    cogbox.runtimeEnvironment.enable = false;
+  };
+}
+```
+
 The workstation profile (local, darwin, the k8s VM-in-pod backend) and the container guest keep it off. Enabling it there, including from a plugin, is **unsupported** and is not prevented, because an assertion would turn a plugin's setting into a failed compose:
 
 - On the workstation profile the writable store is a 50%-of-RAM tmpfs, so every boot would restore the bundle into memory.
