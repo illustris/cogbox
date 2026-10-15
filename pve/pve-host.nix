@@ -23,6 +23,9 @@
 #   floor-site.nix    the SITE floor (nft table inet cogworx_pve_floor): rules
 #                     4a, 4 and 5, beside gce/floor.nix's own table
 #   image.nix         the qcow2 disk image (legacy BIOS, grub on /dev/vda)
+#   mkfs-nodiscard.nix  the format units' mke2fs profile: no whole-device
+#                     discard, which the drives' IO limits throttle past the
+#                     units' timeout
 #
 # The cross-repo contract (SMBIOS blob, served routes, files, disk serials,
 # units) is written down in README.md next to this file.
@@ -110,6 +113,7 @@ in
 		./hostname.nix
 		./self-refresh.nix
 		./floor-site.nix
+		./mkfs-nodiscard.nix
 	];
 
 	options.cogworx.pve = {
