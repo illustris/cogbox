@@ -140,7 +140,17 @@ On the hosted guest, [runtime tool environments](runtime-environment.md) offer a
 
 Precedence: a selected bundle's `bin` comes first in login shells and harness launchers, ahead of plugin tools (the brain's `bin`) and the base system. That order is base-owned: the contract gives a plugin no `loginShellInit` surface.
 
-The hosted guest enables the feature with `lib.mkDefault`, so a plugin module may set `cogbox.runtimeEnvironment.enable = false` to turn it off for the sandboxes that install it; the composition still evaluates. Setting it to `true` from a plugin on any other profile (workstation, container) is unsupported: there every boot would restore into a RAM-backed store (workstation), or into a copy-on-write store whose stale database an import cannot repair (container).
+The hosted guest enables the feature with `lib.mkDefault`, so a plugin module may set `cogbox.runtimeEnvironment.enable = false` to turn it off for the sandboxes that install it; the composition still evaluates. Only images that ship `runtime/module.nix` declare the option, so an unguarded setting fails the whole composition on an older image ("The option `cogbox.runtimeEnvironment' does not exist"). Guard it on the option's existence; `lib.mkIf` cannot guard an undeclared option, because the module system still checks the definition's path:
+
+```nix
+{ options, lib, ... }: {
+  config = lib.optionalAttrs (options ? cogbox && options.cogbox ? runtimeEnvironment) {
+    cogbox.runtimeEnvironment.enable = false;
+  };
+}
+```
+
+Setting it to `true` from a plugin on any other profile (workstation, container) is unsupported: there every boot would restore into a RAM-backed store (workstation), or into a copy-on-write store whose stale database an import cannot repair (container).
 
 ## Harness-agnostic → native mapping
 
@@ -236,4 +246,6 @@ Adding a plugin evaluates third-party nix code at add time (pure eval, IFD disab
 | `cogbox plugin add FLAKE_URL[#ATTR] [--as PLUGIN] [-y] [-n NAME]` | Resolve, pin, and install. `#ATTR` selects `cogboxPlugins.<attr>` (default: `default`). `--as` overrides the derived name; `-y` skips the confirmation. Reports unit-name collisions with the installed plugins, and refuses (65) the ones the build cannot resolve. |
 | `cogbox plugin resolve FLAKE_URL[#ATTR] [--git-credential-stdin]` | Preview (JSON) the contract + host-side rules/inject without installing |
 | `cogbox plugin del PLUGIN [-y] [-n NAME]` | Remove a plugin and exactly the network rules it brought in |
-| `cogbox plugin update [PLUGIN] [-n NAME]` | Re-resolve the original URL(s), re-pin, and replace the plugins' tagged rules |
+| `cogbox plugin update [PLUGIN] [--git-credential-stdin] [--defer-rules] [-n NAME]` | Re-resolve the original URL(s), re-pin, and replace the plugins' tagged rules. `--defer-rules` (control-plane use; needs `PLUGIN`) leaves the plugin's applied tagged L4/L7 rules untouched, still replaces its inject specs, and prints the incoming rules not already tagged for the plugin (compared ignoring the tag and the comment) as one `{"deferred":{"plugin","l4","l7"}}` stdout line after the config is saved; nothing for an up-to-date plugin or outside rules mode |
+
+`add` and `update` take two control-plane flags. `--git-credential-stdin` reads one `host<TAB>user<TAB>token` line from stdin and authenticates that run's nix fetches with it through a temporary 0600 netrc, so the token is never in argv or the environment. `add --defer-rules` installs the module and merges inject specs as usual but does not merge the plugin's L4/L7 network rules: it prints them as the same one-line `{"deferred":...}` JSON on stdout (its own messages go to stderr, and the confirmation prompt is skipped) for the control plane to route through admin approval. `update --defer-rules` is described in the table above. Neither flag reviews inject specs: `secret bind` gates the credential, but every inject-spec host renders as an L7 `allow <host> terminate` whether or not its secret is bound, so a plugin's inject host is reachable as soon as the add or update lands.

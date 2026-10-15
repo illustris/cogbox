@@ -308,6 +308,116 @@ pub fn countTaggedRules(rules_arr: *const std.json.Array, tag: []const u8) usize
 	return n;
 }
 
+pub const RuleKind = enum { l4, l7 };
+
+/// Structural rule identity for `plugin update --defer-rules`: true when `a`
+/// and `b` enforce the same thing. The "plugin" tag and "comment" never
+/// count. L4: action + the allow/deny string as stored (it carries any
+/// `tcp|udp` prefix and `:PORT`). L7: action, host, path (absent == absent),
+/// methods, pathmode=="exact", service, passthrough, insecure_upstream and the
+/// EFFECTIVE terminate (terminate || path || insecure_upstream || methods ||
+/// exact || service), so `{allow h, insecure_upstream}` equals the stored
+/// `{allow h, terminate, insecure_upstream}`. Mirrored by cogworx
+/// cogbox.DeferredL4Rule.Same / DeferredL7Rule.Same; keep the two in step.
+pub fn sameRule(kind: RuleKind, a: std.json.Value, b: std.json.Value) bool {
+	if (a != .object or b != .object) return false;
+	switch (kind) {
+		.l4 => {
+			const pa = rule.ruleAction(a.object) orelse return false;
+			const pb = rule.ruleAction(b.object) orelse return false;
+			return pa.action == pb.action and std.mem.eql(u8, pa.cidr, pb.cidr);
+		},
+		.l7 => {
+			const pa = l7_rule.ruleAction(a.object) orelse return false;
+			const pb = l7_rule.ruleAction(b.object) orelse return false;
+			if (pa.action != pb.action or !std.mem.eql(u8, pa.host, pb.host)) return false;
+			const sa = l7Shape(a.object);
+			const sb = l7Shape(b.object);
+			return optEql(sa.path, sb.path) and
+				optEql(sa.methods, sb.methods) and
+				optEql(sa.service, sb.service) and
+				sa.exact == sb.exact and
+				sa.terminate == sb.terminate and
+				sa.insecure == sb.insecure and
+				sa.passthrough == sb.passthrough;
+		},
+	}
+}
+
+const L7Shape = struct {
+	path: ?[]const u8,
+	methods: ?[]const u8,
+	service: ?[]const u8,
+	exact: bool,
+	terminate: bool,
+	insecure: bool,
+	passthrough: bool,
+};
+
+fn l7Shape(obj: std.json.ObjectMap) L7Shape {
+	const path = nonEmptyString(obj, "path");
+	const methods = nonEmptyString(obj, "methods");
+	const service = nonEmptyString(obj, "service");
+	const exact = if (obj.get("pathmode")) |v| v == .string and std.mem.eql(u8, v.string, "exact") else false;
+	const insecure = boolField(obj, "insecure_upstream");
+	return .{
+		.path = path,
+		.methods = methods,
+		.service = service,
+		.exact = exact,
+		.terminate = boolField(obj, "terminate") or path != null or insecure or methods != null or exact or service != null,
+		.insecure = insecure,
+		.passthrough = boolField(obj, "passthrough"),
+	};
+}
+
+fn nonEmptyString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+	const v = obj.get(key) orelse return null;
+	if (v != .string or v.string.len == 0) return null;
+	return v.string;
+}
+
+fn boolField(obj: std.json.ObjectMap, key: []const u8) bool {
+	const v = obj.get(key) orelse return false;
+	return v == .bool and v.bool;
+}
+
+fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
+	if (a == null or b == null) return a == null and b == null;
+	return std.mem.eql(u8, a.?, b.?);
+}
+
+/// The `incoming` rules with no sameRule match among `existing`'s entries
+/// tagged `tag` (another plugin's rule, or an untagged identical one, does
+/// not count). Pure: `existing` is untouched, and the result aliases the
+/// incoming values; the caller frees the slice. A null `existing` returns
+/// every incoming rule.
+pub fn novelRules(
+	allocator: std.mem.Allocator,
+	existing: ?*const std.json.Array,
+	tag: []const u8,
+	incoming: []const std.json.Value,
+	kind: RuleKind,
+) ![]std.json.Value {
+	var out: std.ArrayList(std.json.Value) = .empty;
+	errdefer out.deinit(allocator);
+	for (incoming) |in| {
+		var present = false;
+		if (existing) |ex| {
+			for (ex.items) |item| {
+				const t = ruleTag(item) orelse continue;
+				if (!std.mem.eql(u8, t, tag)) continue;
+				if (sameRule(kind, item, in)) {
+					present = true;
+					break;
+				}
+			}
+		}
+		if (!present) try out.append(allocator, in);
+	}
+	return out.toOwnedSlice(allocator);
+}
+
 pub fn ruleTag(v: std.json.Value) ?[]const u8 {
 	if (v != .object) return null;
 	const t = v.object.get("plugin") orelse return null;
