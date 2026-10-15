@@ -1815,9 +1815,11 @@ fn buildSubstituters(allocator: std.mem.Allocator, cache_dir: []const u8, extra_
 /// out-path's closure into the LOCAL per-instance plugin-cache (file://cache_dir,
 /// on the state PVC). The agent's boot has no egress, so without this seed the
 /// brain rebuild cannot realise the plugin tools; with it, boot substitutes the
-/// whole closure offline. Every failure is logged and swallowed (boot then falls
-/// back to the baked base brain -- skills survive, tools are simply absent, i.e.
-/// no worse than before this fix). Determinism mirrors the runner path: nothing
+/// whole closure offline. Every failure is logged and swallowed; a boot that
+/// then cannot build the brain falls back to the plugin-less base brain (no
+/// plugin skills, agents, commands, rules or tools, and the materializer also
+/// removes links left by earlier boots; see brain.fallback). Determinism
+/// mirrors the runner path: nothing
 /// instance-specific is in the brain closure, so the pre-built out-path is
 /// byte-identical to the one boot's brainResolveContainer evaluates.
 fn prebuildBrainLocal(ctx: *const Ctx) Prebuild {

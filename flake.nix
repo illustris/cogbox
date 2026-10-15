@@ -1549,6 +1549,11 @@
 				# off it is just the system bundle, so pointing tools at it
 				# unconditionally is safe.
 				l7CaBundle = "/run/cogbox/ca-bundle.crt";
+				# VM targets' Claude connection marker (claudeStubScriptVm): cogworx
+				# writes "1" (owner connected) or "0" (managed, owner NOT connected) on
+				# the 9p source; absent = not control-plane managed. The container's
+				# marker is presence-gated instead and never reads "0".
+				vmClaudeMarker = "/var/lib/cogbox/claude-oauth.bound";
 				l7CaEnv = {
 					SSL_CERT_FILE = l7CaBundle;
 					NIX_SSL_CERT_FILE = l7CaBundle;
@@ -1583,6 +1588,23 @@
 								${unflaggedPattern}) ${command} "$@" ;;
 							esac
 						'';
+						# A managed VM whose owner has not connected Claude boots claude-code
+						# with no credential at all, and its /login is usually a dead end (the
+						# sign-in hosts are not on the default l7 allow-list). Say what to do
+						# instead, once, to an interactive stderr only. Silent once a non-empty
+						# credential file exists: with marker "0" the stub oneshot has already
+						# removed cogbox's own stub, so that file is the user's own in-guest
+						# /login. Silent too when claude-code authenticates another way: one of
+						# these env vars set by the caller's shell (checked at run time) or by
+						# the launcher's own plugin/harness env (applied only at exec, so gated
+						# at eval time).
+						claudeAltAuthVars = [ "ANTHROPIC_API_KEY" "ANTHROPIC_AUTH_TOKEN" "CLAUDE_CODE_OAUTH_TOKEN" "CLAUDE_CODE_USE_BEDROCK" "CLAUDE_CODE_USE_VERTEX" ];
+						claudeConnectHint = lib.optionalString (h.launcher.name == "c" && isVm
+							&& !(lib.any (k: (pluginEnv // h.launcher.env) ? ${k}) claudeAltAuthVars)) ''
+							if [ -t 2 ] && [ -z "${lib.concatMapStrings (k: "\${${k}-}") claudeAltAuthVars}" ] && [ ! -s /root/.claude/.credentials.json ] && [ -r ${vmClaudeMarker} ] && [ "$(< ${vmClaudeMarker})" = 0 ]; then
+								echo "cogbox: Claude is not connected for this sandbox: its owner has not connected a Claude account. The owner can connect one in the control plane's Settings; then relaunch c (an in-sandbox /login usually cannot reach the sign-in hosts)." >&2
+							fi
+						'';
 					# Land non-login `cogbox ssh -- c/oc/om/cx/h/p/ds` in the standardized
 					# workdir too (loginShellInit covers the interactive login path).
 					# Prepend the brain's plugin-tool bin to PATH so the harness AND its
@@ -1593,6 +1615,7 @@
 					# (literal in the '' string); redundant-but-harmless on the VM.
 					in "#!${pkgs.runtimeShell}\n"
 						+ "cd /root/work 2>/dev/null || true\n"
+						+ claudeConnectHint
 						+ unflaggedDispatch
 						+ ''${command} ${flagsStr} "$@"''
 						+ "\n"
@@ -2271,7 +2294,36 @@
 					ln -sfn "$WORK" /root/work
 					ln -sfn "$brain" "$WORK/.cogbox/brain"
 
+					# STALE-LINK PRUNE. Links are made per leaf, so a leaf the new brain no
+					# longer has (a removed plugin's skill, a renamed command) would keep
+					# pointing into the PREVIOUS brain's store path -- still resolving, so
+					# the harness keeps loading it. Before linking, drop every symlink whose
+					# target is inside an EARLIER /nix/store/*-cogbox-brain. Never touches
+					# a regular file, a directory, a link into the current brain, or a link
+					# anywhere else (a user's own links, other store paths); plain readlink,
+					# never -f, so a dangling old-brain link is pruned too. Never fatal.
+					stalebrainlink() {  # $1 = path; true iff a symlink into an EARLIER cogbox-brain
+						[ -L "$1" ] || return 1
+						local t
+						t=$(readlink "$1") || return 1
+						case "$t" in
+							"$brain"/*) return 1 ;;
+							/nix/store/*-cogbox-brain/*) ;;
+							*) return 1 ;;
+						esac
+						# The store entry ITSELF must be the brain: a case `*` also matches
+						# "/", so .../<hash>-sometool/share/x-cogbox-brain/y matched above.
+						t=''${t#/nix/store/}
+						case "''${t%%/*}" in *-cogbox-brain) return 0 ;; esac
+						return 1
+					}
+					dropstale() {  # $1 = path
+						if stalebrainlink "$1"; then rm -f -- "$1" || echo "cogbox-brain: could not remove stale link $1" >&2; fi
+					}
+
 					linkleaves() {  # $1 = brain subdir, $2 = dest dir
+						# prune first, even when the new brain has no such subdir at all
+						if [ -d "$2" ]; then for old in "$2"/*; do dropstale "$old"; done; fi
 						[ -d "$1" ] || return 0
 						mkdir -p "$2"
 						for leaf in "$1"/*; do
@@ -2285,11 +2337,16 @@
 					linkleaves "$brain/claude/agents"   "$WORK/.claude/agents"
 					linkleaves "$brain/claude/commands" "$WORK/.claude/commands"
 					linkleaves "$brain/rules"           "$WORK/.claude/rules"
+					# The single-file links below are pruned the same way: a removed
+					# plugin's hooks/model pin must not keep applying, and an old-brain
+					# .mcp.json would otherwise block the only-if-absent relink.
+					dropstale "$WORK/.claude/settings.json"
 					if [ -e "$brain/claude/settings.json" ]; then
 						mkdir -p "$WORK/.claude"
 						ln -sfn "$brain/claude/settings.json" "$WORK/.claude/settings.json"
 					fi
 					# project .mcp.json only when the user has none (never clobber)
+					dropstale "$WORK/.mcp.json"
 					if [ -e "$brain/claude/.mcp.json" ] && [ ! -e "$WORK/.mcp.json" ]; then
 						ln -sfn "$brain/claude/.mcp.json" "$WORK/.mcp.json"
 					fi
@@ -2305,6 +2362,7 @@
 					linkleaves "$brain/omp/agents"   "$WORK/.omp/agents"
 					linkleaves "$brain/omp/commands" "$WORK/.omp/commands"
 					linkleaves "$brain/omp/rules"    "$WORK/.omp/rules"
+					dropstale "$WORK/.omp/mcp.json"
 					if [ -e "$brain/omp/mcp.json" ] && [ ! -e "$WORK/.omp/mcp.json" ]; then
 						mkdir -p "$WORK/.omp"
 						ln -sfn "$brain/omp/mcp.json" "$WORK/.omp/mcp.json"
@@ -2528,7 +2586,7 @@
 				# restart).
 				claudeStubScriptVm = pkgs.writeShellScript "cogbox-claude-stub-vm" ''
 					set -eu
-					marker=/var/lib/cogbox/claude-oauth.bound
+					marker=${vmClaudeMarker}
 					[ -e "$marker" ] || exit 0
 					${self.packages.${system}.cogbox-container}/bin/cogbox __claude-stub /root/.claude "$marker"
 				'';
@@ -3061,7 +3119,10 @@
 						};
 					}
 				) fwCfgPaths)) // {
-					cogbox-additional-dirs = {
+					# VM-only: the unit reads the launch-time fw_cfg manifest, which a
+					# container never has. Ungated, its `jq -e` on the missing file
+					# fails the oneshot and leaves the container's system degraded.
+					cogbox-additional-dirs = lib.mkIf isVm {
 						description = "Validate and mount launch-only host directories";
 						wantedBy = [ "multi-user.target" ];
 						before = [ "multi-user.target" "sshd.service" ];
@@ -3293,7 +3354,28 @@
 					# makes it truly background: the sandbox is Ready (the readiness probe gates
 					# on brain-materialize, well before this) while the reconcile builds. The
 					# `reconcile` verb no-ops fast when nothing changed (composition-hash guard)
-					# and removes the record when no plugins remain (revert to base). Best-effort.
+					# and removes the record when no plugins remain (revert to base).
+					#
+					# Best-effort (the unit always exits 0) but LOUD. The verb exits 0 even
+					# when the toplevel build fails -- every such path only warns, and every
+					# such warning carries "(boot uses baked base)" -- so a failure is a
+					# nonzero exit OR that phrase in its output. A failure prints one
+					# "cogbox-toplevel-reconcile: FAILED" journal line and leaves
+					# toplevel.reconcile-failed (time, rc, attempts, then the last 40 lines
+					# of the verb's output) beside the instance's toplevel.path; a clean run
+					# removes it.
+					#
+					# /homeless-shelter. The pod's nix builds without a sandbox (sandbox =
+					# false), so a derivation that writes $HOME (a Go build's telemetry/cache
+					# dirs) creates nix's sentinel HOME on the real root, and every LATER
+					# derivation -- in this invocation or any other in the pod -- aborts with
+					# "home directory /homeless-shelter exists". It is removed before each
+					# attempt and after the last (so later live builds are not poisoned), and
+					# a failed attempt that left it behind is retried, at most 3 attempts.
+					# The retry keys on the sentinel's presence, not on nix's "home
+					# directory ... exists" message: the verb keeps only the last 600 bytes
+					# of nix's stderr, and the per-ancestor dependency-failure lines that
+					# follow the root error usually push that message out.
 					cogbox-toplevel-reconcile = lib.mkIf isContainer {
 						description = "Reconcile + record the per-instance full toplevel for the next boot";
 						wantedBy = [ "multi-user.target" ];
@@ -3302,7 +3384,7 @@
 							Type = "oneshot";
 							# cogbox resolves the instance config from $XDG_CONFIG_HOME/cogbox/...
 							# (else $HOME/.config, which is /.config with HOME unset -> "no config
-							# found" -> the || true swallows it -> silent no-op). systemd does not
+							# found" -> a FAILED line below, nothing reconciled). systemd does not
 							# forward PID1's env, so set it explicitly (same as brain-materialize).
 							Environment = [ "XDG_CONFIG_HOME=${stateRoot}/config" ];
 							PassEnvironment = [ "COGBOX_INSTANCE" ];
@@ -3310,13 +3392,44 @@
 						script = ''
 							inst="''${COGBOX_INSTANCE:-}"
 							cbx=${self.packages.${system}.cogbox-container}/bin/cogbox
+							icd="''${XDG_CONFIG_HOME:-${stateRoot}/config}/cogbox/instances/''${inst:-default}"
+							failmark="$icd/toplevel.reconcile-failed"
+							shelter=/homeless-shelter
 							# The plugin verb resolves the instance from -n only (not the env), and
 							# rejects the reserved name "default"; omit -n for the default instance.
-							# Best-effort: never fail the unit -- a miss just leaves the last record.
-							if [ -n "$inst" ] && [ "$inst" != "default" ]; then
-								"$cbx" plugin reconcile -n "$inst" || true
+							args=(plugin reconcile)
+							if [ -n "$inst" ] && [ "$inst" != "default" ]; then args+=(-n "$inst"); fi
+							# Never fail the unit: a miss leaves the last record (or the baked
+							# base) for the next boot, and says so below.
+							failed=0
+							for attempt in 1 2 3; do
+								rm -rf "$shelter" || true
+								rc=0
+								out=$("$cbx" "''${args[@]}" 2>&1) || rc=$?
+								if [ -n "$out" ]; then printf '%s\n' "$out" >&2; fi
+								failed=0
+								if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -qF '(boot uses baked base)'; then
+									failed=1
+								fi
+								if [ "$failed" = 1 ] && [ -e "$shelter" ] && [ "$attempt" -lt 3 ]; then
+									echo "cogbox-toplevel-reconcile: a sandbox-less build left $shelter behind; retrying" >&2
+									continue
+								fi
+								break
+							done
+							rm -rf "$shelter" || true
+							if [ "$failed" = 1 ]; then
+								echo "cogbox-toplevel-reconcile: FAILED rc=$rc attempts=$attempt; the next boot keeps the previous toplevel record or the baked base (details: $failmark)" >&2
+								# The output TAIL, not just the matching line: nix's own error
+								# lines follow the warning (and a die()'s reason matches nothing),
+								# and the pod journal is gone once the pod is replaced. Small: the
+								# verb already caps nix's stderr at 600 bytes per warning.
+								{ {
+									printf 'time=%s rc=%s attempts=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" "$attempt"
+									[ -z "$out" ] || printf '%s\n' "$out" | tail -n 40
+								} > "$failmark"; } 2>/dev/null || true
 							else
-								"$cbx" plugin reconcile || true
+								rm -f "$failmark" || true
 							fi
 						'';
 					};
@@ -6001,6 +6114,97 @@
 				nativeBuildInputs = with pkgs; [ bash coreutils gnused gnugrep findutils ];
 			} ''
 				bash ${./tests/test_brain_resolve.sh} ${self.nixosConfigurations."${configName system}-container".config.systemd.services.cogbox-brain-materialize.serviceConfig.ExecStart}
+				touch $out
+			'';
+
+			# cogbox-additional-dirs reads the launch-time fw_cfg manifest
+			# (/sys/firmware/qemu_fw_cfg), which only a VM has. Declared in the
+			# container it fails at every boot and leaves the system degraded; dropped
+			# from a VM profile, --add-dir grants silently never mount.
+			guest-additional-dirs-vm-only = let
+				has = c: self.nixosConfigurations.${c}.config.systemd.services ? cogbox-additional-dirs;
+			in pkgs.runCommand "cogbox-guest-additional-dirs-vm-only" { } ''
+				fails=0
+				${lib.optionalString (has "${configName system}-container") ''
+					echo "FAIL: ${configName system}-container declares cogbox-additional-dirs.service; it reads a fw_cfg manifest a container never has, fails, and degrades the system" >&2
+					fails=$((fails + 1))
+				''}
+				${lib.concatMapStrings (c: lib.optionalString (!(has c)) ''
+					echo "FAIL: ${c} does not declare cogbox-additional-dirs.service; --add-dir grants would never mount" >&2
+					fails=$((fails + 1))
+				'') [ (configName system) "${configName system}-hosted" ]}
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The container's post-boot toplevel reconcile is best-effort but LOUD: a
+			# failed build (nonzero exit, or the verb's exit-0 "(boot uses baked
+			# base)" warning) prints FAILED and leaves a marker, /homeless-shelter is
+			# cleaned before and after, and a sentinel-poisoned attempt is retried (at
+			# most 3). Driven against the REAL rendered unit script with cogbox
+			# stubbed (tests/test_toplevel_reconcile.sh). The vacuity guard pins the
+			# coupling: if the verb's failure warnings lose the phrase, the unit would
+			# read every failed build as a success.
+			container-toplevel-reconcile = pkgs.runCommand "cogbox-container-toplevel-reconcile" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnused gnugrep findutils ];
+			} ''
+				if [ "$(grep -c '(boot uses baked base)' ${./zig/src/plugin/main.zig})" = 0 ]; then
+					echo "FAIL: zig/src/plugin/main.zig no longer warns '(boot uses baked base)'; cogbox-toplevel-reconcile keys its failure detection on that phrase" >&2
+					exit 1
+				fi
+				bash ${./tests/test_toplevel_reconcile.sh} ${self.nixosConfigurations."${configName system}-container".config.systemd.services.cogbox-toplevel-reconcile.serviceConfig.ExecStart}
+				touch $out
+			'';
+
+			# The brain materializer prunes links into an EARLIER cogbox-brain (a
+			# removed plugin's leaves and single-file links) and nothing else. Driven
+			# against the REAL rendered VM materialize script, fixture brain then base
+			# brain then fixture again (tests/test_brain_linkleaves.sh).
+			brain-linkleaves-prune = pkgs.runCommand "cogbox-brain-linkleaves-prune" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnused gnugrep findutils ];
+			} ''
+				bash ${./tests/test_brain_linkleaves.sh} ${self.nixosConfigurations.${configName system}.config.systemd.services.cogbox-brain-materialize.serviceConfig.ExecStart} ${self.nixosConfigurations.cogbox-x86_64-brain-fixture-container.config.system.build.cogboxBrain}
+				touch $out
+			'';
+
+			# A managed VM whose owner has not connected Claude (marker "0") gets a
+			# one-line stderr hint from `c` instead of a (usually dead-end) in-guest /login.
+			# VM `c` only: the container's marker is presence-gated and never "0", and
+			# no other harness reads it, and none when claude-code's auth comes from
+			# the env (caller's shell at run time, cogbox.env at eval time). Behaviour
+			# driven against the REAL rendered launcher (tests/test_claude_hint.sh).
+			claude-connect-hint = let
+				launcher = c: n: lib.findFirst (p: p.name == n)
+					(throw "no ${n} launcher in ${c}")
+					self.nixosConfigurations.${c}.config.environment.systemPackages;
+				vmC = launcher (configName system) "c";
+				readsMarker = p: lib.hasInfix "claude-oauth.bound" p.text;
+				# A plugin env that routes claude-code's auth elsewhere (applied only at
+				# exec, after the hint would run) drops the hint at eval time.
+				altAuthC = lib.findFirst (p: p.name == "c") (throw "no c launcher")
+					(self.nixosConfigurations.${configName system}.extendModules {
+						modules = [ { cogbox.env.CLAUDE_CODE_USE_BEDROCK = "1"; } ];
+					}).config.environment.systemPackages;
+			in pkgs.runCommand "cogbox-claude-connect-hint" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnused gnugrep ];
+			} ''
+				${lib.optionalString (readsMarker (launcher "${configName system}-container" "c")) ''
+					echo "FAIL: the container c launcher reads claude-oauth.bound; its marker is presence-gated and never reads 0" >&2
+					exit 1
+				''}
+				${lib.optionalString (readsMarker (launcher (configName system) "oc")) ''
+					echo "FAIL: the VM oc launcher reads claude-oauth.bound; the connect hint is for c only" >&2
+					exit 1
+				''}
+				${lib.optionalString (!(readsMarker vmC)) ''
+					echo "FAIL: the VM c launcher does not read claude-oauth.bound, so it has no connect hint" >&2
+					exit 1
+				''}
+				${lib.optionalString (readsMarker altAuthC) ''
+					echo "FAIL: the VM c launcher keeps the connect hint although cogbox.env routes claude-code's auth elsewhere (CLAUDE_CODE_USE_BEDROCK)" >&2
+					exit 1
+				''}
+				bash ${./tests/test_claude_hint.sh} ${vmC}/bin/c
 				touch $out
 			'';
 
