@@ -101,6 +101,30 @@ let
 		(n: lib.all (s: s == "") (lib.toList (svc.${n}.serviceConfig.ExecStart or [ ])))
 		(lib.unique (specSocketClients ++ pve.metadataClients));
 
+	# --- the format units' mke2fs profile (mkfs-nodiscard.nix) -----------------
+	#
+	# Spelled here, like specSocketClients, rather than read back from the
+	# module under test.
+	formatUnits = [ "cogworx-state-disk" "cogworx-guest-disk" ];
+	mke2fsProfile = discard "${cfg.system.build.pveMke2fsConfig}";
+	mke2fsValue = n: discard (toString (svc.${n}.environment.MKE2FS_CONFIG or ""));
+	mke2fsCarriers = lib.filter (n: (svc.${n}.environment or { }) ? MKE2FS_CONFIG) (lib.attrNames svc);
+	# The SYSTEM's e2fsprogs, not this file's nixpkgs: the profile is derived
+	# from it and the units run it, so an overlay cannot split the two.
+	sysE2fsprogs = sys.pkgs.e2fsprogs;
+	# Every non-comment line under gce/ that runs mkfs or mke2fs, as its file
+	# name. A format leg added there runs with mke2fs's whole-device discard
+	# until its unit joins mkfs-nodiscard.nix's list (and formatUnits).
+	gceSrc = "${flake}/gce";
+	gceFormatLines = lib.concatMap (f:
+		map (_: lib.removePrefix "${gceSrc}/" f)
+			(lib.filter (l: builtins.match "[[:space:]]*#.*" l == null && builtins.match ".*(mkfs|mke2fs).*" l != null)
+				(lib.splitString "\n" (builtins.readFile f))))
+		(lib.filter (f: lib.hasSuffix ".nix" f || lib.hasSuffix ".sh" f) (map toString (lib.filesystem.listFilesRecursive gceSrc)));
+	# The negative control for mkfs-nodiscard.nix's assertion: a format unit
+	# reduced to an environment-only stub.
+	formatStub = failedAssertions (evalPve [ fixtureSite { systemd.services.cogworx-state-disk.serviceConfig.ExecStart = lib.mkForce ""; } ]);
+
 	# Every rendered unit, context discarded: grepping them builds nothing.
 	unitsJson = pkgs.writeText "pve-units.json"
 		(builtins.toJSON (lib.mapAttrs (_: u: discard (toString (u.text or ""))) cfg.systemd.units));
@@ -238,6 +262,16 @@ let
 		(lib.optional (stubClients != [ ]) "metadata client unit(s) with no ExecStart, i.e. edge-only stubs that metadata.nix keeps defined after the real unit is gone: ${toString stubClients}")
 		# Fail closed on rule 5: sshd must not listen on eth0 without it.
 		(lib.optional (!(lib.elem "sshd.service" svc.cogworx-pve-floor.requiredBy)) "cogworx-pve-floor is not RequiredBy= sshd.service; a floor that fails to load would leave sshd open to the shared L2")
+		# The format units run mke2fs with the no-discard profile, and they are
+		# the only units that do and the only format legs gce/ has.
+		(lib.concatMap (n: lib.optional (mke2fsValue n != mke2fsProfile)
+			"${n}: MKE2FS_CONFIG is '${mke2fsValue n}', not the no-discard profile ${mke2fsProfile}; its mkfs.ext4 would discard the whole device") formatUnits)
+		(lib.optional (lib.sort lib.lessThan mke2fsCarriers != lib.sort lib.lessThan formatUnits)
+			"the units carrying MKE2FS_CONFIG are [${toString mke2fsCarriers}], not exactly [${toString formatUnits}]")
+		(lib.optional (lib.sort lib.lessThan gceFormatLines != [ "guest-disk.nix" "guest-disk.nix" "state-disk.nix" ])
+			"gce/ runs mkfs/mke2fs on non-comment lines in [${toString gceFormatLines}], not exactly state-disk.nix's one and guest-disk.nix's two; a new format leg discards the whole device until its unit joins pve/mkfs-nodiscard.nix's list")
+		(lib.optional (!(lib.any (lib.hasInfix "pve/mkfs-nodiscard.nix: cogworx-state-disk has no ExecStart") formatStub))
+			"a format unit with no ExecStart does not trip mkfs-nodiscard.nix's assertion (got: ${lib.concatStringsSep " | " formatStub})")
 	];
 
 	failureList = name: failures: pkgs.runCommand name {
@@ -324,6 +358,18 @@ let
 			has "$r" Before cogworx-supervisor.service
 			line "$r" 'RequiresMountsFor=${gce.stateDir}'
 			line "$r" 'Environment="XDG_CONFIG_HOME=${gce.stateDir}/config"'
+
+			# The format units: mke2fs with the no-discard profile
+			# (mkfs-nodiscard.nix), and no other unit with it.
+			for u in ${toString formatUnits}; do
+				line "$u.service" 'Environment="MKE2FS_CONFIG=${mke2fsProfile}"'
+			done
+			for u in $(jq -r 'to_entries[] | select(.value | contains("MKE2FS_CONFIG")) | .key' ${unitsJson}); do
+				case " ${toString formatUnits} " in
+					*" ''${u%.service} "*) ;;
+					*) fail "$u carries MKE2FS_CONFIG" ;;
+				esac
+			done
 
 			# hostname: before anything reads or sends it.
 			h=cogworx-pve-hostname.service
@@ -456,6 +502,20 @@ let
 			COGWORX_PVE_METADATA=${./metadata/cogworx_pve_metadata.py} \
 			COGWORX_PVE_VECTORS=${./testdata/bootcfg-v1.json} \
 				python3 -I ${tests}/test_metadata.py
+			touch $out
+		'';
+
+		# The format units' mke2fs profile, built and RUN: the package default
+		# plus `discard = false` and nothing else, derived from the file the
+		# units' own mke2fs compiles in, and every realized mkfs line of those
+		# units discarding under the default profile but not under theirs
+		# (strace on a sparse file, with a control that must discard). Builds
+		# the two small unit scripts.
+		mkfs-nodiscard = pkgs.runCommand "pve-mkfs-nodiscard" {
+			nativeBuildInputs = with pkgs; [ bash coreutils diffutils gnugrep gnused strace ];
+		} ''
+			bash ${tests}/test_mkfs_nodiscard.sh ${sysE2fsprogs} ${sysE2fsprogs.out}/etc/mke2fs.conf ${cfg.system.build.pveMke2fsConfig} \
+				${lib.concatMapStringsSep " " (n: lib.escapeShellArg "${n}=${builtins.head (execPaths n)}=${toString (svc.${n}.environment.MKE2FS_CONFIG or "")}") formatUnits}
 			touch $out
 		'';
 

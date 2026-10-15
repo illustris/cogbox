@@ -18,10 +18,11 @@ All addresses, names and keys in this directory are fictional (RFC 5737 / RFC 25
 | `self-refresh.nix`, `self-refresh.sh` | Refreshes cogbox's write-once `bindAddr` / `selfAddrs` to the current DHCP address before the supervisor launches. |
 | `floor-site.nix`, `floor_render.py` | The site floor: nft table `inet cogworx_pve_floor`, rules 4a, 4 and 5, rendered and validated at build time. |
 | `image.nix` | The qcow2 template disk (`config.system.build.pveImage`). |
+| `mkfs-nodiscard.nix` | The mke2fs profile for the two host units that format a disk: the package default without the whole-device discard (see [Disks: no discard at format time](#disks-no-discard-at-format-time)). |
 | `eval.nix` | Builds the system from this checkout's flake inputs, the way `flake.nix`'s `mkGceHost` builds the GCE one. |
 | `checks.nix` | The checks (see below). |
 | `testdata/bootcfg-v1.json` | Canonical boot-config vectors, shared byte for byte with the cogworx Go encoder. |
-| `tests/` | Emulator unit tests, and the floor, self-refresh, hostname, serial-cap, qemu-ga and route-coverage tests. |
+| `tests/` | Emulator unit tests, and the floor, self-refresh, hostname, serial-cap, qemu-ga, route-coverage and mke2fs-discard tests. |
 
 The flake does not export any of this yet (`lib.mkPveHost`, `packages.pve-image` and flake checks are planned). Until it does:
 
@@ -108,6 +109,19 @@ Residual: the allow-list removes exec and write, not path scope. qemu-ga runs as
 - Any PVE principal with `VM.GuestAgent.FileRead` on the VM, cogworxd's own scoped token included, can read any guest file as root.
 - Any principal with `VM.GuestAgent.FileWrite` or `VM.GuestAgent.Unrestricted` (or root on a PVE node, which reaches the agent socket directly) can create or truncate any file through `guest-file-open` with mode `w`. Observed live: a file-write that the allow-list refused still left a 0-byte file behind, because the open that created it is allowed.
 
+## Disks: no discard at format time
+
+PVE gives every drive of a sandbox VM QEMU IO limits, and QEMU charges discarded bytes against the drive's write-bandwidth limit. By default mke2fs discards the whole device before it formats it. At a 20 MB/s write limit that takes about 27 minutes for the 32 GiB state disk, about 14 for the 16 GiB store volume on the guest disk and about 40 for the pool, while the format units time out after 600 s. Measured on a live first boot: `cogworx-state-disk` and `cogworx-guest-disk` were both killed at 600 s after about 26 ms of CPU, each having discarded about 12 GiB. The state disk was then not mounted, so self-refresh and the supervisor refused to start, and the guest-disk unit refused to re-make the store filesystem in the same host boot. `cogworx-guest-disk` re-formats the store volume on every host boot, so this is not a first-boot failure only: without the fix, no PVE boot gets a bootable guest.
+
+`mkfs-nodiscard.nix` sets `MKE2FS_CONFIG` on those two units, and on no other, to a profile built from the e2fsprogs they run: its compiled-in `mke2fs.conf` plus `discard = false` under `[defaults]`. Nothing in `gce/` changes, so GCE is unaffected. The nested guest formats no device, so it needs nothing.
+
+Skipping the discard costs nothing at first format, because a freshly allocated volume on thin storage such as Ceph RBD already reads as zeros (the state and guest disks are never linked clones). A block device reports that discard does not zero data, so mke2fs handles the inode tables and the journal exactly as before. The drives keep `discard=on`, so later frees from the guest still reach the storage.
+
+Residuals (asynchronous and throttled, but not boot failures; nothing here changes them):
+
+- The store volume is re-made over the previous boot's blocks without a discard, so those blocks stay allocated in the storage until the guest's fstrim trims them (online discard returns only blocks the new filesystem itself frees). That is bounded by the store volume's size.
+- Periodic discards hit the same limits. The host's NixOS `fstrim.timer` (on by default, weekly, and `Persistent=`, so it catches up after a stop that spans the weekly point) trims the free space of the state filesystem (about 27 minutes at 20 MB/s) and of the boot disk. The guest mounts both of its filesystems with `discard` and runs its own weekly fstrim, all against the guest disk's single limit. Turning the host timer off would also give up the boot disk's reclaim, so that is left as a decision. The guest side lives in `flake.nix`.
+
 ## Units and ordering
 
 | Unit | Role and edges |
@@ -182,8 +196,8 @@ Run with `nix build --impure -f pve/checks.nix <name>`, or `all`. The fixture sy
 
 | Check | What it proves |
 |---|---|
-| `unit-graph` | Every ordering edge above, root-only clients, the qemu-ga allow-list line, and journal-only streams, all on the rendered unit files |
-| `config-values` | Device paths, serial path, tmpfiles, kernel parameters, GRUB device, sysctls, the hosts pin, DHCP shape, no google or firewall units, and sshd requiring the site floor. It also requires every `cogworx-*` unit to be classified as a metadata client or not, and every metadata client to still run something (an edge-only stub left behind by a removed gce/ unit fails). |
+| `unit-graph` | Every ordering edge above, root-only clients, the qemu-ga allow-list line, journal-only streams, and `MKE2FS_CONFIG` on exactly the two format units, all on the rendered unit files |
+| `config-values` | Device paths, serial path, tmpfiles, kernel parameters, GRUB device, sysctls, the hosts pin, DHCP shape, no google or firewall units, and sshd requiring the site floor. It also requires every `cogworx-*` unit to be classified as a metadata client or not, and every metadata client to still run something (an edge-only stub left behind by a removed gce/ unit fails). The two format units carry the no-discard mke2fs profile and no other unit does, `gce/` has no format line beyond the three known ones, and a format unit reduced to a stub trips `mkfs-nodiscard.nix`'s assertion. |
 | `publish-gates` | The fixture and the CA-less default both evaluate. Each gate trips on exactly its own assertion, and a CA-baked image with no `controlPlaneCIDRs` does not evaluate. |
 | `floor-warnings` | A `controlPlaneCIDRs` entry that covers an `infraDenyCIDRs` entry (opening it to passt's mosh-range UDP), or is wider than `/16`, warns, and the fixture's narrow one does not. Malformed entries are left to the build-time refusal. |
 | `dhcpcd-conf` | The realized `dhcpcd.conf` |
@@ -196,6 +210,7 @@ Run with `nix build --impure -f pve/checks.nix <name>`, or `all`. The fixture sy
 | `serial-cap` | The serial log is trimmed to its last 128 KiB on a line boundary, keeps its newest line and mode 0600, and is left alone below the cap |
 | `unit-scripts` | Every `cogworx-pve-*` unit program builds (writeShellApplication shellchecks at build time) |
 | `metadata-unittests` | The emulator's unit tests and the shared vectors |
+| `mkfs-nodiscard` | The profile is the package default plus `discard = false` under `[defaults]` and nothing else, derived from the file the units' mke2fs compiles in, and the units' `PATH` resolves `mkfs.ext4` to that mke2fs. Each realized `mkfs.ext4` line of the two units is run on a sparse file under strace: under the default profile it discards (the control, which must), and under the unit's `MKE2FS_CONFIG` it discards nothing. Apart from the discard, `dumpe2fs` shows the same filesystem either way. |
 | `eval` | The default and fixture toplevels and the image evaluate |
 | `offline-closure` | **Not in `all`**, because it builds the whole system. The fixture toplevel's closure (the store the image registers) holds the flake input sources and the cogbox package that the launcher's offline re-exec needs. |
 
@@ -209,3 +224,4 @@ Not yet covered here: a booted-image test (a nixosTest with a fixture SMBIOS ser
 - A deliberately broken floor keeps `sshd` down while the serial console (`serial0`, the break-glass getty) still works.
 - On a real NIC, a neighbour's frame to 169.254.169.254 arriving on eth0 is dropped and counted by `rule4a-input` (`nft list chain inet cogworx_pve_floor input`).
 - A mosh session through the cogworxd relay survives an idle gap longer than the conntrack UDP timeout, with the `rule4-cp-mosh` counter advancing.
+- On a fresh clone, `systemctl show -p Environment` lists `MKE2FS_CONFIG` for `cogworx-state-disk` and `cogworx-guest-disk`, both finish within about a minute, and the discard columns of `/proc/diskstats` for the state and guest disks do not move while they run. After a Stop and Start, the second boot's store re-format also finishes in seconds.
