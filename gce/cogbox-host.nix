@@ -527,6 +527,28 @@ in
 		# already exists -- which a freshly baked boot disk has no reason to.
 		services.journald.settings.Journal.Storage = "persistent";
 
+		# --- Host memory pressure ------------------------------------------
+		#
+		# Guest RAM is a memfd with share=on, so it is host SHMEM, and the
+		# guest's tmpfs root is backed by it. Shmem is swappable, so a zram
+		# device gives the kernel a reclaim target for cold guest pages other
+		# than OOM-killing QEMU or evicting executable file pages -- and
+		# evicting those is the thrash/livelock shape of a host that freezes
+		# instead of failing. Kept small (25%) because its compressed pages
+		# cost RAM too, and a large one only prolongs a doomed thrash.
+		# Compression stays at the default zstd, priority at the default 5.
+		#
+		# Deliberately NO MemoryMin on cogworx-supervisor: memory.min would
+		# exempt the guest's shmem from reclaim, which defeats this device,
+		# and on a host sized guest + 2 GiB it would push all the remaining
+		# pressure onto everything else. The unit's OOM posture
+		# (OOMScoreAdjust/OOMPolicy) lives in gce/supervisor.nix, and
+		# gce-image-memory-pressure asserts both halves.
+		zramSwap = {
+			enable = true;
+			memoryPercent = 25;
+		};
+
 		# --- The cogbox host half ------------------------------------------
 		#
 		# Dragging in the cogbox package drags in the microvm runner, the guest
@@ -985,7 +1007,9 @@ in
 		# here clamps it against the VM's real memory budget. cogbox exposes no
 		# `init` flag for it, so the only
 		# lever this image has is the control plane's host-headroom sizing
-		# (COGWORX_GCP_HOST_HEADROOM_MB / _VCPU). Recorded as a residual.
+		# (COGWORX_GCP_HOST_HEADROOM_MB / _VCPU). Recorded as a residual. The
+		# zram device and the supervisor's OOMScoreAdjust (see "Host memory
+		# pressure" above) soften the flat headroom; they do not fix it.
 
 		system.stateVersion = "25.11";
 	};

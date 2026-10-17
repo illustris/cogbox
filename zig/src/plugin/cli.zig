@@ -4,7 +4,7 @@
 //   cogbox plugin ... list
 //   cogbox plugin ... add FLAKE_URL [--as PLUGIN] [-y]
 //   cogbox plugin ... del PLUGIN [-y]
-//   cogbox plugin ... update [PLUGIN]
+//   cogbox plugin ... update [PLUGIN] [--defer-rules]
 //
 // The plugin-name override is --as (not --name) so it can't collide with the
 // instance selector, which every cogbox verb spells -n/--name.
@@ -50,6 +50,12 @@ pub const UpdateArgs = struct {
 	plugin: ?[]const u8 = null,
 	// update re-resolves the flake, so it takes the same single-fetch credential.
 	git_credential_stdin: bool = false,
+	// --defer-rules (control plane, like AddArgs.defer_rules): update the module +
+	// replace inject specs as usual, but leave the plugin's applied tagged L4/L7
+	// rules exactly as they are. Incoming rules the plugin does not already carry
+	// are emitted as one JSON line on stdout for the admin-approval flow. Needs
+	// PLUGIN: the deferred line names exactly one plugin.
+	defer_rules: bool = false,
 };
 
 pub const ResolveArgs = struct {
@@ -146,9 +152,12 @@ fn parseDel(args: []const []const u8) ParseError!Cmd {
 fn parseUpdate(args: []const []const u8) ParseError!Cmd {
 	var plugin: ?[]const u8 = null;
 	var git_cred = false;
+	var defer_rules = false;
 	for (args) |a| {
 		if (std.mem.eql(u8, a, "--git-credential-stdin")) {
 			git_cred = true;
+		} else if (std.mem.eql(u8, a, "--defer-rules")) {
+			defer_rules = true;
 		} else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
 			return error.InvalidArgs;
 		} else {
@@ -156,7 +165,9 @@ fn parseUpdate(args: []const []const u8) ParseError!Cmd {
 			plugin = a;
 		}
 	}
-	return .{ .update = .{ .plugin = plugin, .git_credential_stdin = git_cred } };
+	// The deferred line names exactly one plugin.
+	if (defer_rules and plugin == null) return error.InvalidArgs;
+	return .{ .update = .{ .plugin = plugin, .git_credential_stdin = git_cred, .defer_rules = defer_rules } };
 }
 
 fn parseResolve(args: []const []const u8) ParseError!Cmd {
@@ -265,6 +276,19 @@ test "update --git-credential-stdin (with and without name)" {
 	const c2 = try parse(&.{ "update", "myplugin", "--git-credential-stdin" });
 	try t.expect(c2.update.git_credential_stdin);
 	try t.expectEqualStrings("myplugin", c2.update.plugin.?);
+}
+
+test "update --defer-rules (PLUGIN required)" {
+	const c = try parse(&.{ "update", "p", "--defer-rules" });
+	try t.expect(c.update.defer_rules);
+	try t.expectEqualStrings("p", c.update.plugin.?);
+	const c2 = try parse(&.{ "update", "--defer-rules", "p", "--git-credential-stdin" });
+	try t.expect(c2.update.defer_rules);
+	try t.expect(c2.update.git_credential_stdin);
+	try t.expectEqualStrings("p", c2.update.plugin.?);
+	try t.expectError(error.InvalidArgs, parse(&.{ "update", "--defer-rules" }));
+	const c3 = try parse(&.{ "update", "p" });
+	try t.expect(!c3.update.defer_rules);
 }
 
 test "resolve parses (url required, optional --git-credential-stdin)" {

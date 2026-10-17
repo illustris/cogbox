@@ -23,7 +23,14 @@
 #     a pid the script wrote from $! would name a process that may already have
 #     died on a bind failure. The cogbox stub here never writes it, so a
 #     non-empty file at any point would prove the script did -- and a restart
-#     must truncate a stale pid away rather than leave it to be read as live.
+#     must truncate a stale pid away rather than leave it to be read as live;
+#   - 6. a PRESENT-but-unrenderable config (here 0 bytes) does NOT kill PID1:
+#     the old `|| die` exited 70 -> CrashLoopBackOff -> no kubectl exec, so the
+#     control plane could never re-courier. The supervisor must move it aside to
+#     config.json.bad, keep the wire files already in $RUNTIME (last-known-good;
+#     the emptyDir survives an in-pod restart) and still start all three
+#     children;
+#   - 7. a GOOD config is rendered and left in place (never moved aside).
 #
 # Usage: test_enforce.sh <path-to-cogbox-enforce.sh>
 # Needs: bash, coreutils, gawk, gnugrep. NOT cogbox/mitmproxy -- both are stubs.
@@ -51,13 +58,18 @@ mkdir -p "$BIN" "$RT" "$CAPUB" "$CACONF"
 BASH_BIN=$(command -v bash)
 shebang() { printf '#!%s\n' "$BASH_BIN"; }
 
-# The cogbox stub: __render-rules is a no-op; __l7proxy / __authproxy record a
-# start line (with role + pid) and then become a long-lived, killable process so
-# `wait -n` has something to wait on and a kill triggers exactly one restart.
+# The cogbox stub: __render-rules records the call and then, like the real
+# renderer on unparseable JSON, fails unless the config ($2) starts with '{';
+# __l7proxy / __authproxy record a start line (with role + pid) and then become a
+# long-lived, killable process so `wait -n` has something to wait on and a kill
+# triggers exactly one restart.
 { shebang; cat <<'STUB'
 verb="${1:-}"
 case "$verb" in
-	__render-rules) echo "render $*" >> "$EVENTS"; exit 0 ;;
+	__render-rules)
+		echo "render $*" >> "$EVENTS"
+		grep -q '^{' "$2" 2>/dev/null || { echo "error: InvalidJson" >&2; exit 1; }
+		exit 0 ;;
 	__l7proxy)   role=l7proxy ;;
 	__authproxy) role=authproxy ;;
 	*) echo "cogbox-unknown $*" >> "$EVENTS"; exit 0 ;;
@@ -290,6 +302,128 @@ if [ "$alive" -eq 0 ]; then
 else
 	bad "terminate() left $alive child(ren) alive"
 fi
+
+# --- helpers for the config-present runs (6, 7) -------------------------------
+# prepare_run <tag>: a fresh tree under $ROOT/<tag> with its own RT/CAPUB/CACONF,
+# EVENTS log and XDG config dir, plus a supervisor copy sed-ed exactly like the
+# first run's (path CONSTANTS and @...@ slots only). Re-points the globals the
+# helpers above read (RT, EVENTS) at the new tree.
+prepare_run() {
+	local tag="$1"
+	RUN="$ROOT/$tag"
+	RT="$RUN/rt"
+	CAPUB="$RUN/capub"
+	CACONF="$RUN/caconf"
+	EVENTS="$RUN/events"
+	XDG="$RUN/config"
+	CFG="$XDG/cogbox/instances/demo/config.json"
+	mkdir -p "$RT" "$CAPUB" "$CACONF" "$(dirname "$CFG")"
+	: > "$EVENTS"
+	export EVENTS
+	sed \
+		-e "s#@cogbox@#$BIN/cogbox-stub#g" \
+		-e "s#@mitmdump@#$BIN/mitmdump-stub#g" \
+		-e "s#@l7addon@#/dev/null#g" \
+		-e "s#^RUNTIME=/run/cogbox-rt#RUNTIME=$RT#" \
+		-e "s#^CAPUB_DIR=/run/cogbox-capub#CAPUB_DIR=$CAPUB#" \
+		-e "s#^CA_CONF=/run/cogbox-ca-conf#CA_CONF=$CACONF#" \
+		"$SRC" > "$RUN/enforce.sh"
+}
+# start_run: launch the prepared copy; SUP_PID is reused so the EXIT trap still
+# kills it.
+start_run() {
+	PATH="$BIN:$PATH" \
+	XDG_CONFIG_HOME="$XDG" \
+	COGBOX_DIVERT_PORT=18443 \
+		bash "$RUN/enforce.sh" demo > "$RUN/out.log" 2>&1 &
+	SUP_PID=$!
+}
+# stop_run <label>: TERM the supervisor and assert none of its children outlive it.
+stop_run() {
+	local mitm auth l7 pid alive=0
+	mitm=$(pidof_child l7mitm.pid)
+	auth=$(auth_pid)
+	l7=$(pidof_child l7proxy.pid)
+	kill -TERM "$SUP_PID" 2>/dev/null
+	for _ in $(seq 1 50); do
+		kill -0 "$SUP_PID" 2>/dev/null || break
+		sleep 0.1
+	done
+	SUP_PID=""
+	for pid in "$mitm" "$auth" "$l7"; do
+		[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && alive=$((alive + 1))
+	done
+	if [ "$alive" -eq 0 ]; then
+		ok "$1: terminate() kills all three children"
+	else
+		bad "$1: terminate() left $alive child(ren) alive"
+	fi
+}
+
+# --- 6. an unrenderable PRESENT config is moved aside, PID1 survives ---------
+# A 0-byte config.json (a torn courier / truncated PVC file) and a runtime dir
+# that already holds the last successful render, as after an in-pod restart.
+prepare_run bad
+: > "$CFG"
+echo "allow last-good.example" > "$RT/l7-rules"
+start_run
+if wait_for "start mitm " && wait_for "start authproxy " && wait_for "start l7proxy "; then
+	ok "6: an unrenderable config does not kill the supervisor; all three children start"
+else
+	bad "6: the supervisor died on an unrenderable config (CrashLoopBackOff, no exec path for the control plane); out: $(cat "$RUN/out.log")"
+fi
+if grep -q "^render __render-rules $CFG " "$EVENTS"; then
+	ok "6: the boot render was attempted on the present config"
+else
+	bad "6: no boot render of $CFG; events: $(cat "$EVENTS")"
+fi
+if kill -0 "$SUP_PID" 2>/dev/null; then
+	ok "6: the supervisor (PID1) is still alive"
+else
+	bad "6: the supervisor exited"
+fi
+if [ ! -e "$CFG" ] && [ -f "$CFG.bad" ] && [ ! -s "$CFG.bad" ]; then
+	ok "6: the unrenderable config was moved aside to config.json.bad (0 bytes, kept for forensics)"
+else
+	bad "6: expected $CFG gone and an empty $CFG.bad (config present=$([ -e "$CFG" ] && echo y || echo n), .bad present=$([ -e "$CFG.bad" ] && echo y || echo n))"
+fi
+if grep -q "render of" "$RUN/out.log" && grep -q "\.bad" "$RUN/out.log"; then
+	ok "6: the fallthrough is logged (render of ... moved aside to ....bad)"
+else
+	bad "6: the fallthrough was not logged; out: $(cat "$RUN/out.log")"
+fi
+if grep -qx "allow last-good.example" "$RT/l7-rules" 2>/dev/null; then
+	ok "6: the wire files already in the runtime dir were kept (last-known-good, not wiped)"
+else
+	bad "6: the runtime dir's last-good l7-rules was cleared or replaced"
+fi
+stop_run "6"
+
+# --- 7. a GOOD config is rendered and left in place --------------------------
+prepare_run good
+echo '{}' > "$CFG"
+start_run
+if wait_for "start l7proxy "; then
+	ok "7: a good config boots the supervisor through to l7proxy"
+else
+	bad "7: the supervisor did not come up on a good config; out: $(cat "$RUN/out.log")"
+fi
+if grep -q "^render __render-rules $CFG " "$EVENTS"; then
+	ok "7: the boot render was attempted on the good config"
+else
+	bad "7: no boot render of $CFG; events: $(cat "$EVENTS")"
+fi
+if [ -f "$CFG" ] && [ ! -e "$CFG.bad" ]; then
+	ok "7: a good config stays in place (never moved aside)"
+else
+	bad "7: a good config was moved aside"
+fi
+if kill -0 "$SUP_PID" 2>/dev/null; then
+	ok "7: the supervisor (PID1) is alive"
+else
+	bad "7: the supervisor exited on a good config"
+fi
+stop_run "7"
 
 if [ "$fails" -gt 0 ]; then
 	echo "$fails check(s) failed" >&2

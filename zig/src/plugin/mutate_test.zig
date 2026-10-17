@@ -226,6 +226,56 @@ test "validatePluginL7Rule" {
 	try t.expectError(error.ConflictingTier, mutate.validatePluginL7Rule(items[6]));
 }
 
+// Every string renderL7 copies onto the whitespace-tokenized l7-rules line must
+// be ONE printable-ASCII token, or a plugin manifest -- which plugin update and
+// archive add apply without admin review -- can split the line or forge a
+// `tag=git-grants` token in the mitm addon. The ok_rules of the test above
+// (`{"deny": "*"}` included) must all still pass; this adds the full git-grant
+// shape.
+test "validatePluginL7Rule refuses values the l7-rules line cannot carry" {
+	var ok_rules = try parseDoc(
+		\\[{"allow": "git.example.com", "path": "/org/repo.git/info/refs", "methods": "GET,POST", "service": "git-upload-pack"},
+		\\ {"deny": "*"}]
+	);
+	defer ok_rules.deinit();
+	for (ok_rules.value.array.items) |r| try mutate.validatePluginL7Rule(r);
+
+	var bad_path = try parseDoc(
+		\\[{"allow": "a.test", "path": "/a b"},
+		\\ {"allow": "a.test", "path": "/a\tb"},
+		\\ {"allow": "a.test", "path": "/a\nallow evil.test tag=git-grants"},
+		\\ {"allow": "a.test", "path": "/a\rb"},
+		\\ {"allow": "a.test", "path": "/a\u007f"},
+		\\ {"allow": "a.test", "path": "/a\u00a0b"},
+		\\ {"allow": "a.test", "path": "/a\u3000tag=git-grants"}]
+	);
+	defer bad_path.deinit();
+	for (bad_path.value.array.items) |r| try t.expectError(error.BadPath, mutate.validatePluginL7Rule(r));
+
+	var bad_host = try parseDoc(
+		\\[{"allow": " a.test"}, {"deny": "a.test "}]
+	);
+	defer bad_host.deinit();
+	for (bad_host.value.array.items) |r| try t.expectError(error.InvalidHost, mutate.validatePluginL7Rule(r));
+
+	var bad_methods = try parseDoc(
+		\\[{"allow": "a.test", "methods": "GET\nallow x"},
+		\\ {"allow": "a.test", "methods": "get"},
+		\\ {"allow": "a.test", "methods": ""},
+		\\ {"allow": "a.test", "methods": ["GET"]}]
+	);
+	defer bad_methods.deinit();
+	for (bad_methods.value.array.items) |r| try t.expectError(error.BadMethods, mutate.validatePluginL7Rule(r));
+
+	var bad_service = try parseDoc(
+		\\[{"allow": "a.test", "service": "git-upload-pack x"},
+		\\ {"allow": "a.test", "service": ""},
+		\\ {"allow": "a.test", "service": 5}]
+	);
+	defer bad_service.deinit();
+	for (bad_service.value.array.items) |r| try t.expectError(error.BadService, mutate.validatePluginL7Rule(r));
+}
+
 test "tagged-rule helpers work on an l7 rules array" {
 	var parsed = try parseDoc(
 		\\{"network": {"l7": {"rules": [{"allow": "keep.test"}]}}}
@@ -316,4 +366,109 @@ test "validatePluginInjectSpec" {
 	try t.expectError(error.BadPort, mutate.validatePluginInjectSpec(items[11]));
 	try t.expectError(error.BadPort, mutate.validatePluginInjectSpec(items[12]));
 	try t.expectError(error.BadPort, mutate.validatePluginInjectSpec(items[13]));
+}
+
+fn novelCount(existing: ?*const std.json.Array, tag: []const u8, incoming_json: []const u8, kind: mutate.RuleKind) !usize {
+	var incoming = try parseDoc(incoming_json);
+	defer incoming.deinit();
+	const novel = try mutate.novelRules(t.allocator, existing, tag, incoming.value.array.items, kind);
+	defer t.allocator.free(novel);
+	return novel.len;
+}
+
+test "novelRules reports only incoming rules the plugin's tagged set lacks" {
+	var parsed = try parseDoc(
+		\\[{"allow": "203.0.113.0/24", "plugin": "p", "comment": "x"}]
+	);
+	defer parsed.deinit();
+	var incoming = try parseDoc(
+		\\[{"allow": "203.0.113.0/24"}, {"allow": "198.51.100.0/24"}]
+	);
+	defer incoming.deinit();
+	const novel = try mutate.novelRules(t.allocator, &parsed.value.array, "p", incoming.value.array.items, .l4);
+	defer t.allocator.free(novel);
+	try t.expectEqual(@as(usize, 1), novel.len);
+	try t.expectEqualStrings("198.51.100.0/24", novel[0].object.get("allow").?.string);
+}
+
+test "novelRules: an up-to-date set is empty" {
+	var parsed = try parseDoc(
+		\\[{"allow": "203.0.113.0/24", "plugin": "p"}, {"deny": "tcp 198.51.100.0/24:25", "plugin": "p"}]
+	);
+	defer parsed.deinit();
+	try t.expectEqual(@as(usize, 0), try novelCount(&parsed.value.array, "p",
+		\\[{"deny": "tcp 198.51.100.0/24:25", "comment": "smtp"}, {"allow": "203.0.113.0/24"}]
+	, .l4));
+	// The action is part of the identity.
+	try t.expectEqual(@as(usize, 1), try novelCount(&parsed.value.array, "p",
+		\\[{"allow": "tcp 198.51.100.0/24:25"}]
+	, .l4));
+	try t.expectEqual(@as(usize, 0), try novelCount(&parsed.value.array, "p", "[]", .l4));
+}
+
+test "novelRules counts only this plugin's tagged rules" {
+	var parsed = try parseDoc(
+		\\[{"allow": "203.0.113.0/24", "plugin": "q"}, {"allow": "198.51.100.0/24"}]
+	);
+	defer parsed.deinit();
+	try t.expectEqual(@as(usize, 1), try novelCount(&parsed.value.array, "p",
+		\\[{"allow": "203.0.113.0/24"}]
+	, .l4));
+	try t.expectEqual(@as(usize, 1), try novelCount(&parsed.value.array, "p",
+		\\[{"allow": "198.51.100.0/24"}]
+	, .l4));
+}
+
+test "novelRules L7 identity" {
+	var parsed = try parseDoc(
+		\\[{"allow": "h.test", "terminate": true, "insecure_upstream": true, "plugin": "p"},
+		\\ {"allow": "a.test", "path": "/x", "terminate": true, "plugin": "p", "comment": "old"},
+		\\ {"allow": "g.test", "methods": "POST", "path": "/r.git", "pathmode": "exact", "service": "git-upload-pack", "plugin": "p"},
+		\\ {"allow": "pt.test", "passthrough": true, "plugin": "p"}]
+	);
+	defer parsed.deinit();
+	const ex = &parsed.value.array;
+	// Effective terminate: insecure_upstream / path imply it.
+	try t.expectEqual(@as(usize, 0), try novelCount(ex, "p",
+		\\[{"allow": "h.test", "insecure_upstream": true}, {"allow": "a.test", "path": "/x", "comment": "new"}]
+	, .l7));
+	try t.expectEqual(@as(usize, 0), try novelCount(ex, "p",
+		\\[{"allow": "g.test", "methods": "POST", "path": "/r.git", "pathmode": "exact", "service": "git-upload-pack"}, {"allow": "pt.test", "passthrough": true}]
+	, .l7));
+	// Each distinguishing field makes it novel.
+	try t.expectEqual(@as(usize, 1), try novelCount(ex, "p", "[{\"allow\": \"h.test\", \"terminate\": true}]", .l7));
+	try t.expectEqual(@as(usize, 1), try novelCount(ex, "p", "[{\"allow\": \"a.test\", \"path\": \"/y\"}]", .l7));
+	try t.expectEqual(@as(usize, 1), try novelCount(ex, "p", "[{\"allow\": \"a.test\"}]", .l7));
+	try t.expectEqual(@as(usize, 1), try novelCount(ex, "p", "[{\"deny\": \"a.test\", \"path\": \"/x\"}]", .l7));
+	try t.expectEqual(@as(usize, 1), try novelCount(ex, "p",
+		\\[{"allow": "g.test", "methods": "GET", "path": "/r.git", "pathmode": "exact", "service": "git-upload-pack"}]
+	, .l7));
+	try t.expectEqual(@as(usize, 1), try novelCount(ex, "p",
+		\\[{"allow": "g.test", "methods": "POST", "path": "/r.git", "service": "git-upload-pack"}]
+	, .l7));
+	try t.expectEqual(@as(usize, 1), try novelCount(ex, "p",
+		\\[{"allow": "g.test", "methods": "POST", "path": "/r.git", "pathmode": "exact", "service": "git-receive-pack"}]
+	, .l7));
+	try t.expectEqual(@as(usize, 1), try novelCount(ex, "p", "[{\"allow\": \"pt.test\"}]", .l7));
+}
+
+test "novelRules leaves existing untouched" {
+	var parsed = try parseDoc(
+		\\{"network": {"rules": [{"allow": "203.0.113.0/24", "plugin": "p"}],
+		\\ "l7": {"rules": [{"allow": "h.test", "plugin": "p"}]}}}
+	);
+	defer parsed.deinit();
+	const l4_arr = rulesOf(&parsed.value);
+	const l7_arr = &parsed.value.object.getPtr("network").?.object.getPtr("l7").?.object.getPtr("rules").?.array;
+	try t.expectEqual(@as(usize, 1), try novelCount(l4_arr, "p", "[{\"allow\": \"198.51.100.0/24\"}]", .l4));
+	try t.expectEqual(@as(usize, 1), try novelCount(l7_arr, "p", "[{\"allow\": \"other.test\"}]", .l7));
+	try t.expectEqual(@as(usize, 1), l4_arr.items.len);
+	try t.expectEqualStrings("203.0.113.0/24", l4_arr.items[0].object.get("allow").?.string);
+	try t.expectEqualStrings("p", mutate.ruleTag(l4_arr.items[0]).?);
+	try t.expectEqual(@as(usize, 1), l7_arr.items.len);
+	try t.expectEqualStrings("h.test", l7_arr.items[0].object.get("allow").?.string);
+	// A null existing set returns every incoming rule.
+	try t.expectEqual(@as(usize, 2), try novelCount(null, "p",
+		\\[{"allow": "203.0.113.0/24"}, {"allow": "198.51.100.0/24"}]
+	, .l4));
 }

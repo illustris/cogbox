@@ -132,7 +132,7 @@ At build, the base folds every plugin's merged `config.cogbox` into **one deriva
 ~/work/.agents/skills/...                        (codex skills)
 ```
 
-The base drops only **child** symlinks into real writable dirs (never a whole-dir or whole-file link), so the harness can scaffold session state alongside and peers coexist. A single base oneshot pre-accepts Claude Code workspace trust for `~/work`.
+The base drops only **child** symlinks into real writable dirs (never a whole-dir or whole-file link), so the harness can scaffold session state alongside and peers coexist. At boot the materializer first removes every link whose store entry is an earlier `*-cogbox-brain` (in the harness leaf dirs, plus `.claude/settings.json`, `.mcp.json` and `.omp/mcp.json`), so a removed plugin's skills, agents, commands, rules and MCP config stop loading; user files, dirs and other links are never touched. A single base oneshot pre-accepts Claude Code workspace trust for `~/work`.
 
 ## Plugins and runtime tool environments
 
@@ -140,7 +140,17 @@ On the hosted guest, [runtime tool environments](runtime-environment.md) offer a
 
 Precedence: a selected bundle's `bin` comes first in login shells and harness launchers, ahead of plugin tools (the brain's `bin`) and the base system. That order is base-owned: the contract gives a plugin no `loginShellInit` surface.
 
-The hosted guest enables the feature with `lib.mkDefault`, so a plugin module may set `cogbox.runtimeEnvironment.enable = false` to turn it off for the sandboxes that install it; the composition still evaluates. Setting it to `true` from a plugin on any other profile (workstation, container) is unsupported: there every boot would restore into a RAM-backed store (workstation), or into a copy-on-write store whose stale database an import cannot repair (container).
+The hosted guest enables the feature with `lib.mkDefault`, so a plugin module may set `cogbox.runtimeEnvironment.enable = false` to turn it off for the sandboxes that install it; the composition still evaluates. Only images that ship `runtime/module.nix` declare the option, so an unguarded setting fails the whole composition on an older image ("The option `cogbox.runtimeEnvironment' does not exist"). Guard it on the option's existence; `lib.mkIf` cannot guard an undeclared option, because the module system still checks the definition's path:
+
+```nix
+{ options, lib, ... }: {
+  config = lib.optionalAttrs (options ? cogbox && options.cogbox ? runtimeEnvironment) {
+    cogbox.runtimeEnvironment.enable = false;
+  };
+}
+```
+
+Setting it to `true` from a plugin on any other profile (workstation, container) is unsupported: there every boot would restore into a RAM-backed store (workstation), or into a copy-on-write store whose stale database an import cannot repair (container).
 
 ## Harness-agnostic → native mapping
 
@@ -162,6 +172,8 @@ The same store copy is symlinked into each layout (no duplication). OMP consumes
 ## Network rules and credential injection
 
 `cogboxPlugins.<attr>.networkRules` (L4 CIDR), `.l7Rules` ([L7 vhost rules](network-filtering.md#l7-host-filtering)), and `.inject` ([credential injection](network-filtering.md#host-side-credential-injection)) are the host-side, hot-reloadable policy. If the plugin declares any and the instance is in `rules` mode, `add` shows them all and asks once before merging (auto-confirmed with `-y` or when stdin is not a tty). Injection gets its own louder confirmation section (granting a host-side credential is a different trust than a firewall rule) and prints a `cogbox secret add` bind checklist — the secret is named symbolically and **never** enters the guest.
+
+An `l7Rules` entry's host, `path`, `methods` and `service` must each be a single printable-ASCII token (no whitespace, control or non-ASCII bytes), because the rendered policy file is whitespace-tokenized and its two readers split lines differently. A rule `path` is compared literally against the percent-DECODED request path, so a path that needs whitespace or non-ASCII cannot be expressed; percent-encoding it does not help, since the result only matches a double-encoded request. `methods` must be upper-case HTTP methods joined by commas (`"GET,POST"`), as `l7 add --method` requires. A manifest that violates this fails `plugin add`, `update` and `resolve` with exit 65 and `invalid cogboxPlugins.l7Rules[<i>]: ...` naming the field.
 
 Each merged rule/spec carries a `"plugin": "<name>"` field, so `del`/`update` remove or replace exactly what that plugin brought in. **Rule/inject changes hot-reload** into a running instance; **kit/module changes need a `cogbox restart`** — that asymmetry is the §"organizing principle" above. An `mcp` server may name only `command`/`args`/`env`/`url`/`headers` — a token/cred_file/secret path is rejected (MCP auth goes through host-side inject, never inline).
 
@@ -234,4 +246,6 @@ Adding a plugin evaluates third-party nix code at add time (pure eval, IFD disab
 | `cogbox plugin add FLAKE_URL[#ATTR] [--as PLUGIN] [-y] [-n NAME]` | Resolve, pin, and install. `#ATTR` selects `cogboxPlugins.<attr>` (default: `default`). `--as` overrides the derived name; `-y` skips the confirmation. Reports unit-name collisions with the installed plugins, and refuses (65) the ones the build cannot resolve. |
 | `cogbox plugin resolve FLAKE_URL[#ATTR] [--git-credential-stdin]` | Preview (JSON) the contract + host-side rules/inject without installing |
 | `cogbox plugin del PLUGIN [-y] [-n NAME]` | Remove a plugin and exactly the network rules it brought in |
-| `cogbox plugin update [PLUGIN] [-n NAME]` | Re-resolve the original URL(s), re-pin, and replace the plugins' tagged rules |
+| `cogbox plugin update [PLUGIN] [--git-credential-stdin] [--defer-rules] [-n NAME]` | Re-resolve the original URL(s), re-pin, and replace the plugins' tagged rules. `--defer-rules` (control-plane use; needs `PLUGIN`) leaves the plugin's applied tagged L4/L7 rules untouched, still replaces its inject specs, and prints the incoming rules not already tagged for the plugin (compared ignoring the tag and the comment) as one `{"deferred":{"plugin","l4","l7"}}` stdout line after the config is saved; nothing for an up-to-date plugin or outside rules mode |
+
+`add` and `update` take two control-plane flags. `--git-credential-stdin` reads one `host<TAB>user<TAB>token` line from stdin and authenticates that run's nix fetches with it through a temporary 0600 netrc, so the token is never in argv or the environment. `add --defer-rules` installs the module and merges inject specs as usual but does not merge the plugin's L4/L7 network rules: it prints them as the same one-line `{"deferred":...}` JSON on stdout (its own messages go to stderr, and the confirmation prompt is skipped) for the control plane to route through admin approval. `update --defer-rules` is described in the table above. Neither flag reviews inject specs: `secret bind` gates the credential, but every inject-spec host renders as an L7 `allow <host> terminate` whether or not its secret is bound, so a plugin's inject host is reachable as soon as the add or update lands.

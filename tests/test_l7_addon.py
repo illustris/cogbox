@@ -402,9 +402,19 @@ with open(os.path.join(HERE, "..", "cogbox-launch.sh")) as _f:
     _launch = _f.read()
 check(_launch.count("sk-ant-oat01-cogbox-host-injected-placeholder") == 1,
       "stub token literal is single-sourced in harness_stub_token (no drift)")
+import re as _re
 with open(os.path.join(HERE, "..", "flake.nix")) as _f:
     _flake = _f.read()
-check("ANTHROPIC_AUTH_TOKEN" not in _flake,
+# The c launcher's connect hint is the ONE allowed occurrence: its
+# claudeAltAuthVars list only READS the name (to stay silent when claude-code
+# authenticates from the env). Exempt exactly that line and keep the bare-name
+# test for the rest, so every way of SETTING it (an env attr, wrapProgram --set
+# or --set-default, a nameValuePair) still fails here.
+_flake_rest, _alt_lists = _re.subn(
+    r'^[ \t]*claudeAltAuthVars = \[[^\]\n]*\];[ \t]*$', '', _flake, flags=_re.M)
+check(_alt_lists == 1,
+      "exactly one one-line claudeAltAuthVars list (the single exempted read site)")
+check("ANTHROPIC_AUTH_TOKEN" not in _flake_rest,
       "no ANTHROPIC_AUTH_TOKEN env stub in the launcher (would shadow the cred file)")
 
 # The ZIG side must carry the SAME literal. The sentinel is duplicated out of

@@ -119,6 +119,138 @@ fn warnRender(io: std.Io, comptime fmt: []const u8, args: anytype) void {
 	credgrant.warn(io, "render: " ++ fmt, args);
 }
 
+/// True when `s` is ONE token to both readers of an `l7-rules` line: non-empty
+/// and printable ASCII only (0x21-0x7e). This is the strict form, used for a
+/// rule's host (filter.isValidHostName admits nothing else anyway) and by the
+/// plugin-manifest validator (plugin/mutate.zig), which has no back-compat
+/// reason to admit more. The render judges path, methods and service with the
+/// looser l7LineSafe instead, so a UTF-8 path that `l7 add` stored keeps
+/// rendering as it always has.
+///
+/// Intentionally stricter than l7/cli.zig lineSafeValue, which admits bytes
+/// >= 0x80.
+pub fn l7LineToken(s: []const u8) bool {
+	if (s.len == 0) return false;
+	for (s) |c| if (c < 0x21 or c > 0x7e) return false;
+	return true;
+}
+
+/// True when `s` stays ONE token in BOTH readers of an `l7-rules` line, which
+/// tokenize differently. The Zig proxy (filter.parseL7Line) splits on '\n' and
+/// then on space/tab, so to it any other byte is part of a token. The mitm
+/// addon decodes the file as text, ends a line at a lone '\r' too (universal
+/// newlines), and splits with str.split(), i.e. on everything Python's
+/// str.isspace() accepts: \t-\r, \x1c-\x1f, space, U+0085, U+00A0, U+1680,
+/// U+2000-200A, U+2028/9, U+202F, U+205F and U+3000. A value carrying any of
+/// those re-tokenizes in the addon -- the layer that gates injection on
+/// `tag=git-grants` -- while Zig still sees one token. So: valid UTF-8 (the
+/// addon reads the file as text, where an invalid byte fails the whole read
+/// rather than making a token), no C0 or C1 control or DEL, and none of the
+/// Unicode spaces above. Other non-ASCII is one token to both, and is
+/// admitted: `l7 add --path` and `l7 replace` both accept it, and it rendered
+/// and matched before this check existed.
+fn l7LineSafe(s: []const u8) bool {
+	if (s.len == 0 or !std.unicode.utf8ValidateSlice(s)) return false;
+	var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+	while (it.nextCodepoint()) |cp| switch (cp) {
+		0x00...0x20, 0x7f...0x9f => return false,
+		0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => return false,
+		else => {},
+	};
+	return true;
+}
+
+const L7Head = struct { deny: bool, host: []const u8 };
+
+/// A rule's action and host exactly as renderL7 extracts them: `allow` wins
+/// when present (a non-string `allow` drops the rule without looking at
+/// `deny`), then `deny`, else nothing.
+fn l7RuleHead(obj: std.json.ObjectMap) ?L7Head {
+	if (obj.get("allow")) |v| {
+		if (v != .string) return null;
+		return .{ .deny = false, .host = v.string };
+	}
+	if (obj.get("deny")) |v| {
+		if (v != .string) return null;
+		return .{ .deny = true, .host = v.string };
+	}
+	return null;
+}
+
+const L7LineFit = enum { full, host_deny, skip };
+
+/// Whether a rule can be rendered onto its `l7-rules` line as written (.full),
+/// only as a host-wide deny (.host_deny), or not at all (.skip).
+///
+/// The host is judged TRIMMED of space/tab, because `l7 add` legally stores a
+/// padded host (filter.parseDnsPattern trims before validating) and both
+/// readers' tokenizers eat that padding. A host that still fails is skipped
+/// whatever the action: the Zig parser already drops such a line, and there is
+/// no host to deny.
+///
+/// Each other value must be one token to both readers (l7LineSafe), of the
+/// token class its slot is read as, and within the Zig parser's cap for it
+/// (filter.max_l7_*, over which parseL7Line drops the whole line while the
+/// addon, which has no cap, keeps it). The class matters because methods and
+/// path are written as BARE tokens and both readers classify a bare token by
+/// its shape: a `methods` of `tag=git-grants`, `insecure` or `/x`, or a `path`
+/// of `insecure`, would be read as that keyword or slot rather than as what it
+/// was stored as. `service` is written glued to `service=`, so it has no class
+/// of its own. Plugin data is validated on write (plugin/mutate.zig), but a rule
+/// merged before that validation existed, or a hand-edited config, reaches here
+/// unchecked.
+///
+/// A value that fails makes the rule .host_deny, for either action. renderL7
+/// keeps a deny in place, broadened to `deny <host>` (never lost). An allow
+/// emits nothing in place and a `deny <host>` after every other line: see
+/// renderL7 for why that is exactly an allow that matches nothing.
+///
+/// The key list is exactly the set of strings renderL7 copies verbatim onto the
+/// line (methods, path, service) and must be kept in step with it. An absent,
+/// non-string or empty value is ignored, as renderL7 emits only non-empty
+/// strings.
+///
+/// Deliberately NOT consulted by hostNamedInRules: a .host_deny or .skip rule's
+/// host still counts as named, so the inject-union line, renderL7Inject and the
+/// auth-proxy conf all stay fail-closed for it.
+fn l7RuleLineFit(obj: std.json.ObjectMap, host: []const u8) L7LineFit {
+	if (!l7LineToken(std.mem.trim(u8, host, " \t"))) return .skip;
+	const Slot = struct { key: []const u8, cap: usize };
+	for ([_]Slot{
+		.{ .key = "methods", .cap = filter.max_l7_methods_len },
+		.{ .key = "path", .cap = filter.max_l7_path_len },
+		.{ .key = "service", .cap = filter.max_l7_service_len },
+	}) |slot| {
+		const v = obj.get(slot.key) orelse continue;
+		if (v != .string or v.string.len == 0) continue;
+		const s = v.string;
+		if (!l7LineSafe(s) or s.len > slot.cap) return .host_deny;
+		if (std.mem.eql(u8, slot.key, "methods") and !filter.isMethodsToken(s)) return .host_deny;
+		if (std.mem.eql(u8, slot.key, "path") and s[0] != '/') return .host_deny;
+	}
+	return .full;
+}
+
+/// Warn, by rule index only, about every `.l7.rules[]` entry renderL7 will not
+/// render as written. The raw values are deliberately not echoed: they may
+/// carry a newline or a control byte (the precedent is the audience warning in
+/// seedOperatorInjectSpecs).
+fn warnUnrenderableL7(io: std.Io, network: std.json.Value) void {
+	const rules = l7Rules(network) orelse return;
+	for (rules.items, 1..) |r, n| {
+		if (r != .object) continue;
+		const head = l7RuleHead(r.object) orelse continue;
+		switch (l7RuleLineFit(r.object, head.host)) {
+			.full => {},
+			.skip => warnRender(io, "l7 rule #{d} not rendered: its host carries whitespace, a control byte or a non-ASCII byte", .{n}),
+			.host_deny => if (head.deny)
+				warnRender(io, "l7 rule #{d} (deny) rendered as a host-wide deny: its path, methods or service cannot be carried on an l7-rules line (whitespace, a control byte, invalid UTF-8, the wrong form, or over the length cap)", .{n})
+			else
+				warnRender(io, "l7 rule #{d} (allow) not rendered; its host is denied for every request no other rule allows: its path, methods or service cannot be carried on an l7-rules line (whitespace, a control byte, invalid UTF-8, the wrong form, or over the length cap)", .{n}),
+		}
+	}
+}
+
 fn hostNamedInRules(rules: ?std.json.Array, host: []const u8) bool {
 	const r = rules orelse return false;
 	for (r.items) |item| {
@@ -352,17 +484,23 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 	if (rules) |rs| {
 		for (rs.items) |r| {
 			if (r != .object) continue;
-			var action: []const u8 = undefined;
-			var host: []const u8 = undefined;
-			if (r.object.getPtr("allow")) |v| {
-				if (v.* != .string) continue;
-				action = "allow";
-				host = v.string;
-			} else if (r.object.getPtr("deny")) |v| {
-				if (v.* != .string) continue;
-				action = "deny";
-				host = v.string;
-			} else continue;
+			const head = l7RuleHead(r.object) orelse continue;
+			const action: []const u8 = if (head.deny) "deny" else "allow";
+			const host = head.host;
+			// Every value below is copied onto a whitespace-tokenized line, so
+			// one that is not a single token of its slot's class could split it
+			// or forge a token (`tag=git-grants`). See l7RuleLineFit:
+			// writeL7Rules warns about each rule this narrows or drops.
+			switch (l7RuleLineFit(r.object, host)) {
+				.skip => continue,
+				.host_deny => {
+					// A deny keeps its place, broadened to the whole host. An
+					// allow emits nothing here: see the trailing pass below.
+					if (head.deny) try appendL7HostDeny(allocator, out, host);
+					continue;
+				},
+				.full => {},
+			}
 
 			try out.appendSlice(allocator, action);
 			try out.append(allocator, ' ');
@@ -433,6 +571,31 @@ pub fn renderL7(allocator: std.mem.Allocator, network: std.json.Value, out: *std
 		try out.appendSlice(allocator, h);
 		try out.appendSlice(allocator, " terminate\n");
 	}
+
+	// An allow l7RuleLineFit could not render still NAMES its host, and that is
+	// load-bearing: both readers deny a request to a host some allow names but
+	// no rule matches, while a host nothing names is no rule's business (the
+	// Zig proxy returns .no_match, passes it through, and the L4 policy
+	// decides). Dropping the allow alone would therefore WIDEN that host to the
+	// L4 policy. A `deny <host>` placed after every other line, the union lines
+	// included, is reached only by a request no earlier line matched: exactly
+	// the request the named-but-unmatched rule denies. So it gives the verdict
+	// of an allow that matches nothing, and shadows no other rule. Still at
+	// most one line per entry, which is what the rule-cap budget assumes.
+	if (rules) |rs| {
+		for (rs.items) |r| {
+			if (r != .object) continue;
+			const head = l7RuleHead(r.object) orelse continue;
+			if (head.deny or l7RuleLineFit(r.object, head.host) != .host_deny) continue;
+			try appendL7HostDeny(allocator, out, head.host);
+		}
+	}
+}
+
+fn appendL7HostDeny(allocator: std.mem.Allocator, out: *std.ArrayList(u8), host: []const u8) !void {
+	try out.appendSlice(allocator, "deny ");
+	try out.appendSlice(allocator, host);
+	try out.append(allocator, '\n');
 }
 
 /// Render the host-side credential-injection conf (the
@@ -1267,6 +1430,7 @@ pub fn writeRuntimeRules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: 
 
 /// Write `<runtime>/l7-rules` (the host-side proxy's rule file).
 pub fn writeL7Rules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, network: std.json.Value) !void {
+	warnUnrenderableL7(io, network);
 	var out: std.ArrayList(u8) = .empty;
 	defer out.deinit(allocator);
 	try renderL7(allocator, network, &out);
@@ -1930,6 +2094,166 @@ test "renderL7 wire format incl. insecure token" {
 	try std.testing.expect(has(s, "allow plain.test\n"));
 	try std.testing.expect(has(s, "allow api.test /v1/\n"));
 	try std.testing.expect(!has(s, "plain.test insecure"));
+}
+
+test "renderL7 never emits a value the l7-rules line format cannot carry" {
+	// Each smuggling rule is one a plugin manifest (or a hand-edited config)
+	// can carry: a newline or a lone CR splits the line in the addon, U+3000 is
+	// whitespace to the addon's str.split() but one token to Zig, a space in
+	// methods/service is a token boundary in both, and a keyword-shaped methods
+	// or path value is read as that keyword by both.
+	const gpa = std.testing.allocator;
+	const src =
+		\\{"l7":{"mode":"terminate","rules":[
+		\\  {"allow":"ok.test","path":"/v1/"},
+		\\  {"allow":"smuggle.test","path":"/a\nallow evil.test tag=git-grants"},
+		\\  {"allow":"cr.test","path":"/a\rallow evil2.test"},
+		\\  {"allow":"ws.test","path":"/a\u3000tag=git-grants"},
+		\\  {"allow":"m.test","methods":"GET\nallow evil3.test"},
+		\\  {"allow":"s.test","service":"git-upload-pack x"},
+		\\  {"allow":"g.test","methods":"tag=git-grants"},
+		\\  {"allow":"i.test","methods":"insecure"},
+		\\  {"allow":"p.test","path":"insecure"},
+		\\  {"deny":"d.test","path":"/admin x"},
+		\\  {"allow":" pad.test","path":"/p"},
+		\\  {"allow":"bad host.test"}
+		\\]}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderL7(gpa, parsed.value, &out);
+	const s = out.items;
+
+	var nrules: usize = 0;
+	var lines = std.mem.splitScalar(u8, s, '\n');
+	while (lines.next()) |line| {
+		for (line) |c| try std.testing.expect(c >= 0x20 and c <= 0x7e);
+		if (std.mem.startsWith(u8, line, "allow ") or std.mem.startsWith(u8, line, "deny ")) nrules += 1;
+	}
+	try std.testing.expect(std.mem.indexOf(u8, s, "evil") == null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "tag=") == null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "insecure") == null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "allow ok.test /v1/\n") != null);
+	// An unsafe DENY narrows to the whole host, in place, rather than
+	// disappearing.
+	try std.testing.expect(std.mem.indexOf(u8, s, "allow ok.test /v1/\ndeny d.test\n") != null);
+	try std.testing.expect(std.mem.indexOf(u8, s, "deny d.test /admin") == null);
+	// A padded host is still tolerated: `l7 add` can legally store one.
+	try std.testing.expect(std.mem.indexOf(u8, s, " pad.test /p\n") != null);
+	// An unsafe ALLOW leaves its host named by a trailing deny, in entry order,
+	// after every other line. The bad host has nothing to name and is skipped.
+	try std.testing.expect(std.mem.endsWith(u8, s, "pad.test /p\ndeny smuggle.test\ndeny cr.test\ndeny ws.test\ndeny m.test\ndeny s.test\ndeny g.test\ndeny i.test\ndeny p.test\n"));
+	try std.testing.expectEqual(@as(usize, 11), nrules);
+}
+
+test "an allow the render cannot carry keeps its host denied, and nothing wider" {
+	// The verdicts, end to end through the proxy's own parser: a dropped allow
+	// must not widen its host to the L4 policy (.no_match), must not shadow a
+	// later allow for the same host, and a UTF-8 path that `l7 add` accepts
+	// still renders and matches -- on an allow, and on a `deny *` that must
+	// stay path-scoped rather than become a global deny.
+	const gpa = std.testing.allocator;
+	const src =
+		\\{"l7":{"mode":"terminate","rules":[
+		\\  {"allow":"api.test","path":"/a\u001fb/"},
+		\\  {"allow":"both.test","path":"/x\u00a0y/"},
+		\\  {"allow":"both.test","path":"/ok/"},
+		\\  {"allow":"utf.test","path":"/caf\u00e9/"},
+		\\  {"deny":"*","path":"/\u00fc/"},
+		\\  {"allow":"free.test"}
+		\\]}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	try renderL7(gpa, parsed.value, &out);
+	var set: filter.L7RuleSet = undefined;
+	filter.parseL7Rules(out.items, &set);
+
+	try std.testing.expectEqual(filter.L7Verdict.deny, set.evaluate("api.test", "/other"));
+	try std.testing.expectEqual(filter.L7Verdict.deny, set.evaluate("api.test", "/a"));
+	try std.testing.expectEqual(filter.L7Verdict.deny, set.evaluate("api.test", null));
+	try std.testing.expectEqual(filter.L7Verdict.allow, set.evaluate("both.test", "/ok/z"));
+	try std.testing.expectEqual(filter.L7Verdict.deny, set.evaluate("both.test", "/x"));
+	try std.testing.expectEqual(filter.L7Verdict.allow, set.evaluate("utf.test", "/caf\xc3\xa9/z"));
+	try std.testing.expectEqual(filter.L7Verdict.deny, set.evaluate("utf.test", "/other"));
+	try std.testing.expectEqual(filter.L7Verdict.deny, set.evaluate("free.test", "/\xc3\xbc/"));
+	try std.testing.expectEqual(filter.L7Verdict.allow, set.evaluate("free.test", "/other"));
+	try std.testing.expectEqual(filter.L7Verdict.no_match, set.evaluate("unnamed.test", "/"));
+}
+
+test "l7LineToken / l7LineSafe / l7RuleLineFit" {
+	for ([_][]const u8{ "/v1/", "GET,POST", "git-upload-pack", "*.example.com" }) |ok| {
+		try std.testing.expect(l7LineToken(ok));
+		try std.testing.expect(l7LineSafe(ok));
+	}
+	for ([_][]const u8{ "", "/a b", "/a\tb", "/a\nb", "/a\rb", "/a\x1f", "/a\x7f", "/a\xc2\xa0" }) |bad| {
+		try std.testing.expect(!l7LineToken(bad));
+		try std.testing.expect(!l7LineSafe(bad));
+	}
+	// Non-ASCII that is one token to both readers: e-acute, and U+200B (zero
+	// width, but not whitespace to str.isspace()).
+	for ([_][]const u8{ "/caf\xc3\xa9/", "/a\xe2\x80\x8bb" }) |ok| {
+		try std.testing.expect(!l7LineToken(ok));
+		try std.testing.expect(l7LineSafe(ok));
+	}
+	// What the addon would split on, or could not decode: NEL, a C1 control,
+	// U+1680, U+2000, U+2028, U+202F, U+3000, a lone continuation byte, an
+	// overlong encoding.
+	for ([_][]const u8{ "/a\xc2\x85", "/a\xc2\x80", "/a\xe1\x9a\x80", "/a\xe2\x80\x80", "/a\xe2\x80\xa8", "/a\xe2\x80\xaf", "/a\xe3\x80\x80", "/a\x80", "/a\xc0\xaf" }) |bad| {
+		try std.testing.expect(!l7LineSafe(bad));
+	}
+
+	const gpa = std.testing.allocator;
+	const src =
+		\\[{"allow":"a.test","path":"/v1/","methods":"GET","service":"git-upload-pack"},
+		\\ {"allow":"a.test","path":"/a b"},
+		\\ {"deny":"a.test","path":"/a b"},
+		\\ {"deny":"bad host.test","path":"/v1/"},
+		\\ {"allow":" pad.test ","path":"/v1/"},
+		\\ {"allow":"a.test","methods":"tag=git-grants"},
+		\\ {"allow":"a.test","methods":"get"},
+		\\ {"allow":"a.test","path":"insecure"},
+		\\ {"allow":"a.test","path":"/caf\u00e9/"},
+		\\ {"allow":"a.test","methods":"","path":""},
+		\\ {"allow":5,"deny":"a.test"}]
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+	const items = parsed.value.array.items;
+	const want = [_]L7LineFit{ .full, .host_deny, .host_deny, .skip, .full, .host_deny, .host_deny, .host_deny, .full, .full };
+	for (want, 0..) |w, i| {
+		const head = l7RuleHead(items[i].object).?;
+		try std.testing.expectEqual(w, l7RuleLineFit(items[i].object, head.host));
+	}
+	// renderL7's extraction: a non-string allow drops the rule outright, and
+	// never falls through to its deny.
+	try std.testing.expect(l7RuleHead(items[10].object) == null);
+
+	// The Zig parser's caps: one byte over drops the whole line there, so it
+	// is a .host_deny here; exactly at the cap renders.
+	const caps = [_]struct { key: []const u8, prefix: []const u8, cap: usize, fill: u8 }{
+		.{ .key = "path", .prefix = "/", .cap = filter.max_l7_path_len, .fill = 'a' },
+		.{ .key = "methods", .prefix = "", .cap = filter.max_l7_methods_len, .fill = 'G' },
+		.{ .key = "service", .prefix = "", .cap = filter.max_l7_service_len, .fill = 's' },
+	};
+	for (caps) |c| {
+		for ([_]usize{ c.cap, c.cap + 1 }) |len| {
+			const val = try gpa.alloc(u8, len);
+			defer gpa.free(val);
+			@memset(val, c.fill);
+			@memcpy(val[0..c.prefix.len], c.prefix);
+			const doc = try std.fmt.allocPrint(gpa, "{{\"allow\":\"a.test\",\"{s}\":\"{s}\"}}", .{ c.key, val });
+			defer gpa.free(doc);
+			var p = try std.json.parseFromSlice(std.json.Value, gpa, doc, .{});
+			defer p.deinit();
+			const fit = l7RuleLineFit(p.value.object, "a.test");
+			try std.testing.expectEqual(if (len > c.cap) L7LineFit.host_deny else L7LineFit.full, fit);
+		}
+	}
 }
 
 test "l7Active counts inject specs (inject-only instance still funnels)" {
