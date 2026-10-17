@@ -1750,10 +1750,39 @@ STUB_STAMP=match STUB_POOL=missing
 rc=$(run_boot proofpool "${BASE_ATTRS[@]}")
 unset STUB_STAMP STUB_POOL
 want="PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 hb=$HOST_BOOT_ID gb=$GUEST_BOOT_ID pool=missing sf=1"
-if grep -qxF "$want" "$ROOT/proofpool/md/events"; then
+if [ "$(proof_puts "$ROOT/proofpool/md")" = 1 ] && grep -qxF "$want" "$ROOT/proofpool/md/events"; then
 	ok "a stamp saying the pool did not mount publishes a proof with pool=missing"
 else
 	bad "pool=missing: proof events: $(proof_events "$ROOT/proofpool/md")"
+fi
+# ...and pool=na, the accept set's third member (a guest with no data pool), is
+# published too: the control plane, not the host, fails the upgrade for it.
+STUB_STAMP=match STUB_POOL=na
+rc=$(run_boot proofpoolna "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_POOL
+want="PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 hb=$HOST_BOOT_ID gb=$GUEST_BOOT_ID pool=na sf=1"
+if [ "$(proof_puts "$ROOT/proofpoolna/md")" = 1 ] && grep -qxF "$want" "$ROOT/proofpoolna/md/events"; then
+	ok "a stamp saying the guest has no pool publishes a proof with pool=na"
+else
+	bad "pool=na: proof events: $(proof_events "$ROOT/proofpoolna/md")"
+fi
+
+# The set is closed: a pool state that is a plain lowercase word outside it is
+# refused like any malformed stamp. 11e's pool=stamp-canary cannot tell the
+# closed set from a loosened [a-z]+ or [[:alnum:]_]+ class (both refuse the
+# hyphen anyway); this can. The stamp is the real writer's, only the pool
+# differs.
+STUB_STAMP=match STUB_POOL=bogus
+rc=$(run_boot proofpoolbogus "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_POOL
+refused proofpoolbogus "a stamp whose pool state is outside ok|missing|na (pool=bogus)"
+# ...and the refusal is the pool check's, not a stamp that was never there or
+# never read: a passing case above that never opened the stamp would pin nothing.
+if grep -qxF "$GUEST_BOOT_ID pool=bogus" "$(stamp_at proofpoolbogus)" 2>/dev/null \
+	&& [ "$(evcount "$ROOT/proofpoolbogus/md" '^dd-read ')" -ge 1 ]; then
+	ok "the pool=bogus stamp reached the supervisor's stamp read"
+else
+	bad "the pool=bogus case never reached the stamp read: reads $(evcount "$ROOT/proofpoolbogus/md" '^dd-read '), stamp: $(cat "$(stamp_at proofpoolbogus)" 2>&1)"
 fi
 
 # 11g. No valid baked protocol version is the LEGACY shape: readiness with no
