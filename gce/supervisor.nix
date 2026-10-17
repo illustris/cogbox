@@ -177,6 +177,64 @@ in
 				# nothing anywhere saying why. The backoff therefore lives in
 				# supervise.sh, which can tell a failed boot from a finished one.
 				RestartSec = 5;
+				# HOST OOM POSTURE. Every process in this unit inherits the adj --
+				# QEMU, passt, l7proxy, mitmdump, authproxy and supervise.sh itself
+				# -- so on a host OOM the kernel takes an unprotected process first:
+				# a nix-daemon builder, a control-session command, the log tail.
+				# -900 and NOT -1000: at -1000 QEMU becomes unkillable, so a host
+				# whose only large consumer is the guest would panic instead of
+				# losing the guest. Among this unit's processes QEMU usually scores
+				# highest once nothing else is left, but not always: guest RAM that
+				# zram has swapped out stops counting toward its score, and mitmdump
+				# buffers whole response bodies, so a helper can be picked first.
+				# See the OOM-kill watch below for what then happens.
+				#
+				# The flip side: this unit's own `cogbox init` and `cogbox start` run
+				# their nix evaluations and builds (the composition re-pin, the
+				# runner build, a cold-store rebuild after an image Upgrade) as root
+				# inside this cgroup, so they inherit -900 too. An OOM during one of
+				# them takes the host's adj-0 services (resolved, logind, the
+				# control sessions, the log tail) before the build. That is
+				# transient -- those units restart -- and confined to the owner's own
+				# VM. Demoting only the builds would need a change in the launcher:
+				# `cogbox start` both builds and becomes QEMU's parent, so a choom
+				# around it here would demote QEMU as well.
+				#
+				# OOMPolicy=continue is LOAD-BEARING for supervise.sh leg (j). Under
+				# systemd's default (DefaultOOMPolicy=stop), a kernel OOM kill of
+				# QEMU makes systemd stop the whole unit: it runs ExecStop
+				# (cogworx-stop-supervisor creates the $STOPPING marker) and then
+				# TERMs supervise.sh, usually while it sits in `sleep`. Leg (j) then
+				# either never runs or classifies the death as a requested stop, and
+				# the OOM kill -- the one death the inner-exit forensics exist for --
+				# leaves no record. With `continue`, the launcher's `wait` returns,
+				# its EXIT trap records stop-result `exited`, and supervise.sh's poll
+				# takes leg (j) like any other inner exit; Restart=always still
+				# re-runs it.
+				#
+				# The cost of `continue` is that systemd no longer reacts to ANY OOM
+				# kill in the unit, and nothing else waits on the helpers (passt,
+				# l7proxy, mitmdump, the auth proxy): the launcher waits only on
+				# QEMU and `cogbox status` checks only QEMU. So supervise.sh watches
+				# the kernel's oom_kill count in this unit's memory.events -- the
+				# counter OOMPolicy itself acts on -- and takes leg (j) as `oom-kill`
+				# when it rises. Every OOM kill in the unit once the sandbox has
+				# started therefore still ends in a restart, and now leaves a record.
+				# The guest drain is kept too, but by a different route: leg (j)'s
+				# nonzero exit skips ExecStop (see KillSignal above), so when QEMU
+				# is still alive (a helper was the victim) supervise.sh itself runs
+				# the same bounded `cogbox stop` that ExecStop would, before leg (j),
+				# without the $STOPPING marker. A drain that fails or times out is
+				# only noted; the cgroup TERM after leg (j) is then the backstop, as
+				# for any exit with a live QEMU.
+				#
+				# The sshd listener needs no unit change: OpenSSH's
+				# LINUX_OOM_ADJUST sets its own oom_score_adj to -1000, and the
+				# NixOS sshd unit is Restart=always. Session children reset to 0,
+				# but they are tiny. Deliberately no MemoryMin/MemoryLow either: see
+				# the zram block in gce/cogbox-host.nix.
+				OOMScoreAdjust = -900;
+				OOMPolicy = "continue";
 				# journal, NOT journal+console. See the header.
 				StandardOutput = "journal";
 				StandardError = "journal";

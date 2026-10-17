@@ -240,9 +240,9 @@ const Ctx = struct {
 	// this to the temp-netrc env for the duration of the fetch, then tear it down.
 	fetch_env: ?*const std.process.Environ.Map = null,
 	// --defer-rules: when true, every human announce() is redirected to STDERR so
-	// the only thing on STDOUT is the one `{"deferred":...}` JSON line cmdAdd
-	// emits. The control plane parses that line; routing chatter to stderr keeps
-	// it clean. Set by cmdAdd for the duration of a deferred add.
+	// the only thing on STDOUT is the one `{"deferred":...}` JSON line cmdAdd /
+	// cmdUpdate emits. The control plane parses that line; routing chatter to
+	// stderr keeps it clean. Set by cmdAdd/cmdUpdate/cmdResolve for the run.
 	defer_rules: bool = false,
 };
 
@@ -457,8 +457,11 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 	// report them on stdout instead (the control plane routes them through admin
 	// approval). The module install and the inject-spec merge are UNCHANGED:
 	// injection is a separate trust class, gated host-side by `secret bind`, so it
-	// keeps its own confirm/merge path. The withheld L4/L7 rules count zero toward
-	// the prompt below; only inject specs prompt under defer.
+	// keeps its own confirm/merge path. That gate covers the credential only:
+	// renderL7 still unions every inject-spec host into `allow <host> terminate`,
+	// bound or not, so a plugin's inject host is reachable without review (a known
+	// residual, docs/plugins.md). The withheld L4/L7 rules count zero toward the
+	// prompt below; only inject specs prompt under defer.
 	const merge_l4 = if (a.defer_rules) &[_]std.json.Value{} else incoming_l4;
 	const merge_l7 = if (a.defer_rules) &[_]std.json.Value{} else incoming_l7;
 
@@ -528,6 +531,60 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 		defer allocator.free(line);
 		try writeStdout(io, line);
 	}
+}
+
+/// cmdUpdate's merge of plugin `n`'s contributed rules into a rules-mode config
+/// (`rules_arr`, `old_l7` and `old_inject` are its arrays as the caller found
+/// them). The plugin's tagged inject specs are always replaced by the incoming
+/// ones. Live, its tagged L4/L7 rules are too. Under --defer-rules
+/// (`defer_rules`) those stay exactly as they are -- a version that stops
+/// declaring a rule does not narrow it here -- and the incoming rules the plugin
+/// does not already carry (mutate.novelRules: ignoring tag and comment) come
+/// back as the rendered deferred line, or null when there are none. The caller
+/// owns the line and prints it only once config.save has committed. Touches
+/// nothing but the loaded tree, so the defer/live split is unit-tested.
+///
+/// Inject specs are not reviewed: `secret bind` gates the credential, but
+/// renderL7 unions every inject-spec host into `allow <host> terminate`, bound
+/// or not, so a new version's inject host is reachable after a deferred update
+/// as after `add --defer-rules` (a known residual, docs/plugins.md).
+fn updatePluginRules(
+	allocator: std.mem.Allocator,
+	loaded: *config.Loaded,
+	rules_arr: *std.json.Array,
+	old_l7: ?*std.json.Array,
+	old_inject: ?*std.json.Array,
+	n: []const u8,
+	incoming_l4: []const std.json.Value,
+	incoming_l7: []const std.json.Value,
+	incoming_inject: []const std.json.Value,
+	defer_rules: bool,
+) !?[]u8 {
+	var line: ?[]u8 = null;
+	errdefer if (line) |l| allocator.free(l);
+	if (defer_rules) {
+		const novel_l4 = try mutate.novelRules(allocator, rules_arr, n, incoming_l4, .l4);
+		defer allocator.free(novel_l4);
+		const novel_l7 = try mutate.novelRules(allocator, old_l7, n, incoming_l7, .l7);
+		defer allocator.free(novel_l7);
+		if (novel_l4.len + novel_l7.len > 0) {
+			line = try renderDeferredJson(allocator, n, novel_l4, novel_l7);
+		}
+	} else {
+		_ = mutate.removeTaggedRules(rules_arr, n);
+		try mutate.prependTaggedRules(loaded.treeAllocator(), rules_arr, n, incoming_l4);
+		if (old_l7) |la| _ = mutate.removeTaggedRules(la, n);
+		if (incoming_l7.len > 0) {
+			const l7_arr = try ensureL7Rules(loaded);
+			try mutate.prependTaggedRules(loaded.treeAllocator(), l7_arr, n, incoming_l7);
+		}
+	}
+	if (old_inject) |ia| _ = mutate.removeTaggedRules(ia, n);
+	if (incoming_inject.len > 0) {
+		const inj_arr = try ensureInjectSpecs(loaded);
+		try mutate.prependTaggedRules(loaded.treeAllocator(), inj_arr, n, incoming_inject);
+	}
+	return line;
 }
 
 /// Unit-name lint for an incoming plugin version, shared by `add` and
@@ -796,6 +853,9 @@ fn cmdDel(ctx: *const Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 	const allocator = ctx.allocator;
 	const io = ctx.io;
+	// --defer-rules: announce/print/restart-hint chatter goes to stderr; stdout
+	// carries only the deferred JSON line (cli guarantees PLUGIN is named).
+	ctx.defer_rules = u.defer_rules;
 
 	// --git-credential-stdin: same single-fetch netrc setup as add. update
 	// re-resolves the flake (nix flake metadata + archive), so the private repo
@@ -844,6 +904,11 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 		for (resolved.items) |*r| r.meta.deinit(allocator);
 		resolved.deinit(allocator);
 	}
+	// --defer-rules: the one `{"deferred":...}` line for the named plugin,
+	// rendered inside the loop (the incoming rule trees are freed per
+	// iteration) and written only after config.save commits the update.
+	var deferred_line: ?[]u8 = null;
+	defer if (deferred_line) |l| allocator.free(l);
 
 	for (plugins_arr.items) |*item| {
 		if (item.* != .object) continue;
@@ -997,15 +1062,21 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 				(if (old_inject) |ia| mutate.countTaggedRules(ia, n) else 0);
 			if (old_count > 0 or incoming_l4.len + incoming_l7.len + incoming_inject.len > 0) {
 				try announce(ctx, "{s}: contributed rules + inject specs", .{n});
-				for (rules_arr.items) |r| {
-					if (mutate.ruleTag(r)) |tag| {
-						if (std.mem.eql(u8, tag, n)) try printRuleLine(ctx, "-", r);
-					}
-				}
-				if (old_l7) |la| {
-					for (la.items) |r| {
+				if (u.defer_rules) {
+					// The applied L4/L7 rules stay as they are (updatePluginRules); a -/+
+					// diff of them would read as replaced. Only the inject specs move.
+					try announce(ctx, "{s}: L4/L7 rules kept; incoming ones not already applied are withheld for review", .{n});
+				} else {
+					for (rules_arr.items) |r| {
 						if (mutate.ruleTag(r)) |tag| {
-							if (std.mem.eql(u8, tag, n)) try printL7RuleLine(ctx, "-", r);
+							if (std.mem.eql(u8, tag, n)) try printRuleLine(ctx, "-", r);
+						}
+					}
+					if (old_l7) |la| {
+						for (la.items) |r| {
+							if (mutate.ruleTag(r)) |tag| {
+								if (std.mem.eql(u8, tag, n)) try printL7RuleLine(ctx, "-", r);
+							}
 						}
 					}
 				}
@@ -1016,20 +1087,14 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 						}
 					}
 				}
-				for (incoming_l4) |r| try printRuleLine(ctx, "+", r);
-				for (incoming_l7) |r| try printL7RuleLine(ctx, "+", r);
-				for (incoming_inject) |s| try printInjectLine(ctx, "+", s);
-				_ = mutate.removeTaggedRules(rules_arr, n);
-				try mutate.prependTaggedRules(loaded.treeAllocator(), rules_arr, n, incoming_l4);
-				if (old_l7) |la| _ = mutate.removeTaggedRules(la, n);
-				if (incoming_l7.len > 0) {
-					const l7_arr = try ensureL7Rules(loaded);
-					try mutate.prependTaggedRules(loaded.treeAllocator(), l7_arr, n, incoming_l7);
+				if (!u.defer_rules) {
+					for (incoming_l4) |r| try printRuleLine(ctx, "+", r);
+					for (incoming_l7) |r| try printL7RuleLine(ctx, "+", r);
 				}
-				if (old_inject) |ia| _ = mutate.removeTaggedRules(ia, n);
-				if (incoming_inject.len > 0) {
-					const inj_arr = try ensureInjectSpecs(loaded);
-					try mutate.prependTaggedRules(loaded.treeAllocator(), inj_arr, n, incoming_inject);
+				for (incoming_inject) |s| try printInjectLine(ctx, "+", s);
+				if (try updatePluginRules(allocator, loaded, rules_arr, old_l7, old_inject, n, incoming_l4, incoming_l7, incoming_inject, u.defer_rules)) |line| {
+					if (deferred_line) |prev| allocator.free(prev);
+					deferred_line = line;
 				}
 				rules_touched = true;
 			}
@@ -1050,6 +1115,9 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 
 	if (changed) {
 		try config.save(allocator, io, ctx.config_path, loaded.root().*);
+		// The withheld rules are reported only once the update is committed: a
+		// failure above leaves nothing for the control plane to file.
+		if (deferred_line) |line| try writeStdout(io, line);
 		if (rules_touched) try rules_module.maybeReload(allocator, io, ctx.runtime_path, loaded);
 	}
 	// Regenerate even without changes: update doubles as the self-heal for
@@ -1747,9 +1815,11 @@ fn buildSubstituters(allocator: std.mem.Allocator, cache_dir: []const u8, extra_
 /// out-path's closure into the LOCAL per-instance plugin-cache (file://cache_dir,
 /// on the state PVC). The agent's boot has no egress, so without this seed the
 /// brain rebuild cannot realise the plugin tools; with it, boot substitutes the
-/// whole closure offline. Every failure is logged and swallowed (boot then falls
-/// back to the baked base brain -- skills survive, tools are simply absent, i.e.
-/// no worse than before this fix). Determinism mirrors the runner path: nothing
+/// whole closure offline. Every failure is logged and swallowed; a boot that
+/// then cannot build the brain falls back to the plugin-less base brain (no
+/// plugin skills, agents, commands, rules or tools, and the materializer also
+/// removes links left by earlier boots; see brain.fallback). Determinism
+/// mirrors the runner path: nothing
 /// instance-specific is in the brain closure, so the pre-built out-path is
 /// byte-identical to the one boot's brainResolveContainer evaluates.
 fn prebuildBrainLocal(ctx: *const Ctx) Prebuild {
@@ -2455,7 +2525,9 @@ fn evalL7Rules(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?std.
 				error.NotAnObject => "not an object",
 				error.BadAction => "must have exactly one of allow/deny",
 				error.InvalidHost => "invalid host pattern",
-				error.BadPath => "path must be a string starting with /",
+				error.BadPath => "path must be a string starting with / made of printable ASCII with no whitespace (rules match the decoded request path, so a path with whitespace or non-ASCII cannot be expressed; do not percent-encode it)",
+				error.BadMethods => "methods must be upper-case HTTP methods joined by commas (e.g. \"GET,POST\")",
+				error.BadService => "service must be a non-empty string of printable ASCII with no whitespace",
 				error.BadFlag => "tier flags must be booleans",
 				error.ConflictingTier => "passthrough excludes terminate/path/insecure_upstream",
 				error.OutOfMemory => "out of memory",
@@ -2875,6 +2947,126 @@ test "renderDeferredJson emits one line with the validated rule shapes" {
 	try t.expectEqualStrings("api.example.com", l7.items[0].object.get("deny").?.string);
 	try t.expect(l7.items[0].object.get("terminate").?.bool);
 	try t.expectEqualStrings("x", l7.items[0].object.get("comment").?.string);
+}
+
+// updatePluginRules fixtures: plugin p carries a tagged L4 allow, a tagged L7
+// allow and a tagged inject spec; an untagged deny sits beside them.
+const update_rules_doc =
+	\\{"network":{"rules":[{"allow":"10.0.0.0/8","plugin":"p","comment":"old"},{"deny":"192.0.2.0/24"}],
+	\\"l7":{"rules":[{"allow":"a.example.com","plugin":"p"}],
+	\\"inject":{"enabled":true,"specs":[{"host":"old.example.com","style":"bearer","secret":"api-token","plugin":"p"}]}}}}
+;
+
+fn updateRulesTestLoaded(doc: []const u8) !config.Loaded {
+	return .{ .parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, doc, .{}), .path = "" };
+}
+
+fn updateRulesCompact(items: []const std.json.Value) ![]u8 {
+	var out: std.ArrayList(u8) = .empty;
+	errdefer out.deinit(t.allocator);
+	try writeCompactArray(t.allocator, &out, items);
+	return out.toOwnedSlice(t.allocator);
+}
+
+const UpdateRulesIncoming = struct {
+	l4: std.json.Parsed(std.json.Value),
+	l7: std.json.Parsed(std.json.Value),
+	inject: std.json.Parsed(std.json.Value),
+
+	fn init(l4: []const u8, l7: []const u8, inject: []const u8) !UpdateRulesIncoming {
+		const a = t.allocator;
+		var p4 = try std.json.parseFromSlice(std.json.Value, a, l4, .{});
+		errdefer p4.deinit();
+		var p7 = try std.json.parseFromSlice(std.json.Value, a, l7, .{});
+		errdefer p7.deinit();
+		return .{ .l4 = p4, .l7 = p7, .inject = try std.json.parseFromSlice(std.json.Value, a, inject, .{}) };
+	}
+
+	fn deinit(self: *UpdateRulesIncoming) void {
+		self.l4.deinit();
+		self.l7.deinit();
+		self.inject.deinit();
+	}
+
+	fn apply(self: *UpdateRulesIncoming, loaded: *config.Loaded, defer_rules: bool) !?[]u8 {
+		return updatePluginRules(t.allocator, loaded, rulesOrNull(loaded).?, l7RulesOrNull(loaded), injectSpecsOrNull(loaded), "p", self.l4.value.array.items, self.l7.value.array.items, self.inject.value.array.items, defer_rules);
+	}
+};
+
+test "updatePluginRules --defer-rules: L4/L7 untouched, inject replaced, only novel rules reported" {
+	const a = t.allocator;
+	var loaded = try updateRulesTestLoaded(update_rules_doc);
+	defer loaded.deinit();
+	var in = try UpdateRulesIncoming.init(
+		"[{\"allow\":\"10.0.0.0/8\"},{\"allow\":\"198.51.100.0/24\"}]",
+		"[{\"allow\":\"a.example.com\"},{\"allow\":\"b.example.com\",\"path\":\"/x\"}]",
+		"[{\"host\":\"new.example.com\",\"style\":\"bearer\",\"secret\":\"api-token\"}]",
+	);
+	defer in.deinit();
+
+	const l4_before = try updateRulesCompact(rulesOrNull(&loaded).?.items);
+	defer a.free(l4_before);
+	const l7_before = try updateRulesCompact(l7RulesOrNull(&loaded).?.items);
+	defer a.free(l7_before);
+
+	const line = (try in.apply(&loaded, true)) orelse return error.TestExpectedDeferredLine;
+	defer a.free(line);
+
+	// The applied L4/L7 arrays are byte-identical: nothing removed, nothing added.
+	const l4_after = try updateRulesCompact(rulesOrNull(&loaded).?.items);
+	defer a.free(l4_after);
+	try t.expectEqualStrings(l4_before, l4_after);
+	const l7_after = try updateRulesCompact(l7RulesOrNull(&loaded).?.items);
+	defer a.free(l7_after);
+	try t.expectEqualStrings(l7_before, l7_after);
+
+	// The inject specs are replaced as on a live update.
+	const specs = injectSpecsOrNull(&loaded).?.items;
+	try t.expectEqual(@as(usize, 1), specs.len);
+	try t.expectEqualStrings("new.example.com", specs[0].object.get("host").?.string);
+	try t.expectEqualStrings("p", specs[0].object.get("plugin").?.string);
+
+	// The line names only the rules p does not already carry.
+	var rt = try std.json.parseFromSlice(std.json.Value, a, line, .{});
+	defer rt.deinit();
+	const d = rt.value.object.get("deferred").?.object;
+	try t.expectEqualStrings("p", d.get("plugin").?.string);
+	const l4 = d.get("l4").?.array.items;
+	try t.expectEqual(@as(usize, 1), l4.len);
+	try t.expectEqualStrings("198.51.100.0/24", l4[0].object.get("allow").?.string);
+	const l7 = d.get("l7").?.array.items;
+	try t.expectEqual(@as(usize, 1), l7.len);
+	try t.expectEqualStrings("b.example.com", l7[0].object.get("allow").?.string);
+}
+
+test "updatePluginRules --defer-rules: an up-to-date rule set reports nothing" {
+	var loaded = try updateRulesTestLoaded(update_rules_doc);
+	defer loaded.deinit();
+	var in = try UpdateRulesIncoming.init("[{\"allow\":\"10.0.0.0/8\"}]", "[{\"allow\":\"a.example.com\"}]", "[]");
+	defer in.deinit();
+	try t.expect((try in.apply(&loaded, true)) == null);
+	// No inject spec incoming: the old one is gone, as on a live update.
+	try t.expectEqual(@as(usize, 0), injectSpecsOrNull(&loaded).?.items.len);
+}
+
+test "updatePluginRules live: the tagged L4/L7 rules are replaced, nothing reported" {
+	var loaded = try updateRulesTestLoaded(update_rules_doc);
+	defer loaded.deinit();
+	var in = try UpdateRulesIncoming.init(
+		"[{\"allow\":\"198.51.100.0/24\"}]",
+		"[{\"allow\":\"b.example.com\"}]",
+		"[]",
+	);
+	defer in.deinit();
+	try t.expect((try in.apply(&loaded, false)) == null);
+	const rules = rulesOrNull(&loaded).?.items;
+	try t.expectEqual(@as(usize, 2), rules.len);
+	try t.expectEqualStrings("198.51.100.0/24", rules[0].object.get("allow").?.string);
+	try t.expectEqualStrings("p", rules[0].object.get("plugin").?.string);
+	try t.expectEqualStrings("192.0.2.0/24", rules[1].object.get("deny").?.string);
+	const l7 = l7RulesOrNull(&loaded).?.items;
+	try t.expectEqual(@as(usize, 1), l7.len);
+	try t.expectEqualStrings("b.example.com", l7[0].object.get("allow").?.string);
 }
 
 test "renderDeferredJson with no rules emits empty arrays" {

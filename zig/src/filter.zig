@@ -1260,7 +1260,7 @@ pub const L7Line = union(enum) {
 /// letter (e.g. `GET` or `GET,POST`). The keyword tokens (`terminate`,
 /// `passthrough`, `insecure`, `exact`) and `service=` are all lowercase, so an
 /// all-uppercase token is unambiguously the optional method list.
-fn isMethodsToken(tok: []const u8) bool {
+pub fn isMethodsToken(tok: []const u8) bool {
 	if (tok.len == 0) return false;
 	var saw_letter = false;
 	for (tok) |c| switch (c) {

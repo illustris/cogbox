@@ -90,8 +90,24 @@ export COGBOX_L7_FUNNEL_ALL="${COGBOX_L7_FUNNEL_ALL:-1}"
 # renderFiles(..., .preserve); a live .replace beside a second writer strips its
 # specs while leaving l7-rules' terminate-allow and the :443 funnel standing.
 # See docs/network-filtering.md, "Where the two-writer contract actually applies".
+#
+# A PRESENT-but-unrenderable config (empty, torn, invalid JSON) must NOT kill
+# PID1: an exit here is CrashLoopBackOff, a crashlooping container cannot be
+# kubectl-exec'd, and the control plane's only repair path (courier config ->
+# __render-rules -> SIGHUP) IS an exec -- so the pod would never heal. Instead
+# the file is moved aside to config.json.bad (kept for forensics) and the
+# supervisor carries on as if no config had been delivered. Do NOT clear
+# $RUNTIME on that path: the rules emptyDir survives an in-pod container
+# restart, so keeping it means the last successful render's wire files stay
+# live there (last-known-good), and a fresh pod's empty emptyDir is
+# default-deny. The control plane re-renders after any enforcer restart (it
+# keys its skip on the container's restartCount): it re-couriers the agent's
+# config (staged, rendered, then renamed over $CONFIG on success).
 if [ -f "$CONFIG" ]; then
-	@cogbox@ __render-rules "$CONFIG" "$RUNTIME" || die "render of $CONFIG failed"
+	if ! @cogbox@ __render-rules "$CONFIG" "$RUNTIME"; then
+		log "error: render of $CONFIG failed; moving it aside to $CONFIG.bad and continuing on the wire files already in $RUNTIME (none on a fresh pod = default-deny); the control plane will re-deliver config + SIGHUP"
+		mv -f "$CONFIG" "$CONFIG.bad" || log "warning: could not move $CONFIG aside"
+	fi
 else
 	log "no config at $CONFIG yet -> starting default-deny (empty wire files); the control plane will deliver config + SIGHUP"
 fi

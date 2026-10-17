@@ -410,7 +410,7 @@ pub fn parseReplacePayload(
 /// method tokens (`GET` / `GET,POST`). Rejects lowercase / empty / stray chars
 /// so the rendered l7-rules line's METHODS token round-trips through the zig
 /// parser (which admits only all-uppercase-and-comma method tokens).
-fn validMethods(s: []const u8) bool {
+pub fn validMethods(s: []const u8) bool {
 	if (s.len == 0) return false;
 	var saw_letter = false;
 	for (s) |c| switch (c) {
