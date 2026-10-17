@@ -4,7 +4,9 @@
 #
 # Leg map, so a reader can line this up against the pod args. The order below is
 # the order the code runs in; keep it synchronized with the implementation:
-#   a   read the per-start readiness nonce from instance metadata, ONCE
+#   a   read the per-start readiness nonce from instance metadata, ONCE; then
+#       delete any cogworx/boot-proof a crashed previous run left (h2), and
+#       read the host boot id and the image's baked protocol values for it
 #   a2  publish the VM's own host key as a guest attribute, stamped with (a),
 #       on EVERY boot class and BEFORE both short-circuits
 #   d1  resolver short-circuit: never start the sandbox, and never touch the
@@ -20,20 +22,32 @@
 #       (deduplicated) and to the cogworx/boot-error guest attribute. Both are
 #       cleared only by an init that RUNS and SUCCEEDS -- a maintenance boot
 #       skips init, and is the boot an operator uses to investigate a wedged
-#       box, so it must preserve them.
+#       box, so it must preserve them. The control plane reads the generic
+#       fallback summary init_error_summary prints when nothing matched
+#       ("cogbox init failed") as UNCLASSIFIED and anything else as
+#       CLASSIFIED, so that literal is frozen protocol (gce/protocol.nix),
+#       and a `cogbox: `-stamped WARNING never counts as a match.
 #   d2  maintenance short-circuit: initialized, but the sandbox guest is
 #       deliberately never started
 #   c   stage the gateway SSH CA + principal before the guest boots
 #   e   clear stale runtime under the instance lock, keeping its inode
-#   f   cogbox start --no-ssh
+#   f   clear the guest's boot stamp (h2), then cogbox start --no-ssh
 #   g   (moved out) the cogbox.log tail lives in cogworx-cogbox-log.service
 #   h   publish readiness once the GUEST's host key file appears
+#   h2  the boot proof, cogworx/boot-proof: deleted at run start (a); the
+#       guest's boot stamp is cleared before (f), and a stamp path that cannot
+#       be cleared publishes the err=stamp-path proof there instead (a PUT that
+#       fails is retried from the hold loop until one lands); once (h)
+#       has published, the hold loop reads the stamp this launch's guest wrote
+#       and publishes the proof binding it to this nonce, this host boot and
+#       the image's baked protocol values. At most once per run, never on
+#       serial, and level-held like readiness (deleted wherever it is)
 #   i   hold the unit open for the sandbox's lifetime: until QEMU is gone, the
 #       readiness budget runs out, or anything in the unit is OOM-killed (a
 #       helper's OOM kill drains the still-live guest first)
-#   j   delete readiness FIRST, record the inner exit (state-disk ring +
-#       cogworx/inner-exit) unless a stop was requested, then exit non-zero so
-#       Restart=always re-runs
+#   j   delete readiness FIRST (then the boot proof), record the inner exit
+#       (state-disk ring + cogworx/inner-exit) unless a stop was requested,
+#       then exit non-zero so Restart=always re-runs
 #
 # Failure backoff: every exit that means "this boot FAILED" sleeps first
 # (backoff_sleep, doubling per consecutive failed boot), because the unit's own
@@ -170,9 +184,20 @@ INIT_STATE="${XDG_RUNTIME_DIR:-/run}/cogworx-init-error.state"
 # so one failure cannot overwrite the 1 MB serial ring buffer, stripped of
 # anything outside printable ASCII, and falling back to today's generic string
 # when nothing matched.
+#
+# A WARNING is never the failure, however it is stamped: nix prints a
+# lib.warn/lib.warnIf message as `evaluation warning: cogbox: ...` (older nix,
+# `trace: warning: cogbox: ...`) and the cogbox CLI prints its own as
+# `cogbox: warning: ...`. Both are skipped. The control plane reads every
+# summary but the generic string as CLASSIFIED (see the leg map), so a box whose
+# config draws one non-fatal warning (two cogbox.env sources setting one key)
+# would otherwise publish that warning as the reason for an unrelated, unstamped
+# failure -- a substituter or egress blip -- and turn a transient boot failure
+# into target evidence against a good image.
 init_error_summary() {
 	local s
 	s=$(awk '
+		/warning: cogbox: / || /cogbox: warning: / { next }
 		/cogbox: / && n < 3 {
 			line = substr($0, 1, 200)
 			gsub(/[^ -~]/, " ", line)
@@ -352,6 +377,38 @@ unit_oom_killed() {
 NONCE="$(md_get cogworx-start-nonce)"
 [ -n "$NONCE" ] || fatal "no cogworx-start-nonce in instance metadata; readiness could never be bound to this start epoch"
 
+# --- (h2) boot-proof inputs, read once per run ------------------------------
+#
+# A proof a crashed previous run left behind dies FIRST, before this run
+# publishes anything: Restart=always and the provider's automatic restart both
+# re-run this script under the SAME nonce, and ExecStopPost and the scrub unit,
+# the other two deletes, are best-effort.
+ga_del cogworx/boot-proof \
+	|| note "warning: could not delete a stale cogworx/boot-proof guest attribute"
+# The host boot id, which binds a proof to THIS host boot. Test seam only,
+# matching COGWORX_MD_BASE; the unit starts from a clean environment.
+BOOT_ID_FILE="${COGWORX_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+HB="$(head -c 64 "$BOOT_ID_FILE" 2>/dev/null | tr -d '\n')"
+if ! [[ "$HB" =~ $UUID_RE ]]; then
+	note "warning: the host boot id in $BOOT_ID_FILE is not UUID-shaped; no boot proof this run"
+	HB=""
+fi
+# The image's OWN protocol values, baked into the unit's environment from
+# gce/protocol.nix (gce/supervisor.nix). They travel inside the image, so they
+# are what the control plane checks the image's labels against. An empty BP is
+# the legacy shape: no readiness tail and no proof of either kind.
+BP="${COGWORX_IMAGE_BOOT_PROOF:-}"
+SF="${COGWORX_IMAGE_STATE_FORMAT:-}"
+if ! [[ "$BP" =~ ^[1-9][0-9]*$ ]]; then
+	note "warning: COGWORX_IMAGE_BOOT_PROOF ('$BP') is not a protocol version; legacy readiness, no boot proof"
+	BP=""
+fi
+if ! [[ "$SF" =~ ^[0-9]+$ ]]; then
+	note "warning: COGWORX_IMAGE_STATE_FORMAT ('$SF') is not a state format; no boot proof this run"
+	SF=""
+fi
+
 # --- (a2) publish the VM host key, before anything else ---------------------
 #
 # On EVERY boot class -- fresh, maintenance, resolver, provider-driven restart
@@ -416,6 +473,7 @@ md_has cogworx-maintenance && MAINTENANCE=1
 # restart storm.
 if md_has cogworx-resolver; then
 	ga_del cogworx/ready || true
+	ga_del cogworx/boot-proof || true
 	emit "resolver boot: sandbox deliberately not started"
 	note "cogworx-resolver is set; holding the host half up with no sandbox"
 	exec sleep infinity
@@ -575,6 +633,7 @@ fi
 # reason spelled out at (d1).
 if [ "$MAINTENANCE" -eq 1 ]; then
 	ga_del cogworx/ready || true
+	ga_del cogworx/boot-proof || true
 	emit "maintenance boot: sandbox deliberately not started"
 	note "cogworx-maintenance is set; holding the host half up with no sandbox"
 	exec sleep infinity
@@ -722,9 +781,54 @@ start_sandbox() {
 	(umask 077; printf '%s\n' "$INSTANCE" > "$STOP_INSTANCE") || return 1
 	cogbox "${start_args[@]}" 9>&-
 }
+# Leg (h2)'s freshness half: the guest's boot stamp is cleared IMMEDIATELY before
+# the launch, so a stamp the hold loop reads after it was written by THIS
+# launch's guest. It rides the 9p data share, at the same root as GUEST_KEY below
+# (guest path /var/lib/cogbox/.cogbox-boot-stamp). No guest runs at this line --
+# leg (e)'s lifetime flock refused while a previous guest still owned its
+# runtime, and the share is reachable only by a running guest -- so removing a
+# directory the guest left there recursively races nothing, and
+# --one-file-system keeps the removal from crossing into anything mounted
+# below it.
+BOOT_STAMP="$COGBOX_DATA/instances/$INSTANCE/.cogbox-boot-stamp"
+# proof_ok: this run may publish a success proof. refusal: this run owes the
+# err=stamp-path refusal instead. proof: this run has published a proof of
+# either kind, so it publishes nothing more.
+proof_ok=1
+refusal=0
+proof=0
+# The refusal is published here and, when that PUT fails, retried on every
+# hold-loop poll until one lands, as the success proof is: a run that owes it
+# and publishes nothing leaves the control plane waiting out its whole window
+# with the target running, and reading that silence as a fault of the image.
+put_refusal() {
+	if ga_put cogworx/boot-proof "$NONCE bp=$BP err=stamp-path"; then
+		proof=1
+	else
+		note "warning: could not publish the cogworx/boot-proof refusal; will retry"
+	fi
+}
+rm -f -- "$BOOT_STAMP" 2>/dev/null
+if [ -d "$BOOT_STAMP" ] && [ ! -L "$BOOT_STAMP" ]; then
+	rm -rf --one-file-system -- "$BOOT_STAMP" 2>/dev/null
+fi
+if [ -e "$BOOT_STAMP" ] || [ -L "$BOOT_STAMP" ]; then
+	# A stamp this launch's guest could not have written might still be read
+	# after it, so no success proof this run. Say so on the wire instead: the
+	# control plane reads err= as "the host could not prove this boot", not as
+	# a fault of the image.
+	proof_ok=0
+	note "warning: could not clear the boot stamp at $BOOT_STAMP; no boot proof this run"
+	if [ -n "$BP" ] && [ -n "$HB" ]; then
+		refusal=1
+		put_refusal
+	fi
+fi
+[ -n "$HB" ] && [ -n "$BP" ] && [ -n "$SF" ] || proof_ok=0
 if ! start_sandbox 9> "${XDG_RUNTIME_DIR:-/run}/cogworx-supervisor-start.lock"; then
 	emit "sandbox start failed"
 	ga_del cogworx/ready || true
+	ga_del cogworx/boot-proof || true
 	backoff_sleep
 	exit 1
 fi
@@ -746,6 +850,30 @@ backoff_reset
 # it. Timing budget mirrors the pod's initialDelay 10 + 5*60.
 GUEST_KEY="$COGBOX_DATA/instances/$INSTANCE/ssh/ssh_host_ed25519_key.pub"
 ready=0
+
+# Leg (h2)'s read half. The stamp is the guest's (cogbox-boot-stamp.service,
+# written after its sshd started): exactly `<guest boot id> pool=<ok|missing|na>`.
+# It is tenant-writable, so it is read defensively -- a regular file, never
+# through a symlink (checked, and O_NOFOLLOW in case one is swapped in after the
+# check), bounded in time (a FIFO swapped in after the check would block the
+# open) and in size -- and the shape is matched, anchored at both ends, over
+# the first 256 bytes after the shell strips trailing newlines (and NULs). A
+# guest boot id equal to the HOST's is no evidence of a guest boot at all.
+# Prints `<gb> <pool>`. Nothing read here reaches serial.
+# One residual: neither guard stops root opening a DEVICE node the guest
+# renames over the stamp after the check (the data share is 9p with
+# security_model=none, so a guest mknod there is a real node on this host).
+# Nothing read is published unless it is the shape above, and this VM serves
+# only that guest's tenant, so the worst it can do is an open() side effect on
+# its own host; moving the stamp off the share before reading it would close it.
+read_boot_stamp() {
+	local v
+	[ -f "$BOOT_STAMP" ] && [ ! -L "$BOOT_STAMP" ] || return 1
+	v=$(timeout 2 dd if="$BOOT_STAMP" iflag=nofollow bs=256 count=1 2>/dev/null) || return 1
+	[[ "$v" =~ ^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\ pool=(ok|missing|na)$ ]] || return 1
+	[ "${BASH_REMATCH[1]}" != "$HB" ] || return 1
+	printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
 # Which way the loop below ends, for leg (j)'s inner-exit record.
 exit_leg=exited
 # The OOM-kill baseline is taken only now, so an OOM kill during `cogbox start`
@@ -776,17 +904,38 @@ while :; do
 		# the record's stop-result is this drain's outcome. A drain that fails
 		# is only noted: leg (j) and its cgroup TERM are the backstop.
 		ga_del cogworx/ready || true
+		ga_del cogworx/boot-proof || true
 		note "draining the guest before the restart"
 		timeout 70 cogbox stop --name "$INSTANCE" \
 			|| note "warning: the guest drain after the OOM kill did not complete (exit $?); the unit's cgroup TERM is the backstop"
 		break
 	fi
 	if [ "$ready" -eq 0 ] && [ -s "$GUEST_KEY" ]; then
-		if ga_put cogworx/ready "$NONCE ok"; then
+		# The `bp=` tail names the image's protocol version. A control plane
+		# that predates it compares only the nonce half, so it sees no change.
+		if ga_put cogworx/ready "$NONCE ok${BP:+ bp=$BP}"; then
 			ready=1
 			emit "sandbox ready"
 		else
 			note "warning: could not publish the readiness guest attribute; will retry"
+		fi
+	fi
+	# A refusal leg (f) could not publish, readiness or not: it was due before
+	# the launch.
+	if [ "$proof" -eq 0 ] && [ "$refusal" -eq 1 ]; then
+		put_refusal
+	fi
+	# The boot proof, at most once per run and only after readiness. A stamp
+	# that is absent or refused is simply polled again: it never kills the
+	# guest, and READY_TIMEOUT below still counts readiness alone, so a boot
+	# with no proof times out exactly when it did before the proof existed.
+	if [ "$proof" -eq 0 ] && [ "$proof_ok" -eq 1 ] && [ "$ready" -eq 1 ] && stamp=$(read_boot_stamp); then
+		read -r gb pool <<< "$stamp"
+		if ga_put cogworx/boot-proof "$NONCE bp=$BP hb=$HB gb=$gb pool=$pool sf=$SF"; then
+			proof=1
+			emit "boot proof published"
+		else
+			note "warning: could not publish the cogworx/boot-proof guest attribute; will retry"
 		fi
 	fi
 	if [ "$ready" -eq 0 ]; then
@@ -825,6 +974,7 @@ done
 # supporting processes, so the launcher's orderly attempt has no guaranteed
 # guest drain window. See docs/graceful-guest-shutdown.md.)
 ga_del cogworx/ready || true
+ga_del cogworx/boot-proof || true
 if [ -e "$STOPPING" ]; then
 	note "sandbox stopped on request; not recorded as an inner exit"
 else

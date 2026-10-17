@@ -1,5 +1,7 @@
-# cogworx-attr-scrub.service -- delete the previous boot's readiness and
-# host-key guest attributes, as early as the metadata endpoint is reachable.
+# cogworx-attr-scrub.service -- delete the previous boot's readiness, host-key
+# and boot-proof guest attributes, as early as the metadata endpoint is
+# reachable. cogworx/boot-error is deliberately NOT in the list: it is cleared
+# only by an init that ran and succeeded (gce/supervise.sh leg (b)).
 #
 # Two properties are the entire point of this unit, and both are easy to lose
 # by "tidying" the dependency graph:
@@ -31,7 +33,7 @@
 {
 	config = {
 		systemd.services.cogworx-attr-scrub = {
-			description = "Scrub stale cogworx readiness and host-key guest attributes";
+			description = "Scrub stale cogworx readiness, host-key and boot-proof guest attributes";
 			wantedBy = [ "multi-user.target" ];
 			# network-online only; deliberately no relationship to
 			# cogworx-floor.service (see the header).
@@ -65,14 +67,14 @@
 							exit 1
 						fi
 
-						for key in cogworx/ready cogworx/vm-host-key; do
+						for key in cogworx/ready cogworx/vm-host-key cogworx/boot-proof; do
 							curl -fsS -o /dev/null -X DELETE -H "$hdr" --max-time 10 "$GA/$key" || true
 							if curl -fsS -o /dev/null -H "$hdr" --max-time 10 "$GA/$key"; then
 								echo "cogworx-attr-scrub: $key still present after DELETE; will retry" >&2
 								exit 1
 							fi
 						done
-						echo "cogworx-attr-scrub: stale readiness and host-key attributes removed"
+						echo "cogworx-attr-scrub: stale readiness, host-key and boot-proof attributes removed"
 					'';
 				}}/bin/cogworx-attr-scrub";
 			};
