@@ -35,6 +35,8 @@
 { config, lib, pkgs, ... }:
 let
 	cfg = config.cogworx.gce;
+	# The readiness wire contract with the cogworx control plane. See the file.
+	proto = import ./protocol.nix;
 
 	supervise = pkgs.runCommand "cogworx-supervise" { } ''
 		mkdir -p $out/bin
@@ -48,15 +50,22 @@ let
 	# (unit stop, failure past the restart limit, a killed supervisor). Without
 	# it a dead sandbox coasts on a stamped attribute for the rest of the start
 	# epoch, which is exactly what the kubelet's level-checked pod readiness
-	# does not do.
+	# does not do. The boot proof is level-held the same way, for the same
+	# reason. The two DELETEs run concurrently, so the post-stop leg stays one
+	# ten-second bound inside GCE's shutdown window (docs/graceful-guest-shutdown.md);
+	# both are best-effort, and `wait` with no operand always succeeds.
 	stopPost = pkgs.writeShellApplication {
 		name = "cogworx-supervisor-stop";
 		runtimeInputs = [ pkgs.curl ];
 		text = ''
 			curl -fsS -o /dev/null -X DELETE -H 'Metadata-Flavor: Google' --max-time 10 \
 				"http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/cogworx/ready" \
-				2>/dev/null || true
-			echo "cogworx-supervisor: readiness attribute unpublished"
+				2>/dev/null &
+			curl -fsS -o /dev/null -X DELETE -H 'Metadata-Flavor: Google' --max-time 10 \
+				"http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/cogworx/boot-proof" \
+				2>/dev/null &
+			wait
+			echo "cogworx-supervisor: readiness and boot-proof attributes unpublished"
 		'';
 	};
 
@@ -143,6 +152,14 @@ in
 				COGWORX_STATE_DIR = cfg.stateDir;
 					COGBOX_ENVIRONMENT = "cogworx";
 				COGWORX_SERIAL = cfg.serialDevice;
+				# The readiness protocol version and state format THIS image speaks
+				# (gce/protocol.nix), which supervise.sh reports in cogworx/ready's
+				# `bp=` tail and in cogworx/boot-proof. They travel inside the image
+				# tarball, so no re-registration or setLabels call can change what a
+				# booted image reports about itself: they are the content truth the
+				# control plane checks the image's labels against.
+				COGWORX_IMAGE_BOOT_PROOF = toString proto.bootProof;
+				COGWORX_IMAGE_STATE_FORMAT = toString proto.stateFormat;
 				HOME = "/root";
 			};
 			serviceConfig = {

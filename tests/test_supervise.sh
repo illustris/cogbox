@@ -73,6 +73,32 @@
 #     A helper's kill first drains the still-live guest with `cogbox stop`
 #     (readiness deleted before it, the record and the exit after it), since
 #     leg (j)'s exit skips ExecStop; a drain that fails is only noted.
+#   - the boot proof (leg h2). cogworx/boot-proof is deleted at run start
+#     before anything is published, and wherever readiness is (leg (j), the
+#     OOM drain, a failed start, both short-circuits). The guest's boot stamp
+#     is cleared before `cogbox start` -- a directory with rm -rf -- and a path
+#     that survives both removals (a file, a dangling symlink, a directory)
+#     publishes exactly the err=stamp-path proof instead of any success proof.
+#     A stamp this launch's guest wrote publishes exactly
+#     `<nonce> bp= hb= gb= pool= sf=`, each value from its own baked
+#     variable, once and after readiness; a stale,
+#     malformed, host-boot-id, symlinked or FIFO stamp publishes nothing,
+#     never reaches the read at all when it is already a symlink or a FIFO,
+#     and never costs the guest its life -- nor does one the guest swaps for a
+#     symlink or a FIFO after the host's check, which the read's O_NOFOLLOW
+#     and 2 s bound (exactly 2 s) refuse without stalling the loop; the read
+#     stops at 256 bytes; and READY_TIMEOUT still counts readiness alone.
+#     Readiness gains a
+#     `bp=` tail only from a valid baked protocol version; without one there
+#     is no proof of either kind. A PUT that fails -- readiness, the proof,
+#     the refusal -- is retried until one lands, in the same order; the
+#     refusal is retried whether or not the guest is ready, and while it is
+#     still owed no success proof lands and the ready guest is not killed for
+#     it. Nothing
+#     from the stamp reaches serial, and the boot-error contract the control
+#     plane classifies by (a classified summary, the generic literal, cleared
+#     by a later successful init) is unchanged -- except that a
+#     cogbox-stamped WARNING no longer stands in for an unstamped failure.
 #
 # Usage: test_supervise.sh <path-to-supervise.sh>
 # Needs: bash, coreutils, gawk, gnugrep. NOT curl/cogbox/GCE -- both are stubs.
@@ -115,6 +141,22 @@ while [ $# -gt 0 ]; do
 	esac
 done
 path="${url#*/computeMetadata/v1/}"
+# STUB_PUT_FAIL_ONCE=<attr>: the FIRST PUT of that guest attribute fails, as a
+# transient metadata-server error would. It is logged as FAILED-PUT, so a count
+# of `^PUT ` events still counts only the publishes that landed.
+if [ "$method" = PUT ] && [ -n "${STUB_PUT_FAIL_ONCE:-}" ] \
+	&& [ "$path" = "instance/guest-attributes/$STUB_PUT_FAIL_ONCE" ] \
+	&& [ ! -e "$FAKEMD/put-failed-once" ]; then
+	: > "$FAKEMD/put-failed-once"
+	printf 'FAILED-PUT %s %s\n' "$path" "$data" >> "$FAKEMD/events"
+	exit 22
+fi
+# STUB_PUT_FAIL_DATA=<text>: EVERY PUT whose value contains that text fails,
+# logged the same way -- a metadata-server error that outlasts the run.
+if [ "$method" = PUT ] && [ -n "${STUB_PUT_FAIL_DATA:-}" ] && [[ "$data" == *"$STUB_PUT_FAIL_DATA"* ]]; then
+	printf 'FAILED-PUT %s %s\n' "$path" "$data" >> "$FAKEMD/events"
+	exit 22
+fi
 printf '%s %s %s\n' "$method" "$path" "$data" >> "$FAKEMD/events"
 gakey() { printf '%s' "${path#instance/guest-attributes/}" | tr / _; }
 case "$method" in
@@ -185,6 +227,15 @@ case "${1:-}" in
 		[ -f "$d/config.json" ] || printf '{"vcpu":4}\n' > "$d/config.json"
 		exit 0 ;;
 	start)
+		# Leg (h2): whatever sits at the guest's boot-stamp path when the launch
+		# begins. The supervisor must have cleared it, or a stamp it reads after
+		# this line could be a previous boot's.
+		stamp="$COGBOX_DATA/instances/demo/.cogbox-boot-stamp"
+		if [ -e "$stamp" ] || [ -L "$stamp" ]; then
+			echo "stamp at start: present" >> "$FAKEMD/events"
+		else
+			echo "stamp at start: absent" >> "$FAKEMD/events"
+		fi
 		# The guest writes its persisted host key only after it boots, so a
 		# stub that creates it up front would make the readiness ordering
 		# assertion vacuous.
@@ -200,6 +251,22 @@ case "${1:-}" in
 			printf '%s\n' "$STUB_CONSOLE" > "$XDG_RUNTIME_DIR/cogbox-demo/console.log"
 			printf 'run-1 exited\n' > "$XDG_RUNTIME_DIR/cogbox-demo/stop-result"
 		fi
+		# What this launch's guest leaves at the stamp path: its
+		# cogbox-boot-stamp.service, which writes once its sshd is up. `stale`
+		# and `none` write nothing (stale is a PREVIOUS boot's stamp, seeded by
+		# run_boot); `undeletable` and `dir` write a good one over whatever the
+		# supervisor could or could not clear; `undeletable-link` and
+		# `dir-undeletable` leave what run_boot seeded and neither removal
+		# clears.
+		mkdir -p "$(dirname "$stamp")"
+		case "${STUB_STAMP:-none}" in
+			match|dir|undeletable) printf '%s pool=%s\n' "$STUB_GB" "$STUB_POOL" > "$stamp" ;;
+			bad) printf '%b' "$STUB_STAMP_TEXT" > "$stamp" ;;
+			symlink)
+				printf '%s pool=ok\n' "$STUB_GB" > "$stamp.target"
+				ln -s "$stamp.target" "$stamp" ;;
+			fifo) mkfifo "$stamp" ;;
+		esac
 		exit "${STUB_START_RC:-0}" ;;
 	stop)
 		# The supervisor's own guest drain (leg (i), after a helper's OOM kill).
@@ -244,7 +311,70 @@ echo '[  797.1] Out of memory: Killed process 988 (qemu-system-x86) shmem-rss:1k
 echo '[  797.2] unrelated-dmesg-line'
 STUB
 } > "$BIN/dmesg"
+# Every removal is the real one, but one naming the guest's boot stamp is also
+# logged, so leg (h2)'s clear can be ordered against `cogbox start` -- and under
+# STUB_STAMP=undeletable (a file), undeletable-link (a dangling symlink) or
+# dir-undeletable (a directory, so `rm -rf` fails too) it fails, standing in for
+# a path neither of the supervisor's removals can clear (an immutable attribute,
+# a mount squatting there or below it).
+REAL_RM=$(command -v rm)
+{ shebang; printf 'REAL_RM=%q\n' "$REAL_RM"; cat <<'STUB'
+for a in "$@"; do
+	case "$a" in
+		*/.cogbox-boot-stamp)
+			printf 'rm %s\n' "$*" >> "$FAKEMD/events"
+			case "${STUB_STAMP:-}" in undeletable|undeletable-link|dir-undeletable) exit 1 ;; esac ;;
+	esac
+done
+exec "$REAL_RM" "$@"
+STUB
+} > "$BIN/rm"
+# Every stamp read is the real dd too, logged as `dd-read <path>`, but under
+# STUB_STAMP_SWAP it first renames a symlink or a FIFO over the stamp: the guest
+# winning the race between the supervisor's `[ -f ] && [ ! -L ]` check and dd's
+# open, which is the only window the read's O_NOFOLLOW and its time bound exist
+# for. A stamp that is ALREADY a symlink or FIFO must never reach dd -- the log
+# is what asserts that -- so without this seam neither defence is load-bearing
+# in any case.
+REAL_DD=$(command -v dd)
+{ shebang; printf 'REAL_DD=%q\n' "$REAL_DD"; cat <<'STUB'
+for a in "$@"; do
+	case "$a" in
+		if=*/.cogbox-boot-stamp)
+			p="${a#if=}"
+			printf 'dd-read %s\n' "$p" >> "$FAKEMD/events"
+			case "${STUB_STAMP_SWAP:-}" in
+				symlink)
+					printf '%s pool=ok\n' "$STUB_GB" > "$p.target"
+					ln -sfn "$p.target" "$p.swap" && mv -fT "$p.swap" "$p" ;;
+				fifo) mkfifo "$p.swap" && mv -fT "$p.swap" "$p" ;;
+			esac ;;
+	esac
+done
+exec "$REAL_DD" "$@"
+STUB
+} > "$BIN/dd"
+# ...and every stamp read's time bound is the real timeout's, logged as
+# `timeout-read <duration>`. The FIFO-swap run's wall time shows the bound
+# works; this pins it at the 2 s the protocol names, which no wall-clock
+# threshold a loaded build machine can keep could tell from 5 s.
+REAL_TIMEOUT=$(command -v timeout)
+{ shebang; printf 'REAL_TIMEOUT=%q\n' "$REAL_TIMEOUT"; cat <<'STUB'
+for a in "$@"; do
+	case "$a" in
+		if=*/.cogbox-boot-stamp) printf 'timeout-read %s\n' "$1" >> "$FAKEMD/events" ;;
+	esac
+done
+exec "$REAL_TIMEOUT" "$@"
+STUB
+} > "$BIN/timeout"
 chmod 0755 "$BIN"/*
+
+# Leg (h2)'s boot ids: the HOST's (the supervisor's COGWORX_BOOT_ID_FILE seam),
+# the guest's for this launch, and a previous guest boot's.
+HOST_BOOT_ID=11111111-2222-4333-8444-555555555555
+GUEST_BOOT_ID=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+PREV_BOOT_ID=99999999-8888-4777-8666-555555555555
 
 # --- harness ----------------------------------------------------------------
 
@@ -284,6 +414,24 @@ run_boot() {
 	rm -f "$home/memory.events"
 	[ -n "${SEED_NO_MEM_EVENTS:-}" ] \
 		|| printf 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n' > "$home/memory.events"
+	# The host boot id leg (h2) binds a proof to, and the guest's boot stamp as
+	# a PREVIOUS boot left it on the 9p share: a complete, well-formed stamp
+	# (`stale`, and the one that cannot be cleared), a directory (and one that
+	# cannot be cleared), or a dangling symlink that cannot be cleared (which
+	# `-e` alone does not see).
+	printf '%s\n' "$HOST_BOOT_ID" > "$home/boot_id"
+	local stamp="$home/state/data/cogbox/instances/demo/.cogbox-boot-stamp"
+	case "${STUB_STAMP:-none}" in
+		stale|undeletable)
+			mkdir -p "$(dirname "$stamp")"
+			printf '%s pool=ok\n' "$PREV_BOOT_ID" > "$stamp" ;;
+		dir|dir-undeletable)
+			mkdir -p "$stamp/sub"
+			printf '%s pool=ok\n' "$PREV_BOOT_ID" > "$stamp/sub/f" ;;
+		undeletable-link)
+			mkdir -p "$(dirname "$stamp")"
+			ln -s "$stamp.gone" "$stamp" ;;
+	esac
 	local kv
 	for kv in "$@"; do
 		printf '%s' "${kv#*=}" > "$FAKEMD/attrs/${kv%%=*}"
@@ -307,12 +455,29 @@ run_boot() {
 	STUB_STATUS_OK="${STUB_STATUS_OK:-2}" \
 	STUB_OOM_AT="${STUB_OOM_AT:-}" \
 	STUB_STOP_RC="${STUB_STOP_RC:-0}" \
+	STUB_START_RC="${STUB_START_RC:-0}" \
+	STUB_STAMP="${STUB_STAMP:-none}" \
+	STUB_STAMP_TEXT="${STUB_STAMP_TEXT:-}" \
+	STUB_STAMP_SWAP="${STUB_STAMP_SWAP:-}" \
+	STUB_PUT_FAIL_ONCE="${STUB_PUT_FAIL_ONCE:-}" \
+	STUB_PUT_FAIL_DATA="${STUB_PUT_FAIL_DATA:-}" \
+	STUB_GB="$GUEST_BOOT_ID" \
+	STUB_POOL="${STUB_POOL:-ok}" \
+	COGWORX_BOOT_ID_FILE="${SEED_BOOT_ID_FILE-$home/boot_id}" \
+	COGWORX_IMAGE_BOOT_PROOF="${SEED_BP-1}" \
+	COGWORX_IMAGE_STATE_FORMAT="${SEED_SF-1}" \
 	COGWORX_UNIT_MEMORY_EVENTS="$home/memory.events" \
 	XDG_CONFIG_HOME="${SEED_XDG_CONFIG_HOME-$home/state/config}" \
 	COGBOX_DATA="$home/state/data/cogbox" \
 	XDG_RUNTIME_DIR="$home/run" \
-		bash "$SUP" > "$home/out.log" 2>&1
-	echo $?
+		timeout 60 bash "$SUP" > "$home/out.log" 2>&1
+	local rc=$?
+	# Every case finishes in well under a second (sleep is a stub), so a run
+	# that hits the bound is a supervisor that wedged -- a stamp read that
+	# blocks, say. Recorded here and failed at the end: this function runs in a
+	# command substitution, where `bad` would not count.
+	[ "$rc" != 124 ] || echo "$tag" >> "$ROOT/wedged"
+	echo "$rc"
 }
 
 evline() { grep -n -- "$2" "$1/events" 2>/dev/null | head -1 | cut -d: -f1; }
@@ -943,6 +1108,43 @@ if grep -q '^cogworx: FAILED: init: cogbox init failed$' "$ROOT/initopaque/seria
 else
 	bad "opaque init failure did not fall back cleanly: $(cat "$ROOT/initopaque/serial.log" 2>/dev/null)"
 fi
+
+# A WARNING IS NOT THE FAILURE. The control plane reads every summary but the
+# generic string as CLASSIFIED -- a fault of the image, which fails an upgrade
+# and is remembered against it -- so a non-fatal cogbox-stamped warning must
+# never stand in for an unstamped failure. A box whose config draws a warning on
+# every evaluation (two cogbox.env sources setting one key) would otherwise turn
+# a transient fetch failure on its first boot of a new image into a classified
+# one. Each shape on its own: nix's, older nix's (whose lib.warn carries its own
+# colour escape), and the cogbox CLI's.
+n=0
+for warnline in \
+	"evaluation warning: cogbox: env var(s) EDITOR are defined by more than one cogbox.env source; the highest-priority definition wins silently" \
+	$'trace: \033[1;31mwarning: cogbox: env var(s) EDITOR are defined by more than one cogbox.env source\033[0m' \
+	"cogbox: warning: COGBOX_OLD_NAME is set but no longer honored. Rename to COGBOX_NEW_NAME."; do
+	n=$((n + 1))
+	STUB_INIT_OUT="$warnline
+error: unable to download 'https://cache.example.com/nar/0abc.nar.xz': HTTP error 503"
+	rc=$(run_boot "initwarn$n" "${BASE_ATTRS[@]}")
+	ga="$ROOT/initwarn$n/md/ga/cogworx_boot-error"
+	if [ "$(cat "$ga" 2>/dev/null)" = 'n0nce-aaaa cogbox init failed' ] \
+		&& grep -qx 'cogworx: FAILED: init: cogbox init failed' "$ROOT/initwarn$n/serial.log" 2>/dev/null; then
+		ok "a stamped warning ($(printf '%s' "$warnline" | tr -c ' -~' '?' | head -c 40)) beside an unstamped failure publishes the generic literal"
+	else
+		bad "a stamped warning was published as the failure ($n): boot-error '$(tr -c ' -~' '?' < "$ga" 2>/dev/null)'"
+	fi
+done
+# ...while a REAL stamped error beside the same warning is still classified, and
+# its summary carries the error, not the warning.
+STUB_INIT_OUT="evaluation warning: cogbox: env var(s) EDITOR are defined by more than one cogbox.env source
+error: cogbox: config.json is empty"
+rc=$(run_boot initwarnerr "${BASE_ATTRS[@]}")
+ga="$ROOT/initwarnerr/md/ga/cogworx_boot-error"
+if grep -q '^n0nce-aaaa error: cogbox: config.json is empty' "$ga" 2>/dev/null && ! grep -q 'warning' "$ga"; then
+	ok "a stamped error beside a stamped warning publishes the error alone, still classified"
+else
+	bad "a stamped error beside a warning: boot-error '$(cat "$ga" 2>/dev/null)'"
+fi
 unset STUB_INIT_RC STUB_INIT_OUT
 
 # CLEARED ON SUCCESS. A boot-error that outlives its failure is worse than
@@ -1261,6 +1463,527 @@ if [ "$rc" != 0 ] && [ "$(evcount "$md" '^cogbox stop ')" = 1 ] \
 	ok "a failed guest drain is noted and leg (j) still records oom-kill and restarts"
 else
 	bad "failed guest drain: rc=$rc record=$(head -1 "${recs[0]}" 2>/dev/null) out: $(cat "$ROOT/inneroomdrainfail/out.log" 2>/dev/null)"
+fi
+
+# --- 11. the boot proof (leg h2) ---------------------------------------------
+#
+# The control plane's image upgrade commits only on cogworx/boot-proof: proof
+# that THIS launch's guest booted, on THIS host boot, from an image whose baked
+# protocol values it can check the image's labels against. So the proof must be
+# fresh (a previous run's proof and a previous boot's stamp both die before the
+# launch), exact (the control plane parses it), refused rather than guessed (a
+# stamp the host cannot trust publishes nothing), and level-held like readiness.
+# None of it may change what an old control plane sees: readiness keeps its
+# nonce half and its timing, and READY_TIMEOUT still counts readiness alone.
+# proof_events <md>: every boot-proof PUT/DELETE, in order.
+proof_events() { grep -E '^(PUT|DELETE) instance/guest-attributes/cogworx/boot-proof' "$1/events" 2>/dev/null; }
+proof_puts() { grep -c '^PUT instance/guest-attributes/cogworx/boot-proof ' "$1/events" 2>/dev/null || true; }
+
+# 11a. A stamp this launch's guest wrote: the proof, exactly, once, after
+# readiness, and only after a run-start delete that precedes every publish.
+STUB_STAMP=match
+rc=$(run_boot proofmatch "${BASE_ATTRS[@]}")
+unset STUB_STAMP
+md="$ROOT/proofmatch/md"
+first_ga=$(grep -n 'instance/guest-attributes/' "$md/events" | head -1)
+case "${first_ga#*:}" in
+	"DELETE instance/guest-attributes/cogworx/boot-proof "*)
+		ok "a previous run's boot proof is deleted at run start, before anything is published" ;;
+	*) bad "the first guest-attribute event is not the boot-proof DELETE: $first_ga" ;;
+esac
+want="PUT instance/guest-attributes/cogworx/ready n0nce-aaaa ok bp=1"
+if [ "$(grep -c '^PUT instance/guest-attributes/cogworx/ready ' "$md/events")" = 1 ] \
+	&& grep -qxF "$want" "$md/events"; then
+	ok "readiness carries the image's protocol version as a bp= tail after the nonce half"
+else
+	bad "readiness is not exactly '$want': $(grep 'cogworx/ready' "$md/events")"
+fi
+want="PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 hb=$HOST_BOOT_ID gb=$GUEST_BOOT_ID pool=ok sf=1"
+ready=$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')
+put=$(evline "$md" 'PUT instance/guest-attributes/cogworx/boot-proof')
+if [ "$(proof_puts "$md")" = 1 ] && grep -qxF "$want" "$md/events" \
+	&& [ -n "$ready" ] && [ -n "$put" ] && [ "$put" -gt "$ready" ]; then
+	ok "a stamp this launch's guest wrote publishes exactly the proof, once, after readiness"
+else
+	bad "expected one '$want' after readiness ($ready); proof events: $(proof_events "$md")"
+fi
+# Level-held: leg (j) deletes it after the readiness delete, so a dead
+# sandbox's proof does not outlive it.
+last=$(grep -n 'guest-attributes/cogworx/boot-proof' "$md/events" | tail -1)
+rdel=$(grep -n 'DELETE instance/guest-attributes/cogworx/ready' "$md/events" | tail -1 | cut -d: -f1)
+case "${last#*:}" in
+	"DELETE instance/guest-attributes/cogworx/boot-proof "*)
+		if [ -n "$rdel" ] && [ "${last%%:*}" -gt "$rdel" ] && [ ! -e "$md/ga/cogworx_boot-proof" ]; then
+			ok "leg (j) deletes the boot proof, after readiness"
+		else
+			bad "leg (j)'s boot-proof delete (${last%%:*}) does not follow the readiness delete ($rdel), or the proof survived"
+		fi ;;
+	*) bad "the last boot-proof event is not leg (j)'s DELETE: $last" ;;
+esac
+if grep -q '^cogworx: boot proof published$' "$ROOT/proofmatch/serial.log" 2>/dev/null \
+	&& ! grep -qF -e "$GUEST_BOOT_ID" -e "$HOST_BOOT_ID" -e 'pool=' "$ROOT/proofmatch/serial.log"; then
+	ok "serial says a proof was published and carries none of its values"
+else
+	bad "serial lacks the proof line or carries the stamp's values: $(cat "$ROOT/proofmatch/serial.log" 2>/dev/null)"
+fi
+# Each baked value travels under its own key. Every other case bakes bp=1 and
+# sf=1, which cannot tell the two apart, and a swapped sf is exactly what the
+# control plane decides a fallback to an older image by.
+STUB_STAMP=match SEED_BP=2 SEED_SF=7
+rc=$(run_boot proofdistinct "${BASE_ATTRS[@]}")
+unset STUB_STAMP SEED_BP SEED_SF
+md="$ROOT/proofdistinct/md"
+if grep -qxF "PUT instance/guest-attributes/cogworx/ready n0nce-aaaa ok bp=2" "$md/events" \
+	&& grep -qxF "PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=2 hb=$HOST_BOOT_ID gb=$GUEST_BOOT_ID pool=ok sf=7" "$md/events"; then
+	ok "readiness and the proof carry bp and sf each from its own baked value"
+else
+	bad "bp=2 sf=7 baked: readiness $(grep 'cogworx/ready' "$md/events" | head -1); proof events: $(proof_events "$md")"
+fi
+STUB_STAMP=undeletable SEED_BP=2 SEED_SF=7
+rc=$(run_boot proofdistinctstuck "${BASE_ATTRS[@]}")
+unset STUB_STAMP SEED_BP SEED_SF
+if grep -qxF "PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=2 err=stamp-path" "$ROOT/proofdistinctstuck/md/events"; then
+	ok "the err=stamp-path refusal carries bp from its own baked value"
+else
+	bad "bp=2 sf=7 baked, uncleanable stamp path: proof events: $(proof_events "$ROOT/proofdistinctstuck/md")"
+fi
+
+# 11b. A PREVIOUS boot's stamp, still on the share: cleared before the launch,
+# so this guest -- which writes none -- gets no proof from it.
+STUB_STAMP=stale
+rc=$(run_boot proofstale "${BASE_ATTRS[@]}")
+unset STUB_STAMP
+md="$ROOT/proofstale/md"
+clr=$(evline "$md" '^rm -f -- .*/instances/demo/\.cogbox-boot-stamp$')
+start=$(evline "$md" '^cogbox start')
+if [ -n "$clr" ] && [ -n "$start" ] && [ "$clr" -lt "$start" ] && grep -qx 'stamp at start: absent' "$md/events" \
+	&& [ "$(proof_puts "$md")" = 0 ] && [ -n "$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')" ]; then
+	ok "a previous boot's stamp is removed before cogbox start and proves nothing"
+else
+	bad "stale stamp: clear=$clr start=$start; events: $(cat "$md/events")"
+fi
+
+# 11c. A DIRECTORY squatting at the path (the guest can make one): removed
+# recursively, which is safe because no guest runs at leg (f), and the proof
+# then publishes normally.
+STUB_STAMP=dir
+rc=$(run_boot proofdir "${BASE_ATTRS[@]}")
+unset STUB_STAMP
+md="$ROOT/proofdir/md"
+want="PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 hb=$HOST_BOOT_ID gb=$GUEST_BOOT_ID pool=ok sf=1"
+if [ -n "$(evline "$md" '^rm -rf --one-file-system -- .*/\.cogbox-boot-stamp$')" ] \
+	&& grep -qx 'stamp at start: absent' "$md/events" && grep -qxF "$want" "$md/events"; then
+	ok "a directory at the stamp path is removed with rm -rf and the proof then publishes"
+else
+	bad "directory stamp: events: $(cat "$md/events")"
+fi
+
+# 11d. A path that survives both removals: exactly the err=stamp-path proof,
+# before the launch, and no success proof even though this guest then writes a
+# perfectly good stamp over it -- the host cannot tell whose it is.
+STUB_STAMP=undeletable
+rc=$(run_boot proofstuck "${BASE_ATTRS[@]}")
+unset STUB_STAMP
+md="$ROOT/proofstuck/md"
+want="PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 err=stamp-path"
+put=$(evline "$md" 'PUT instance/guest-attributes/cogworx/boot-proof')
+start=$(evline "$md" '^cogbox start')
+if [ "$(proof_puts "$md")" = 1 ] && grep -qxF "$want" "$md/events" \
+	&& [ -n "$put" ] && [ -n "$start" ] && [ "$put" -lt "$start" ] \
+	&& grep -qx 'stamp at start: present' "$md/events" \
+	&& [ -n "$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')" ]; then
+	ok "an uncleanable stamp path publishes exactly '<nonce> bp=1 err=stamp-path' before start, and no success proof"
+else
+	bad "uncleanable stamp: expected one '$want' before start ($start); proof events: $(proof_events "$md")"
+fi
+# A DANGLING symlink that survives both removals is the same refusal: `-e`
+# follows it and sees nothing, so only the `-L` half of the check catches it.
+STUB_STAMP=undeletable-link
+rc=$(run_boot proofstucklink "${BASE_ATTRS[@]}")
+unset STUB_STAMP
+md="$ROOT/proofstucklink/md"
+put=$(evline "$md" 'PUT instance/guest-attributes/cogworx/boot-proof')
+start=$(evline "$md" '^cogbox start')
+if [ "$(proof_puts "$md")" = 1 ] && grep -qxF "$want" "$md/events" \
+	&& [ -n "$put" ] && [ -n "$start" ] && [ "$put" -lt "$start" ]; then
+	ok "an uncleanable dangling symlink at the stamp path publishes exactly the err=stamp-path proof before start"
+else
+	bad "uncleanable dangling symlink: expected one '$want' before start ($start); proof events: $(proof_events "$md")"
+fi
+# stuck <tag> <what>: exactly the err=stamp-path refusal, once, before start.
+stuck() {
+	local md="$ROOT/$1/md" put start
+	put=$(evline "$md" 'PUT instance/guest-attributes/cogworx/boot-proof')
+	start=$(evline "$md" '^cogbox start')
+	if [ "$(proof_puts "$md")" = 1 ] && grep -qxF "$want" "$md/events" \
+		&& [ -n "$put" ] && [ -n "$start" ] && [ "$put" -lt "$start" ]; then
+		ok "$2 publishes exactly the err=stamp-path proof before start"
+	else
+		bad "$2: expected one '$want' before start ($start); proof events: $(proof_events "$md")"
+	fi
+}
+# A DIRECTORY that outlives `rm -rf --one-file-system` (something mounted below
+# it, the realistic undeletable shape) is the same refusal.
+STUB_STAMP=dir-undeletable
+rc=$(run_boot proofdirstuck "${BASE_ATTRS[@]}")
+unset STUB_STAMP
+[ -n "$(evline "$ROOT/proofdirstuck/md" '^rm -rf --one-file-system -- .*/\.cogbox-boot-stamp$')" ] \
+	|| bad "the uncleanable directory case never reached rm -rf; the next check proves nothing"
+stuck proofdirstuck "a directory at the stamp path that rm -rf cannot clear"
+# The refusal is gated on a valid version and host boot id only, never on the
+# state format: an image whose sf is broken still says why it proves nothing.
+SEED_SF=x STUB_STAMP=undeletable
+rc=$(run_boot proofsfstuck "${BASE_ATTRS[@]}")
+unset SEED_SF STUB_STAMP
+stuck proofsfstuck "an invalid state format with an uncleanable stamp path"
+
+# 11e. Stamps the host must refuse: each publishes nothing, the sandbox runs and
+# ends exactly as it would without a stamp (never stopped for it), and nothing
+# of the stamp reaches serial. `bad` covers a stamp that is not a boot id, one
+# equal to the HOST's boot id (no evidence of a guest boot at all), leading and
+# trailing junk, an unknown pool state and an uppercase id; a symlink is
+# refused even though its target is good, and so is a FIFO. Both are refused
+# again when the guest renames one over a good stamp AFTER the host's check:
+# the symlink by O_NOFOLLOW (its target is good), the FIFO by the read's 2 s
+# bound -- without it the open blocks forever, the loop stops polling, and the
+# run hits the test's 60 s bound instead of ending on its own leg.
+refused() {
+	local tag="$1" what="$2" md="$ROOT/$1/md" recs
+	recs=( "$ROOT/$tag/state/inner-exit"/*.log )
+	if [ "$rc" != 0 ] && [ "$(proof_puts "$md")" = 0 ] \
+		&& [ -n "$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')" ] \
+		&& [ "$(evcount "$md" '^cogbox stop ')" = 0 ] \
+		&& grep -q '^leg: exited$' "${recs[0]}" 2>/dev/null \
+		&& ! grep -qF -e 'stamp-canary' -e "$GUEST_BOOT_ID" -e 'pool=' "$ROOT/$tag/serial.log"; then
+		ok "$what publishes no proof and leaves the sandbox alone"
+	else
+		bad "$what: rc=$rc proof events: $(proof_events "$md"); stops: $(evcount "$md" '^cogbox stop '); record: $(head -1 "${recs[0]}" 2>/dev/null); serial: $(cat "$ROOT/$tag/serial.log" 2>/dev/null)"
+	fi
+}
+n=0
+for text in 'stamp-canary pool=ok\n' "$HOST_BOOT_ID pool=ok\n" "$GUEST_BOOT_ID pool=ok\nstamp-canary\n" \
+	"$GUEST_BOOT_ID pool=stamp-canary\n" "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE pool=ok\n" "$GUEST_BOOT_ID  pool=ok\n" \
+	"x$GUEST_BOOT_ID pool=ok\n"; do
+	n=$((n + 1))
+	STUB_STAMP=bad STUB_STAMP_TEXT="$text"
+	rc=$(run_boot "proofbad$n" "${BASE_ATTRS[@]}")
+	unset STUB_STAMP STUB_STAMP_TEXT
+	refused "proofbad$n" "a malformed stamp ($(printf '%s' "$text" | head -c 50))"
+done
+STUB_STAMP=symlink
+rc=$(run_boot proofsymlink "${BASE_ATTRS[@]}")
+unset STUB_STAMP
+refused proofsymlink "a symlinked stamp"
+STUB_STAMP=fifo
+rc=$(run_boot prooffifo "${BASE_ATTRS[@]}")
+unset STUB_STAMP
+refused prooffifo "a FIFO at the stamp path"
+STUB_STAMP=match STUB_STAMP_SWAP=symlink
+rc=$(run_boot proofswapsym "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_STAMP_SWAP
+refused proofswapsym "a stamp swapped for a symlink after the check (O_NOFOLLOW)"
+STUB_STAMP=match STUB_STAMP_SWAP=fifo
+t0=$SECONDS
+rc=$(run_boot proofswapfifo "${BASE_ATTRS[@]}")
+swapfifo_secs=$((SECONDS - t0))
+unset STUB_STAMP STUB_STAMP_SWAP
+refused proofswapfifo "a stamp swapped for a FIFO after the check (the read's time bound)"
+# ...and both swaps really reached the read: a passing pair above that never
+# opened the stamp would prove neither defence.
+stamp_at() { printf '%s' "$ROOT/$1/state/data/cogbox/instances/demo/.cogbox-boot-stamp"; }
+if [ -L "$(stamp_at proofswapsym)" ] && [ -p "$(stamp_at proofswapfifo)" ] \
+	&& [ "$(evcount "$ROOT/proofswapsym/md" '^dd-read ')" -ge 1 ] \
+	&& [ "$(evcount "$ROOT/proofswapfifo/md" '^dd-read ')" -ge 1 ]; then
+	ok "the swap seam fired on the supervisor's stamp read in both swap cases"
+else
+	bad "a swap case never reached the stamp read: $(ls -l "$(stamp_at proofswapsym)" "$(stamp_at proofswapfifo)" 2>&1)"
+fi
+# The check ahead of the read is the PRIMARY defence and the only one against a
+# device node already at the path (O_NOFOLLOW and the time bound do nothing for
+# it): a stamp that is already a symlink or a FIFO is refused before dd opens
+# anything.
+if [ "$(evcount "$ROOT/proofsymlink/md" '^dd-read ')" = 0 ] && [ "$(evcount "$ROOT/prooffifo/md" '^dd-read ')" = 0 ]; then
+	ok "a stamp that is already a symlink or a FIFO never reaches the read"
+else
+	bad "the stamp read opened a non-regular stamp: symlink case $(evcount "$ROOT/proofsymlink/md" '^dd-read ') read(s), FIFO case $(evcount "$ROOT/prooffifo/md" '^dd-read ') read(s)"
+fi
+# The time bound is 2 s, and a swapped-in FIFO blocks exactly one read (every
+# later poll's check refuses it before dd), so that run takes a couple of
+# seconds. A bound loosened to tens of seconds would stall the hold loop -- and
+# the QEMU and OOM-kill watch with it -- that long per swap, well short of the
+# 60 s wedge bound.
+if [ "$swapfifo_secs" -lt 10 ]; then
+	ok "a FIFO swapped over the stamp costs the hold loop one short bounded read (${swapfifo_secs}s)"
+else
+	bad "the FIFO swap run took ${swapfifo_secs}s; the read's time bound is not the 2 s it should be"
+fi
+# ...and it is exactly the protocol's 2 s, on every read, the blocked one and an
+# ordinary one alike.
+for tag in proofswapfifo proofmatch; do
+	if [ "$(evcount "$ROOT/$tag/md" '^timeout-read ')" -ge 1 ] \
+		&& ! grep '^timeout-read ' "$ROOT/$tag/md/events" | grep -qvx 'timeout-read 2'; then
+		ok "every stamp read in $tag runs under a 2 s bound"
+	else
+		bad "a stamp read in $tag is not bounded at 2 s: $(grep '^timeout-read ' "$ROOT/$tag/md/events" | sort | uniq -c | tr '\n' ' ')"
+	fi
+done
+# The size bound: only the first 256 bytes are read. A good stamp padded with
+# newlines to exactly 256 bytes, with junk past them, reads as that good stamp
+# (the shell trims the trailing newlines), while an unbounded read sees the junk
+# and refuses it. This pins the bound, not a shape the guest writes.
+stampline="$GUEST_BOOT_ID pool=ok"
+STUB_STAMP=bad STUB_STAMP_TEXT="$stampline$(printf '\\n%.0s' $(seq $((256 - ${#stampline}))))stamp-canary-past-the-bound\n"
+rc=$(run_boot proofpad "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_STAMP_TEXT
+want="PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 hb=$HOST_BOOT_ID gb=$GUEST_BOOT_ID pool=ok sf=1"
+if [ "$(head -c 256 "$(stamp_at proofpad)" | wc -l)" = $((256 - ${#stampline})) ] \
+	&& [ "$(stat -c %s "$(stamp_at proofpad)")" -gt 256 ] \
+	&& [ "$(proof_puts "$ROOT/proofpad/md")" = 1 ] && grep -qxF "$want" "$ROOT/proofpad/md/events"; then
+	ok "the stamp read stops at 256 bytes"
+else
+	bad "the stamp read is not bounded at 256 bytes: proof events: $(proof_events "$ROOT/proofpad/md")"
+fi
+
+# 11f. pool=missing is still a well-formed proof: the control plane, not the
+# host, decides that a guest whose data pool did not mount fails the upgrade.
+STUB_STAMP=match STUB_POOL=missing
+rc=$(run_boot proofpool "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_POOL
+want="PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 hb=$HOST_BOOT_ID gb=$GUEST_BOOT_ID pool=missing sf=1"
+if grep -qxF "$want" "$ROOT/proofpool/md/events"; then
+	ok "a stamp saying the pool did not mount publishes a proof with pool=missing"
+else
+	bad "pool=missing: proof events: $(proof_events "$ROOT/proofpool/md")"
+fi
+
+# 11g. No valid baked protocol version is the LEGACY shape: readiness with no
+# tail and no proof of either kind, even for a good stamp or an uncleanable
+# path. A valid version with no valid state format or host boot id keeps the
+# tail but publishes no success proof; the err=stamp-path refusal needs only a
+# valid version and host boot id.
+legacy() {
+	local tag="$1" what="$2" want="$3" md="$ROOT/$1/md"
+	if [ "$(grep -c '^PUT instance/guest-attributes/cogworx/ready ' "$md/events")" = 1 ] \
+		&& grep -qxF "PUT instance/guest-attributes/cogworx/ready $want" "$md/events" \
+		&& [ "$(proof_puts "$md")" = 0 ]; then
+		ok "$what: readiness is '$want' and no proof is published"
+	else
+		bad "$what: readiness $(grep 'cogworx/ready' "$md/events" | head -2 | tr '\n' ' '); proof events: $(proof_events "$md")"
+	fi
+}
+for bp in "" 0 abc 1x; do
+	SEED_BP="$bp" STUB_STAMP=match
+	rc=$(run_boot "proofbp${bp:-empty}" "${BASE_ATTRS[@]}")
+	unset SEED_BP STUB_STAMP
+	legacy "proofbp${bp:-empty}" "COGWORX_IMAGE_BOOT_PROOF='$bp'" "n0nce-aaaa ok"
+done
+SEED_BP="" STUB_STAMP=undeletable
+rc=$(run_boot proofbpstuck "${BASE_ATTRS[@]}")
+unset SEED_BP STUB_STAMP
+legacy proofbpstuck "no protocol version and an uncleanable stamp path" "n0nce-aaaa ok"
+for sf in "" x -1; do
+	SEED_SF="$sf" STUB_STAMP=match
+	rc=$(run_boot "proofsf${sf:-empty}" "${BASE_ATTRS[@]}")
+	unset SEED_SF STUB_STAMP
+	legacy "proofsf${sf:-empty}" "COGWORX_IMAGE_STATE_FORMAT='$sf'" "n0nce-aaaa ok bp=1"
+done
+printf 'not-a-boot-id\n' > "$ROOT/badhostid"
+SEED_BOOT_ID_FILE="$ROOT/badhostid" STUB_STAMP=match
+rc=$(run_boot proofhb "${BASE_ATTRS[@]}")
+unset SEED_BOOT_ID_FILE STUB_STAMP
+legacy proofhb "a host boot id that is not a UUID" "n0nce-aaaa ok bp=1"
+# The refusal needs a valid host boot id too: without one an uncleanable path
+# publishes nothing at all.
+SEED_BOOT_ID_FILE="$ROOT/badhostid" STUB_STAMP=undeletable
+rc=$(run_boot proofhbstuck "${BASE_ATTRS[@]}")
+unset SEED_BOOT_ID_FILE STUB_STAMP
+legacy proofhbstuck "a host boot id that is not a UUID and an uncleanable stamp path" "n0nce-aaaa ok bp=1"
+
+# 11h. No stamp at all: readiness alone decides the boot. A ready guest whose
+# stamp never appears stays up until it exits on its own -- never a
+# ready-timeout, which still means only "the guest never became ready".
+STUB_STAMP=none STUB_STATUS_OK=100
+rc=$(run_boot proofnone "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_STATUS_OK
+md="$ROOT/proofnone/md"
+recs=( "$ROOT/proofnone/state/inner-exit"/*.log )
+if [ "$(cat "$md/statusn" 2>/dev/null)" = 101 ] && grep -q '^leg: exited$' "${recs[0]}" 2>/dev/null \
+	&& ! grep -q 'did not become ready' "$ROOT/proofnone/serial.log" 2>/dev/null \
+	&& [ "$(proof_puts "$md")" = 0 ] && [ "$(evcount "$md" '^cogbox stop ')" = 0 ]; then
+	ok "a ready guest with no stamp is held to readiness alone, never a ready-timeout"
+else
+	bad "no stamp: polls=$(cat "$md/statusn" 2>/dev/null) record=$(head -1 "${recs[0]}" 2>/dev/null) serial: $(cat "$ROOT/proofnone/serial.log" 2>/dev/null)"
+fi
+# ...and the converse: a good stamp from a guest that never becomes ready
+# proves nothing, and the boot still times out on readiness exactly as before.
+SEED_GUEST_KEY="" STUB_STAMP=match STUB_STATUS_OK=100
+rc=$(run_boot proofnoready "${BASE_ATTRS[@]}")
+unset SEED_GUEST_KEY STUB_STAMP STUB_STATUS_OK
+md="$ROOT/proofnoready/md"
+recs=( "$ROOT/proofnoready/state/inner-exit"/*.log )
+if grep -q '^leg: ready-timeout$' "${recs[0]}" 2>/dev/null && [ "$(proof_puts "$md")" = 0 ] \
+	&& [ -z "$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')" ]; then
+	ok "a stamp from a guest that never becomes ready publishes nothing, and readiness still times out"
+else
+	bad "stamp without readiness: record=$(head -1 "${recs[0]}" 2>/dev/null) proof events: $(proof_events "$md")"
+fi
+
+# 11i. Level-held at every other site readiness is deleted.
+# The OOM drain: after the readiness delete and before the guest is stopped.
+STUB_STAMP=match STUB_STATUS_OK=100 STUB_OOM_AT=3
+rc=$(run_boot proofoom "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_STATUS_OK STUB_OOM_AT
+md="$ROOT/proofoom/md"
+put=$(evline "$md" 'PUT instance/guest-attributes/cogworx/boot-proof')
+rdel=$(evline "$md" 'DELETE instance/guest-attributes/cogworx/ready')
+stop=$(evline "$md" '^cogbox stop ')
+pdel=$(grep -n '^DELETE instance/guest-attributes/cogworx/boot-proof' "$md/events" | awk -F: -v r="${rdel:-0}" '$1 > r { print $1; exit }')
+if [ -n "$put" ] && [ -n "$rdel" ] && [ -n "$stop" ] && [ -n "$pdel" ] && [ "$put" -lt "$rdel" ] && [ "$pdel" -lt "$stop" ]; then
+	ok "the OOM drain deletes the boot proof before it stops the guest"
+else
+	bad "OOM drain: proof put=$put ready delete=$rdel proof delete=$pdel stop=$stop; events: $(cat "$md/events")"
+fi
+# A failed start, which may follow an err=stamp-path proof.
+STUB_STAMP=undeletable STUB_START_RC=1
+rc=$(run_boot proofstartfail "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_START_RC
+md="$ROOT/proofstartfail/md"
+start=$(evline "$md" '^cogbox start')
+last=$(grep -n 'guest-attributes/cogworx/boot-proof' "$md/events" | tail -1)
+if [ "$rc" != 0 ] && grep -q '^cogworx: sandbox start failed$' "$ROOT/proofstartfail/serial.log" 2>/dev/null \
+	&& [ -n "$start" ] && [ "${last%%:*}" -gt "$start" ] \
+	&& [ "${last#*:}" = "DELETE instance/guest-attributes/cogworx/boot-proof " ]; then
+	ok "a failed start deletes the boot proof"
+else
+	bad "failed start: rc=$rc start=$start last proof event: $last"
+fi
+# Both short-circuits: the run-start delete, and their own after readiness's.
+for tag in resolver maint; do
+	md="$ROOT/$tag/md"
+	rdel=$(evline "$md" 'DELETE instance/guest-attributes/cogworx/ready')
+	pdel=$(grep -n '^DELETE instance/guest-attributes/cogworx/boot-proof' "$md/events" | tail -1 | cut -d: -f1)
+	if [ "$(evcount "$md" '^DELETE instance/guest-attributes/cogworx/boot-proof')" = 2 ] \
+		&& [ -n "$rdel" ] && [ -n "$pdel" ] && [ "$pdel" -gt "$rdel" ]; then
+		ok "the $tag short-circuit deletes the boot proof after readiness"
+	else
+		bad "$tag short-circuit: proof events: $(proof_events "$md"); ready delete at $rdel"
+	fi
+done
+
+# 11j. The boot-error contract the control plane classifies by is unchanged: a
+# classified failure publishes its cogbox-stamped summary, an unmatched one the
+# frozen generic literal, and a later successful init clears it.
+ga="$ROOT/initfail/md/ga/cogworx_boot-error"
+if grep -q '^n0nce-aaaa error: cogbox: config.json is empty' "$ga" 2>/dev/null \
+	&& [ "$(cat "$ga")" != 'n0nce-aaaa cogbox init failed' ]; then
+	ok "a classified init failure publishes '<nonce> <cogbox-stamped summary>'"
+else
+	bad "classified boot-error is not '<nonce> error: cogbox: ...': $(cat "$ga" 2>/dev/null)"
+fi
+if [ "$(cat "$ROOT/initopaque/md/ga/cogworx_boot-error" 2>/dev/null)" = 'n0nce-aaaa cogbox init failed' ]; then
+	ok "an unmatched init failure publishes exactly '<nonce> cogbox init failed'"
+else
+	bad "unclassified boot-error is not the generic literal: $(cat "$ROOT/initopaque/md/ga/cogworx_boot-error" 2>/dev/null)"
+fi
+rc=$(run_boot initfail "${BASE_ATTRS[@]}")
+if [ ! -e "$ga" ] && [ -n "$(evline "$ROOT/initfail/md" 'DELETE instance/guest-attributes/cogworx/boot-error')" ]; then
+	ok "a later successful init clears the published boot-error"
+else
+	bad "a successful init left boot-error in place: $(cat "$ga" 2>/dev/null)"
+fi
+
+# 11k. A transient PUT failure never costs a run its publish: each publish is
+# retried on the next poll until one lands, and the order holds across the
+# retry. Without the retry one metadata-server blip leaves the control plane
+# waiting out its whole window on a running target and reading the silence as a
+# fault of the image.
+evlinex() { grep -nxF -- "$2" "$1/events" 2>/dev/null | head -1 | cut -d: -f1; }
+proof="n0nce-aaaa bp=1 hb=$HOST_BOOT_ID gb=$GUEST_BOOT_ID pool=ok sf=1"
+# The success proof.
+STUB_STAMP=match STUB_PUT_FAIL_ONCE=cogworx/boot-proof STUB_STATUS_OK=4
+rc=$(run_boot proofputretry "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_PUT_FAIL_ONCE STUB_STATUS_OK
+md="$ROOT/proofputretry/md"
+failed=$(evlinex "$md" "FAILED-PUT instance/guest-attributes/cogworx/boot-proof $proof")
+put=$(evlinex "$md" "PUT instance/guest-attributes/cogworx/boot-proof $proof")
+if [ -n "$failed" ] && [ -n "$put" ] && [ "$failed" -lt "$put" ] && [ "$(proof_puts "$md")" = 1 ]; then
+	ok "a boot-proof PUT that fails is retried, and lands exactly once"
+else
+	bad "boot-proof PUT retry: failed at $failed, landed at $put, $(proof_puts "$md") landed; events: $(cat "$md/events")"
+fi
+# Readiness: the proof still waits for the readiness PUT that LANDED, not for
+# the guest's host key that made the failed attempt.
+STUB_STAMP=match STUB_PUT_FAIL_ONCE=cogworx/ready STUB_STATUS_OK=4
+rc=$(run_boot readyputretry "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_PUT_FAIL_ONCE STUB_STATUS_OK
+md="$ROOT/readyputretry/md"
+failed=$(evlinex "$md" "FAILED-PUT instance/guest-attributes/cogworx/ready n0nce-aaaa ok bp=1")
+ready=$(evlinex "$md" "PUT instance/guest-attributes/cogworx/ready n0nce-aaaa ok bp=1")
+put=$(evlinex "$md" "PUT instance/guest-attributes/cogworx/boot-proof $proof")
+if [ -n "$failed" ] && [ -n "$ready" ] && [ -n "$put" ] && [ "$failed" -lt "$ready" ] && [ "$ready" -lt "$put" ] \
+	&& [ "$(grep -c '^PUT instance/guest-attributes/cogworx/ready ' "$md/events")" = 1 ] && [ "$(proof_puts "$md")" = 1 ]; then
+	ok "a readiness PUT that fails is retried, and the proof lands only after the retry"
+else
+	bad "readiness PUT retry: failed at $failed, readiness landed at $ready, proof at $put; events: $(cat "$md/events")"
+fi
+# The err=stamp-path refusal: its leg (f) PUT fails, and the hold loop lands it.
+STUB_STAMP=undeletable STUB_PUT_FAIL_ONCE=cogworx/boot-proof
+rc=$(run_boot proofstuckretry "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_PUT_FAIL_ONCE
+md="$ROOT/proofstuckretry/md"
+failed=$(evlinex "$md" "FAILED-PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 err=stamp-path")
+start=$(evline "$md" '^cogbox start')
+put=$(evlinex "$md" "PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 err=stamp-path")
+if [ -n "$failed" ] && [ -n "$start" ] && [ -n "$put" ] && [ "$failed" -lt "$start" ] && [ "$start" -lt "$put" ] \
+	&& [ "$(proof_puts "$md")" = 1 ]; then
+	ok "an err=stamp-path refusal whose PUT fails before start is retried from the hold loop, once"
+else
+	bad "refusal PUT retry: failed at $failed, start at $start, landed at $put; proof events: $(proof_events "$md")"
+fi
+# A refusal whose PUT keeps failing leaves the hold loop ready, owing the
+# refusal and with nothing published -- the window in which only the refusal's
+# own "no success proof this run" stands between the host and a proof built from
+# a stamp it could not clear, possibly a previous boot's (on network=none the
+# control plane has no guest hop to catch that). So no proof of either kind may
+# land, the refusal is still retried after readiness, and the ready guest is
+# never killed for it: READY_TIMEOUT counts readiness alone, refusal pending or
+# not.
+STUB_STAMP=undeletable STUB_PUT_FAIL_DATA='err=stamp-path' STUB_STATUS_OK=6
+rc=$(run_boot proofstuckfailing "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_PUT_FAIL_DATA STUB_STATUS_OK
+md="$ROOT/proofstuckfailing/md"
+recs=( "$ROOT/proofstuckfailing/state/inner-exit"/*.log )
+ready=$(evlinex "$md" "PUT instance/guest-attributes/cogworx/ready n0nce-aaaa ok bp=1")
+failed=$(grep -nxF "FAILED-PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 err=stamp-path" "$md/events" | tail -1 | cut -d: -f1)
+if [ "$(proof_puts "$md")" = 0 ] \
+	&& [ "$(evcount "$md" '^FAILED-PUT instance/guest-attributes/cogworx/boot-proof ')" -ge 2 ] \
+	&& [ -n "$ready" ] && [ -n "$failed" ] && [ "$failed" -gt "$ready" ] \
+	&& grep -q '^leg: exited$' "${recs[0]}" 2>/dev/null \
+	&& ! grep -q 'did not become ready' "$ROOT/proofstuckfailing/serial.log" 2>/dev/null; then
+	ok "a refusal that never lands lets no success proof through, is retried after readiness, and never kills the ready guest"
+else
+	bad "refusal PUT failing throughout: ready at $ready, last failed refusal at $failed; proof events: $(proof_events "$md"); failed: $(grep -c '^FAILED-PUT' "$md/events"); record: $(head -1 "${recs[0]}" 2>/dev/null)"
+fi
+# ...and its retry does not wait for readiness: a guest that never becomes
+# ready still gets the refusal it owes from the hold loop, so the control plane
+# reads "the host could not prove this boot" rather than silence.
+STUB_STAMP=undeletable STUB_PUT_FAIL_ONCE=cogworx/boot-proof SEED_GUEST_KEY="" STUB_STATUS_OK=100
+rc=$(run_boot proofstucknoready "${BASE_ATTRS[@]}")
+unset STUB_STAMP STUB_PUT_FAIL_ONCE SEED_GUEST_KEY STUB_STATUS_OK
+md="$ROOT/proofstucknoready/md"
+recs=( "$ROOT/proofstucknoready/state/inner-exit"/*.log )
+start=$(evline "$md" '^cogbox start')
+put=$(evlinex "$md" "PUT instance/guest-attributes/cogworx/boot-proof n0nce-aaaa bp=1 err=stamp-path")
+if [ -n "$start" ] && [ -n "$put" ] && [ "$put" -gt "$start" ] && [ "$(proof_puts "$md")" = 1 ] \
+	&& [ -z "$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')" ] \
+	&& grep -q '^leg: ready-timeout$' "${recs[0]}" 2>/dev/null; then
+	ok "a refusal whose first PUT fails lands from the hold loop even when the guest never becomes ready"
+else
+	bad "refusal retry without readiness: start at $start, landed at $put; proof events: $(proof_events "$md"); record: $(head -1 "${recs[0]}" 2>/dev/null)"
+fi
+
+if [ -s "$ROOT/wedged" ]; then
+	bad "the supervisor hit the test's 60 s bound in: $(tr '\n' ' ' < "$ROOT/wedged")"
 fi
 
 if [ "$fails" -gt 0 ]; then

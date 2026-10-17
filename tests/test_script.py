@@ -1072,8 +1072,24 @@ with subtest("Phase I: background default, console + monitor sockets, stop teard
     rc, _ = machine.execute(as_user("cogbox monitor 2>&1"))
     assert rc != 0, "monitor on stopped instance should fail"
 
+    # cogbox-boot-stamp.service (the guest half of the GCE boot proof) writes
+    # this guest boot's id onto the 9p data share once sshd is up: the GUEST's
+    # boot id, never this machine's, and pool=na because a workstation guest
+    # has no data pool. Earlier phases booted this instance too, so the path is
+    # cleared before each boot (as the GCE supervisor does) and a stamp seen
+    # afterwards is that boot's. The stop and start at the end of this phase
+    # must change it.
+    stamp = "/home/testuser/.local/share/cogbox/instances/default/.cogbox-boot-stamp"
+    stamp_re = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} pool=na$"
+    machine.succeed(f"rm -f {stamp}")
+
     # `cogbox start` daemonizes and returns; boot_and_wait asserts SSH is up.
     boot_and_wait("cc-default", "", ssh_port=2222)
+
+    machine.wait_until_succeeds(f"grep -qE '{stamp_re}' {stamp}", timeout=60)
+    first_stamp = machine.succeed(f"cat {stamp}").strip()
+    outer_boot_id = machine.succeed("cat /proc/sys/kernel/random/boot_id").strip()
+    assert first_stamp.split()[0] != outer_boot_id, f"the boot stamp carries the outer machine's boot id: {first_stamp}"
 
     # The per-instance console + monitor sockets exist, and the serial
     # console was captured to console.log (proves the chardev rewrite took).
@@ -1145,6 +1161,15 @@ sys.exit(0 if (b"running" in buf or b"VM status" in buf) else 1)
     # QEMU via `exec -a microvm@nixos`, so the cmdline contains no "qemu" and
     # `pgrep -f qemu-system` would (a) never match the VM and (b) self-match
     # the test driver's own `bash -c 'pgrep ...'` wrapper.
+    machine.wait_until_fails("pgrep qemu-system", timeout=15)
+
+    # A new guest boot writes a stamp with a new boot id.
+    machine.succeed(f"rm -f {stamp}")
+    boot_and_wait("cc-default", "", ssh_port=2222)
+    machine.wait_until_succeeds(f"grep -qE '{stamp_re}' {stamp}", timeout=60)
+    second_stamp = machine.succeed(f"cat {stamp}").strip()
+    assert second_stamp != first_stamp, f"a stop and start did not change the boot stamp: {second_stamp}"
+    stop_instance("cc-default")
     machine.wait_until_fails("pgrep qemu-system", timeout=15)
 
 with subtest("Phase H: TCP remap routes via SOCKS5 to a host stub"):
