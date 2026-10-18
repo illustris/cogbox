@@ -33,7 +33,10 @@
 #   e   clear stale runtime under the instance lock, keeping its inode
 #   f   clear the guest's boot stamp (h2), then cogbox start --no-ssh
 #   g   (moved out) the cogbox.log tail lives in cogworx-cogbox-log.service
-#   h   publish readiness once the GUEST's host key file appears
+#   h   publish readiness once the GUEST's host key file exists AND this
+#       launch's boot stamp (written after the guest's sshd started) is
+#       present; in effect on the key alone if (f) could not clear the stamp
+#       path, since what survived the clear is present
 #   h2  the boot proof, cogworx/boot-proof: deleted at run start (a); the
 #       guest's boot stamp is cleared before (f), and a stamp path that cannot
 #       be cleared publishes the err=stamp-path proof there instead (a PUT that
@@ -43,8 +46,9 @@
 #       the image's baked protocol values. At most once per run, never on
 #       serial, and level-held like readiness (deleted wherever it is)
 #   i   hold the unit open for the sandbox's lifetime: until QEMU is gone, the
-#       readiness budget runs out, or anything in the unit is OOM-killed (a
-#       helper's OOM kill drains the still-live guest first)
+#       guest's host key never appears within READY_TIMEOUT, or anything in the
+#       unit is OOM-killed (a helper's OOM kill drains the still-live guest
+#       first)
 #   j   delete readiness FIRST (then the boot proof), record the inner exit
 #       (state-disk ring + cogworx/inner-exit) unless a stop was requested,
 #       then exit non-zero so Restart=always re-runs
@@ -783,17 +787,22 @@ start_sandbox() {
 }
 # Leg (h2)'s freshness half: the guest's boot stamp is cleared IMMEDIATELY before
 # the launch, so a stamp the hold loop reads after it was written by THIS
-# launch's guest. It rides the 9p data share, at the same root as GUEST_KEY below
-# (guest path /var/lib/cogbox/.cogbox-boot-stamp). No guest runs at this line --
-# leg (e)'s lifetime flock refused while a previous guest still owned its
-# runtime, and the share is reachable only by a running guest -- so removing a
-# directory the guest left there recursively races nothing, and
-# --one-file-system keeps the removal from crossing into anything mounted
-# below it.
+# launch's guest. The same clear gates readiness (h): the guest writes the stamp
+# only once its sshd is up, so a stamp present after this line says this
+# launch's guest has its sshd listening, where its persisted host key says only
+# that some boot of it once got that far. It rides the 9p data share, at the
+# same root as GUEST_KEY below (guest path /var/lib/cogbox/.cogbox-boot-stamp).
+# No guest runs at this line -- leg (e)'s lifetime flock refused while a
+# previous guest still owned its runtime, and the share is reachable only by a
+# running guest -- so removing a directory the guest left there recursively
+# races nothing, and --one-file-system keeps the removal from crossing into
+# anything mounted below it.
 BOOT_STAMP="$COGBOX_DATA/instances/$INSTANCE/.cogbox-boot-stamp"
 # proof_ok: this run may publish a success proof. refusal: this run owes the
 # err=stamp-path refusal instead. proof: this run has published a proof of
-# either kind, so it publishes nothing more.
+# either kind, so it publishes nothing more. Readiness (h) keys on none of
+# these: proof_ok is also zeroed by a missing host boot id, protocol version or
+# state format, and the guest writes its stamp regardless of those.
 proof_ok=1
 refusal=0
 proof=0
@@ -816,9 +825,14 @@ if [ -e "$BOOT_STAMP" ] || [ -L "$BOOT_STAMP" ]; then
 	# A stamp this launch's guest could not have written might still be read
 	# after it, so no success proof this run. Say so on the wire instead: the
 	# control plane reads err= as "the host could not prove this boot", not as
-	# a fault of the image.
+	# a fault of the image. Readiness cannot use the path either, and needs no
+	# flag for that: whatever survived the clear already passes its existence
+	# test, so it rests on the host key alone. Waiting for a real stamp would
+	# not help, since the guest's own rename onto the path fails the same way
+	# in the shapes that survive both removals; an entry that later vanished
+	# would leave readiness waiting for the real stamp, as on any launch.
 	proof_ok=0
-	note "warning: could not clear the boot stamp at $BOOT_STAMP; no boot proof this run"
+	note "warning: could not clear the boot stamp at $BOOT_STAMP; no boot proof this run, and readiness falls back to the guest host key alone"
 	if [ -n "$BP" ] && [ -n "$HB" ]; then
 		refusal=1
 		put_refusal
@@ -835,21 +849,39 @@ fi
 # A sandbox that started is the proof this boot got somewhere, so the failure
 # backoff resets here and NOT at leg (j): leg (j) fires on every ordinary
 # sandbox exit, an in-guest `reboot` included, which is not a failure and must
-# never be delayed. The one shape this leaves un-backed-off -- start succeeds,
-# guest never becomes ready -- needs none: that cycle already costs a full
-# READY_TIMEOUT (300 s by default) before it can exit, which IS the cap.
+# never be delayed. The two shapes this leaves un-backed-off need none: a guest
+# whose host key never appears still costs a full READY_TIMEOUT (300 s by
+# default) before it can exit, which IS the cap, and one whose key exists but
+# whose sshd never starts is held, never restarted, so neither hot-loops.
 backoff_reset
 
 # --- (h) + (i) readiness, then hold the unit open ---------------------------
 #
-# Readiness is the GUEST's persisted host key file appearing on the state disk
-# -- the same signal the k8s startupProbe uses -- published as a guest attribute
-# stamped with this boot's nonce. It is level-HELD, not latched: leg (j) below
-# and ExecStopPost both delete it, so a dead sandbox cannot coast on a stamped
-# attribute for the rest of the start epoch the way a one-shot stamp would let
-# it. Timing budget mirrors the pod's initialDelay 10 + 5*60.
+# Readiness is the guest's sshd having started in THIS launch: the GUEST's
+# persisted host key file on the state disk AND something at the boot-stamp
+# path leg (f) cleared, which the guest's cogbox-boot-stamp.service (After= and
+# Requires= its sshd) writes. The key alone is not enough: the guest makes it
+# only when it is missing, so on every boot after the first it predates the
+# launch, and a readiness published on it reached the control plane -- which
+# maps it to Running, and whose SSH gateway dials the guest once -- before the
+# guest's sshd listened. The stamp test is existence only, `-L` before `-e`: it
+# never opens the tenant-writable path, a link there (dangling or not) passes
+# without stat following it, and what the stamp says is the proof's business
+# below. When leg (f) could not clear the path, what survived passes this test,
+# so readiness rests on the key alone.
+# It is published as a guest attribute stamped with this boot's nonce, and it
+# is level-HELD, not latched: leg (j) below and ExecStopPost both delete it, so
+# a dead sandbox cannot coast on a stamped attribute for the rest of the start
+# epoch the way a one-shot stamp would let it.
+# READY_TIMEOUT bounds only the wait for the key, which on a later boot
+# predates the launch and on a first boot follows only the guest's 9p mount.
+# The wait for sshd is unbounded HERE on purpose: the guest's one-time work and
+# harness migrations run in front of sshd (up to 900 s), a killed copy restarts
+# from scratch, and the control plane's stuck-in-Booting timer bounds it
+# instead.
 GUEST_KEY="$COGBOX_DATA/instances/$INSTANCE/ssh/ssh_host_ed25519_key.pub"
 ready=0
+stamp_wait_noted=0
 
 # Leg (h2)'s read half. The stamp is the guest's (cogbox-boot-stamp.service,
 # written after its sshd started): exactly `<guest boot id> pool=<ok|missing|na>`.
@@ -911,13 +943,21 @@ while :; do
 		break
 	fi
 	if [ "$ready" -eq 0 ] && [ -s "$GUEST_KEY" ]; then
-		# The `bp=` tail names the image's protocol version. A control plane
-		# that predates it compares only the nonce half, so it sees no change.
-		if ga_put cogworx/ready "$NONCE ok${BP:+ bp=$BP}"; then
-			ready=1
-			emit "sandbox ready"
-		else
-			note "warning: could not publish the readiness guest attribute; will retry"
+		if [ -L "$BOOT_STAMP" ] || [ -e "$BOOT_STAMP" ]; then
+			# The `bp=` tail names the image's protocol version. A control plane
+			# that predates it compares only the nonce half, so it sees no change.
+			if ga_put cogworx/ready "$NONCE ok${BP:+ bp=$BP}"; then
+				ready=1
+				emit "sandbox ready"
+			else
+				note "warning: could not publish the readiness guest attribute; will retry"
+			fi
+		elif [ "$stamp_wait_noted" -eq 0 ]; then
+			# Journal only, at most once per run. Never serial, and never
+			# cogworx/boot-error: the control plane fails an image upgrade at
+			# once on any classified boot-error, and waiting is not a fault.
+			stamp_wait_noted=1
+			note "the guest's host key is present; holding readiness until its boot stamp appears (cogbox-boot-stamp.service, after the guest's sshd)"
 		fi
 	fi
 	# A refusal leg (f) could not publish, readiness or not: it was due before
@@ -925,10 +965,11 @@ while :; do
 	if [ "$proof" -eq 0 ] && [ "$refusal" -eq 1 ]; then
 		put_refusal
 	fi
-	# The boot proof, at most once per run and only after readiness. A stamp
-	# that is absent or refused is simply polled again: it never kills the
-	# guest, and READY_TIMEOUT below still counts readiness alone, so a boot
-	# with no proof times out exactly when it did before the proof existed.
+	# The boot proof, at most once per run and only after readiness, which a
+	# fresh stamp opens in the same poll. A stamp that is absent or refused is
+	# simply polled again: it never kills the guest, and READY_TIMEOUT below
+	# counts only the host-key wait, so a stamp the proof refuses never times
+	# a boot out.
 	if [ "$proof" -eq 0 ] && [ "$proof_ok" -eq 1 ] && [ "$ready" -eq 1 ] && stamp=$(read_boot_stamp); then
 		read -r gb pool <<< "$stamp"
 		if ga_put cogworx/boot-proof "$NONCE bp=$BP hb=$HB gb=$gb pool=$pool sf=$SF"; then
@@ -938,7 +979,8 @@ while :; do
 			note "warning: could not publish the cogworx/boot-proof guest attribute; will retry"
 		fi
 	fi
-	if [ "$ready" -eq 0 ]; then
+	# Only the host-key wait is bounded; see (h) above.
+	if [ "$ready" -eq 0 ] && [ ! -s "$GUEST_KEY" ]; then
 		iters_left=$(( iters_left - 1 ))
 		if [ "$iters_left" -le 0 ]; then
 			emit "sandbox did not become ready within ${READY_TIMEOUT}s"

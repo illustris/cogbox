@@ -35,9 +35,12 @@
 #     that evaluates attacker-controlled flakes.
 #   - the per-start nonce is read exactly once. Re-reading it would let a later
 #     leg stamp a different epoch's value onto readiness.
-#   - readiness is published only after the GUEST's host key file appears, and
-#     the readiness DELETE precedes the non-zero exit, so a dead sandbox cannot
-#     coast on a stamped attribute.
+#   - readiness is published only once the GUEST's host key file exists AND
+#     this launch's boot stamp (written after the guest's sshd started) is
+#     present -- on a later boot the key predates the launch, so the key alone
+#     reported Running before sshd listened -- and on the key alone only when
+#     the stamp path could not be cleared. The readiness DELETE precedes the
+#     non-zero exit, so a dead sandbox cannot coast on a stamped attribute.
 #   - `cogbox init` carries --bind-addr, --no-implicit-dns and one --self-addr
 #     per metadata entry. Without a producer, cogbox's parameterized port-53
 #     allow and l7proxy's self-address floor are both dead code and the image
@@ -87,7 +90,8 @@
 #     and never costs the guest its life -- nor does one the guest swaps for a
 #     symlink or a FIFO after the host's check, which the read's O_NOFOLLOW
 #     and 2 s bound (exactly 2 s) refuse without stalling the loop; the read
-#     stops at 256 bytes; and READY_TIMEOUT still counts readiness alone.
+#     stops at 256 bytes; and READY_TIMEOUT counts only the host-key wait,
+#     never the wait for the stamp.
 #     Readiness gains a
 #     `bp=` tail only from a valid baked protocol version; without one there
 #     is no proof of either kind. A PUT that fails -- readiness, the proof,
@@ -281,6 +285,18 @@ case "${1:-}" in
 		n=0
 		[ -f "$FAKEMD/statusn" ] && n=$(cat "$FAKEMD/statusn")
 		n=$((n + 1)); echo "$n" > "$FAKEMD/statusn"
+		# The guest's first-boot keygen (sshd-prep) at poll STUB_KEY_AT, and its
+		# cogbox-boot-stamp.service (After=sshd) at poll STUB_STAMP_AT, as the
+		# hold loop sees them: on the share before this poll's readiness check.
+		if [ -n "${STUB_KEY_AT:-}" ] && [ "$n" = "$STUB_KEY_AT" ]; then
+			k="$COGBOX_DATA/instances/demo/ssh/ssh_host_ed25519_key.pub"
+			mkdir -p "$(dirname "$k")"
+			printf 'ssh-ed25519 AAAAguestkey guest\n' > "$k"
+		fi
+		if [ -n "${STUB_STAMP_AT:-}" ] && [ "$n" = "$STUB_STAMP_AT" ]; then
+			s="$COGBOX_DATA/instances/demo/.cogbox-boot-stamp"
+			printf '%s pool=%s\n' "$STUB_GB" "$STUB_POOL" > "$s.tmp" && mv -fT "$s.tmp" "$s"
+		fi
 		# The kernel OOM-killing a process of the unit, as the supervisor sees
 		# it: its cgroup's memory.events `oom_kill` count goes up. Whether
 		# QEMU was the victim is what the status answer below says.
@@ -420,6 +436,12 @@ run_boot() {
 	# cannot be cleared), or a dangling symlink that cannot be cleared (which
 	# `-e` alone does not see).
 	printf '%s\n' "$HOST_BOOT_ID" > "$home/boot_id"
+	# A LATER boot: the guest's persisted host key is already on the state disk
+	# from an earlier boot, before this run launches anything.
+	if [ -n "${SEED_PREV_GUEST_KEY:-}" ]; then
+		mkdir -p "$home/state/data/cogbox/instances/demo/ssh"
+		printf 'ssh-ed25519 AAAAguestkey guest\n' > "$home/state/data/cogbox/instances/demo/ssh/ssh_host_ed25519_key.pub"
+	fi
 	local stamp="$home/state/data/cogbox/instances/demo/.cogbox-boot-stamp"
 	case "${STUB_STAMP:-none}" in
 		stale|undeletable)
@@ -463,6 +485,8 @@ run_boot() {
 	STUB_PUT_FAIL_DATA="${STUB_PUT_FAIL_DATA:-}" \
 	STUB_GB="$GUEST_BOOT_ID" \
 	STUB_POOL="${STUB_POOL:-ok}" \
+	STUB_STAMP_AT="${STUB_STAMP_AT:-}" \
+	STUB_KEY_AT="${STUB_KEY_AT:-}" \
 	COGWORX_BOOT_ID_FILE="${SEED_BOOT_ID_FILE-$home/boot_id}" \
 	COGWORX_IMAGE_BOOT_PROOF="${SEED_BP-1}" \
 	COGWORX_IMAGE_STATE_FORMAT="${SEED_SF-1}" \
@@ -495,7 +519,11 @@ BASE_ATTRS=(
 
 # --- 1. normal boot ---------------------------------------------------------
 
+# A healthy guest writes its boot stamp once its sshd is up, and readiness
+# waits for it (section 12): without one this boot is never ready.
+STUB_STAMP=match
 rc=$(run_boot normal "${BASE_ATTRS[@]}")
+unset STUB_STAMP
 md="$ROOT/normal/md"
 [ "$(cat "$ROOT/normal/run/cogworx-supervisor-instance" 2>/dev/null)" = demo ] \
 	|| bad "normal start did not capture the exact shutdown identity"
@@ -1379,9 +1407,11 @@ fi
 # status` only checks QEMU: before the unit OOM-kill watch the sandbox stayed
 # Running with its network or L7 tier dead until the status poll happened to
 # fail. Status here keeps answering for 100 polls; the counter rises at poll 3.
-STUB_STATUS_OK=100 STUB_OOM_AT=3
+# The guest stamps its boot, so it is ready before the kill and the drain has
+# a readiness to withdraw.
+STUB_STATUS_OK=100 STUB_OOM_AT=3 STUB_STAMP=match
 rc=$(run_boot inneroom "${BASE_ATTRS[@]}")
-unset STUB_STATUS_OK STUB_OOM_AT
+unset STUB_STATUS_OK STUB_OOM_AT STUB_STAMP
 md="$ROOT/inneroom/md"
 recs=( "$ROOT/inneroom/state/inner-exit"/*.log )
 put=$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')
@@ -1474,7 +1504,9 @@ fi
 # launch), exact (the control plane parses it), refused rather than guessed (a
 # stamp the host cannot trust publishes nothing), and level-held like readiness.
 # None of it may change what an old control plane sees: readiness keeps its
-# nonce half and its timing, and READY_TIMEOUT still counts readiness alone.
+# nonce half and its bytes. Its timing moves to the stamp (section 12), the
+# poll the proof can first land in, and READY_TIMEOUT counts only the host-key
+# wait.
 # proof_events <md>: every boot-proof PUT/DELETE, in order.
 proof_events() { grep -E '^(PUT|DELETE) instance/guest-attributes/cogworx/boot-proof' "$1/events" 2>/dev/null; }
 proof_puts() { grep -c '^PUT instance/guest-attributes/cogworx/boot-proof ' "$1/events" 2>/dev/null || true; }
@@ -1549,7 +1581,8 @@ else
 fi
 
 # 11b. A PREVIOUS boot's stamp, still on the share: cleared before the launch,
-# so this guest -- which writes none -- gets no proof from it.
+# so this guest -- which writes none -- gets no proof from it, and no readiness
+# either: readiness waits for this launch's stamp.
 STUB_STAMP=stale
 rc=$(run_boot proofstale "${BASE_ATTRS[@]}")
 unset STUB_STAMP
@@ -1557,8 +1590,8 @@ md="$ROOT/proofstale/md"
 clr=$(evline "$md" '^rm -f -- .*/instances/demo/\.cogbox-boot-stamp$')
 start=$(evline "$md" '^cogbox start')
 if [ -n "$clr" ] && [ -n "$start" ] && [ "$clr" -lt "$start" ] && grep -qx 'stamp at start: absent' "$md/events" \
-	&& [ "$(proof_puts "$md")" = 0 ] && [ -n "$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')" ]; then
-	ok "a previous boot's stamp is removed before cogbox start and proves nothing"
+	&& [ "$(proof_puts "$md")" = 0 ] && [ -z "$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')" ]; then
+	ok "a previous boot's stamp is removed before cogbox start and neither proves nor readies anything"
 else
 	bad "stale stamp: clear=$clr start=$start; events: $(cat "$md/events")"
 fi
@@ -1828,9 +1861,11 @@ rc=$(run_boot proofhbstuck "${BASE_ATTRS[@]}")
 unset SEED_BOOT_ID_FILE STUB_STAMP
 legacy proofhbstuck "a host boot id that is not a UUID and an uncleanable stamp path" "n0nce-aaaa ok bp=1"
 
-# 11h. No stamp at all: readiness alone decides the boot. A ready guest whose
-# stamp never appears stays up until it exits on its own -- never a
-# ready-timeout, which still means only "the guest never became ready".
+# 11h. No stamp at all: a guest whose host key exists but whose stamp never
+# appears (its sshd never started) is never ready, and never a ready-timeout
+# either -- that still means only "the guest's host key never appeared". The
+# supervisor holds it until it exits on its own; the wait for sshd has no bound
+# here, because the guest's one-time migrations run in front of it.
 STUB_STAMP=none STUB_STATUS_OK=100
 rc=$(run_boot proofnone "${BASE_ATTRS[@]}")
 unset STUB_STAMP STUB_STATUS_OK
@@ -1838,13 +1873,15 @@ md="$ROOT/proofnone/md"
 recs=( "$ROOT/proofnone/state/inner-exit"/*.log )
 if [ "$(cat "$md/statusn" 2>/dev/null)" = 101 ] && grep -q '^leg: exited$' "${recs[0]}" 2>/dev/null \
 	&& ! grep -q 'did not become ready' "$ROOT/proofnone/serial.log" 2>/dev/null \
+	&& [ -z "$(evline "$md" 'PUT instance/guest-attributes/cogworx/ready')" ] \
 	&& [ "$(proof_puts "$md")" = 0 ] && [ "$(evcount "$md" '^cogbox stop ')" = 0 ]; then
-	ok "a ready guest with no stamp is held to readiness alone, never a ready-timeout"
+	ok "a guest whose stamp never appears is never ready and never a ready-timeout; the supervisor holds it until it exits"
 else
-	bad "no stamp: polls=$(cat "$md/statusn" 2>/dev/null) record=$(head -1 "${recs[0]}" 2>/dev/null) serial: $(cat "$ROOT/proofnone/serial.log" 2>/dev/null)"
+	bad "no stamp: polls=$(cat "$md/statusn" 2>/dev/null) record=$(head -1 "${recs[0]}" 2>/dev/null) readiness: $(grep 'cogworx/ready' "$md/events" | tr '\n' '|') serial: $(cat "$ROOT/proofnone/serial.log" 2>/dev/null)"
 fi
-# ...and the converse: a good stamp from a guest that never becomes ready
-# proves nothing, and the boot still times out on readiness exactly as before.
+# ...and the converse: a good stamp from a guest whose host key never appears
+# proves nothing, and the boot still times out on the host-key wait, the one
+# wait READY_TIMEOUT bounds.
 SEED_GUEST_KEY="" STUB_STAMP=match STUB_STATUS_OK=100
 rc=$(run_boot proofnoready "${BASE_ATTRS[@]}")
 unset SEED_GUEST_KEY STUB_STAMP STUB_STATUS_OK
@@ -1975,8 +2012,8 @@ fi
 # a stamp it could not clear, possibly a previous boot's (on network=none the
 # control plane has no guest hop to catch that). So no proof of either kind may
 # land, the refusal is still retried after readiness, and the ready guest is
-# never killed for it: READY_TIMEOUT counts readiness alone, refusal pending or
-# not.
+# never killed for it: READY_TIMEOUT counts only the host-key wait, refusal
+# pending or not.
 STUB_STAMP=undeletable STUB_PUT_FAIL_DATA='err=stamp-path' STUB_STATUS_OK=6
 rc=$(run_boot proofstuckfailing "${BASE_ATTRS[@]}")
 unset STUB_STAMP STUB_PUT_FAIL_DATA STUB_STATUS_OK
@@ -2009,6 +2046,135 @@ if [ -n "$start" ] && [ -n "$put" ] && [ "$put" -gt "$start" ] && [ "$(proof_put
 	ok "a refusal whose first PUT fails lands from the hold loop even when the guest never becomes ready"
 else
 	bad "refusal retry without readiness: start at $start, landed at $put; proof events: $(proof_events "$md"); record: $(head -1 "${recs[0]}" 2>/dev/null)"
+fi
+
+# --- 12. readiness waits for the guest's sshd (the boot stamp) ---------------
+#
+# The guest makes its host key only when it is missing, so on every boot after
+# the first the key predates the launch, and a readiness published on it alone
+# reached the control plane -- Running, and an SSH gateway that dials the guest
+# once -- before the guest's sshd listened. Readiness waits for the stamp the
+# guest writes after its sshd, at the path leg (f) cleared. READY_TIMEOUT still
+# bounds the wait for the key, and nothing in the supervisor bounds the wait
+# for sshd: the guest's one-time migrations run in front of it.
+# ready_poll <md>: how many `cogbox status` polls ran before the readiness PUT;
+# proof_poll <md>: the same before the boot proof's first PUT.
+poll_before() {
+	local r; r=$(evline "$1" "$2")
+	[ -n "$r" ] || { echo none; return; }
+	head -n "$r" "$1/events" | grep -c '^cogbox status '
+}
+ready_poll() { poll_before "$1" '^PUT instance/guest-attributes/cogworx/ready '; }
+proof_poll() { poll_before "$1" '^PUT instance/guest-attributes/cogworx/boot-proof '; }
+# 12a. LATER boot: the key predates the launch; no readiness until the stamp.
+# The proof lands in the same poll as readiness, not one poll after it (the
+# swap's pass time rests on that). The wait is said once in the journal, and
+# never on serial or as a boot-error: the control plane fails an image upgrade
+# at once on a classified boot-error.
+SEED_PREV_GUEST_KEY=1 SEED_GUEST_KEY="" STUB_STAMP_AT=3 STUB_STATUS_OK=6
+rc=$(run_boot rdylater "${BASE_ATTRS[@]}")
+unset SEED_PREV_GUEST_KEY SEED_GUEST_KEY STUB_STAMP_AT STUB_STATUS_OK
+md="$ROOT/rdylater/md"
+p=$(ready_poll "$md")
+waitnote='holding readiness until its boot stamp appears'
+if [ "$p" = 3 ] && [ "$(grep -c '^PUT instance/guest-attributes/cogworx/ready ' "$md/events")" = 1 ] \
+	&& [ "$(proof_puts "$md")" = 1 ] && [ "$(proof_poll "$md")" = 3 ] \
+	&& [ "$(grep -c "$waitnote" "$ROOT/rdylater/out.log")" = 1 ] \
+	&& ! grep -q "$waitnote" "$ROOT/rdylater/serial.log" \
+	&& [ -z "$(evline "$md" 'PUT instance/guest-attributes/cogworx/boot-error')" ]; then
+	ok "a later boot whose key predates the launch publishes readiness only once the stamp appears (poll $p), the proof in that same poll, and notes the wait once in the journal"
+else
+	bad "later boot: readiness at poll $p, expected 3; proof at poll $(proof_poll "$md"), expected 3; wait notes in the journal: $(grep -c "$waitnote" "$ROOT/rdylater/out.log"); events: $(grep -E 'status|cogworx/(ready|boot-proof|boot-error)' "$md/events" | tr '\n' '|')"
+fi
+# 12b. ...and that wait never spends READY_TIMEOUT (5 polls here).
+SEED_PREV_GUEST_KEY=1 SEED_GUEST_KEY="" STUB_STAMP_AT=8 STUB_STATUS_OK=10
+rc=$(run_boot rdylate "${BASE_ATTRS[@]}")
+unset SEED_PREV_GUEST_KEY SEED_GUEST_KEY STUB_STAMP_AT STUB_STATUS_OK
+md="$ROOT/rdylate/md"; recs=( "$ROOT/rdylate/state/inner-exit"/*.log )
+p=$(ready_poll "$md")
+if [ "$p" = 8 ] && ! grep -q 'did not become ready' "$ROOT/rdylate/serial.log" && grep -q '^leg: exited$' "${recs[0]}" 2>/dev/null; then
+	ok "a stamp later than the READY_TIMEOUT budget still readies the guest; only the key wait is bounded"
+else
+	bad "late stamp: readiness at poll $p; serial: $(cat "$ROOT/rdylate/serial.log")"
+fi
+# 12c. FIRST boot: the key appears at poll 2, inside the budget, and the stamp
+# at poll 8, past it: once the key is there the budget stops counting, even for
+# a run that entered the loop without it.
+SEED_GUEST_KEY="" STUB_KEY_AT=2 STUB_STAMP_AT=8 STUB_STATUS_OK=10
+rc=$(run_boot rdyfirst "${BASE_ATTRS[@]}")
+unset SEED_GUEST_KEY STUB_KEY_AT STUB_STAMP_AT STUB_STATUS_OK
+recs=( "$ROOT/rdyfirst/state/inner-exit"/*.log )
+p=$(ready_poll "$ROOT/rdyfirst/md")
+if [ "$p" = 8 ] && ! grep -q 'did not become ready' "$ROOT/rdyfirst/serial.log" && grep -q '^leg: exited$' "${recs[0]}" 2>/dev/null; then
+	ok "a first boot publishes readiness at the stamp, not at the key, and its key's arrival stops the budget (poll $p)"
+else
+	bad "first boot: readiness at poll $p, expected 8; serial: $(cat "$ROOT/rdyfirst/serial.log"); record: $(head -1 "${recs[0]}" 2>/dev/null)"
+fi
+# 12d. FIRST boot whose key never appears inside READY_TIMEOUT still times out.
+SEED_GUEST_KEY="" STUB_KEY_AT=7 STUB_STAMP_AT=7 STUB_STATUS_OK=20
+rc=$(run_boot rdykeylate "${BASE_ATTRS[@]}")
+unset SEED_GUEST_KEY STUB_KEY_AT STUB_STAMP_AT STUB_STATUS_OK
+recs=( "$ROOT/rdykeylate/state/inner-exit"/*.log )
+if [ "$(ready_poll "$ROOT/rdykeylate/md")" = none ] && grep -q '^leg: ready-timeout$' "${recs[0]}" 2>/dev/null \
+	&& [ "$(cat "$ROOT/rdykeylate/md/statusn")" = 5 ]; then
+	ok "a key that misses the READY_TIMEOUT budget is still a ready-timeout"
+else
+	bad "late key: polls $(cat "$ROOT/rdykeylate/md/statusn"), record $(head -1 "${recs[0]}" 2>/dev/null)"
+fi
+# 12e. A stamp path that cannot be cleared falls back to the key alone, says so.
+# There is no fallback switch: what survived the clear passes the existence
+# test by itself, so readiness lands with the key. The dangling link
+# (`undeletable-link`, which `-e` does not see) is what pins the gate's `-L`.
+for mode in undeletable-link dir-undeletable; do
+	STUB_STAMP=$mode
+	rc=$(run_boot "rdyfb-$mode" "${BASE_ATTRS[@]}")
+	unset STUB_STAMP
+	if [ "$(ready_poll "$ROOT/rdyfb-$mode/md")" = 1 ] \
+		&& grep -q 'readiness falls back to the guest host key alone' "$ROOT/rdyfb-$mode/out.log"; then
+		ok "an uncleanable stamp path ($mode) falls back to key readiness, with a warning"
+	else
+		bad "fallback ($mode): readiness poll $(ready_poll "$ROOT/rdyfb-$mode/md"); out: $(grep -i warning "$ROOT/rdyfb-$mode/out.log")"
+	fi
+done
+# 12f. A requested stop withdraws readiness that was published.
+STUB_STOPPING=1 STUB_STAMP=match
+rc=$(run_boot rdystop "${BASE_ATTRS[@]}")
+unset STUB_STOPPING STUB_STAMP
+md="$ROOT/rdystop/md"
+put=$(evline "$md" '^PUT instance/guest-attributes/cogworx/ready ')
+del=$(grep -n '^DELETE instance/guest-attributes/cogworx/ready' "$md/events" | tail -1 | cut -d: -f1)
+if [ -n "$put" ] && [ -n "$del" ] && [ "$put" -lt "$del" ]; then
+	ok "a requested stop deletes the readiness it published"
+else
+	bad "stop: put=$put del=$del"
+fi
+# 12g. The LEGACY shapes keep the gate: it depends only on leg (f)'s clear, and
+# the guest writes its stamp whatever the host's environment. No baked protocol
+# version (so no proof of either kind) still waits for the stamp...
+SEED_BP="" SEED_PREV_GUEST_KEY=1 SEED_GUEST_KEY="" STUB_STAMP_AT=3 STUB_STATUS_OK=6
+rc=$(run_boot rdynobp "${BASE_ATTRS[@]}")
+unset SEED_BP SEED_PREV_GUEST_KEY SEED_GUEST_KEY STUB_STAMP_AT STUB_STATUS_OK
+md="$ROOT/rdynobp/md"
+p=$(ready_poll "$md")
+if [ "$p" = 3 ] && grep -qxF 'PUT instance/guest-attributes/cogworx/ready n0nce-aaaa ok' "$md/events" \
+	&& [ "$(grep -c '^PUT instance/guest-attributes/cogworx/ready ' "$md/events")" = 1 ] \
+	&& [ "$(proof_puts "$md")" = 0 ]; then
+	ok "with no baked protocol version readiness still waits for the stamp (poll $p), with no tail and no proof"
+else
+	bad "no protocol version: readiness at poll $p, expected 3; $(grep 'cogworx/ready' "$md/events" | tr '\n' '|'); proof events: $(proof_events "$md")"
+fi
+# 12h. ...and so does a host boot id that is not a UUID (no success proof).
+printf 'not-a-boot-id\n' > "$ROOT/badhostid"
+SEED_BOOT_ID_FILE="$ROOT/badhostid" SEED_PREV_GUEST_KEY=1 SEED_GUEST_KEY="" STUB_STAMP_AT=3 STUB_STATUS_OK=6
+rc=$(run_boot rdybadhb "${BASE_ATTRS[@]}")
+unset SEED_BOOT_ID_FILE SEED_PREV_GUEST_KEY SEED_GUEST_KEY STUB_STAMP_AT STUB_STATUS_OK
+md="$ROOT/rdybadhb/md"
+p=$(ready_poll "$md")
+if [ "$p" = 3 ] && grep -qxF 'PUT instance/guest-attributes/cogworx/ready n0nce-aaaa ok bp=1' "$md/events" \
+	&& [ "$(proof_puts "$md")" = 0 ]; then
+	ok "with a host boot id that is not a UUID readiness still waits for the stamp (poll $p), with no proof"
+else
+	bad "bad host boot id: readiness at poll $p, expected 3; $(grep 'cogworx/ready' "$md/events" | tr '\n' '|'); proof events: $(proof_events "$md")"
 fi
 
 if [ -s "$ROOT/wedged" ]; then

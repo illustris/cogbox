@@ -187,10 +187,11 @@ resolver and network so their reverse stop order keeps guest storage and
 supporting services available.
 
 On an unexpected supervisor exit while QEMU is still alive -- for example,
-`supervise.sh` leg (j) after a readiness timeout on a healthy guest, or a
-`cogbox status` failure that outruns the guest -- the cgroup TERM reaches the
-launcher's trap, which sets a stop request and attempts the orderly lane before
-TERM/KILL fallback, all inside `TimeoutStopSec=75s`.
+`supervise.sh` leg (j) after a readiness timeout (the guest's host key never
+appeared while QEMU stayed up), or a `cogbox status` failure that outruns the
+guest -- the cgroup TERM reaches the launcher's trap, which sets a stop request
+and attempts the orderly lane before TERM/KILL fallback, all inside
+`TimeoutStopSec=75s`.
 With `KillMode=control-group`, however, QEMU and its supporting processes
 receive TERM at the same time, so they can exit before the launcher's orderly
 attempt completes. The full 45-second guest drain window is not guaranteed on
