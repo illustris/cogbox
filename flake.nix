@@ -520,6 +520,23 @@
 			] ++ extraModules;
 		};
 
+		# The readiness wire contract with the cogworx control plane, from its one
+		# source. Exported below as lib.gce*, and stamped onto every registered
+		# image as labels by push-gce-image; gce/supervisor.nix bakes the same file
+		# into the supervisor's environment, which is what a booted image reports.
+		gceProtocol = import ./gce/protocol.nix;
+		gceBootProof = gceProtocol.bootProof;
+		gceStateFormat = gceProtocol.stateFormat;
+		gceImageLabels = "cogworx-boot-proof=${toString gceBootProof},cogworx-state-format=${toString gceStateFormat}";
+		# The guest's boot stamp, by NAME. The guest writes it at the root of its
+		# 9p data share (/var/lib/cogbox) and gce/supervise.sh reads it at the
+		# root of the same share from the host ($COGBOX_DATA/instances/<name>), so
+		# a name that drifts on one side only leaves every boot never ready (the
+		# supervisor's readiness waits for the stamp) and none with a boot proof,
+		# which the control plane reads as a fault of the image. Bound once here;
+		# checks.cogbox-guest-boot-stamp pins both sides to it.
+		gceBootStampName = ".cogbox-boot-stamp";
+
 		# What makes a guest the HOSTED one (the nixosConfigurations
 		# `-hosted` entry below, which the GCE image runs). One binding so
 		# checks.runtime-environment composes plugin modules against exactly the
@@ -3575,6 +3592,71 @@
 							'';
 						};
 					};
+					# The guest half of the GCE boot proof (gce/supervise.sh leg
+					# (h2)): once sshd is up, stamp this boot's id and whether the
+					# data pool mounted onto the 9p share, where the host reads it
+					# as $COGBOX_DATA/instances/<name>/.cogbox-boot-stamp. The host
+					# clears that path before every launch, so a stamp present after
+					# it was written by this boot. The guest can only claim facts
+					# about itself; the host binds them to the start epoch, its own
+					# boot and the image's protocol values. The stamp also gates the
+					# host's readiness: cogworx/ready waits for it, so a guest that
+					# writes none stays Booting. VM-only: the container has no 9p
+					# share and no host supervisor reading one.
+					#
+					# Written to a temp file and renamed with `mv -T`, so the host
+					# never reads half a stamp and a directory squatting at the path
+					# is a failed write rather than a move into it. Whatever a
+					# previous boot left at the temp path is removed first: a
+					# directory there, or a symlink sending the write elsewhere,
+					# would otherwise cost every later boot its stamp. The three
+					# COGBOX_STAMP_* variables are test seams only
+					# (checks.cogbox-guest-boot-stamp); the unit sets none of them.
+					#
+					# Requires= sshd, so a stamp never vouches for a boot whose sshd
+					# did not start, and for the same reason ALSO WantedBy= it. An
+					# sshd whose FIRST start fails fails this unit's start job with
+					# it, and sshd's own Restart=always then brings sshd back without
+					# re-queueing anything that merely required it: that boot would
+					# never write a stamp, so it would never be ready, and the control
+					# plane would read the silence as a fault of the image. Wanted by
+					# sshd, this unit is started again with sshd's later start; while
+					# it is active, that start is a no-op.
+					cogbox-boot-stamp = lib.mkIf isVm {
+						description = "Stamp this guest boot for the host's boot proof";
+						wantedBy = [ "multi-user.target" "sshd.service" ];
+						after = [ "sshd.service" "var-lib-cogbox.mount" ] ++ lib.optional poolEnabled poolUnit;
+						requires = [ "sshd.service" "var-lib-cogbox.mount" ];
+						serviceConfig = {
+							Type = "oneshot";
+							RemainAfterExit = true;
+							ExecStart = "${pkgs.writeShellApplication {
+								name = "cogbox-boot-stamp";
+								runtimeInputs = [ pkgs.coreutils pkgs.util-linux ];
+								text = ''
+									boot_id_file="''${COGBOX_STAMP_BOOT_ID:-/proc/sys/kernel/random/boot_id}"
+									out="''${COGBOX_STAMP_OUT:-/var/lib/cogbox/${gceBootStampName}}"
+									# Empty when this guest has no data pool: `na`.
+									pool_mount="''${COGBOX_STAMP_POOL-${lib.optionalString poolEnabled poolMount}}"
+									gb=$(head -c 64 "$boot_id_file" | tr -d '\n')
+									if ! [[ "$gb" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+										echo "cogbox-boot-stamp: $boot_id_file does not hold a boot id; writing no stamp" >&2
+										exit 1
+									fi
+									if [ -z "$pool_mount" ]; then
+										pool=na
+									elif mountpoint -q "$pool_mount"; then
+										pool=ok
+									else
+										pool=missing
+									fi
+									rm -rf --one-file-system -- "$out.tmp"
+									printf '%s pool=%s\n' "$gb" "$pool" > "$out.tmp"
+									mv -fT "$out.tmp" "$out"
+								'';
+							}}/bin/cogbox-boot-stamp";
+						};
+					};
 					# The VM host key lives on the late 9p mount; order sshd after
 					# it (and after the prep unit that creates the dir + key) so sshd
 					# never starts before the key it must read is present.
@@ -4461,6 +4543,15 @@
 		#     "x86_64-linux" { extraModules = [ { cogworx.gce.controlCAPublicKey = "ssh-ed25519 AAAA... control-ca"; } ]; }
 		#   ).config.system.build.googleComputeImage'
 		lib.mkGceHost = mkGceHost;
+		# The readiness protocol constants (gce/protocol.nix). gceImageLabels is
+		# the `--labels` value every bake must register its image with, from the
+		# SAME rev as the image: the control plane's automatic upgrade considers
+		# only a labelled image, and rejects one whose label claims a newer
+		# protocol than its content reports.
+		lib.gceBootProof = gceBootProof;
+		lib.gceStateFormat = gceStateFormat;
+		lib.gceStateFormatInputs = gceProtocol.stateFormatInputs;
+		lib.gceImageLabels = gceImageLabels;
 		nixosModules.gce-host = ./gce/cogbox-host.nix;
 		nixosModules.runtime-environment = ./runtime/module.nix;
 
@@ -5072,6 +5163,15 @@
 			# whose cogworx.gce.controlCAPublicKey is empty. Publishing is the one
 			# step where that mistake becomes expensive, so this is where it
 			# fails closed. See README ("Two things the image cannot supply").
+			#
+			# It also registers the image with the readiness-protocol labels
+			# (lib.gceImageLabels, from gce/protocol.nix). The control plane's
+			# automatic base-image upgrade only ever targets an image that carries
+			# them, so an image registered without them is inert for it -- and a
+			# promotion that re-registers the same tarball as a new image must
+			# copy both labels from the image it promotes. They are taken from THIS
+			# flake rev unless COGWORX_GCE_IMAGE_LABELS says otherwise, which is
+			# only right when COGWORX_GCE_IMAGE_SRC was built from this rev too.
 			push-gce-image = {
 				type = "app";
 				program = "${pkgs.writeShellApplication {
@@ -5093,19 +5193,39 @@
 							src=$(echo "$src"/*.raw.tar.gz)
 						fi
 						[ -f "$src" ] || { echo "push-gce-image: no image tarball at $src" >&2; exit 1; }
+						labels="''${COGWORX_GCE_IMAGE_LABELS:-${gceImageLabels}}"
+						if [ -z "''${COGWORX_GCE_IMAGE_LABELS:-}" ]; then
+							echo "push-gce-image: warning: labels taken from THIS flake rev ($labels); COGWORX_GCE_IMAGE_SRC must be built from the same rev (the control plane rejects an image whose content reports a lower protocol than its label)" >&2
+						fi
+						# The override REPLACES the protocol labels rather than adding
+						# to them, so one that drops them registers an image the
+						# automatic upgrade will never target, or one whose state
+						# format the control plane has to presume.
+						case ",$labels" in
+							*,cogworx-boot-proof=*) ;;
+							*) echo "push-gce-image: warning: COGWORX_GCE_IMAGE_LABELS ($labels) has no cogworx-boot-proof label; the control plane's automatic upgrade will never target this image (it replaces the default ${gceImageLabels}, it does not add to it)" >&2 ;;
+						esac
+						case ",$labels" in
+							*,cogworx-state-format=*) ;;
+							*) echo "push-gce-image: warning: COGWORX_GCE_IMAGE_LABELS ($labels) has no cogworx-state-format label; the control plane will presume this image's state format instead of reading it (it replaces the default ${gceImageLabels}, it does not add to it)" >&2 ;;
+						esac
 						obj="$bucket/$(basename "$src")"
 						echo "Staging $src -> $obj" >&2
 						gcloud storage cp "$src" "$obj"
-						echo "Creating image $name (family $family) from $obj" >&2
+						echo "Creating image $name (family $family, labels $labels) from $obj" >&2
 						gcloud compute images create "$name" \
 							--source-uri="$obj" \
-							--family="$family"
+							--family="$family" \
+							--labels="$labels"
 						# The control plane pins the IMMUTABLE NUMERIC ID, never
 						# the name: deleting an image frees its name, so a
 						# name pin would let the whole trusted half be replaced
 						# while the recorded pin still matched. Print the id so
-						# the operator records the right thing.
-						gcloud compute images describe "$name" --format='value(id,name,selfLink)'
+						# the operator records the right thing, and the labels so
+						# a promotion can copy them -- as registered, and in the
+						# comma form --labels takes (describe prints k=v;k=v).
+						gcloud compute images describe "$name" --format='value(id,name,selfLink,labels)'
+						echo "labels (for a promotion's --labels): $labels"
 					'';
 				}}/bin/push-gce-image";
 			};
@@ -6152,6 +6272,145 @@
 				touch $out
 			'';
 
+			# The guest half of the GCE boot proof (cogbox-boot-stamp.service; the
+			# host half is gce/supervise.sh leg (h2)). VM-only, ordered after sshd
+			# and the 9p mount it writes to, and after the data pool's mount but
+			# NOT requiring it: a pool that failed to mount must still produce a
+			# stamp, saying `pool=missing`, because that is the evidence the control
+			# plane fails an upgrade on. Wanted by sshd as well as by
+			# multi-user.target, so an sshd that comes up only on a later attempt
+			# still gets its stamp. Both halves name the one file
+			# (gceBootStampName): the guest's default output and the host
+			# supervisor's read path. Then the script itself, run against the
+			# realized hosted unit with its test seams: the exact line for each pool
+			# state, written by rename (a new inode, no temp left), nothing at all
+			# for a boot id that is not a lowercase UUID, a failed write rather
+			# than a move INTO a directory squatting at the path, and a good stamp
+			# despite a directory or a symlink left at the temp path.
+			#
+			# The pool states use REAL mount points rather than a stubbed
+			# `mountpoint`: writeShellApplication puts util-linux ahead of PATH, so a
+			# stub could never shadow it. /proc is a mount point in any build
+			# sandbox; a fresh directory under $TMPDIR is not.
+			cogbox-guest-boot-stamp = let
+				hostedName = "${configName system}-hosted";
+				hostedCfg = self.nixosConfigurations.${hostedName}.config;
+				has = c: self.nixosConfigurations.${c}.config.systemd.services ? cogbox-boot-stamp;
+			in pkgs.runCommand "cogbox-guest-boot-stamp" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnugrep diffutils ];
+			} ''
+				fails=0
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+				${lib.optionalString (has "${configName system}-container") ''
+					bad "${configName system}-container declares cogbox-boot-stamp.service; a container has no 9p share and no host supervisor that reads one"
+				''}
+				${lib.concatMapStrings (c: lib.optionalString (!(has c)) ''
+					bad "${c} does not declare cogbox-boot-stamp.service; a GCE host could never prove this guest booted"
+				'') [ (configName system) hostedName ]}
+
+				units=${hostedCfg.system.build.toplevel}/etc/systemd/system
+				unit=$units/cogbox-boot-stamp.service
+				[ -e "$units/multi-user.target.wants/cogbox-boot-stamp.service" ] \
+					|| bad "cogbox-boot-stamp.service is not WantedBy=multi-user.target in the hosted guest"
+				[ -e "$units/sshd.service.wants/cogbox-boot-stamp.service" ] \
+					|| bad "cogbox-boot-stamp.service is not WantedBy=sshd.service in the hosted guest; an sshd whose first start fails and that Restart=always brings back later leaves that boot with no stamp at all"
+				aft=$(grep '^After=' "$unit" || true)
+				for u in sshd.service var-lib-cogbox.mount 'var-lib-cogbox\x2dguest.mount'; do
+					case " ''${aft#After=} " in
+						*" $u "*) ;;
+						*) bad "cogbox-boot-stamp.service is not After=$u ($aft)" ;;
+					esac
+				done
+				req=$(grep '^Requires=' "$unit" || true)
+				for u in sshd.service var-lib-cogbox.mount; do
+					case " ''${req#Requires=} " in
+						*" $u "*) ;;
+						*) bad "cogbox-boot-stamp.service does not Requires=$u ($req)" ;;
+					esac
+				done
+				case "$req" in
+					*'var-lib-cogbox\x2dguest.mount'*) bad "cogbox-boot-stamp.service Requires= the data pool's mount; an unmounted pool would then write no stamp instead of pool=missing ($req)" ;;
+				esac
+				for setting in Type=oneshot RemainAfterExit=true; do
+					grep -qx "$setting" "$unit" || bad "cogbox-boot-stamp.service lacks $setting"
+				done
+
+				s=${hostedCfg.systemd.services.cogbox-boot-stamp.serviceConfig.ExecStart}
+				grep -qx "ExecStart=$s" "$unit" || bad "the realized unit does not run $s"
+				# The hosted guest has a data pool, so its default is the pool mount.
+				grep -qF 'COGBOX_STAMP_POOL-/var/lib/cogbox-guest}' "$s" \
+					|| bad "the hosted guest's stamp does not default to checking the data pool mount"
+				# The two halves meet at one file: the guest writes it at the root of
+				# its side of the 9p data share, and the host supervisor reads it at
+				# the root of the same share from outside, where it reads the guest's
+				# host key too. Each must be a live statement, not text in a comment.
+				# has_line <file> <line>: <file> has <line> whole, indentation aside.
+				has_line() { L="$2" awk '{ sub(/^[ \t]+/, "") } $0 == ENVIRON["L"] { f = 1 } END { exit !f }' "$1"; }
+				has_line "$s" 'out="''${COGBOX_STAMP_OUT:-/var/lib/cogbox/${gceBootStampName}}"' \
+					|| bad "the guest's stamp does not default to /var/lib/cogbox/${gceBootStampName}, where the host supervisor reads it"
+				has_line ${gceSuperviseScript} 'BOOT_STAMP="$COGBOX_DATA/instances/$INSTANCE/${gceBootStampName}"' \
+					|| bad "gce/supervise.sh does not read the stamp at \$COGBOX_DATA/instances/\$INSTANCE/${gceBootStampName}, where the guest writes it; no boot would ever be ready, and none would carry a proof"
+				w=$TMPDIR/stamp
+				mkdir -p "$w/notmounted"
+				gb=0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0
+				printf '%s\n' "$gb" > "$w/boot_id"
+
+				COGBOX_STAMP_BOOT_ID="$w/boot_id" COGBOX_STAMP_OUT="$w/out" COGBOX_STAMP_POOL=/proc "$s" \
+					|| bad "the stamp script failed with a valid boot id"
+				printf '%s pool=ok\n' "$gb" | cmp -s - "$w/out" \
+					|| bad "a mounted pool did not stamp exactly '<boot id> pool=ok': $(cat "$w/out" 2>&1)"
+				ino=$(stat -c %i "$w/out")
+				COGBOX_STAMP_BOOT_ID="$w/boot_id" COGBOX_STAMP_OUT="$w/out" COGBOX_STAMP_POOL="$w/notmounted" "$s" \
+					|| bad "the stamp script failed with an unmounted pool"
+				printf '%s pool=missing\n' "$gb" | cmp -s - "$w/out" \
+					|| bad "an unmounted pool did not stamp exactly '<boot id> pool=missing': $(cat "$w/out" 2>&1)"
+				[ "$(stat -c %i "$w/out")" != "$ino" ] \
+					|| bad "the stamp was rewritten in place rather than renamed over, so the host could read half of it"
+				COGBOX_STAMP_BOOT_ID="$w/boot_id" COGBOX_STAMP_OUT="$w/out" COGBOX_STAMP_POOL="" "$s" \
+					|| bad "the stamp script failed with no pool"
+				printf '%s pool=na\n' "$gb" | cmp -s - "$w/out" \
+					|| bad "a guest with no pool did not stamp exactly '<boot id> pool=na': $(cat "$w/out" 2>&1)"
+				[ ! -e "$w/out.tmp" ] || bad "a successful stamp left its temp file behind"
+
+				# Anything but a lowercase UUID writes nothing at all.
+				for id in not-a-boot-id 0F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F0 "$gb-x" ""; do
+					printf '%s\n' "$id" > "$w/boot_id2"
+					rm -f "$w/out2" "$w/out2.tmp"
+					if COGBOX_STAMP_BOOT_ID="$w/boot_id2" COGBOX_STAMP_OUT="$w/out2" COGBOX_STAMP_POOL="" "$s" 2>/dev/null; then
+						bad "the stamp script succeeded on boot id '$id'"
+					fi
+					[ ! -e "$w/out2" ] && [ ! -e "$w/out2.tmp" ] || bad "boot id '$id' still wrote a stamp"
+				done
+
+				# A directory squatting at the path: a failed write, never a move into it.
+				mkdir "$w/outdir"
+				if COGBOX_STAMP_BOOT_ID="$w/boot_id" COGBOX_STAMP_OUT="$w/outdir" COGBOX_STAMP_POOL="" "$s" 2>/dev/null; then
+					bad "the stamp script succeeded with a directory at its output path"
+				fi
+				[ -z "$(ls -A "$w/outdir")" ] || bad "the stamp was moved INTO a directory squatting at its path: $(ls -A "$w/outdir")"
+
+				# Whatever a previous boot left at the TEMP path -- a directory, or a
+				# symlink that would send the write elsewhere -- is cleared, and the
+				# stamp still lands, by rename, with the symlink's target untouched.
+				rm -f "$w/out"
+				mkdir -p "$w/out.tmp/sub"
+				COGBOX_STAMP_BOOT_ID="$w/boot_id" COGBOX_STAMP_OUT="$w/out" COGBOX_STAMP_POOL="" "$s" 2>/dev/null \
+					|| bad "the stamp script failed with a directory left at its temp path"
+				printf '%s pool=na\n' "$gb" | cmp -s - "$w/out" \
+					|| bad "a directory left at the temp path cost the boot its stamp: $(ls -ld "$w/out" 2>&1)"
+				rm -f "$w/out"
+				printf 'elsewhere\n' > "$w/elsewhere"
+				ln -s "$w/elsewhere" "$w/out.tmp"
+				COGBOX_STAMP_BOOT_ID="$w/boot_id" COGBOX_STAMP_OUT="$w/out" COGBOX_STAMP_POOL="" "$s" 2>/dev/null \
+					|| bad "the stamp script failed with a symlink left at its temp path"
+				[ -f "$w/out" ] && [ ! -L "$w/out" ] && printf '%s pool=na\n' "$gb" | cmp -s - "$w/out" \
+					|| bad "a symlink left at the temp path turned the stamp into something else: $(ls -l "$w/out" 2>&1)"
+				[ "$(cat "$w/elsewhere")" = elsewhere ] \
+					|| bad "the stamp was written through a symlink left at its temp path"
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
 			# The container's post-boot toplevel reconcile is best-effort but LOUD: a
 			# failed build (nonzero exit, or the verb's exit-0 "(boot uses baked
 			# base)" warning) prints FAILED and leaves a marker, /homeless-shelter is
@@ -6892,6 +7151,65 @@
 				for v in XDG_CONFIG_HOME COGBOX_DATA XDG_RUNTIME_DIR; do
 					if ! grep -qF "$v" ${gceCogboxWrapper}/bin/cogbox; then
 						echo "FAIL: the cogbox wrapper does not set $v; control-channel verbs would exit 66" >&2
+						fails=$((fails + 1))
+					fi
+				done
+
+				# THE BOOT PROOF IS LEVEL-HELD LIKE READINESS. supervise.sh deletes
+				# it at run start and wherever it deletes readiness; ExecStopPost and
+				# the scrub unit cover what it cannot (a killed supervisor, a reboot
+				# within the start epoch). Without them a dead boot's proof, still
+				# carrying the current nonce, outlives it. boot-error is the one
+				# attribute the scrub must NOT take: only an init that ran and
+				# succeeded proves it stale.
+				stoppost=${gceCfg.systemd.services.cogworx-supervisor.serviceConfig.ExecStopPost}
+				# The attribute's full metadata URL, as the continuation of a curl
+				# DELETE: any URL that merely contains its name is not this DELETE.
+				url='"http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/cogworx/boot-proof" \'
+				if ! URL="$url" awk '{ l = $0; sub(/^[ \t]+/, "", l) } l == ENVIRON["URL"] && prev ~ /^curl .*-X DELETE .*\\$/ { f = 1 } { prev = l } END { exit !f }' "$stoppost"; then
+					echo "FAIL: the supervisor's ExecStopPost does not DELETE the cogworx/boot-proof guest attribute's metadata URL; a proof would latch across the crash paths the poll loop cannot see" >&2
+					fails=$((fails + 1))
+				fi
+				# ...and its DELETEs run concurrently, so the post-stop leg stays one
+				# ten-second bound: two in sequence would push a full-length ExecStop
+				# past GCE's shutdown window (docs/graceful-guest-shutdown.md).
+				ncurl=$(grep -cE '^[[:space:]]*curl ' "$stoppost" || true)
+				nbg=$(grep -cE '^[[:space:]]*2>/dev/null &$' "$stoppost" || true)
+				if [ "$ncurl" -lt 2 ] || [ "$nbg" != "$ncurl" ] || ! grep -qxE '[[:space:]]*wait' "$stoppost"; then
+					echo "FAIL: the supervisor's ExecStopPost does not background each of its $ncurl DELETEs ($nbg backgrounded) and join them with one wait; in sequence they exceed the ten-second post-stop leg" >&2
+					fails=$((fails + 1))
+				fi
+				scrub=${gceCfg.systemd.services.cogworx-attr-scrub.serviceConfig.ExecStart}
+				# Its ONE key loop, whole: exactly one `for key in` in the script, on
+				# a line that is nothing but `for key in <keys>; do`, whose body opens
+				# with the DELETE of "$GA/$key". A second loop, or a dead one ahead of
+				# the real one, would otherwise let this parse read keys nothing
+				# deletes.
+				loop='^[[:space:]]*for key in [a-z/ -]+; do$'
+				nloops=$( (grep -o 'for key in' "$scrub" || true) | wc -l)
+				keys=$(grep -E "$loop" "$scrub" || true)
+				body=$( (grep -A1 -E "$loop" "$scrub" || true) | tail -n +2)
+				if [ "$nloops" != 1 ] || [ -z "$keys" ] \
+					|| ! grep -qE '^[[:space:]]*curl .*-X DELETE .*"\$GA/\$key"' <<< "$body"; then
+					echo "FAIL: the scrub unit does not have exactly one key loop, a whole \`for key in ...; do\` line whose body DELETEs \"\$GA/\$key\" ($nloops loop(s): $keys)" >&2
+					fails=$((fails + 1))
+				fi
+				# The word list only: `for key in a b c; do` -> ` a b c`.
+				keys=''${keys%%;*}
+				keys=''${keys#*for key in}
+				case "$keys " in
+					*' cogworx/boot-proof '*) ;;
+					*) echo "FAIL: the scrub unit's key list does not include cogworx/boot-proof ($keys)" >&2; fails=$((fails + 1)) ;;
+				esac
+				case "$keys" in
+					*boot-error*) echo "FAIL: the scrub unit deletes cogworx/boot-error; only a successful init may clear it ($keys)" >&2; fails=$((fails + 1)) ;;
+				esac
+				# The image's own protocol values, from gce/protocol.nix, travel in
+				# the supervisor's environment: inside the image, where no
+				# re-registration can change them.
+				for kv in 'COGWORX_IMAGE_BOOT_PROOF=${toString gceProtocol.bootProof}' 'COGWORX_IMAGE_STATE_FORMAT=${toString gceProtocol.stateFormat}'; do
+					if ! grep -qxF "Environment=\"$kv\"" "$sup"; then
+						echo "FAIL: the supervisor unit does not carry $kv from gce/protocol.nix: $(grep -F "''${kv%%=*}" "$sup" || echo absent)" >&2
 						fails=$((fails + 1))
 					fi
 				done
@@ -9980,6 +10298,117 @@
 				fi
 
 				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# THE READINESS-PROTOCOL LABELS AGREE WITH THE CONTENT. The control plane
+			# reads an image's cogworx-boot-proof / cogworx-state-format labels
+			# before a boot and checks them, after it, against what the booted
+			# supervisor reports from its own baked environment. So the three
+			# copies must say the same thing: the default push-gce-image registers
+			# with (lib.gceImageLabels), the values the realized supervisor unit
+			# carries, and the two publishes in the realized supervise script that
+			# report them -- cogworx/ready's `bp=` tail and both cogworx/boot-proof
+			# forms.
+			gce-boot-proof-labels = pkgs.runCommand "gce-boot-proof-labels" { } ''
+				fails=0
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+				push=${self.apps.x86_64-linux.push-gce-image.program}
+				grep -qF 'labels="''${COGWORX_GCE_IMAGE_LABELS:-${self.lib.gceImageLabels}}"' "$push" \
+					|| bad "push-gce-image does not default its labels to lib.gceImageLabels (${self.lib.gceImageLabels})"
+				# On the create invocation itself, as a live argument: the lines from
+				# `gcloud compute images create` through its last continuation, not
+				# text a comment or another command happens to carry.
+				create=$(awk '/^[[:space:]]*gcloud compute images create "\$name" \\$/ { on = 1 } on { print; if ($0 !~ /\\$/) exit }' "$push")
+				grep -qxE '[[:space:]]*--labels="\$labels"' <<< "$create" \
+					|| bad "push-gce-image's gcloud compute images create does not pass --labels=\"\$labels\"; the automatic upgrade would never target the image: $create"
+				grep -qF '*,cogworx-boot-proof=*) ;;' "$push" \
+					|| bad "push-gce-image does not warn when COGWORX_GCE_IMAGE_LABELS drops the cogworx-boot-proof label, which silently makes the image inert for the automatic upgrade"
+				grep -qF '*,cogworx-state-format=*) ;;' "$push" \
+					|| bad "push-gce-image does not warn when COGWORX_GCE_IMAGE_LABELS drops the cogworx-state-format label, which leaves the control plane presuming the image's state format"
+				grep -qF -- "--format='value(id,name,selfLink,labels)'" "$push" \
+					|| bad "push-gce-image's describe does not print the labels as registered, which a promotion copies"
+				sup=${gceUnits}/cogworx-supervisor.service
+				bp=$(sed -n 's/^Environment="COGWORX_IMAGE_BOOT_PROOF=\(.*\)"$/\1/p' "$sup")
+				sf=$(sed -n 's/^Environment="COGWORX_IMAGE_STATE_FORMAT=\(.*\)"$/\1/p' "$sup")
+				[ "${self.lib.gceImageLabels}" = "cogworx-boot-proof=$bp,cogworx-state-format=$sf" ] \
+					|| bad "lib.gceImageLabels (${self.lib.gceImageLabels}) disagrees with the supervisor unit's baked bp='$bp' sf='$sf'"
+				script=${gceSuperviseScript}
+				grep -qF 'BP="''${COGWORX_IMAGE_BOOT_PROOF:-}"' "$script" \
+					|| bad "supervise.sh does not read its protocol version from COGWORX_IMAGE_BOOT_PROOF"
+				grep -qF 'SF="''${COGWORX_IMAGE_STATE_FORMAT:-}"' "$script" \
+					|| bad "supervise.sh does not read its state format from COGWORX_IMAGE_STATE_FORMAT"
+				grep -qF 'ga_put cogworx/ready "$NONCE ok''${BP:+ bp=$BP}"' "$script" \
+					|| bad "supervise.sh's readiness publish does not carry the bp=\$BP tail"
+				grep -qF 'ga_put cogworx/boot-proof "$NONCE bp=$BP hb=$HB gb=$gb pool=$pool sf=$SF"' "$script" \
+					|| bad "supervise.sh's boot-proof publish does not carry bp=\$BP and sf=\$SF"
+				grep -qF 'ga_put cogworx/boot-proof "$NONCE bp=$BP err=stamp-path"' "$script" \
+					|| bad "supervise.sh's stamp-path refusal does not carry bp=\$BP"
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# THE GENERIC BOOT-ERROR LITERAL IS FROZEN PROTOCOL. The control plane
+			# reads a cogworx/boot-error whose summary is exactly "cogbox init
+			# failed" -- init_error_summary's fallback when no `cogbox: `-stamped
+			# line matched -- as UNCLASSIFIED (keep waiting, Restart=always may
+			# recover it), and any other summary as CLASSIFIED (fail the image
+			# upgrade fast and remember the target). Rewording the fallback, or a
+			# second spelling of it anywhere in the script, would silently turn
+			# every transient init failure into a classified one.
+			gce-boot-error-generic-literal = pkgs.runCommand "gce-boot-error-generic-literal" { } ''
+				script=${gceSuperviseScript}
+				body=$(sed -n '/^init_error_summary() {$/,/^}$/p' "$script")
+				if [ -z "$body" ]; then
+					echo "FAIL: supervise.sh has no init_error_summary(); the boot-error classification contract has nothing to pin" >&2
+					exit 1
+				fi
+				fallback=$(printf '%s\n' "$body" | grep -cE '^[[:space:]]*\[ -n "\$s" \] \|\| s="cogbox init failed"$' || true)
+				total=$(grep -cF 's="cogbox init failed"' "$script" || true)
+				if [ "$fallback" != 1 ] || [ "$total" != 1 ]; then
+					echo "FAIL: expected exactly one 's=\"cogbox init failed\"' fallback, inside init_error_summary (found $fallback there, $total in the script); the control plane classifies boot-error by that exact literal" >&2
+					exit 1
+				fi
+				touch $out
+			'';
+
+			# cogbox-env's STATE_FORMAT is an input of the image's state format
+			# (gce/protocol.nix). A change to it without a stateFormat bump would
+			# let the control plane fall back to an older image after a newer one
+			# converted the sandbox's data, so the recorded input must match --
+			# and, through the append-only stateFormatHistory, a changed input must
+			# come with a newly appended entry and a new, higher stateFormat, not
+			# just an updated record. What it cannot see: an existing entry edited
+			# in place (append, never edit), and poolLayout, a hand-maintained
+			# number nothing ties to the pool's real layout.
+			gce-state-format-pin = let
+				hist = gceProtocol.stateFormatHistory;
+				show = e: lib.concatStringsSep " " (lib.mapAttrsToList (k: v: "${k}=${toString v}") e);
+				current = show (gceProtocol.stateFormatInputs // { inherit (gceProtocol) stateFormat; });
+				last = if hist == [ ] then "(no entry)" else show (lib.last hist);
+				formats = lib.concatMapStringsSep " " (e: toString e.stateFormat) hist;
+			in pkgs.runCommand "gce-state-format-pin" { } ''
+				got=$(sed -n 's/^STATE_FORMAT = \([0-9][0-9]*\)$/\1/p' ${./runtime/cogbox-env.py})
+				if [ "$(printf '%s\n' "$got" | grep -c .)" != 1 ]; then
+					echo "FAIL: expected exactly one 'STATE_FORMAT = <int>' line in runtime/cogbox-env.py, found: '$got'" >&2
+					exit 1
+				fi
+				if [ "$got" != '${toString gceProtocol.stateFormatInputs.cogboxEnv}' ]; then
+					echo "FAIL: runtime/cogbox-env.py STATE_FORMAT is $got but gce/protocol.nix records stateFormatInputs.cogboxEnv = ${toString gceProtocol.stateFormatInputs.cogboxEnv}; update the input AND bump stateFormat" >&2
+					exit 1
+				fi
+				if [ '${current}' != '${last}' ]; then
+					echo "FAIL: gce/protocol.nix's current state format (${current}) is not the last stateFormatHistory entry (${last}); append a new entry with the new inputs and a HIGHER stateFormat, and set stateFormat to it -- never edit an existing entry" >&2
+					exit 1
+				fi
+				prev=""
+				for f in ${formats}; do
+					if [ -n "$prev" ] && [ "$f" -le "$prev" ]; then
+						echo "FAIL: stateFormatHistory's stateFormat does not strictly increase (${formats}); a changed input needs a new, higher stateFormat" >&2
+						exit 1
+					fi
+					prev=$f
+				done
 				touch $out
 			'';
 
