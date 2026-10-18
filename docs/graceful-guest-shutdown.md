@@ -187,10 +187,11 @@ resolver and network so their reverse stop order keeps guest storage and
 supporting services available.
 
 On an unexpected supervisor exit while QEMU is still alive -- for example,
-`supervise.sh` leg (j) after a readiness timeout on a healthy guest, or a
-`cogbox status` failure that outruns the guest -- the cgroup TERM reaches the
-launcher's trap, which sets a stop request and attempts the orderly lane before
-TERM/KILL fallback, all inside `TimeoutStopSec=75s`.
+`supervise.sh` leg (j) after a readiness timeout (the guest's host key never
+appeared while QEMU stayed up), or a `cogbox status` failure that outruns the
+guest -- the cgroup TERM reaches the launcher's trap, which sets a stop request
+and attempts the orderly lane before TERM/KILL fallback, all inside
+`TimeoutStopSec=75s`.
 With `KillMode=control-group`, however, QEMU and its supporting processes
 receive TERM at the same time, so they can exit before the launcher's orderly
 attempt completes. The full 45-second guest drain window is not guaranteed on
@@ -213,7 +214,10 @@ where its status loop exits while `ExecStop` is waiting, and prove no replacemen
 guest starts until the stop transaction is complete.
 
 Set `TimeoutStopSec=75s`; the synchronous command must honor its own 65-second
-bound. Keep the existing best-effort ten-second `ExecStopPost` readiness removal.
+bound. Keep the existing best-effort ten-second `ExecStopPost` readiness removal;
+it also removes the boot proof (`cogworx/boot-proof`), as a second DELETE run
+concurrently with the first under the same ten-second bound, never after it
+(`checks.gce-image-unit-ordering`).
 On the normal path (ExecStop completes) the 75-second command backstop plus the
 ten-second post-stop leg fits inside GCE's default 90-second host shutdown
 window (unverified against the provider; Spot/preemptible windows are shorter).
