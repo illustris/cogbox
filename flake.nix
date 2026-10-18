@@ -4636,6 +4636,7 @@
 					--replace-fail "@harnesses@" "${harnessNames}" \
 					--replace-fail "@mitmdump@" "${pkgs.mitmproxy}/bin/mitmdump" \
 					--replace-fail "@l7addon@" "$out/libexec/l7-mitm-addon.py" \
+					--replace-fail "@openssl@" "${pkgs.openssl.bin}/bin/openssl" \
 					--replace-fail "@flock@" "${pkgs.util-linux}/bin/flock" \
 					--replace-fail "@dumpe2fs@" "${pkgs.e2fsprogs}/bin/dumpe2fs" \
 					--replace-fail "@flakeSource@" "${self}" \
@@ -5955,6 +5956,20 @@
 				bash ${./tests/test_launch_flags.sh} ${./cogbox-launch.sh}
 				python3 ${./tests/test_runtime_base.py} ${./cogbox-launch.sh} -v
 				python3 ${./tests/test_app_environment.py} ${./cogbox-launch.sh} -v
+				touch $out
+			'';
+
+			# The L7 terminate CA must be in the fw_cfg slot before QEMU launches:
+			# the guest reads it once per boot, and a cold first boot used to time
+			# out waiting on mitmproxy's own mint and launch without it. Runs the
+			# launcher's real start_l7mitm region (the openssl pre-mint, the wait,
+			# the staging) against stub mitmdumps and a real one, plain and under a
+			# runas wrapper. See tests/test_l7ca_stage.sh for what each case guards.
+			launch-l7ca-tests = pkgs.runCommand "cogbox-launch-l7ca-tests" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnugrep gawk openssl mitmproxy curl ];
+			} ''
+				export HOME=$TMPDIR
+				bash ${./tests/test_l7ca_stage.sh} ${./cogbox-launch.sh}
 				touch $out
 			'';
 
