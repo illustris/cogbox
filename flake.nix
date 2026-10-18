@@ -531,9 +531,10 @@
 		# The guest's boot stamp, by NAME. The guest writes it at the root of its
 		# 9p data share (/var/lib/cogbox) and gce/supervise.sh reads it at the
 		# root of the same share from the host ($COGBOX_DATA/instances/<name>), so
-		# a name that drifts on one side only leaves every image ready with no
-		# boot proof, which the control plane reads as a fault of the image. Bound
-		# once here; checks.cogbox-guest-boot-stamp pins both sides to it.
+		# a name that drifts on one side only leaves every boot never ready (the
+		# supervisor's readiness waits for the stamp) and none with a boot proof,
+		# which the control plane reads as a fault of the image. Bound once here;
+		# checks.cogbox-guest-boot-stamp pins both sides to it.
 		gceBootStampName = ".cogbox-boot-stamp";
 
 		# What makes a guest the HOSTED one (the nixosConfigurations
@@ -3598,8 +3599,10 @@
 					# clears that path before every launch, so a stamp present after
 					# it was written by this boot. The guest can only claim facts
 					# about itself; the host binds them to the start epoch, its own
-					# boot and the image's protocol values. VM-only: the container
-					# has no 9p share and no host supervisor reading one.
+					# boot and the image's protocol values. The stamp also gates the
+					# host's readiness: cogworx/ready waits for it, so a guest that
+					# writes none stays Booting. VM-only: the container has no 9p
+					# share and no host supervisor reading one.
 					#
 					# Written to a temp file and renamed with `mv -T`, so the host
 					# never reads half a stamp and a directory squatting at the path
@@ -3615,10 +3618,10 @@
 					# sshd whose FIRST start fails fails this unit's start job with
 					# it, and sshd's own Restart=always then brings sshd back without
 					# re-queueing anything that merely required it: that boot would
-					# never write a stamp, and the control plane would read the
-					# silence as a fault of the image. Wanted by sshd, this unit is
-					# started again with sshd's later start; while it is active,
-					# that start is a no-op.
+					# never write a stamp, so it would never be ready, and the control
+					# plane would read the silence as a fault of the image. Wanted by
+					# sshd, this unit is started again with sshd's later start; while
+					# it is active, that start is a no-op.
 					cogbox-boot-stamp = lib.mkIf isVm {
 						description = "Stamp this guest boot for the host's boot proof";
 						wantedBy = [ "multi-user.target" "sshd.service" ];
@@ -6331,7 +6334,7 @@
 				has_line "$s" 'out="''${COGBOX_STAMP_OUT:-/var/lib/cogbox/${gceBootStampName}}"' \
 					|| bad "the guest's stamp does not default to /var/lib/cogbox/${gceBootStampName}, where the host supervisor reads it"
 				has_line ${gceSuperviseScript} 'BOOT_STAMP="$COGBOX_DATA/instances/$INSTANCE/${gceBootStampName}"' \
-					|| bad "gce/supervise.sh does not read the stamp at \$COGBOX_DATA/instances/\$INSTANCE/${gceBootStampName}, where the guest writes it; every boot would be ready with no proof"
+					|| bad "gce/supervise.sh does not read the stamp at \$COGBOX_DATA/instances/\$INSTANCE/${gceBootStampName}, where the guest writes it; no boot would ever be ready, and none would carry a proof"
 				w=$TMPDIR/stamp
 				mkdir -p "$w/notmounted"
 				gb=0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0
