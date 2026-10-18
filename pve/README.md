@@ -87,7 +87,7 @@ cogworxd reads both files with the QEMU guest agent (`agent/file-read`), and rea
 
 | Path | Content |
 |---|---|
-| `/run/cogworx/guest-attributes.json` | `{"v":1,"boot_id":"...","gen":N,"attrs":{"cogworx/vm-host-key":"<nonce> ssh-ed25519 ...","cogworx/ready":"<nonce> ok","cogworx/boot-error":"<nonce> <text>"}}`. Mode 0600, rewritten atomically on every guest-attribute mutation, and reset on reboot. |
+| `/run/cogworx/guest-attributes.json` | `{"v":1,"boot_id":"...","gen":N,"attrs":{"cogworx/vm-host-key":"<nonce> ssh-ed25519 ...","cogworx/ready":"<nonce> ok bp=1","cogworx/boot-proof":"<nonce> bp=1 hb=... gb=... pool=ok sf=1","cogworx/boot-error":"<nonce> <text>"}}`. Mode 0600, rewritten atomically on every guest-attribute mutation, and reset on reboot. `cogworx/ready` appears only once the hosted guest's sshd has started in this launch: `gce/supervise.sh` waits for the guest's boot stamp (written by `cogbox-boot-stamp.service`, after its sshd) as well as its host key. The `bp=` tail and `cogworx/boot-proof` carry the image's protocol values from `gce/protocol.nix`; the proof is `<nonce> bp=1 err=stamp-path` when the supervisor could not clear the stamp path, and readiness then rests on the host key alone. cogworxd compares only the nonce half of `cogworx/ready` and does not read `cogworx/boot-proof`. |
 | `/run/cogworx/serial.log` | The classified `cogworx: ...` lifecycle lines that the supervisor writes (on GCE they go to serial port 1). Pre-created 0600. When it passes 256 KiB, a timer trims it to the last 128 KiB, starting on a line boundary. |
 
 `/run/cogworx` is created 0700 by tmpfiles.
@@ -133,7 +133,7 @@ Residuals (asynchronous and throttled, but not boot failures; nothing here chang
 | `cogworx-control-principal`, `cogworx-attr-scrub`, `cogworx-floor`, `cogworx-resolver-deadline`, `cogworx-cogbox-log` (gce/) | Also `After=` and `Requires=` the socket. The principal fetch is one-shot, so the address must already be on lo. |
 | `cogworx-pve-self-refresh` | `After=` network-online and the socket; `RequiresMountsFor=` the state disk; `Before=` the supervisor. |
 | `cogworx-pve-floor` | Loads the site floor, then verifies rule 4a against the live emulator socket: root connects, while `nobody` and a nix build user are dropped. `Before=` sshd and the supervisor, and `RequiredBy=` sshd: a floor that fails to load or verify leaves the VM without sshd rather than with an sshd open to the shared L2 (the serial console stays as break-glass). |
-| `cogworx-supervisor` (gce/) | Also `After=` the emulator (its `ExecStopPost` unpublishes readiness at shutdown), `After=` and `Requires=` `cogworx-pve-floor`, and `After=` and `Wants=` `cogworx-pve-self-refresh`. |
+| `cogworx-supervisor` (gce/) | Also `After=` the emulator (its `ExecStopPost` unpublishes readiness and the boot proof at shutdown), `After=` and `Requires=` `cogworx-pve-floor`, and `After=` and `Wants=` `cogworx-pve-self-refresh`. |
 
 Clients depend on the socket, never on the emulator service: the emulator is socket-activated and restarts on failure, so a crashed emulator is re-activated by the next request and its restart does not propagate to any client.
 
