@@ -1,0 +1,19 @@
+{
+ "entry0": {
+  "init": "/nix/store/6rfk8j8m7zks6fb73y4584brh9798i61-nixos-system-machine-test",
+  "title": "NixOS"
+ },
+ "errors": [],
+ "profiles": {},
+ "submenus": [
+  {
+   "entries": [
+    {
+     "init": "/nix/store/6rfk8j8m7zks6fb73y4584brh9798i61-nixos-system-machine-test",
+     "title": "NixOS - Configuration 1 (2026-10-18 - test)"
+    }
+   ],
+   "title": "NixOS - All configurations"
+  }
+ ]
+}

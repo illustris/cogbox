@@ -1,0 +1,52 @@
+{
+ "expected": "09d66288c2da7e18c8ed061e0e121ce0b2a22e7b84c876a82b1b70cde113488a",
+ "format": "cogworx-pve closure digest v1: sha256 hex of the concatenated lines '<path> sha256:<nix32>\\n', one per path of nix-store -qR <target> (target included), sorted by byte order; hashes normalized from whatever form nix-store -q --hash prints",
+ "hash_forms": [
+  {
+   "base16": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "nix32": "0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73",
+   "of": "the empty string",
+   "sri": "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+  }
+ ],
+ "lines": "/nix/store/2pqwj4j7h1yhhgql3h46nghswvgwqm4d-glibc-2.42-67 sha256:1wfagfydzfm1x9gyqyllbivmh98ygwaq4sfv7w2b9d2216k0dskz\n/nix/store/5k4gfcnhk2j6rqfg1cs66y1k3zdy2rxj-nixos-system-unnamed-26.11.20261008.e7439b6 sha256:18lxfwmzrxy77dh3wr7sfbli2jdn637ywh02g3mp44p3zqrxr5gy\n/nix/store/bdf0nvc8g9xpq25512zi2hf5b1w8ldk3-Zebra-1.0 sha256:17kppfczri4kbqcacx09w675z6x5kyv1vf2ymydh7j2a8ciyi5qz\n/nix/store/hh73c656h96gj572m4pimfhlcw2rr914-cogworx-pve-upgrade sha256:18rd2pjm8qpydk1wv8brwbdyzf3i2m77i8qs9gzyc5744kgq9p9m\n/nix/store/zgrqbxjz3s5qvay63b209xcvah7wnq16-empty sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73\n",
+ "nar_bytes": 5309,
+ "paths": [
+  {
+   "base16": "35dd84df24e414e6ff4b1aa3784e1571b8efdbe279a1cdc36cfe6254e5152da3",
+   "nar_size": 1063,
+   "nix32": "sha256:18rd2pjm8qpydk1wv8brwbdyzf3i2m77i8qs9gzyc5744kgq9p9m",
+   "path": "/nix/store/hh73c656h96gj572m4pimfhlcw2rr914-cogworx-pve-upgrade",
+   "sri": "sha256-Nd2E3yTkFOb/SxqjeE4Vcbjv2+J5oc3DbP5iVOUVLaM="
+  },
+  {
+   "base16": "fe95dc33fee31272eb780240eecf30b64911e972fa643e603bc7f7fc2b779da2",
+   "nar_size": 1087,
+   "nix32": "sha256:18lxfwmzrxy77dh3wr7sfbli2jdn637ywh02g3mp44p3zqrxr5gy",
+   "path": "/nix/store/5k4gfcnhk2j6rqfg1cs66y1k3zdy2rxj-nixos-system-unnamed-26.11.20261008.e7439b6",
+   "sri": "sha256-/pXcM/7jEnLreAJA7s8wtkkR6XL6ZD5gO8f3/Ct3naI="
+  },
+  {
+   "base16": "1f97e823434ac8039baf5eb81db69fa59b5f8ee10974a6185e93c4fc99bb779e",
+   "nar_size": 1053,
+   "nix32": "sha256:17kppfczri4kbqcacx09w675z6x5kyv1vf2ymydh7j2a8ciyi5qz",
+   "path": "/nix/store/bdf0nvc8g9xpq25512zi2hf5b1w8ldk3-Zebra-1.0",
+   "sri": "sha256-H5foI0NKyAObr164HbafpZtfjuEJdKYYXpPE/Jm7d54="
+  },
+  {
+   "base16": "7fea06a60942b4b4043fdb6982157f1e2558775c947aec5feaa1badfbc7bcaf1",
+   "nar_size": 1057,
+   "nix32": "sha256:1wfagfydzfm1x9gyqyllbivmh98ygwaq4sfv7w2b9d2216k0dskz",
+   "path": "/nix/store/2pqwj4j7h1yhhgql3h46nghswvgwqm4d-glibc-2.42-67",
+   "sri": "sha256-f+oGpglCtLQEP9tpghV/HiVYd1yUeuxf6qG637x7yvE="
+  },
+  {
+   "base16": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "nar_size": 1049,
+   "nix32": "sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73",
+   "path": "/nix/store/zgrqbxjz3s5qvay63b209xcvah7wnq16-empty",
+   "sri": "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+  }
+ ],
+ "target": "/nix/store/5k4gfcnhk2j6rqfg1cs66y1k3zdy2rxj-nixos-system-unnamed-26.11.20261008.e7439b6"
+}

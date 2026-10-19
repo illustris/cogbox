@@ -136,6 +136,13 @@ in
 		networking.useDHCP = false;
 		networking.interfaces.${iface}.useDHCP = true;
 		networking.hostName = lib.mkDefault "";
+
+		# No cloud-init. It would take the hostname, the network and SSH keys
+		# from a datasource this image does not have; here the metadata
+		# emulator, hostname.nix and dhcpcd own those. Forced, because a base
+		# profile for Proxmox guests (nixpkgs' proxmox-image.nix) turns it on,
+		# and with it systemd-networkd; asserted below.
+		services.cloud-init.enable = lib.mkForce false;
 		networking.dhcpcd = {
 			# network-online.target means "eth0 has its IPv4 lease", which
 			# self-refresh and the gce floor's first-boot fallback depend on.
@@ -281,6 +288,18 @@ in
 			{
 				assertion = !config.networking.firewall.enable;
 				message = "cogworx.pve: networking.firewall.enable is true. This image's packet policy is gce/floor.nix's and floor-site.nix's nft tables; a NixOS firewall from a composed profile would be a third, unreviewed policy (and opens ports of its own). Leave it off.";
+			}
+			{
+				assertion = !config.services.cloud-init.enable;
+				message = "cogworx.pve: services.cloud-init.enable is true. cloud-init would take the hostname, the network and SSH keys from a datasource this image does not have; the metadata emulator, hostname.nix and dhcpcd own those here. Leave it off (platform.nix forces it off; something overrode that).";
+			}
+			{
+				assertion = !config.systemd.network.enable;
+				message = "cogworx.pve: systemd.network.enable is true. dhcpcd on ${iface} is this image's network stack: it holds the lease network-online.target waits for, with its hostname and resolv.conf hooks off. systemd-networkd from a composed profile would replace it. Leave it off.";
+			}
+			{
+				assertion = config.networking.hostName == "";
+				message = "cogworx.pve: networking.hostName is set (\"${config.networking.hostName}\"). hostname.nix sets the hostname from the boot config before dhcpcd and consul read it, so a static name would make every clone claim the same one. Leave it empty.";
 			}
 		];
 	};

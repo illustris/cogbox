@@ -567,6 +567,18 @@
 			cogbox.runtimeEnvironment.enable = lib.mkDefault hostedRuntimeDefault;
 		};
 
+		# The Proxmox backend HOST system (pve/). Same specialArgs as mkGceHost;
+		# operators pass their base and site modules as extraModules, and those
+		# modules must evaluate on THIS flake's nixpkgs.
+		mkPveHost = system: { extraModules ? [ ] }: nixpkgs.lib.nixosSystem {
+			inherit system;
+			specialArgs = { inherit self inputs system; };
+			modules = [
+				./pve/pve-host.nix
+				{ system.configurationRevision = lib.mkDefault (self.rev or self.dirtyRev or null); }
+			] ++ extraModules;
+		};
+
 		# `userExt` defaults to the no-op userExtensions input but can be
 		# overridden by tests to inject a known module in the same list
 		# position the runtime override-input would, so the resulting
@@ -4554,6 +4566,11 @@
 		lib.gceImageLabels = gceImageLabels;
 		nixosModules.gce-host = ./gce/cogbox-host.nix;
 		nixosModules.runtime-environment = ./runtime/module.nix;
+		# The PVE host system (pve/README.md). The module needs specialArgs
+		# `self`, `inputs` and `system`, as mkGceHost's does; lib.mkPveHost is
+		# the supported way to build it, with operator modules as extraModules.
+		lib.mkPveHost = mkPveHost;
+		nixosModules.pve-host = ./pve/pve-host.nix;
 
 		packages = forAllSystems (system: if system == "aarch64-darwin" then
 			import ./darwin/packages.nix {
@@ -5065,6 +5082,11 @@
 			# PHASE-0: nixpkgs' postVM tars with the default GNU format. Confirm `gcloud compute
 			# images create` accepts it before the bake is called done.
 			gce-image = self.nixosConfigurations.cogbox-x86_64-gce.config.system.build.googleComputeImage;
+
+			# The PVE template disk (pve/image.nix) of the CA-less
+			# cogbox-x86_64-pve system: fail-closed, a dev image. A publishable
+			# one is built from lib.mkPveHost with the operator's modules.
+			pve-image = self.nixosConfigurations.cogbox-x86_64-pve.config.system.build.pveImage;
 		});
 
 		# `nix run .#push-pod-image [-- <registry-ref>]` streams the sandbox-pod
@@ -10466,7 +10488,12 @@
 				bash ${./tests/test_floor.sh} ${gceFloorInstall} ${gceFloorVerify}
 				touch $out
 			'';
-		}) // {
+		} // lib.optionalAttrs (system == "x86_64-linux") (
+			# The PVE host image's checks (pve/checks.nix) as pve-<name>, the
+			# heavy ones included and the `all` link farm left out.
+			lib.mapAttrs' (name: lib.nameValuePair "pve-${name}")
+				(builtins.removeAttrs (import ./pve/checks.nix { flake = self; inherit system; }) [ "all" ])
+		)) // {
 			aarch64-darwin = import ./darwin/checks.nix {
 				inherit self nixpkgs lib;
 			};
@@ -10527,6 +10554,12 @@
 			# gce-image-* checks assert its closure, userland and unit graph
 			# without needing the image itself.
 			cogbox-x86_64-gce = mkGceHost "x86_64-linux" { };
+
+			# The PVE backend HOST system (see mkPveHost). CA-less, so it is
+			# fail-closed (no control certificate is ever accepted), and its
+			# cogworx.pve.release is null, so it is never an upgrade target.
+			# `packages.pve-image` builds its template disk.
+			cogbox-x86_64-pve = mkPveHost "x86_64-linux" { };
 
 			# Test fixture used by tests/cogbox.nix Phase E. Pre-builds
 			# a runner whose closure includes pkgs.hello, so the offline
