@@ -51,6 +51,9 @@ CASES = {c["name"]: c for c in VECTORS["cases"]}
 
 BOOT_ID = "0b0a0908-0706-4504-8302-010000005000"
 OWNER = "0a1b2c3d-4e5f-4a6b-8c7d-8e9fa0b15010"
+# Booted systems, as /run/booted-system resolves to them (nix32 hash alphabet).
+SYS_A = "/nix/store/" + "a" * 32 + "-nixos-system-unnamed-26.11.20261008.0000000"
+SYS_B = "/nix/store/" + "b" * 32 + "-nixos-system-unnamed-26.11.20261009.0000000"
 
 
 def decode_outcome(blob):
@@ -121,7 +124,7 @@ class ServerCase(unittest.TestCase):
         self.state_dir = os.path.join(tmp, "run-cogworx")
         self.peer = 0
         self.addr = "198.51.100.7"
-        self.store = md.GuestAttributeStore(self.state_dir, BOOT_ID)
+        self.store = md.GuestAttributeStore(self.state_dir, BOOT_ID, SYS_A)
         attrs = CASES[self.attrs_case]["expect_attrs"] if self.attrs_case else {}
         self.app = md.Metadata(
             instance_id=OWNER,
@@ -524,7 +527,7 @@ class GuestAttributesHTTPTest(ServerCase):
     def test_each_mutation_rewrites_the_state_file(self):
         self.assertFalse(os.path.exists(self.store.path))
         self.send("PUT", GA + "cogworx/vm-host-key", body=b"n1 ssh-ed25519 AAAA")
-        self.assertEqual(self.state(), {"v": 1, "boot_id": BOOT_ID, "gen": 1, "attrs": {"cogworx/vm-host-key": "n1 ssh-ed25519 AAAA"}})
+        self.assertEqual(self.state(), {"v": 1, "boot_id": BOOT_ID, "gen": 1, "sys": SYS_A, "attrs": {"cogworx/vm-host-key": "n1 ssh-ed25519 AAAA"}})
         self.assertEqual(os.stat(self.store.path).st_mode & 0o777, 0o600)
         self.send("PUT", GA + "cogworx/ready", body=b"n1 ok")
         self.send("PUT", GA + "cogworx/ready", body="n1 \u00e9t\u00e9".encode())
@@ -533,7 +536,7 @@ class GuestAttributesHTTPTest(ServerCase):
         self.send("DELETE", GA + "cogworx/absent")
         self.assertEqual(self.state()["gen"], 3, "deleting an absent key is not a mutation")
         self.send("DELETE", GA + "cogworx/ready")
-        self.assertEqual(self.state(), {"v": 1, "boot_id": BOOT_ID, "gen": 4, "attrs": {"cogworx/vm-host-key": "n1 ssh-ed25519 AAAA"}})
+        self.assertEqual(self.state(), {"v": 1, "boot_id": BOOT_ID, "gen": 4, "sys": SYS_A, "attrs": {"cogworx/vm-host-key": "n1 ssh-ed25519 AAAA"}})
         with open(self.store.path, "rb") as f:
             f.read().decode("ascii")  # ensure_ascii: QGA hands it back as-is
         self.assertNoTempFiles()
@@ -626,10 +629,10 @@ class GuestAttributeStoreTest(unittest.TestCase):
 
     def test_another_boots_file_is_discarded_and_rewritten(self):
         os.makedirs(self.dir)
-        self.write({"v": 1, "boot_id": "another-boot", "gen": 7, "attrs": {"cogworx/ready": "old ok"}})
-        store = md.GuestAttributeStore(self.dir, BOOT_ID)
+        self.write({"v": 1, "boot_id": "another-boot", "gen": 7, "sys": SYS_B, "attrs": {"cogworx/ready": "old ok"}})
+        store = md.GuestAttributeStore(self.dir, BOOT_ID, SYS_A)
         self.assertIsNone(store.get("cogworx/ready"))
-        self.assertEqual(self.read(), {"v": 1, "boot_id": BOOT_ID, "gen": 0, "attrs": {}})
+        self.assertEqual(self.read(), {"v": 1, "boot_id": BOOT_ID, "gen": 0, "sys": SYS_A, "attrs": {}})
 
     def test_malformed_files_are_discarded(self):
         os.makedirs(self.dir)
@@ -644,9 +647,63 @@ class GuestAttributeStoreTest(unittest.TestCase):
         ):
             with self.subTest(doc=str(doc)[:60]):
                 self.write(doc)
-                store = md.GuestAttributeStore(self.dir, BOOT_ID)
-                self.assertEqual(self.read(), {"v": 1, "boot_id": BOOT_ID, "gen": 0, "attrs": {}})
+                store = md.GuestAttributeStore(self.dir, BOOT_ID, SYS_A)
+                self.assertEqual(self.read(), {"v": 1, "boot_id": BOOT_ID, "gen": 0, "sys": SYS_A, "attrs": {}})
                 self.assertIsNone(store.get("a/b"))
+
+    # --- `sys`: the booted system, read once at start -----------------------
+
+    def link(self, target):
+        path = os.path.join(os.path.dirname(self.dir), "booted-system")
+        if os.path.lexists(path):
+            os.unlink(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.symlink(target, path)
+        return path
+
+    def test_sys_is_absent_when_unknown(self):
+        cases = {
+            "missing link": os.path.join(os.path.dirname(self.dir), "no-such-link"),
+            "link to a store path that is not a system": self.link("/nix/store/" + "c" * 32 + "-hello-2.12"),
+        }
+        for name, path in cases.items():
+            with self.subTest(name):
+                with self.assertLogs(md.LOG, logging.WARNING):
+                    booted = md.read_booted_system(path)
+                self.assertIsNone(booted)
+                if os.path.exists(os.path.join(self.dir, md.STATE_FILE)):
+                    os.unlink(os.path.join(self.dir, md.STATE_FILE))
+                store = md.GuestAttributeStore(self.dir, BOOT_ID, booted)
+                store.put("cogworx/ready", "n1 ok")
+                self.assertEqual(self.read(), {"v": 1, "boot_id": BOOT_ID, "gen": 1, "attrs": {"cogworx/ready": "n1 ok"}})
+        # A link to a directory that merely sits elsewhere.
+        other = os.path.join(os.path.dirname(self.dir), "nixos-system-x")
+        os.makedirs(other)
+        with self.assertLogs(md.LOG, logging.WARNING):
+            self.assertIsNone(md.read_booted_system(self.link(other)))
+
+    def test_sys_from_a_valid_link(self):
+        path = self.link(SYS_A)
+        self.assertEqual(md.read_booted_system(path), SYS_A)
+        store = md.GuestAttributeStore(self.dir, BOOT_ID, md.read_booted_system(path))
+        store.put("cogworx/ready", "n1 ok")
+        with open(os.path.join(self.dir, md.STATE_FILE), "rb") as f:
+            raw = f.read()
+        self.assertEqual(json.loads(raw), {"v": 1, "boot_id": BOOT_ID, "gen": 1, "sys": SYS_A, "attrs": {"cogworx/ready": "n1 ok"}})
+        self.assertTrue(raw.startswith(b'{"v":1,"boot_id":"%s","gen":1,"sys":"%s","attrs":' % (BOOT_ID.encode(), SYS_A.encode())), raw)
+
+    def test_a_restart_never_takes_sys_from_the_file(self):
+        os.makedirs(self.dir)
+        for booted, want in ((SYS_A, {"sys": SYS_A}), (None, {})):
+            with self.subTest(booted=booted):
+                self.write({"v": 1, "boot_id": BOOT_ID, "gen": 5, "sys": SYS_B, "attrs": {"cogworx/ready": "n1 ok"}})
+                with self.assertLogs(md.LOG, logging.INFO) as logs:
+                    store = md.GuestAttributeStore(self.dir, BOOT_ID, booted)
+                self.assertIn("re-adopted 1 attribute(s) at gen 5", "\n".join(logs.output))
+                self.assertEqual(store.get("cogworx/ready"), "n1 ok")
+                store.put("cogworx/vm-host-key", "n1 ssh-ed25519 AAAA")
+                self.assertEqual(self.read(), dict({"v": 1, "boot_id": BOOT_ID, "gen": 6,
+                                                    "attrs": {"cogworx/ready": "n1 ok", "cogworx/vm-host-key": "n1 ssh-ed25519 AAAA"}}, **want))
 
 
 # --- peer uid and interface address ---------------------------------------------------
@@ -863,10 +920,12 @@ class CLITest(unittest.TestCase):
             self.stop(proc)
 
     def test_serve_listen_mode(self):
+        booted = os.path.join(self.tmp, "booted-system")
+        os.symlink(SYS_A, booted)
         proc = subprocess.Popen(
             [sys.executable, str(MODULE_PATH), "serve", "--listen", "127.0.0.1:0",
              "--dmi-serial-path", self.serial, "--dmi-uuid-path", self.uuid,
-             "--state-dir", os.path.join(self.tmp, "state")],
+             "--state-dir", os.path.join(self.tmp, "state"), "--booted-system-path", booted],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         lines = queue.Queue()
         reader = threading.Thread(target=lambda: [lines.put(line) for line in proc.stderr], daemon=True)

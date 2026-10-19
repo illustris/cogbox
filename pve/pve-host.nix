@@ -26,14 +26,19 @@
 #   mkfs-nodiscard.nix  the format units' mke2fs profile: no whole-device
 #                     discard, which the drives' IO limits throttle past the
 #                     units' timeout
+#   upgrade/module.nix  in-place system upgrades: the cogworx-pve-upgrade tool,
+#                     the compat doc, the GRUB guard, the panic parameters and
+#                     the nix-gc lock wrapper (docs/pve-system-upgrade.md)
 #
 # The cross-repo contract (SMBIOS blob, served routes, files, disk serials,
 # units) is written down in README.md next to this file.
 #
-# NOT EXPORTED BY THE FLAKE YET. flake.nix is held unchanged while a concurrent
-# batch edits it, so there is no lib.mkPveHost; eval.nix builds this module the
-# way flake.nix's mkGceHost builds the GCE one (same specialArgs), and the bake
-# does the same from its own flake reference.
+# The flake builds this module with lib.mkPveHost (the same specialArgs as
+# mkGceHost: `self`, `inputs`, `system`) and exports it as
+# nixosModules.pve-host, nixosConfigurations.cogbox-x86_64-pve (CA-less, so
+# fail-closed) and packages.x86_64-linux.pve-image. Operators pass their base
+# and site modules as mkPveHost's extraModules; eval.nix remains as a shim over
+# it.
 {
 	config,
 	lib,
@@ -114,9 +119,23 @@ in
 		./self-refresh.nix
 		./floor-site.nix
 		./mkfs-nodiscard.nix
+		./upgrade/module.nix
 	];
 
 	options.cogworx.pve = {
+		allowConsoleAutologin = lib.mkOption {
+			type = lib.types.bool;
+			default = false;
+			description = ''
+				Allow console root autologin (services.getty.autologinUser) on a
+				published, CA-baked image. Console autologin on ttyS0 gives a
+				root shell, i.e. the trusted half, to every PVE principal with
+				VM.Console on the VM and to root on its node. Set true only
+				where that is the site's break-glass policy; a CA-baked image
+				with autologin and without this opt-in does not evaluate.
+			'';
+		};
+
 		interface = lib.mkOption {
 			type = lib.types.strMatching "[A-Za-z0-9_.-]{1,15}";
 			default = "eth0";
@@ -233,6 +252,21 @@ in
 	};
 
 	config = {
+		# The host values the upgrade compat doc carries (upgrade/module.nix),
+		# read from the options that already define them so the doc cannot
+		# drift from the system it describes.
+		cogworx.pve.upgrade.hostContract = {
+			controlCAKeys = lib.filter (l: l != "" && !(lib.hasPrefix "#" l))
+				(map lib.trim (lib.splitString "\n" (config.environment.etc."ssh/cogworx-control-ca.pub".text or "")));
+			controlPlaneCIDRs = cfg.floor.controlPlaneCIDRs;
+			controlUser = gce.controlUser;
+			hostKeyPath = (lib.findFirst (k: (k.type or "") == "ed25519")
+				(throw "cogworx.pve: no ed25519 sshd host key") config.services.openssh.hostKeys).path;
+			stateDevice = gce.stateDevice;
+			guestDevice = gce.guestDevice;
+			interface = cfg.interface;
+		};
+
 		# ASSERTED IN THE MODULE, for the reason cogbox-host.nix gives for its
 		# own resolver gate: the values these guard come from an operator-side
 		# bake module, and an assertion living THERE disappears together with
@@ -288,6 +322,18 @@ in
 					"cogworx.pve: this image bakes a control CA while services.openssh.authorizedKeysCommand = \"${config.services.openssh.authorizedKeysCommand}\"."
 					"sshd consults that command whenever a control certificate is refused, which adds a second way into the trusted half that does not go through the control CA."
 					"Force it off in the bake: services.openssh.authorizedKeysCommand = lib.mkOverride 40 \"none\" (a fleet profile may already set it with mkForce, so a second mkForce would conflict)."
+				];
+			}
+			{
+				# Console autologin is the one gate with an escape, and it is an
+				# explicit operator opt-in: a site may keep a root console as its
+				# break-glass path, but never by accident. No warning either way
+				# (a composed image's verification pins warnings == [ ]).
+				assertion = !caBaked || config.services.getty.autologinUser == null || cfg.allowConsoleAutologin;
+				message = lib.concatStringsSep "\n\n" [
+					"cogworx.pve: this image bakes a control CA while services.getty.autologinUser = \"${toString config.services.getty.autologinUser}\"."
+					"Console autologin on ttyS0 gives a root shell -- the trusted half -- to every PVE principal with VM.Console on this VM and to root on its node."
+					"Either set services.getty.autologinUser = null, or, where a root console is the site's break-glass policy, opt in explicitly with cogworx.pve.allowConsoleAutologin = true."
 				];
 			}
 		];

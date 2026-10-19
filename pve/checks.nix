@@ -1,11 +1,14 @@
-# The PVE host image's checks. flake.nix cannot carry them yet (it is held
-# unchanged while a concurrent batch edits it; they move into its checks once
-# it exports this tree), so they are a plain Nix file over eval.nix:
+# The PVE host image's checks. The flake carries every one of them as
+# checks.x86_64-linux.pve-<name>, the heavy ones included (`all` is left out
+# there), and this file still works standalone over eval.nix:
 #
+#   nix build -L .#checks.x86_64-linux.pve-unit-graph    # one check, flake
 #   nix build --impure -f pve/checks.nix all              # everything cheap
 #   nix build --impure -f pve/checks.nix unit-graph       # one check
 #   nix build --impure -f pve/checks.nix offline-closure  # not in `all`: it
 #                                                         # builds the system
+#   nix build --impure -f pve/checks.nix upgrade-vm       # not in `all`: KVM
+#   nix build --impure -f pve/checks.nix upgrade-vm-powercut  # NixOS VM tests
 #
 # Every check reads the REALIZED system: unit files as NixOS renders them, the
 # scripts the units run, the ruleset the floor loads. Unit texts are read at
@@ -15,8 +18,8 @@
 #
 # The fixture system is a PUBLISHABLE-shaped bake (a control CA, a resolver,
 # the floor CIDRs) made entirely of fictional values (RFC 5737/2544 ranges and
-# an example key), so the publish gates are exercised on the image shape that
-# ships. The CA-less default is evaluated too.
+# a key generated for these checks), so the publish gates are exercised on the
+# image shape that ships. The CA-less default is evaluated too.
 {
 	flake ? builtins.getFlake (toString ../.),
 	system ? "x86_64-linux",
@@ -27,8 +30,11 @@ let
 
 	evalPve = extraModules: import ./eval.nix { inherit flake system extraModules; };
 
-	# Fictional: nothing parses the key, it only has to reach sshd's file.
-	fixtureCAKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEcontrolCAkeyFORthePVEcheck control-ca";
+	# A real ed25519 PUBLIC key generated for these checks, whose private half
+	# was deleted: the upgrade compat doc's builder decodes every control CA
+	# key and fingerprints it, so a placeholder blob would fail the build.
+	fixtureCAKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJMmGv60w43igyko8BEEnvP2PPu01MPlwi9Zamq2j/LC control-ca";
+	fixtureCAFingerprint = "SHA256:4fR1sXmorUlWspPK0W8CKAc2aQmmRM9X/JSYyLPQ9GY";
 	fixtureSite = {
 		cogworx.gce.controlCAPublicKey = fixtureCAKey;
 		cogworx.gce.vpcResolver = "192.0.2.1";
@@ -43,6 +49,10 @@ let
 	sys = evalPve [ fixtureSite ];
 	cfg = sys.config;
 	plain = evalPve [ ];
+	# flake.nix exports the CA-less default ("CA-less, fail-closed") as
+	# nixosConfigurations.cogbox-x86_64-pve. publish-gates pins it to `plain`,
+	# so a module added to that entry alone cannot drift from what is tested.
+	exported = flake.nixosConfigurations.cogbox-x86_64-pve;
 
 	discard = builtins.unsafeDiscardStringContext;
 	svc = cfg.systemd.services;
@@ -138,9 +148,42 @@ let
 		filter = path: type: baseNameOf path != "__pycache__";
 	};
 
+	# The in-guest upgrade tool, built with the production headroom floor and
+	# reserve (the module pins those to gce/nix-gc.nix's floor).
+	gib = 1024 * 1024 * 1024;
+	upgradeTool = pkgs.callPackage ./upgrade/package.nix {
+		minFreeBytes = 12 * gib;
+		reserveBytes = 4 * gib;
+	};
+
+	# --- the upgrade module (upgrade/module.nix), spelled from its parts ------
+	#
+	# gce/nix-gc.nix's floor, which the tool's headroom floor must equal.
+	gceMinFreeGB = lib.toInt (builtins.head (builtins.match ".*minFreeGB = ([0-9]+);.*" (builtins.readFile "${gceSrc}/nix-gc.nix")));
+	# The gc unit's realized ExecStart: the gce program, wrapped in the upgrade
+	# lock. The gce program is taken from gce/nix-gc.nix itself (its function
+	# never reads `config`), not from the module under test.
+	gceGcProgram = discard (import "${gceSrc}/nix-gc.nix" { config = cfg; inherit lib; pkgs = sys.pkgs; }).config.systemd.services.cogworx-nix-gc.serviceConfig.ExecStart;
+	gcExecStart = "ExecStart=${discard "${sys.pkgs.util-linux}"}/bin/flock --nonblock --conflict-exit-code 75 /run/cogworx-pve-upgrade.lock ${gceGcProgram}";
+	upgradePackagePath = discard "${pve.upgrade.package}";
+	# The compat doc's substituter lists, from the evaluated nix.settings and
+	# normalized as compat_doc.py does (an http(s) URL loses its trailing
+	# slashes; sorted, unique): a module that stopped writing them, or wrote
+	# something else, fails compat-doc.
+	httpUrl = u: builtins.match "https?://[^/]+(/.*)?" u != null;
+	stripSlashes = u: let s = lib.removeSuffix "/" u; in if s != u && httpUrl s then stripSlashes s else u;
+	sortedUnique = l: lib.unique (lib.sort lib.lessThan l);
+	nixSettings = cfg.nix.settings;
+	expectedSubstituters = sortedUnique (map (u: if httpUrl u then stripSlashes u else u)
+		(nixSettings.substituters ++ (nixSettings.extra-substituters or [ ])));
+	expectedTrustedKeys = sortedUnique (nixSettings.trusted-public-keys ++ (nixSettings.extra-trusted-public-keys or [ ]));
+
 	failedAssertions = s: map (a: a.message) (lib.filter (a: !a.assertion) s.config.assertions);
 	evaluates = s: (builtins.tryEval s.config.system.build.toplevel.drvPath).success;
 	gate = name: extra: { inherit name; messages = failedAssertions (evalPve ([ fixtureSite ] ++ extra)); };
+	# The same over the CA-less default: platform.nix's assertions hold on
+	# every image, CA-baked or not.
+	plainGate = name: extra: { name = "CA-less: ${name}"; messages = failedAssertions (evalPve extra); };
 
 	# Each one differs from the fixture by ONE thing and must trip ONE named
 	# assertion. Matched on the message, not on "evaluation failed": a gate
@@ -165,14 +208,64 @@ let
 		((gate "a metadata client with User=" [ { systemd.services.cogworx-attr-scrub.serviceConfig.User = "nobody"; } ]) // { want = "cogworx-attr-scrub talks to the metadata emulator but sets User=nobody"; })
 		((gate "a metadata client with DynamicUser=" [ { systemd.services.cogworx-pve-self-refresh.serviceConfig.DynamicUser = true; } ]) // { want = "cogworx-pve-self-refresh talks to the metadata emulator but sets DynamicUser="; })
 		((gate "a NixOS firewall a profile forces on" [ { networking.firewall.enable = lib.mkOverride 10 true; } ]) // { want = "networking.firewall.enable is true"; })
+		((gate "console root autologin without the opt-in" [ { services.getty.autologinUser = "root"; } ]) // { want = "services.getty.autologinUser"; })
+		((gate "cloud-init a profile forces on" [ { services.cloud-init.enable = lib.mkOverride 10 true; } ]) // { want = "services.cloud-init.enable is true"; })
+		((gate "systemd-networkd from a profile" [ { systemd.network.enable = true; } ]) // { want = "systemd.network.enable is true"; })
+		((gate "a static hostname" [ { networking.hostName = lib.mkForce "x"; } ]) // { want = "networking.hostName is set"; })
+		# The label type allows ':', the upgrade tool's system path grammar
+		# does not (upgrade/module.nix).
+		((gate "a system label the upgrade tool would refuse" [ { system.nixos.label = lib.mkForce "x:y"; } ]) // { want = "does not match the upgrade tool's system path grammar"; })
+		# A composition that replaces extraConfig drops the GRUB guard (and
+		# its fallback) silently; the upgrade module refuses that.
+		((gate "a composition that replaces the GRUB guard" [ { boot.loader.grub.extraConfig = lib.mkForce ""; } ]) // { want = "does not contain the GRUB guard"; })
+		# A composition that replaces systemPackages drops the upgrade tool:
+		# committed, that generation could never be aborted, released or
+		# moved on (the tool's argv[0] rule).
+		((gate "a composition that replaces environment.systemPackages" [ { environment.systemPackages = lib.mkForce [ ]; } ]) // { want = "environment.systemPackages does not contain the upgrade tool"; })
+		# The upgrade tool pins the distro name and refuses one outside its
+		# grammar (a quote would also break install-grub.pl's titles).
+		((gate "a distroName the upgrade tool cannot pin" [ { system.nixos.distroName = lib.mkForce "Acme'OS"; } ]) // { want = "is not a name the upgrade tool can pin"; })
+		((plainGate "cloud-init a profile forces on" [ { services.cloud-init.enable = lib.mkOverride 10 true; } ]) // { want = "services.cloud-init.enable is true"; })
+		((plainGate "systemd-networkd from a profile" [ { systemd.network.enable = true; } ]) // { want = "systemd.network.enable is true"; })
+		((plainGate "a static hostname" [ { networking.hostName = lib.mkForce "x"; } ]) // { want = "networking.hostName is set"; })
 	];
+	# Console autologin is the one gate with an escape, an explicit operator
+	# opt-in: with it, the fixture plus autologin evaluates cleanly and says
+	# nothing new (a bake may pin warnings == [ ]).
+	autologinOptIn = evalPve [ fixtureSite { services.getty.autologinUser = "root"; cogworx.pve.allowConsoleAutologin = true; } ];
+	# The gate applies to CA-baked images only: a CA-less dev image keeps its
+	# console without the opt-in.
+	autologinCALess = evalPve [ { services.getty.autologinUser = "root"; } ];
+	# cloud-init is FORCED off, not merely asserted off: a base profile that
+	# enables it at default priority (nixpkgs' proxmox-image.nix does) is
+	# neutralized, and the image still evaluates cleanly.
+	cloudInitDefault = evalPve [ fixtureSite { services.cloud-init.enable = true; } ];
+	# Any distro name in the tool's grammar works: grub.nix substitutes it
+	# into install-grub.pl's titles and the compat doc records the same one.
+	otherDistro = evalPve [ fixtureSite { system.nixos.distroName = lib.mkForce "AcmeOS"; } ];
 	gateFailures =
 		lib.optional (failedAssertions sys != [ ]) "the fixture (publishable) system itself fails assertions: ${lib.concatStringsSep " | " (failedAssertions sys)}"
 		++ lib.optional (!(evaluates sys)) "the fixture (publishable) system's toplevel does not evaluate"
 		++ lib.optional (failedAssertions plain != [ ]) "the CA-less default fails assertions; a dev image must evaluate: ${lib.concatStringsSep " | " (failedAssertions plain)}"
 		++ lib.optional (!(evaluates plain)) "the CA-less default's toplevel does not evaluate"
+		++ lib.optional (system == "x86_64-linux" && exported.config.system.build.toplevel.drvPath != plain.config.system.build.toplevel.drvPath)
+			"nixosConfigurations.cogbox-x86_64-pve is not the CA-less default these checks evaluate (mkPveHost with no extra modules)"
+		++ lib.optional (system == "x86_64-linux" && exported.config.cogworx.pve.upgrade.hostContract.controlCAKeys != [ ])
+			"nixosConfigurations.cogbox-x86_64-pve bakes a control CA; the exported default must stay fail-closed"
 		++ lib.optional (evaluates (evalPve [ fixtureSite { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce [ ]; } ]))
 			"a CA-baked image with no controlPlaneCIDRs still EVALUATES its toplevel"
+		++ lib.optional (failedAssertions autologinOptIn != [ ])
+			"console autologin WITH cogworx.pve.allowConsoleAutologin = true still fails assertions: ${lib.concatStringsSep " | " (failedAssertions autologinOptIn)}"
+		++ lib.optional (autologinOptIn.config.warnings != cfg.warnings)
+			"console autologin with the opt-in changes the warnings (got: ${lib.concatStringsSep " | " autologinOptIn.config.warnings})"
+		++ lib.optional (failedAssertions autologinCALess != [ ])
+			"console autologin on the CA-less default (no opt-in) fails assertions; only a CA-baked image needs the opt-in: ${lib.concatStringsSep " | " (failedAssertions autologinCALess)}"
+		++ lib.optional (failedAssertions cloudInitDefault != [ ])
+			"a default-priority services.cloud-init.enable = true fails assertions instead of being forced off: ${lib.concatStringsSep " | " (failedAssertions cloudInitDefault)}"
+		++ lib.optional cloudInitDefault.config.services.cloud-init.enable
+			"a default-priority services.cloud-init.enable = true is not forced off"
+		++ lib.optional (failedAssertions otherDistro != [ ])
+			"a system.nixos.distroName other than NixOS, in the upgrade tool's grammar, fails assertions: ${lib.concatStringsSep " | " (failedAssertions otherDistro)}"
 		++ lib.concatMap (c:
 			lib.optional (!(lib.any (m: lib.hasInfix c.want m) c.messages))
 				"gate '${c.name}' did not trip (wanted '${c.want}'; got: ${lib.concatStringsSep " | " c.messages})") gateCases;
@@ -272,6 +365,31 @@ let
 			"gce/ runs mkfs/mke2fs on non-comment lines in [${toString gceFormatLines}], not exactly state-disk.nix's one and guest-disk.nix's two; a new format leg discards the whole device until its unit joins pve/mkfs-nodiscard.nix's list")
 		(lib.optional (!(lib.any (lib.hasInfix "pve/mkfs-nodiscard.nix: cogworx-state-disk has no ExecStart") formatStub))
 			"a format unit with no ExecStart does not trip mkfs-nodiscard.nix's assertion (got: ${lib.concatStringsSep " | " formatStub})")
+		# The upgrade module (upgrade/module.nix): what every system
+		# generation must carry for the tool and the guard to work.
+		(lib.concatMap (p: lib.optional (!(lib.elem p cfg.boot.kernelParams))
+			"${p} is not in boot.kernelParams; a candidate whose stage 1 fails would hang instead of rebooting onto entry 0") [ "panic=10" "boot.panic_on_fail" ])
+		(lib.optional (cfg.boot.loader.grub.extraConfig != builtins.readFile ./upgrade/grub-guard.cfg)
+			"boot.loader.grub.extraConfig is not exactly upgrade/grub-guard.cfg")
+		(lib.optional cfg.services.cloud-init.enable "services.cloud-init.enable is true")
+		(lib.optional cfg.systemd.network.enable "systemd.network.enable is true")
+		(lib.optional (!(lib.any (p: p == pve.upgrade.package) cfg.environment.systemPackages))
+			"the upgrade tool is not in environment.systemPackages, so <system>/sw/bin/cogworx-pve-upgrade does not exist")
+		(lib.optional (!(lib.hasInfix "cogworx-pve-compat.json" cfg.system.systemBuilderCommands))
+			"the toplevel does not carry cogworx-pve-compat.json")
+		(lib.optional (pve.upgrade.minFreeBytes != 12 * gib)
+			"cogworx.pve.upgrade.minFreeBytes is ${toString pve.upgrade.minFreeBytes}, not 12 GiB")
+		(lib.optional (pve.upgrade.minFreeBytes != gceMinFreeGB * gib)
+			"cogworx.pve.upgrade.minFreeBytes (${toString pve.upgrade.minFreeBytes}) is not gce/nix-gc.nix's minFreeGB (${toString gceMinFreeGB} GiB); a fetch would leave the store below the floor the collector defends")
+		(lib.optional (pve.upgrade.reserveBytes != 4 * gib)
+			"cogworx.pve.upgrade.reserveBytes is ${toString pve.upgrade.reserveBytes}, not 4 GiB")
+		(lib.optional (pve.release != null) "cogworx.pve.release is set on the fixture; only a release bake sets it")
+		(lib.optional (!(lib.elem "f /run/cogworx-pve-upgrade.lock 0600 root root -" cfg.systemd.tmpfiles.rules))
+			"the upgrade lock file is not pre-created root-owned 0600; its first opener would create it (flock(1) in the gc wrapper: 0644) and any local uid could hold a read-only flock on it forever")
+		# mkPveHost's revision (flake.nix): a mkDefault definition (a bake may
+		# override it) of self.rev, else self.dirtyRev, else null.
+		(lib.optional (sys.options.system.configurationRevision.highestPrio != 1000 || cfg.system.configurationRevision != (flake.rev or flake.dirtyRev or null))
+			"system.configurationRevision is not mkPveHost's lib.mkDefault (self.rev or self.dirtyRev or null)")
 	];
 
 	failureList = name: failures: pkgs.runCommand name {
@@ -383,6 +501,15 @@ let
 			has cogworx-pve-floor.service Before cogworx-supervisor.service
 			has cogworx-pve-kvm.service Before cogworx-supervisor.service
 			has cogworx-pve-serial-cap.timer WantedBy timers.target
+
+			# The collector waits for nobody: it skips (exit 75, a success)
+			# while the upgrade tool holds its lock (upgrade/module.nix).
+			line cogworx-nix-gc.service ${lib.escapeShellArg gcExecStart}
+			line cogworx-nix-gc.service 'SuccessExitStatus=75'
+			# Nothing on the VM runs the upgrade tool; cogworxd runs it by path.
+			if jq -r '.[]' ${unitsJson} | grep -qF ${upgradePackagePath}; then
+				fail "a rendered unit references the upgrade tool package ${upgradePackagePath}"
+			fi
 
 			# qemu-ga: an allow-list, with nothing that executes or writes.
 			ga=$(dir qemu-guest-agent.service ExecStart)
@@ -505,6 +632,109 @@ let
 			touch $out
 		'';
 
+		# The upgrade tool (pve/upgrade/): argv grammar, the envelope, the
+		# grub.cfg/grubenv parsers and their shared vectors, the closure digest
+		# vector, the bootloader pin on the image's REAL install-grub.sh, the
+		# guest compat rules, fetch classification on nix 2.34's strings, the
+		# state machine on a fake guest (the real grub-editenv, a fake
+		# installer and fake nix commands) with a power cut after every
+		# numbered step, and the built package itself. Plus compat_doc.py.
+		upgrade-unittests = pkgs.runCommand "pve-upgrade-unittests" {
+			nativeBuildInputs = [ pkgs.python3 pkgs.grub2 pkgs.openssh pkgs.util-linux ];
+		} ''
+			COGWORX_PVE_UPGRADE=${./upgrade/cogworx_pve_upgrade.py} \
+			COGWORX_PVE_UPGRADE_BIN=${upgradeTool}/bin/cogworx-pve-upgrade \
+			GRUB_EDITENV=${pkgs.grub2}/bin/grub-editenv \
+			PVE_INSTALLER=${plain.config.system.build.installBootLoader} \
+			PVE_GRUB_STATE_GRUB=${plain.config.system.build.grub} \
+			UPGRADE_VECTORS=${./testdata} \
+				python3 -I ${tests}/test_upgrade.py
+			COGWORX_PVE_COMPAT_DOC=${./upgrade/compat_doc.py} \
+				python3 -I ${tests}/test_compat_doc.py
+			touch $out
+		'';
+
+		# The GRUB guard (upgrade/grub-guard.cfg) parses as GRUB script, with a
+		# negative control (the same file cut short must not), and carries the
+		# marker the tool's bootloader pin looks for. GRUB's regexp returns
+		# the same failure for a bad pattern as for no match, so a typo in a
+		# pattern would fail closed silently; the VM test boots the positive
+		# cases.
+		grub-guard-syntax = pkgs.runCommand "pve-grub-guard-syntax" {
+			nativeBuildInputs = [ pkgs.grub2 pkgs.gnugrep pkgs.coreutils ];
+		} ''
+			guard=${./upgrade/grub-guard.cfg}
+			grep -qx '# cwx-guard-v1' "$guard" || { echo "FAIL: the guard has no '# cwx-guard-v1' marker line" >&2; exit 1; }
+			grub-script-check "$guard" || { echo "FAIL: grub-script-check rejects the guard" >&2; exit 1; }
+			head -n -1 "$guard" > truncated.cfg
+			if grub-script-check truncated.cfg 2>/dev/null; then
+				echo "FAIL: grub-script-check accepts the guard without its last line; the check above proves nothing" >&2
+				exit 1
+			fi
+			echo "grub-guard-syntax: the guard parses, a truncated copy does not"
+			touch $out
+		'';
+
+		# The fixture's compat doc (<toplevel>/cogworx-pve-compat.json), built
+		# and pinned WHOLE (its key set is the expected object's, and every
+		# key's value is compared): the host contract equals the fixture's
+		# values, the CA key is decoded and fingerprinted, the protocol values
+		# come from gce/protocol.nix, the substituter lists from nix.settings,
+		# the boot loader fields name the system's own installer and the
+		# guard, and the document stays within the readers' 16 KiB cap.
+		compat-doc = pkgs.runCommand "pve-compat-doc" {
+			nativeBuildInputs = [ pkgs.jq pkgs.coreutils ];
+			passAsFile = [ "expected" ];
+			expected = builtins.toJSON {
+				schema = 1;
+				kind = "cogworx-pve-system";
+				toolProto = 1;
+				txnSchema = 1;
+				inherit (import "${gceSrc}/protocol.nix") bootProof stateFormat;
+				bootConfigVersions = [ 1 ];
+				smbiosSelector = "S";
+				guestAttrsVersion = 1;
+				release = null;
+				hostKeyPath = "${gce.stateDir}/sshd/ssh_host_ed25519_key";
+				stateDevice = "/dev/disk/by-id/virtio-cogworx-state";
+				guestDevice = "/dev/disk/by-id/virtio-cogworx-guest";
+				interface = "eth0";
+				controlUser = "root";
+				controlPlaneCIDRs = [ "198.18.7.0/24" ];
+				controlCAKeys = [ (lib.concatStringsSep " " (lib.take 2 (lib.splitString " " fixtureCAKey))) ];
+				controlCAFingerprints = [ fixtureCAFingerprint ];
+				specialisations = [ ];
+				substituters = expectedSubstituters;
+				trustedPublicKeys = expectedTrustedKeys;
+				bootloader = {
+					installer = discard "${cfg.system.build.installBootLoader}";
+					grub = discard "${cfg.system.build.grub}";
+					devices = [ "/dev/vda" ];
+					distroName = "NixOS";
+					guard = "cwx-guard-v1";
+				};
+			};
+		} ''
+			doc=${pve.upgrade.compatDoc}
+			fails=0
+			fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+			jq -e 'type == "object"' "$doc" > /dev/null || { echo "FAIL: $doc is not a JSON object" >&2; exit 1; }
+			wantKeys=$(jq -cS 'keys' "$expectedPath")
+			gotKeys=$(jq -cS 'keys' "$doc")
+			[ "$wantKeys" = "$gotKeys" ] || fail "the doc's keys are $gotKeys, expected $wantKeys"
+			for k in $(jq -r 'keys[]' "$expectedPath"); do
+				want=$(jq -cS --arg k "$k" '.[$k]' "$expectedPath")
+				got=$(jq -cS --arg k "$k" '.[$k]' "$doc")
+				[ "$want" = "$got" ] || fail "$k is $got, expected $want"
+			done
+			size=$(stat -c %s "$doc")
+			[ "$size" -le 16384 ] || fail "the doc is $size bytes, over the readers' 16384-byte cap"
+			[ "$(tr -d '\000-\177' < "$doc" | wc -c)" -eq 0 ] || fail "the doc is not ASCII"
+			[ "$fails" -eq 0 ] || exit 1
+			echo "compat-doc: the fixture's compat doc holds"
+			touch $out
+		'';
+
 		# The format units' mke2fs profile, built and RUN: the package default
 		# plus `discard = false` and nothing else, derived from the file the
 		# units' own mke2fs compiles in, and every realized mkfs line of those
@@ -566,9 +796,28 @@ let
 				echo "FAIL: no cogbox path in the PVE image closure" >&2
 				fails=$((fails + 1))
 			fi
+			# The upgrade compat doc is a regular file in the toplevel, the
+			# one the module built; the tool is in the system path.
+			top=${cfg.system.build.toplevel}
+			if [ -L "$top/cogworx-pve-compat.json" ] || ! cmp -s "$top/cogworx-pve-compat.json" ${pve.upgrade.compatDoc}; then
+				echo "FAIL: $top/cogworx-pve-compat.json is not a regular file equal to ${pve.upgrade.compatDoc}" >&2
+				fails=$((fails + 1))
+			fi
+			if [ ! -x "$top/sw/bin/cogworx-pve-upgrade" ]; then
+				echo "FAIL: $top/sw/bin/cogworx-pve-upgrade is missing" >&2
+				fails=$((fails + 1))
+			fi
 			[ "$fails" -eq 0 ] || exit 1
 			touch $out
 		'';
+
+		# The upgrade path on a real boot loader (legacy MBR, SeaBIOS, GRUB on
+		# /dev/vda) with the REAL tool, the guard and the panic parameters:
+		# tests/upgrade-vm.nix. KVM. `main` boots every guard path and every
+		# verb; `powercut` cuts the power after every commit and abort step and
+		# repairs from txn.json. They share the disk image and run in parallel.
+		upgrade-vm = pkgs.testers.runNixOSTest (import ./tests/upgrade-vm.nix { suite = "main"; });
+		upgrade-vm-powercut = pkgs.testers.runNixOSTest (import ./tests/upgrade-vm.nix { suite = "powercut"; });
 	};
 in
 checks // heavy // {

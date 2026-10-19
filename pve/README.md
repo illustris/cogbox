@@ -19,24 +19,41 @@ All addresses, names and keys in this directory are fictional (RFC 5737 / RFC 25
 | `floor-site.nix`, `floor_render.py` | The site floor: nft table `inet cogworx_pve_floor`, rules 4a, 4 and 5, rendered and validated at build time. |
 | `image.nix` | The qcow2 template disk (`config.system.build.pveImage`). |
 | `mkfs-nodiscard.nix` | The mke2fs profile for the two host units that format a disk: the package default without the whole-device discard (see [Disks: no discard at format time](#disks-no-discard-at-format-time)). |
-| `eval.nix` | Builds the system from this checkout's flake inputs, the way `flake.nix`'s `mkGceHost` builds the GCE one. |
+| `upgrade/` | In-place system upgrades (see [System upgrades](#system-upgrades)): `cogworx_pve_upgrade.py` (the tool), `package.nix` (it as one executable file), `module.nix` (what every system generation carries), `grub-guard.cfg` (the GRUB guard) and `compat_doc.py` (the compat doc builder). |
+| `eval.nix` | Compatibility shim over the flake's `lib.mkPveHost`, with its old signature. |
 | `checks.nix` | The checks (see below). |
 | `testdata/bootcfg-v1.json` | Canonical boot-config vectors, shared byte for byte with the cogworx Go encoder. |
-| `tests/` | Emulator unit tests, and the floor, self-refresh, hostname, serial-cap, qemu-ga, route-coverage and mke2fs-discard tests. |
+| `testdata/grubcfg-v1/`, `testdata/grubenv-v1/`, `testdata/closure-digest-v1.json` | grub.cfg parse vectors (each `*.cfg` with its expected parse as `*.json`; `vm-*` are install-grub.pl's real output captured in `upgrade-vm`), real 1024-byte grubenv blocks from the same runs plus hand-made invalid ones (`*.env` with their parse as `*.json`, `null` when invalid), and the closure digest vector, shared with cogworxd's parsers. |
+| `tests/` | Emulator and upgrade-tool unit tests, the floor, self-refresh, hostname, serial-cap, qemu-ga, route-coverage and mke2fs-discard tests, and the upgrade VM test (`upgrade-vm.nix`, its script `upgrade_vm.py` and the power-cut driver `upgrade_crashat.py`). |
 
-The flake does not export any of this yet (`lib.mkPveHost`, `packages.pve-image` and flake checks are planned). Until it does:
+The flake exports:
+
+| Output | What it is |
+|---|---|
+| `nixosConfigurations.cogbox-x86_64-pve` | The host system, CA-less and therefore fail-closed: no control certificate is ever accepted, so it is a dev image. `cogworx.pve.release` is null, so it is never an upgrade target. |
+| `packages.x86_64-linux.pve-image` | That system's template disk (`config.system.build.pveImage`). |
+| `lib.mkPveHost` | `system: { extraModules ? [ ] }:` the host system with the operator's base and site modules (resolver, control CA, floor CIDRs, release) on top. Those modules must evaluate on this flake's nixpkgs. |
+| `nixosModules.pve-host` | `pve-host.nix` itself. It needs the specialArgs `self`, `inputs` and `system`, as `mkGceHost`'s module does; `lib.mkPveHost` is the supported way to build it. |
+| `checks.x86_64-linux.pve-<name>` | Every check in `checks.nix`, the heavy ones included. |
 
 ```sh
 # evaluate the system (builds nothing)
-nix eval --impure --raw --expr '(import ./pve/eval.nix { }).config.system.build.toplevel.drvPath'
+nix eval --raw .#nixosConfigurations.cogbox-x86_64-pve.config.system.build.toplevel.drvPath
 
-# build the template disk, with an operator site module on top
-nix build --impure --expr '(import ./pve/eval.nix { extraModules = [ ./site.nix ]; }).config.system.build.pveImage'
+# build the CA-less template disk
+nix build .#pve-image
 
-# run every check except offline-closure, which builds the whole system
+# build a template disk with an operator site module on top
+nix build --impure --expr '((builtins.getFlake "/path/to/cogbox").lib.mkPveHost "x86_64-linux" {
+  extraModules = [ ./site.nix ];
+}).config.system.build.pveImage'
+
+# run one check, or every cheap one
+nix build -L .#checks.x86_64-linux.pve-unit-graph
 nix build --impure -f pve/checks.nix all
-nix build --impure -f pve/checks.nix offline-closure
 ```
+
+`eval.nix` (`import ./pve/eval.nix { extraModules = [ ... ]; }`) and the standalone `nix build --impure -f pve/checks.nix <name>` remain for compatibility; both go through `lib.mkPveHost`.
 
 ## Inbound: the SMBIOS boot config (control plane to VM)
 
@@ -87,7 +104,7 @@ cogworxd reads both files with the QEMU guest agent (`agent/file-read`), and rea
 
 | Path | Content |
 |---|---|
-| `/run/cogworx/guest-attributes.json` | `{"v":1,"boot_id":"...","gen":N,"attrs":{"cogworx/vm-host-key":"<nonce> ssh-ed25519 ...","cogworx/ready":"<nonce> ok bp=1","cogworx/boot-proof":"<nonce> bp=1 hb=... gb=... pool=ok sf=1","cogworx/boot-error":"<nonce> <text>"}}`. Mode 0600, rewritten atomically on every guest-attribute mutation, and reset on reboot. `cogworx/ready` appears only once the hosted guest's sshd has started in this launch: `gce/supervise.sh` waits for the guest's boot stamp (written by `cogbox-boot-stamp.service`, after its sshd) as well as its host key. The `bp=` tail and `cogworx/boot-proof` carry the image's protocol values from `gce/protocol.nix`; the proof is `<nonce> bp=1 err=stamp-path` when the supervisor could not clear the stamp path, and readiness then rests on the host key alone. cogworxd compares only the nonce half of `cogworx/ready` and does not read `cogworx/boot-proof`. |
+| `/run/cogworx/guest-attributes.json` | `{"v":1,"boot_id":"...","gen":N,"sys":"<booted toplevel>","attrs":{"cogworx/vm-host-key":"<nonce> ssh-ed25519 ...","cogworx/ready":"<nonce> ok bp=1","cogworx/boot-proof":"<nonce> bp=1 hb=... gb=... pool=ok sf=1","cogworx/boot-error":"<nonce> <text>"}}`. Mode 0600, rewritten atomically on every guest-attribute mutation, and reset on reboot. `cogworx/ready` appears only once the hosted guest's sshd has started in this launch: `gce/supervise.sh` waits for the guest's boot stamp (written by `cogbox-boot-stamp.service`, after its sshd) as well as its host key. The `bp=` tail and `cogworx/boot-proof` carry the image's protocol values from `gce/protocol.nix`; the proof is `<nonce> bp=1 err=stamp-path` when the supervisor could not clear the stamp path, and readiness then rests on the host key alone. cogworxd compares only the nonce half of `cogworx/ready` and does not read `cogworx/boot-proof`. `sys` is the booted system (`realpath /run/booted-system`), read once when the emulator starts and absent when unknown; cogworxd ignores it today, and the upgrade resolver will read it. |
 | `/run/cogworx/serial.log` | The classified `cogworx: ...` lifecycle lines that the supervisor writes (on GCE they go to serial port 1). Pre-created 0600. When it passes 256 KiB, a timer trims it to the last 128 KiB, starting on a line boundary. |
 
 `/run/cogworx` is created 0700 by tmpfiles.
@@ -183,22 +200,41 @@ Residual, root is outside rule 4: rule 4 drops new flows to `@infra4` from passt
 
 Residual: rule 5's forward windows are fixed at build time (`guestSSHPort` and `guestHTTPPort`, each `guestSSHPortRange` wide), but `cogbox-launch.sh` slides a taken forward port upward with no upper bound and persists the result. A forward that slides past its window is bound on `eth0`'s address with no rule 5 drop, so any L2 neighbour can reach it. A slide needs every port in the window to be taken on the VM's address, which a single-instance VM does not do on its own. Closing this properly means bounding the slide in the launcher, which this tree does not change.
 
-**Publish gates** (asserted in `pve-host.nix` whenever the image trusts a user CA: `cogworx.gce.controlCAPublicKey` or `cogworx.gce.extraTrustedUserCAKeys` is set, or anything else makes sshd's `TrustedUserCAKeys` file non-empty). None of them has an escape hatch:
+**Publish gates** (asserted in `pve-host.nix` whenever the image trusts a user CA: `cogworx.gce.controlCAPublicKey` or `cogworx.gce.extraTrustedUserCAKeys` is set, or anything else makes sshd's `TrustedUserCAKeys` file non-empty). No gate has an escape hatch except console autologin, which is an explicit operator opt-in:
 
 - `controlPlaneCIDRs` must be non-empty. There is no open-ingress option. Keeping it narrow is not a gate; see the `@cp` / rule 4 residual above.
 - `infraDenyCIDRs` must be non-empty.
 - `cogworx.gce.vpcResolver` must not be link-local. `allowMetadataResolver` does not apply on PVE.
 - `services.openssh.authorizedKeysCommand` must be `none`.
+- `services.getty.autologinUser` must be null, unless the bake sets `cogworx.pve.allowConsoleAutologin = true`. The opt-in produces no warning.
+
+Residual, with that opt-in: console autologin on `ttyS0` gives a root shell, the trusted half, to every PVE principal with `VM.Console` on the VM and to root on its node.
+
+Asserted on every image, CA-baked or not (`platform.nix`): `services.cloud-init.enable` is false (it is forced off, because a Proxmox base profile turns it and systemd-networkd on), `systemd.network.enable` is false (dhcpcd on `eth0` is the network stack), and `networking.hostName` is empty (`hostname.nix` owns it).
+
+## System upgrades
+
+cogworxd can move a sandbox VM to a newer system generation in place: it fetches the target into the VM's store, arms GRUB's one-shot entry for one trial boot, and then commits or falls back. [docs/pve-system-upgrade.md](../docs/pve-system-upgrade.md) is the full contract; in short:
+
+- **The tool.** Every system generation ships `cogworx-pve-upgrade` at `<toplevel>/sw/bin/cogworx-pve-upgrade` (stdlib Python, one file run as `python3 -I`). cogworxd runs it by store path as root over the control channel, always the committed system's copy (the previous system's copy for `revert-commit`). Nothing on the VM runs it. Verbs: `proto`, `status`, `closure-digest`, `fetch`, `arm`, `commit`, `abort`, `revert-commit`, `release`.
+- **State.** `/var/lib/cogworx-pve-upgrade/txn.json` (the committed system, the rollback, the staged target, the bootloader pin and the newest transaction). Profiles `system`, `system-profiles/cogworx_candidate` (the armed target) and `system-profiles/cogworx_rollback` (the previous system). GC roots under `/nix/var/nix/gcroots/cogworx-pve-upgrade/`: `bootloader`, `staged`, `committed`.
+- **GRUB.** The tool only ever runs the BASE image's installer, pinned at its first use and vetted so it never runs `grub-install`; a later system generation contributes only its kernel, initrd and kernel parameters. grubenv variables it owns: `next_entry` (GRUB's one-shot), `cwx_rollback_entry` and `cwx_once`.
+- **The guard.** `upgrade/grub-guard.cfg` (`boot.loader.grub.extraConfig`; the module asserts the text is there verbatim, so a composition adds GRUB lines with `lib.mkBefore`/`lib.mkAfter` and never replaces `extraConfig`; lines after the guard must not set `default`, `fallback`, `next_entry` or any `cwx_*` variable, which would silently override the guard's decision, and `lib.mkBefore` is the safe place for lines unrelated to boot selection) reads the SMBIOS serial: under a pending one-shot it lets the candidate boot only when the serial carries `S=c`, falls back to entry 0 when it is a v1 blob without it, and stays inert (fail open) when the serial is unreadable. `S=r` boots the rollback. It records its decision and the boot's start nonce as `cwx_once`. `panic=10 boot.panic_on_fail` make a candidate whose stage 1 fails reboot onto entry 0.
+- **The compat doc.** `<toplevel>/cogworx-pve-compat.json`, built from the evaluated configuration: protocol values, the host contract (control CA keys and fingerprints, control-plane CIDRs, control user, host key path, disk devices, interface), substituters and keys, the release (`cogworx.pve.release`; null means not an upgrade target) and the boot loader. The guest and cogworxd check a target's doc against the committed one before a switch.
+- **The lock.** `/run/cogworx-pve-upgrade.lock` (flock), created root-owned 0600 at boot by a tmpfiles rule so no other user can open it and hold it; `cogworx-nix-gc` skips a run (exit 75, a success) while the tool holds it.
+- **What cogworxd reads.** `status` over the control channel, and over the guest agent `/boot/grub/grub.cfg` and `/boot/grub/grubenv`, which the control plane's file-read allow-list must add, plus the emulator's `sys`.
+
+Only images built from a tree with `upgrade/` are upgradeable in place. A VM cloned from an older template lacks the tool, the guard, the pin source and the panic parameters, and is never upgraded in place.
 
 ## Checks
 
-Run with `nix build --impure -f pve/checks.nix <name>`, or `all`. The fixture system is a publishable-shaped bake made of fictional values.
+Run with `nix build -L .#checks.x86_64-linux.pve-<name>`, or standalone with `nix build --impure -f pve/checks.nix <name>` (or `all`). The fixture system is a publishable-shaped bake made of fictional values.
 
 | Check | What it proves |
 |---|---|
-| `unit-graph` | Every ordering edge above, root-only clients, the qemu-ga allow-list line, journal-only streams, and `MKE2FS_CONFIG` on exactly the two format units, all on the rendered unit files |
-| `config-values` | Device paths, serial path, tmpfiles, kernel parameters, GRUB device, sysctls, the hosts pin, DHCP shape, no google or firewall units, and sshd requiring the site floor. It also requires every `cogworx-*` unit to be classified as a metadata client or not, and every metadata client to still run something (an edge-only stub left behind by a removed gce/ unit fails). The two format units carry the no-discard mke2fs profile and no other unit does, `gce/` has no format line beyond the three known ones, and a format unit reduced to a stub trips `mkfs-nodiscard.nix`'s assertion. |
-| `publish-gates` | The fixture and the CA-less default both evaluate. Each gate trips on exactly its own assertion, and a CA-baked image with no `controlPlaneCIDRs` does not evaluate. |
+| `unit-graph` | Every ordering edge above, root-only clients, the qemu-ga allow-list line, journal-only streams, `MKE2FS_CONFIG` on exactly the two format units, the nix-gc lock wrapper's exact `ExecStart` and `SuccessExitStatus=75`, and no unit naming the upgrade tool, all on the rendered unit files |
+| `config-values` | Device paths, serial path, tmpfiles, kernel parameters, GRUB device, sysctls, the hosts pin, DHCP shape, no google or firewall units, and sshd requiring the site floor. It also requires every `cogworx-*` unit to be classified as a metadata client or not, and every metadata client to still run something (an edge-only stub left behind by a removed gce/ unit fails). The two format units carry the no-discard mke2fs profile and no other unit does, `gce/` has no format line beyond the three known ones, and a format unit reduced to a stub trips `mkfs-nodiscard.nix`'s assertion. For upgrades: `panic=10` and `boot.panic_on_fail`, the GRUB guard as `extraConfig`, cloud-init and networkd off, the tool in the system path and the compat doc in the toplevel, the headroom floor equal to `gce/nix-gc.nix`'s (12 GiB) and the 4 GiB reserve, the upgrade lock file pre-created root-owned 0600, no `cogworx.pve.release` on the fixture, and `mkPveHost`'s `system.configurationRevision` (a `lib.mkDefault` of the flake's revision). |
+| `publish-gates` | The fixture and the CA-less default both evaluate, and the exported `nixosConfigurations.cogbox-x86_64-pve` IS that default (same toplevel drvPath, no control CA). Each gate trips on exactly its own assertion (console autologin, cloud-init forced on, networkd, a static hostname, a system label outside the upgrade tool's path grammar, an `extraConfig` that replaced the GRUB guard, an `environment.systemPackages` that dropped the upgrade tool and a `system.nixos.distroName` the upgrade tool cannot pin included), and a CA-baked image with no `controlPlaneCIDRs` does not evaluate. Autologin with `cogworx.pve.allowConsoleAutologin` fails no assertion and adds no warning, autologin on the CA-less default needs no opt-in, the cloud-init, networkd and hostname gates trip on the CA-less default too, and a default-priority `services.cloud-init.enable = true` (what a Proxmox base profile sets) is forced off and fails nothing, and neither does a distro name other than `NixOS` in the tool's grammar. |
 | `floor-warnings` | A `controlPlaneCIDRs` entry that covers an `infraDenyCIDRs` entry (opening it to passt's mosh-range UDP), or is wider than `/16`, warns, and the fixture's narrow one does not. Malformed entries are left to the build-time refusal. |
 | `dhcpcd-conf` | The realized `dhcpcd.conf` |
 | `hosts-pin` | The realized `/etc/hosts` pins `metadata.google.internal` |
@@ -209,16 +245,21 @@ Run with `nix build --impure -f pve/checks.nix <name>`, or `all`. The fixture sy
 | `hostname` | VM name from the blob, the dashless `cwx-<12 hex>` UUID fallback, and never the instance name |
 | `serial-cap` | The serial log is trimmed to its last 128 KiB on a line boundary, keeps its newest line and mode 0600, and is left alone below the cap |
 | `unit-scripts` | Every `cogworx-pve-*` unit program builds (writeShellApplication shellchecks at build time) |
-| `metadata-unittests` | The emulator's unit tests and the shared vectors |
+| `metadata-unittests` | The emulator's unit tests and the shared vectors, `sys` included |
+| `upgrade-unittests` | The upgrade tool: the argv grammar, the envelope, the grub.cfg and grubenv parsers on the shared vectors (grubenv blocks from the real `grub-editenv`), the closure digest vector, the bootloader pin on the image's real `install-grub.sh`, the guest compat rules, fetch classification on nix 2.34's strings, the state machine on a fake guest with a power cut after every numbered step, a wrong menu after the installer runs of commit, abort, release and the headroom release (a fake installer renders a wrong entry 0, a wrong entry init or an extra cogworx submenu), abort stopping a live fetch worker, a stop outside the realise classified `interrupted`, the fetch launcher waiting (bounded) for its worker to register, abort of a switch txn after the fetch worker's headroom release (before arm and from the trial), abort with the rollback booted over an armed candidate, a second tool process holding the lock making a verb busy, a target without its own tool or with an `append-initrd-secrets` refused before any profile points at it, a rollback a GC collected or invalidated dropped as `rollback_lost`, closed txn ids never reused (the newest and every id `history` still holds), `arm` and `release` refused off the committed system, an unknown `txn.state` or `txn.kind` treated as an unreadable file and never overwritten, a failed closing write of commit, `revert-commit` re-asserting the `committed` root a lost commit flip left behind, `commit` refusing before any step a committed (base) system whose `nixos-version` the rollback entry's title cannot carry, `commit`, `abort`, `revert-commit` and `release` refusing a drifted pin before any step, and the built package. Plus the compat doc builder (every schema key required). |
+| `grub-guard-syntax` | `grub-script-check` accepts the guard and rejects a truncated copy (the negative control), and the guard carries the `# cwx-guard-v1` marker |
+| `compat-doc` | The fixture's compat doc, built and pinned whole (its key set and every value): the host contract equals the fixture's values, the control CA is decoded and fingerprinted, the protocol values are `gce/protocol.nix`'s, the substituter lists are `nix.settings`' normalized, the boot loader fields name the system's own installer and the guard, and the doc is ASCII and at most 16 KiB |
 | `mkfs-nodiscard` | The profile is the package default plus `discard = false` under `[defaults]` and nothing else, derived from the file the units' mke2fs compiles in, and the units' `PATH` resolves `mkfs.ext4` to that mke2fs. Each realized `mkfs.ext4` line of the two units is run on a sparse file under strace: under the default profile it discards (the control, which must), and under the unit's `MKE2FS_CONFIG` it discards nothing. Apart from the discard, `dumpe2fs` shows the same filesystem either way. |
 | `eval` | The default and fixture toplevels and the image evaluate |
-| `offline-closure` | **Not in `all`**, because it builds the whole system. The fixture toplevel's closure (the store the image registers) holds the flake input sources and the cogbox package that the launcher's offline re-exec needs. |
+| `offline-closure` | **Not in `all`**, because it builds the whole system. The fixture toplevel's closure (the store the image registers) holds the flake input sources and the cogbox package that the launcher's offline re-exec needs. The toplevel carries the compat doc as a regular file and the tool in `sw/bin`. |
+| `upgrade-vm` | **Not in `all`**; KVM, about 6 minutes. One VM booted like a template (legacy MBR, SeaBIOS, GRUB on `/dev/vda`, `image.nix` plus `upgrade/module.nix`) runs the REAL tool against system generations it fetches from a signed file:// cache, with `-smbios type=1,serial=<blob>` per boot. The guard on every boot path: `S=c` on the 330-byte worst case boots the candidate once (`c:`), a v1 serial without `S` (`d:`), and, failing open (`u:`, the candidate boots), no serial at all and a readable serial that is not a raw v1 blob (still base64-encoded); `S=r` boots the rollback over an armed candidate, a hard stop mid-trial, a missing initrd (panic, reboot), a stage-1 failure (sysrq crash, reboot) and a kernel that does not load (GRUB fallback) all land on entry 0, and the SMBIOS 3.0 entry point. The fetch verdicts `not-found`, `signature`, `compat` and `integrity` on nix's real stderr, the headroom gate, nix-gc skipping (exit 75, a success) while a stand-in and then the REAL fetch worker (parked by the crash driver in its own transient unit) hold the lock, and collecting a planted path but not the staged target afterwards, `busy`, the argv[0] rule, commit, a no-op re-issued commit, abort and `revert-commit`. Every fetch launcher's own status already shows its worker registered (never `interrupted`), and at the first boot (in both VM checks) the lock file is already there, root-owned 0600. The first sector and the first MiB stay byte-identical throughout, and `/boot/grub/state` never changes. Both VM checks fail after 30 minutes (`globalTimeout`) instead of stalling on a QEMU start race in the test harness (docs/pve-system-upgrade.md). |
+| `upgrade-vm-powercut` | **Not in `all`**; KVM, about 9 minutes. The same VM with a power cut (QEMU quits, the guest page cache is lost) right after every numbered step of `commit` (steps 1-7, including the "head = target, entry 0 = old" state after step 2) and of `abort` (steps 1-9); a `--no-rollback` commit after step 3 and then its repairing abort after step 4 (the rollback restored from `pre`); a `--no-rollback` commit after step 8 (the closing write landed, the root flip did not: the old system stays rooted and the next `fetch` re-asserts the root); and `arm` after step 6 (the one-shot survives, `S=c` boots the candidate, `abort` runs from it). Each cut is repaired from `txn.json` by the step table's repair verb, after which the head, entry 0 and the committed system agree, the rollback is the recorded one (a commit's `pre` restored; no collection runs between a cut and its repair here, so the rollback is never lost, which docs/pve-system-upgrade.md's `rollback_lost` covers), no candidate or one-shot is left (after abort steps 2-9 no `cwx_once` either), grub.cfg parses clean and the boot area is unchanged. |
 
 The live floor section needs unprivileged user namespaces with nftables. Where those are unavailable it skips loudly instead of passing silently. The rule 4a input probe also needs veth links and `nsenter`, and skips loudly on its own without them; the realized-ruleset assertion covers the rule's place either way.
 
 ## Validation still owed
 
-Not yet covered here: a booted-image test (a nixosTest with a fixture SMBIOS serial), and a live smoke clone on a cluster. Both need a baked image. The smoke clone must also confirm two things no check here can show:
+Not yet covered here: a booted-image test (a nixosTest with a fixture SMBIOS serial), and a live smoke clone on a cluster. Both need a baked image. For upgrades, `upgrade-vm` covers the boot loader mechanics on a VM built from `image.nix` and `upgrade/module.nix`, but no check boots a full `pve-host.nix` image, and the guard's inputs on a real PVE VM are unchecked: PVE's `base64=1` decode as GRUB sees it, the machine type and the SMBIOS entry point (a negative result is non-blocking, because the guard fails open, and shows as `cwx_once == "u:"`). The smoke clone must also confirm two things no check here can show:
 
 - `sshd` comes up on a fresh clone. `sshd.service` `Requires=` `cogworx-pve-floor` (via `RequiredBy=`), so a floor that does not load and verify on first boot keeps sshd down.
 - A deliberately broken floor keeps `sshd` down while the serial console (`serial0`, the break-glass getty) still works.

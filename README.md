@@ -72,6 +72,7 @@ Each enabled harness ships a full-auto launcher inside the VM: `c` for `claude-c
 | [Harnesses](docs/harnesses.md) | The harness model, per-harness full-auto wiring, adding a harness |
 | [Internals](docs/internals.md) | Directory layout, runtime dir + 9p shares, fw_cfg injection, launch-time patching, re-exec mechanism, host path overrides |
 | [Runtime tool environments](docs/runtime-environment.md) | `cogbox-env`: select, roll back and restore guest tool bundles at runtime without a restart; enabled on the hosted (GCE) guest; protocol, boot restore, retention, recovery |
+| [PVE system upgrades](docs/pve-system-upgrade.md) | In-place system upgrades of a Proxmox sandbox VM: the `cogworx-pve-upgrade` tool contract, the GRUB guard, the compat doc, power-cut repair |
 
 ## Named instances
 
@@ -821,6 +822,10 @@ intentionally constrained by the host module; use
 `cogworx.gce.extraTrustedUserCAKeys` to add trusted user CAs. A composed module
 that also defines `nix.registry.nixpkgs` must resolve that option conflict
 explicitly.
+
+## PVE backend image
+
+`pve/` builds the same host half as a Proxmox VE VM image; see [pve/README.md](pve/README.md). The flake exports `nixosConfigurations.cogbox-x86_64-pve` (CA-less, fail-closed), `packages.x86_64-linux.pve-image` and `lib.mkPveHost`, which takes operator modules as `extraModules`; those modules must evaluate on this flake's nixpkgs. Its checks are `checks.x86_64-linux.pve-*`.
 
 ## Limitations
 

@@ -11,11 +11,11 @@ INBOUND (control plane -> VM): one SMBIOS type-1 `serial`, written by cogworxd
 into the stopped VM's `smbios1` as `uuid=<owner>,base64=1,serial=<b64(blob)>`.
 The blob is a versioned application/x-www-form-urlencoded string (boot config
 v1, below). PVE decodes base64=1 values before handing them to QEMU, so the
-guest most likely sees the RAW blob in /sys/class/dmi/id/product_serial -- but
-that is a platform claim, and the first live smoke test on a cluster is what
-pins which form it delivers. Until then, both are accepted:
+guest sees the RAW blob in /sys/class/dmi/id/product_serial, as confirmed on a
+live PVE VM. Acceptance of its base64 encoding is kept for compatibility, so
+both forms are accepted:
 
-  (a) the raw blob, `...&v=1&w=rules`;
+  (a) the raw blob, `...&v=1&w=rules` (what PVE delivers);
   (b) its standard base64 encoding.
 
 Classification is unambiguous for every blob this decoder would accept: an
@@ -30,11 +30,20 @@ OUTBOUND (VM -> control plane): guest attributes. Every mutation atomically
 rewrites /run/cogworx/guest-attributes.json, which cogworxd reads through the
 QEMU guest agent's file-read:
 
-  {"v":1,"boot_id":"<kernel boot id>","gen":N,"attrs":{"<ns>/<key>":"<value>"}}
+  {"v":1,"boot_id":"<kernel boot id>","gen":N,"sys":"<booted system>","attrs":{"<ns>/<key>":"<value>"}}
 
 `gen` counts mutations within one boot. A restarted emulator re-adopts the file
 only when its boot_id matches this boot, so attributes survive a service
 restart but never a reboot.
+
+`sys` is the booted NixOS system (the toplevel /run/booted-system resolves to),
+read ONCE when the emulator starts. It is ABSENT, never null, when unknown: the
+link is missing or does not resolve to a /nix/store/...-nixos-system-... path.
+A restart re-adopts the attributes only; `sys` is always this process's own
+reading. `v` stays 1 (readers ignore unknown keys, and a bump would make
+cogworxd's parser reject the file). cogworxd ignores `sys` today; it is there
+for the in-place upgrade resolver, which needs to know which system generation
+a VM booted (docs/pve-system-upgrade.md).
 
 Boot config v1 (Go encodes with url.Values.Encode, the reference encoder below
 uses urlencode(sorted(...), quote_via=quote_plus); both produce keys in byte
@@ -386,6 +395,21 @@ STATE_FILE = "guest-attributes.json"
 GA_MAX_KEYS = 64
 GA_MAX_VALUE = 1024
 _GA_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# A NixOS toplevel store path, the upgrade tool's grammar for one.
+_SYSTEM_RE = re.compile(r"/nix/store/[0-9a-df-np-sv-z]{32}-nixos-system-[A-Za-z0-9._+-]{1,200}")
+
+
+def read_booted_system(path="/run/booted-system"):
+    """The booted system's store path, or None when it is unknown.
+
+    Unknown means the link is missing or resolves to anything but a NixOS
+    toplevel store path; the caller then leaves `sys` out of the state file.
+    """
+    target = os.path.realpath(path)
+    if not _SYSTEM_RE.fullmatch(target):
+        LOG.warning("booted system: %s does not resolve to a NixOS system; leaving sys out", path)
+        return None
+    return target
 
 
 class LimitExceeded(Exception):
@@ -401,10 +425,11 @@ class GuestAttributeStore:
     A failed write leaves both the file and the served map as they were.
     """
 
-    def __init__(self, state_dir, boot_id):
+    def __init__(self, state_dir, boot_id, booted_system=None):
         self._dir = state_dir
         self._path = os.path.join(state_dir, STATE_FILE)
         self._boot_id = boot_id
+        self._booted_system = booted_system
         self._lock = threading.Lock()
         self._attrs = {}
         self._gen = 0
@@ -433,11 +458,15 @@ class GuestAttributeStore:
             LOG.warning("guest attributes: discarding %s from another boot", self._path)
             self._persist({}, 0)
         else:
+            # The attributes only: a `sys` in the file is never taken over.
             self._attrs, self._gen = attrs, doc["gen"]
             LOG.info("guest attributes: re-adopted %d attribute(s) at gen %d from this boot", len(attrs), self._gen)
 
     def _persist(self, attrs, gen):
-        doc = {"v": 1, "boot_id": self._boot_id, "gen": gen, "attrs": dict(sorted(attrs.items()))}
+        doc = {"v": 1, "boot_id": self._boot_id, "gen": gen}
+        if self._booted_system is not None:
+            doc["sys"] = self._booted_system
+        doc["attrs"] = dict(sorted(attrs.items()))
         data = (json.dumps(doc, separators=(",", ":"), ensure_ascii=True) + "\n").encode("ascii")
         fd, tmp = tempfile.mkstemp(prefix=".guest-attributes.", suffix=".tmp", dir=self._dir)
         try:
@@ -858,7 +887,7 @@ def serve(args):
     app = Metadata(
         instance_id=read_instance_id(args.dmi_uuid_path),
         attrs=read_boot_attrs(args.dmi_serial_path),
-        store=GuestAttributeStore(args.state_dir, read_boot_id()),
+        store=GuestAttributeStore(args.state_dir, read_boot_id(), read_booted_system(args.booted_system_path)),
         iface=args.iface,
     )
     server = MetadataServer(sock, app)
@@ -898,6 +927,8 @@ def main(argv=None):
     p.add_argument("--dmi-serial-path", default="/sys/class/dmi/id/product_serial")
     p.add_argument("--dmi-uuid-path", default="/sys/class/dmi/id/product_uuid")
     p.add_argument("--state-dir", default="/run/cogworx")
+    p.add_argument("--booted-system-path", default="/run/booted-system",
+                   help="the link whose target is reported as `sys` in the state file (read once at start)")
     p.add_argument("--iface", default="eth0")
     args = p.parse_args(argv)
     if (args.command == "serve") == (args.print_attr is not None):
