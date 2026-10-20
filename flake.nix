@@ -460,10 +460,11 @@
 						programs.bash.loginShellInit = lib.mkForce ''
 							cd /root/work 2>/dev/null || cd /root
 							# Prepend the plugin tools (cogbox.packages) the brain
-							# materialized into $out/bin. This is the container's ONLY PATH
-							# surface for plugin tools (the base image is plugin-less), so it
-							# is what makes `example-plugin-cli` et al. resolve in the
-							# interactive terminal (tmux spawns a login shell).
+							# materialized into $out/bin. On a boot of the plugin-less base
+							# toplevel this and the harness launchers are the only PATH
+							# surface for them, so it is what makes `example-plugin-cli` et
+							# al. resolve in the interactive terminal there (tmux spawns a
+							# login shell).
 							[ -d /root/work/.cogbox/brain/bin ] && export PATH="/root/work/.cogbox/brain/bin:$PATH"${lib.optionalString config.cogbox.runtimeEnvironment.enable runtimeLoginShellInit}
 						'';
 						nix = {
@@ -607,14 +608,18 @@
 					# (never a hard global environment.variables set).
 					env      = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = {}; description = "Plugin-scoped env, merged into the harness launcher env."; };
 					# Plugin-contributed CLI tools that must be on the sandbox PATH.
-					# The base folds these into BOTH environment.systemPackages (so the
-					# VM bakes them into /run/current-system/sw/bin via the per-instance
-					# runner rebuild) AND a $out/bin buildEnv inside cogbox-brain, which
-					# the container backend prepends to the guest PATH -- its base image
-					# is plugin-less, so systemPackages there never carry a plugin's
-					# tools. Use this instead of environment.systemPackages so a plugin's
-					# tools reach BOTH backends. (listOf package: plugins concatenate.)
-					packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = []; description = "Plugin-contributed packages placed on the sandbox PATH (systemPackages on the VM; brain/bin on the container)."; };
+					# The base folds these into BOTH environment.systemPackages (baked
+					# into /run/current-system/sw/bin by the VM's per-instance runner
+					# rebuild and by the container's per-instance toplevel) AND a
+					# $out/bin buildEnv inside cogbox-brain, which login shells and the
+					# harness launchers prepend to PATH. The container resolves the
+					# brain at every boot, separately from its toplevel, so these tools
+					# can still reach PATH on a boot that falls back to the plugin-less
+					# base toplevel (agentInit), where a plugin's plain
+					# environment.systemPackages are absent. Use this instead of
+					# environment.systemPackages for a plugin's tools. (listOf package:
+					# plugins concatenate.)
+					packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = []; description = "Plugin-contributed packages placed on the sandbox PATH (environment.systemPackages, plus the brain's bin, which login shells and the harness launchers prepend to PATH)."; };
 					# Per-harness settings -- NOT harness-agnostic (model strings
 					# differ). ALLOWLIST per harness: model, reasoningEffort. Never
 					# permissions/auth/providers. Keyed by harness name.
@@ -2949,10 +2954,11 @@
 				# agent-image PATH). The VM never carries the CLI in-guest (it is the
 				# host-side launcher there), so gate it to the container.
 				++ lib.optional isContainer self.packages.${system}.cogbox-container
-				# Plugin-contributed tools (cogbox.packages). On the VM the runner
-				# rebuild bakes these into the guest closure here; on the container
-				# they reach PATH via cogbox-brain's $out/bin instead (the baked base
-				# image is plugin-less), so this line is an inert no-op there.
+				# Plugin-contributed tools (cogbox.packages). The VM runner rebuild
+				# and the container's per-instance toplevel bake these into the
+				# guest closure here. The container's plugin-less base toplevel (the
+				# baked image, and agentInit's fallback boot) carries none, so there
+				# they reach PATH only via cogbox-brain's $out/bin.
 				++ cfg.packages;
 
 				# Expose the materialized plugin "brain" as a build product so the

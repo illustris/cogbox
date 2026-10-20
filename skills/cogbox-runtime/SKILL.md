@@ -1,6 +1,6 @@
 ---
 name: cogbox-runtime
-description: Keep a set of command-line tools in this sandbox across restarts with cogbox-env, switch between tool sets, roll back, and recover the tools after a restart.
+description: Keep command-line tools, or an interpreter with a project's libraries, in this sandbox across restarts with cogbox-env, switch between tool sets, roll back, and recover the tools after a restart.
 ---
 
 `cogbox-env` puts one Nix-built bundle of executables first on PATH and keeps an archive of its full closure in `~/work`, so the same tools come back after a restart without network access. Choose the route that fits:
@@ -9,7 +9,7 @@ description: Keep a set of command-line tools in this sandbox across restarts wi
 - Tools this sandbox should keep across restarts: a `cogbox-env` bundle, below. Takes effect without a restart.
 - A shared, reviewed extension that also carries services, skills or network policy: a plugin, as `cogbox-packages` describes. A plugin needs a sandbox restart to load.
 
-A bundle only provides executables. It sets no environment variables, starts no services, supplies no libraries to other programs and changes no network policy.
+A bundle only provides executables. It sets no environment variables, starts no services, supplies no libraries to other programs and changes no network policy. For a language library, bundle an interpreter that already contains it, such as `(pkgs.python3.withPackages (ps: [ ps.requests ]))` in `paths`, or keep a virtualenv or `node_modules` under `~/work`, made with an interpreter from the bundle, and keep that interpreter in the selected bundle so it still works after a restart.
 
 ## Build a bundle
 
