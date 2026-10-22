@@ -20,6 +20,8 @@ the CLI, QEMU, and network proxies run natively; the sandbox is an ARM64 Linux
 guest accelerated by Apple's Hypervisor.framework. See [macOS setup](docs/macos.md)
 for the Linux build prerequisite and platform differences.
 
+On x86_64 the host CPU needs AVX, AES-NI and PCLMULQDQ: Intel Sandy Bridge or AMD Bulldozer and later, though some lower-end parts lack them (many Atom, Celeron and Pentium chips have no AVX, and a few Core i3s no AES-NI). In a VM, give the guest a CPU model that exposes them, such as `host`, not `qemu64`/`kvm64` or Proxmox's `x86-64-v2-AES` default. Without them cogbox dies with SIGILL (exit status 132) at startup.
+
 ```
 nix run github:illustris/cogbox
 ```
