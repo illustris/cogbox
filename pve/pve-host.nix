@@ -21,7 +21,7 @@
 #   self-refresh.nix  per-boot refresh of cogbox's write-once bindAddr, which a
 #                     DHCP address change would otherwise leave stale
 #   floor-site.nix    the SITE floor (nft table inet cogworx_pve_floor): rules
-#                     4a, 4 and 5, beside gce/floor.nix's own table
+#                     4a and 4, beside gce/floor.nix's own table
 #   image.nix         the qcow2 disk image (legacy BIOS, grub on /dev/vda)
 #   mkfs-nodiscard.nix  the format units' mke2fs profile: no whole-device
 #                     discard, which the drives' IO limits throttle past the
@@ -96,11 +96,11 @@ let
 	# passt preserved inside that range, so whatever part of infraDenyCIDRs
 	# controlPlaneCIDRs also covers is open to that one shape of guest UDP
 	# (in rules mode the L4 shim denies it via the seeded private-range rules
-	# unless an owner/admin L4 allow covers that @cp address), and rule 5 admits control
-	# ingress from all of it. A narrow @cp (the control plane's own source
-	# addresses) makes that a few hosts; a wide one -- e.g. whole internal
-	# ranges admitted because the control source is NATed or unstable --
-	# extends both to all of them. Warned rather than asserted: admitting
+	# unless an owner/admin L4 allow covers that @cp address). A narrow @cp
+	# (the control plane's own source addresses) makes that a few hosts; a
+	# wide one -- e.g. whole internal ranges admitted because the control
+	# source is NATed or unstable -- extends it to all of them, and an empty
+	# one removes it. Warned rather than asserted: admitting
 	# internal ranges as @cp is an accepted fallback, so this is the
 	# operator's call, but it must not be a silent one.
 	cpCoversInfra = lib.concatMap (c:
@@ -172,27 +172,31 @@ in
 				default = [ ];
 				example = [ "198.51.100.0/24" ];
 				description = ''
-					Where cogworxd's control channel comes FROM, as the VM sees
-					it: the source of its SSH control connections, gateway
-					forwards and mosh relay. Rule 5 admits new inbound flows to
-					sshd, the guest SSH/HTTP forwards and the mosh UDP range only
-					from these. Rule 4 lets passt's mosh reply sockets (the passt
-					uid, UDP from the mosh range) reach them even when they sit
-					inside infraDenyCIDRs; every other flow rule 4 names is
-					dropped towards them like towards any internal address.
+					Optional (default [ ]). The destination set (@cp) of floor
+					rule 4's passt mosh-reply accept, and that is its only
+					effect: the source address(es) of cogworxd's mosh relay, as
+					the VM sees them. passt answers a datagram on its mosh `-u`
+					forward from a per-flow socket connected to the relay, and
+					for a mosh flow conntrack has forgotten that answer is an
+					original-direction flow, which rule 4 drops when the relay
+					sits inside infraDenyCIDRs. Listed here, those replies (the
+					passt uid, UDP from the mosh range) are accepted ahead of
+					rule 4's drops; every other flow rule 4 names is dropped
+					towards these addresses like towards any internal address.
 
-					Keep it to the control plane's own source addresses: rule 5
-					admits control ingress from all of it, and whatever part of
-					infraDenyCIDRs it also covers is open to passt-uid UDP from
-					the mosh port range. Evaluation warns when an entry covers a
-					whole infraDenyCIDRs entry or is wider than /16.
+					[ ] leaves mosh replies to conntrack's reply direction, which
+					passes them on every flow the relay opened while conntrack
+					still tracks it. There is no ingress filter: the internal
+					network is trusted, and nothing on the VM's input side reads
+					this option.
 
-					REQUIRED on a published (CA-baked) image, with NO open-ingress
-					escape: a PVE sandbox VM shares an L2 segment with other
-					tenants' machines, so "reachable from anywhere" means "from
-					every neighbour". IPv4 only; each entry is an address or a
-					CIDR, at most /8 wide, overlapping neither 127/8, 169.254/16
-					nor 0/8 (floor_render.py refuses the build otherwise).
+					Keep it to the control plane's own source addresses: whatever
+					part of infraDenyCIDRs it also covers is open to passt-uid UDP
+					from the mosh port range. Evaluation warns when an entry
+					covers a whole infraDenyCIDRs entry or is wider than /16. IPv4
+					only; each entry is an address or a CIDR, at most /8 wide,
+					overlapping neither 127/8, 169.254/16 nor 0/8 (floor_render.py
+					refuses the build otherwise).
 				'';
 			};
 			infraDenyCIDRs = lib.mkOption {
@@ -273,18 +277,6 @@ in
 		# the value it guards -- which is exactly the bake that ships open.
 		assertions = [
 			{
-				# THE INGRESS GATE (no escape). A published image admits control
-				# traffic only from named sources. There is deliberately no
-				# allowOpenIngress: on a shared L2, an open sshd and open guest
-				# forwards are reachable from every neighbouring VM.
-				assertion = !caBaked || cfg.floor.controlPlaneCIDRs != [ ];
-				message = lib.concatStringsSep "\n\n" [
-					"cogworx.pve: this image bakes a control CA -- it is meant to be PUBLISHED -- but cogworx.pve.floor.controlPlaneCIDRs is empty."
-					"Floor rule 5 would then admit sshd, the guest SSH/HTTP forwards and the mosh UDP range from nobody, and there is no open-ingress escape on PVE: a sandbox VM shares an L2 segment with other tenants, so open ingress means every neighbour."
-					"Set cogworx.pve.floor.controlPlaneCIDRs to the source address(es) cogworxd's control connections arrive from, as seen by the VM."
-				];
-			}
-			{
 				# THE EGRESS GATE (no escape). Without the site's internal
 				# ranges rule 4 renders no drop at all, and a guest -- or a
 				# nix build user running a plugin derivation's builder -- can
@@ -341,10 +333,10 @@ in
 		warnings = lib.optional (linkLocal gce.vpcResolver)
 			"cogworx.pve: cogworx.gce.vpcResolver (${gce.vpcResolver}) is link-local, and on Proxmox nothing serves DNS there; this image will resolve no names. Set it to the site's recursive resolver."
 			++ map (w:
-				"cogworx.pve: floor rule 4 only partly applies to infraDenyCIDRs entry ${w.infra}: controlPlaneCIDRs entry ${w.cp} covers all of it, and rule 4 accepts passt-uid UDP from the mosh port range to @cp ahead of its drops (passt's mosh replies to the cogworxd relay). A guest datagram whose source port passt preserved in that range may then reach every address in ${w.infra}, and floor rule 5 admits control ingress from all of it. Unless that is intended, narrow controlPlaneCIDRs to the source address(es) cogworxd's control connections actually arrive from.")
+				"cogworx.pve: floor rule 4 only partly applies to infraDenyCIDRs entry ${w.infra}: controlPlaneCIDRs entry ${w.cp} covers all of it, and rule 4 accepts passt-uid UDP from the mosh port range to @cp ahead of its drops (passt's mosh replies to the cogworxd relay). A guest datagram whose source port passt preserved in that range may then reach every address in ${w.infra}. Unless that is intended, narrow controlPlaneCIDRs to the source address(es) cogworxd's control connections actually arrive from.")
 				cpCoversInfra
 			++ map (c:
-				"cogworx.pve: controlPlaneCIDRs entry ${c.str} is wider than /16. Floor rule 5 admits new inbound control traffic (sshd, the guest SSH/HTTP forwards, the mosh range) from all of it, and floor rule 4 accepts passt-uid UDP from the mosh port range to all of it, including any part that lies inside infraDenyCIDRs.")
+				"cogworx.pve: controlPlaneCIDRs entry ${c.str} is wider than /16. Floor rule 4 accepts passt-uid UDP from the mosh port range to all of it, including any part that lies inside infraDenyCIDRs.")
 				cpWide;
 	};
 }

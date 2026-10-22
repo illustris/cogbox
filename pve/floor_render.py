@@ -25,8 +25,8 @@ Rule 4a (always on):
   for the other direction: the emulator's address is scope host on lo, but
   Linux's weak host model still delivers a frame for it that arrives on the
   NIC, so anything for link-local that did not come in on lo is dropped
-  before the emulator (or rule 5's @cp accept) sees it. It is rendered first
-  in the input chain for that reason.
+  before the emulator sees it, whatever its source. It is the input chain's
+  only rule (see "No ingress filter" below).
 
 Rule 4 (output):
     meta skuid <passt> ip daddr @cp udp sport <mosh range> accept
@@ -42,7 +42,12 @@ Rule 4 (output):
   on a flow the control plane opened (SSH and HTTP forwards, which passt
   answers from its own sockets) is in the reply direction and passes, and the
   scoping is a per-packet property that a floor reload cannot turn into a
-  standing exemption.
+  standing exemption. So rule 4 is a no-new-flows rule keyed on conntrack
+  direction, not a peer filter: ANY address that sends to the VM first can be
+  answered from the port it sent to, by passt (which keeps the guest's UDP
+  source port) or by a build user. The guest cannot open such a flow alone,
+  but an internal host or L2 neighbour that sends on its behalf can (README.md
+  states the residual).
   Two accepts come first, because their targets can sit inside @infra4. The
   exact infraAllow sockets. And passt's mosh reply sockets: passt answers a
   datagram that arrived on its `-u` forward from a per-flow socket bound to
@@ -60,15 +65,14 @@ Rule 4 (output):
   allow covers that @cp address. The PVE boot config has no `full` mode (the
   emulator rejects a blob that asks for it).
 
-Rule 5 (input, after rule 4a's input drop):
-    iifname "lo" accept
-    ip saddr @cp accept
-    ct direction original tcp dport { sshd, guest SSH forwards, HTTP forwards } drop
-    ct direction original udp dport { mosh range } drop
-  New inbound flows to the control surfaces only from @cp. Original direction
-  only, so a REPLY to a flow this VM opened is never dropped even when its
-  local port happens to fall in a guarded range (the ephemeral range overlaps
-  the mosh range).
+No ingress filter (decision 2026-10-21):
+  The internal network is trusted, so input is filtered only by rule 4a's
+  link-local drop: sshd, the guest SSH and HTTP forwards and the mosh range
+  are reachable from every host that can route to the VM, and rely on their
+  own authentication. Replies on flows the cogworxd relay opened pass rule 4
+  by direction, whatever the relay's address; so do replies on flows any
+  other peer opened, which with no ingress filter now includes every forward
+  and the mosh range (rule 4's direction residual above).
 
 Validation (every refusal names the field and the value):
   - every CIDR or address is IPv4, in canonical form (no host bits), at most
@@ -76,15 +80,15 @@ Validation (every refusal names the field and the value):
   - infraAllow entries are {address, protocol in tcp|udp, port 1-65535}, and
     the address is ONE host (bare or /32): an exception is an exact socket,
     never a range;
-  - port ranges (ingressTCP, ingressUDP, moshUDP) are [lo, hi] with
-    1 <= lo <= hi <= 65535;
+  - port ranges (moshUDP) are [lo, hi] with 1 <= lo <= hi <= 65535;
   - user/group names and the interface name are plain identifiers, because
     they are rendered into the ruleset.
-Emptiness is NOT refused here: on a CA-baked image the publish gates in
-pve-host.nix require controlPlaneCIDRs and infraDenyCIDRs, and a dev image is
-allowed to render a rule 4 with nothing to drop and a rule 5 that admits no
-one. An empty moshUDP renders no mosh accept (no `-u` forward, no reply
-sockets).
+Emptiness is NOT refused here: on a CA-baked image the publish gate in
+pve-host.nix requires infraDenyCIDRs, and a dev image is allowed to render a
+rule 4 with nothing to drop. An empty controlPlaneCIDRs only leaves the mosh
+accept without a target: passt's mosh replies then pass on conntrack's reply
+direction alone. An empty moshUDP renders no mosh accept (no `-u` forward, no
+reply sockets).
 """
 
 from __future__ import annotations
@@ -107,8 +111,7 @@ _IFACE = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 _CIDR_SHAPE = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?:/[0-9]{1,2})?")
 SPEC_KEYS = frozenset({
     "version", "iface", "controlPlaneCIDRs", "infraDenyCIDRs", "infraAllow",
-    "passtUser", "proxyUser", "buildGroup", "ingressTCP", "ingressUDP",
-    "moshUDP",
+    "passtUser", "proxyUser", "buildGroup", "moshUDP",
 })
 
 
@@ -199,8 +202,6 @@ def validate(spec):
         "passt": parse_name(spec["passtUser"], "passtUser"),
         "proxy": parse_name(spec["proxyUser"], "proxyUser"),
         "build": parse_name(spec["buildGroup"], "buildGroup"),
-        "tcp": parse_ranges(spec["ingressTCP"], "ingressTCP"),
-        "udp": parse_ranges(spec["ingressUDP"], "ingressUDP"),
         "mosh": parse_ranges(spec["moshUDP"], "moshUDP"),
     }
 
@@ -261,17 +262,12 @@ def render(spec):
         "\t}",
         "\tchain input {",
         "\t\ttype filter hook input priority 0; policy accept;",
-        # Rule 4a's input leg, FIRST: ahead of rule 5's @cp accept, so a @cp
-        # source gets no way to the emulator either.
+        # Rule 4a's input leg, and the input chain's only rule: the floor
+        # filters no ingress (the docstring's "No ingress filter").
         '\t\tiifname != "lo" ip daddr 169.254.0.0/16 counter drop %s' % c("rule4a-input"),
-        '\t\tiifname "lo" accept %s' % c("rule5-lo"),
-        "\t\tip saddr @cp counter accept %s" % c("rule5-cp"),
+        "\t}",
+        "}",
     ]
-    if v["tcp"]:
-        out.append("\t\tct direction original tcp dport %s counter drop %s" % (_ports(v["tcp"]), c("rule5-tcp")))
-    if v["udp"]:
-        out.append("\t\tct direction original udp dport %s counter drop %s" % (_ports(v["udp"]), c("rule5-udp")))
-    out += ["\t}", "}"]
     return "\n".join(out) + "\n"
 
 

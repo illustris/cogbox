@@ -1,22 +1,24 @@
 # cogworx-pve-floor.service -- the SITE floor: nft table inet cogworx_pve_floor,
-# rules 4a, 4 and 5, loaded beside gce/floor.nix's own table and verified
-# before any sandbox starts.
+# rules 4a and 4, loaded beside gce/floor.nix's own table and verified before
+# any sandbox starts.
 #
 # WHY A SECOND TABLE. gce/floor.nix is the guest-isolation floor and is
 # provider-neutral (rules 1-3: link-local for passt, the VM's own addresses,
-# loopback). What GCE's VPC firewall supplied around it -- who may reach the VM,
-# and which internal networks a guest may reach -- has no provider equivalent
-# on a shared PVE L2 segment, so the image carries it. A drop in either table is
+# loopback). What GCE's VPC firewall supplied around it -- which internal
+# networks a guest may reach -- has no provider equivalent on a shared PVE L2
+# segment, so the image carries it. (Who may reach the VM is deliberately not
+# filtered: the internal network is trusted, decision 2026-10-21; see
+# floor_render.py's "No ingress filter".) A drop in either table is
 # final, so this one can only narrow what gce/floor.nix admits, and gce/ stays
 # unchanged. The rules, and why each is shaped as it is, are written down in
 # floor_render.py, which renders them from the cogworx.pve.floor options at
 # BUILD time and refuses (fails the build on) a CIDR that is not IPv4, is wider
 # than /8, or overlaps 127/8, 169.254/16 or 0/8.
 #
-# The publish gates -- controlPlaneCIDRs and infraDenyCIDRs non-empty on a
-# CA-baked image, with no escape -- are pve-host.nix assertions, evaluated
-# before anything is built. So is the warning for a controlPlaneCIDRs entry
-# wide enough to take part of infraDenyCIDRs out of rule 4.
+# The publish gate -- infraDenyCIDRs non-empty on a CA-baked image, with no
+# escape -- is a pve-host.nix assertion, evaluated before anything is built.
+# So is the warning for a controlPlaneCIDRs entry wide enough to take part of
+# infraDenyCIDRs out of rule 4.
 #
 # Rule 4a drops every NON-ROOT socket towards 169.254.0.0/16, and the emulator
 # answers only peer uid 0, so every metadata client must run as root: asserted
@@ -37,12 +39,12 @@ let
 
 	range = lo: width: [ lo (lo + width - 1) ];
 	# passt's `-u` forward (gce/supervisor.nix COGBOX_MOSH_UDP_FORWARD, from
-	# gce/cogbox-host.nix moshUDPPort/moshUDPPortRange): rule 5 guards it on
-	# input, and rule 4 accepts passt's reply sockets bound to it towards @cp.
+	# gce/cogbox-host.nix moshUDPPort/moshUDPPortRange): rule 4 accepts
+	# passt's reply sockets bound to it towards @cp.
 	moshRange = range gce.moshUDPPort gce.moshUDPPortRange;
 
-	# The renderer's input. Ingress ports are READ from the options that
-	# decide them, so rule 5 cannot drift from what sshd and passt bind.
+	# The renderer's input. The mosh range is READ from the options that
+	# decide it, so rule 4's mosh accept cannot drift from what passt binds.
 	spec = {
 		version = 1;
 		iface = cfg.interface;
@@ -52,17 +54,6 @@ let
 		passtUser = gce.passtUser;
 		proxyUser = gce.proxyUser;
 		buildGroup = config.nix.settings.build-users-group or "nixbld";
-		ingressTCP =
-			map (p: [ p p ]) config.services.openssh.ports
-			++ [
-				(range gce.guestSSHPort gce.guestSSHPortRange)
-				# The HTTP forward slides with the SSH one (cogbox-launch.sh
-				# next_available_ports), so it gets the same width. Residual:
-				# the launcher's slide has no upper bound, so a forward that
-				# slides past its window is not covered (README.md).
-				(range gce.guestHTTPPort gce.guestSSHPortRange)
-			];
-		ingressUDP = [ moshRange ];
 		moshUDP = [ moshRange ];
 	};
 
@@ -79,7 +70,7 @@ let
 		runtimeInputs = [ pkgs.nftables ];
 		text = ''
 			nft -f ${ruleset}
-			echo "cogworx-pve-floor: ruleset loaded (rule 4a: link-local for local root only; rule 4: ${toString (builtins.length floor.infraDenyCIDRs)} internal range(s) closed to guest, proxy and nix-build-user traffic, ${toString (builtins.length floor.infraAllow)} exception(s), and its @cp accept limited to passt's mosh replies; rule 5: control ingress from ${toString (builtins.length floor.controlPlaneCIDRs)} control-plane range(s) only)"
+			echo "cogworx-pve-floor: ruleset loaded (rule 4a: link-local for local root only; rule 4: ${toString (builtins.length floor.infraDenyCIDRs)} internal range(s) closed to guest, proxy and nix-build-user traffic, ${toString (builtins.length floor.infraAllow)} exception(s), and its @cp accept limited to passt's mosh replies; no ingress filter)"
 		'';
 	};
 
@@ -148,17 +139,15 @@ in
 		systemd.services.cogworx-pve-floor = {
 			description = "Install and verify the cogworx PVE site floor (nftables)";
 			wantedBy = [ "multi-user.target" ];
-			# Ahead of everything that opens a guarded surface: sshd (rule 5's
-			# port 22) and the supervisor (passt's forwards, the guest, the L7
-			# proxy). The metadata socket edges come from metadata.nix: the
-			# verify leg probes the emulator.
+			# Ahead of sshd and the supervisor (passt's forwards, the guest,
+			# the L7 proxy). The metadata socket edges come from metadata.nix:
+			# the verify leg probes the emulator.
 			before = [ "sshd.service" "cogworx-supervisor.service" ];
-			# And sshd REQUIRES it (fail closed, as cogbox-host.nix does for
-			# the control principal): without rule 5, sshd on eth0 is open to
-			# every neighbour on the shared L2. A floor that fails to load or
-			# verify leaves the VM without sshd -- it is unusable anyway, since
-			# the supervisor requires the floor too -- and the serial console
-			# stays as break-glass.
+			# And sshd REQUIRES it: fail closed by policy, as cogbox-host.nix
+			# does for the control principal. A VM whose floor failed to load
+			# or verify is unusable anyway -- the supervisor Requires= it --
+			# so it is left without sshd too, and the serial console stays as
+			# break-glass.
 			requiredBy = [ "sshd.service" ];
 			serviceConfig = {
 				Type = "oneshot";

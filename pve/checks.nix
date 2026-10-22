@@ -189,7 +189,6 @@ let
 	# assertion. Matched on the message, not on "evaluation failed": a gate
 	# that fails for some other reason would otherwise look like a pass.
 	gateCases = [
-		((gate "no controlPlaneCIDRs (no open-ingress escape)" [ { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce [ ]; } ]) // { want = "cogworx.pve.floor.controlPlaneCIDRs is empty"; })
 		((gate "no infraDenyCIDRs" [ { cogworx.pve.floor.infraDenyCIDRs = lib.mkForce [ ]; } ]) // { want = "cogworx.pve.floor.infraDenyCIDRs is empty"; })
 		# The CA reaches sshd's TrustedUserCAKeys file by a route other than
 		# controlCAPublicKey: the gates must still see a published image.
@@ -198,11 +197,11 @@ let
 			cogworx.gce.extraTrustedUserCAKeys = [ fixtureCAKey ];
 			cogworx.pve.floor.infraDenyCIDRs = lib.mkForce [ ];
 		} ]) // { want = "cogworx.pve.floor.infraDenyCIDRs is empty"; })
-		((gate "a CA only appended to the trusted-CA file, no controlPlaneCIDRs" [ {
+		((gate "a CA only appended to the trusted-CA file, no infraDenyCIDRs" [ {
 			cogworx.gce.controlCAPublicKey = lib.mkForce "";
 			environment.etc."ssh/cogworx-control-ca.pub".text = fixtureCAKey;
-			cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce [ ];
-		} ]) // { want = "cogworx.pve.floor.controlPlaneCIDRs is empty"; })
+			cogworx.pve.floor.infraDenyCIDRs = lib.mkForce [ ];
+		} ]) // { want = "cogworx.pve.floor.infraDenyCIDRs is empty"; })
 		((gate "a link-local resolver, even affirmed for GCE" [ { cogworx.gce.vpcResolver = lib.mkForce "169.254.169.254"; cogworx.gce.allowMetadataResolver = true; } ]) // { want = "cogworx.gce.allowMetadataResolver does not apply on PVE"; })
 		((gate "a fleet AuthorizedKeysCommand" [ { services.openssh.authorizedKeysCommand = "/run/current-system/sw/bin/true"; } ]) // { want = "services.openssh.authorizedKeysCommand"; })
 		((gate "a metadata client with User=" [ { systemd.services.cogworx-attr-scrub.serviceConfig.User = "nobody"; } ]) // { want = "cogworx-attr-scrub talks to the metadata emulator but sets User=nobody"; })
@@ -243,6 +242,12 @@ let
 	# Any distro name in the tool's grammar works: grub.nix substitutes it
 	# into install-grub.pl's titles and the compat doc records the same one.
 	otherDistro = evalPve [ fixtureSite { system.nixos.distroName = lib.mkForce "AcmeOS"; } ];
+	# A supported configuration (no ingress filter, decision 2026-10-21): a CA-baked
+	# image with an EMPTY controlPlaneCIDRs evaluates, fails no assertion and
+	# warns about nothing (a bake pins warnings == [ ]). Rule 4's mosh accept
+	# is then left without a target, and passt's mosh replies rely on
+	# conntrack's reply direction.
+	cpEmpty = evalPve [ fixtureSite { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce [ ]; } ];
 	gateFailures =
 		lib.optional (failedAssertions sys != [ ]) "the fixture (publishable) system itself fails assertions: ${lib.concatStringsSep " | " (failedAssertions sys)}"
 		++ lib.optional (!(evaluates sys)) "the fixture (publishable) system's toplevel does not evaluate"
@@ -252,8 +257,14 @@ let
 			"nixosConfigurations.cogbox-x86_64-pve is not the CA-less default these checks evaluate (mkPveHost with no extra modules)"
 		++ lib.optional (system == "x86_64-linux" && exported.config.cogworx.pve.upgrade.hostContract.controlCAKeys != [ ])
 			"nixosConfigurations.cogbox-x86_64-pve bakes a control CA; the exported default must stay fail-closed"
-		++ lib.optional (evaluates (evalPve [ fixtureSite { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce [ ]; } ]))
-			"a CA-baked image with no controlPlaneCIDRs still EVALUATES its toplevel"
+		++ lib.optional (evaluates (evalPve [ fixtureSite { cogworx.pve.floor.infraDenyCIDRs = lib.mkForce [ ]; } ]))
+			"a CA-baked image with no infraDenyCIDRs still EVALUATES its toplevel"
+		++ lib.optional (failedAssertions cpEmpty != [ ])
+			"the supported configuration (a CA-baked image with controlPlaneCIDRs = [ ]) fails assertions: ${lib.concatStringsSep " | " (failedAssertions cpEmpty)}"
+		++ lib.optional (!(evaluates cpEmpty))
+			"the supported configuration (a CA-baked image with controlPlaneCIDRs = [ ]) does not evaluate its toplevel"
+		++ lib.optional (cpEmpty.config.warnings != [ ])
+			"the supported configuration (a CA-baked image with controlPlaneCIDRs = [ ]) warns: ${lib.concatStringsSep " | " cpEmpty.config.warnings}"
 		++ lib.optional (failedAssertions autologinOptIn != [ ])
 			"console autologin WITH cogworx.pve.allowConsoleAutologin = true still fails assertions: ${lib.concatStringsSep " | " (failedAssertions autologinOptIn)}"
 		++ lib.optional (autologinOptIn.config.warnings != cfg.warnings)
@@ -272,11 +283,10 @@ let
 
 	# The @cp / rule 4 coupling (pve-host.nix): a controlPlaneCIDRs entry that
 	# covers an infraDenyCIDRs entry opens it to passt-uid UDP from the mosh
-	# port range (rule 4's mosh-reply accept) and to rule 5's control ingress,
-	# so evaluation must say so -- and stay quiet for the normal shape (a
-	# narrow @cp inside the internal ranges, as in the fixture). Each case replaces
-	# the fixture's @cp and lists the substrings of EXACTLY the floor warnings
-	# it must produce.
+	# port range (rule 4's mosh-reply accept), so evaluation must say so --
+	# and stay quiet for the normal shape (a narrow @cp inside the internal
+	# ranges, as in the fixture). Each case replaces the fixture's @cp and
+	# lists the substrings of EXACTLY the floor warnings it must produce.
 	floorWarnings = s: lib.filter (lib.hasInfix "controlPlaneCIDRs entry") s.config.warnings;
 	warnCase = name: cp: want: { inherit name want; got = floorWarnings (evalPve [ fixtureSite { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce cp; } ]); };
 	warnCases = [
@@ -353,8 +363,10 @@ let
 		(lib.optional (unclassified != [ ]) "cogworx-* unit(s) not classified as metadata client or not: ${toString unclassified}")
 		(lib.optional (staleClassification != [ ]) "classified unit(s) that no longer exist: ${toString staleClassification}")
 		(lib.optional (stubClients != [ ]) "metadata client unit(s) with no ExecStart, i.e. edge-only stubs that metadata.nix keeps defined after the real unit is gone: ${toString stubClients}")
-		# Fail closed on rule 5: sshd must not listen on eth0 without it.
-		(lib.optional (!(lib.elem "sshd.service" svc.cogworx-pve-floor.requiredBy)) "cogworx-pve-floor is not RequiredBy= sshd.service; a floor that fails to load would leave sshd open to the shared L2")
+		# Fail closed by policy: a VM whose floor failed to load or verify is
+		# unusable anyway (the supervisor requires the floor), so it gets no
+		# sshd either.
+		(lib.optional (!(lib.elem "sshd.service" svc.cogworx-pve-floor.requiredBy)) "cogworx-pve-floor is not RequiredBy= sshd.service; sshd would start on a VM whose floor failed to load or verify")
 		# The format units run mke2fs with the no-discard profile, and they are
 		# the only units that do and the only format legs gce/ has.
 		(lib.concatMap (n: lib.optional (mke2fsValue n != mke2fsProfile)
@@ -576,9 +588,10 @@ let
 			export HOME=$TMPDIR
 			# On the REALIZED ruleset, independent of the golden file and of
 			# whether this sandbox can host the live probes:
-			#  - rule 4a's input leg is the FIRST rule of the input chain, so it
-			#    precedes rule 5's @cp accept (a frame for 169.254/16 that
-			#    arrives on eth0 is dropped whatever its source);
+			#  - rule 4a's input leg is the first and ONLY rule of the input
+			#    chain: a frame for 169.254/16 that arrives on eth0 is dropped
+			#    whatever its source, and nothing else filters ingress (no
+			#    ingress filter, decision 2026-10-21);
 			#  - rule 4 accepts @cp ONLY for passt's mosh replies: every rule
 			#    naming @cp in the output chain carries the passt uid, udp and
 			#    the mosh source range, so no uid rule 4 drops gets a blanket
@@ -590,6 +603,8 @@ let
 				*'iifname != "lo" ip daddr 169.254.0.0/16 counter drop'*'rule4a-input'*) echo "ok   - realized: rule 4a's input drop is the first rule of the input chain" ;;
 				*) echo "FAIL: the realized input chain does not open with rule 4a's input drop: $first" >&2; exit 1 ;;
 			esac
+			[ "$(chain input | grep -c .)" = 1 ] || { echo "FAIL: the realized input chain filters more than rule 4a:" >&2; chain input >&2; exit 1; }
+			echo "ok   - realized: the input chain is rule 4a's input drop alone (no ingress filter)"
 			mosh='meta skuid "${gce.passtUser}" ip daddr @cp udp sport ${moshSports} counter accept'
 			cpLines=$(chain output | grep -F '@cp' || true)
 			if [ "$(printf '%s\n' "$cpLines" | grep -c . || true)" != 1 ] || ! printf '%s\n' "$cpLines" | grep -qF -- "$mosh"; then
