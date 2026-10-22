@@ -21,7 +21,8 @@
 #   self-refresh.nix  per-boot refresh of cogbox's write-once bindAddr, which a
 #                     DHCP address change would otherwise leave stale
 #   floor-site.nix    the SITE floor (nft table inet cogworx_pve_floor): rules
-#                     4a and 4, beside gce/floor.nix's own table
+#                     4a and 4 (the nix build users only), beside
+#                     gce/floor.nix's own table
 #   image.nix         the qcow2 disk image (legacy BIOS, grub on /dev/vda)
 #   mkfs-nodiscard.nix  the format units' mke2fs profile: no whole-device
 #                     discard, which the drives' IO limits throttle past the
@@ -68,12 +69,11 @@ let
 
 	linkLocal = s: builtins.match "169\\.254\\..*" s != null;
 
-	# --- how wide @cp is, for the warnings below --------------------------------
+	# --- the shape of a controlPlaneCIDRs entry ---------------------------------
 	#
 	# An address or CIDR as { addr; len; } (addr an integer), or null for
-	# anything floor_render.py refuses: the build then fails with the
-	# renderer's own message, so an evaluation-time warning must not throw
-	# first. No leading zeros, so lib.toInt never sees an octal-looking octet.
+	# anything that is not one. No leading zeros, so lib.toInt never sees an
+	# octal-looking octet.
 	octet = "(0|[1-9][0-9]{0,2})";
 	parseCidr = s:
 		let
@@ -83,31 +83,19 @@ let
 		in
 		if m == null || lib.any (o: o > 255) octets || len > 32 then null
 		else { addr = lib.foldl' (a: o: a * 256 + o) 0 octets; inherit len; };
-	block = len: addr: addr / (lib.foldl' (a: _: a * 2) 1 (lib.range 1 (32 - len)));
-	# `outer` equals or contains `inner`.
-	covers = outer: inner: outer.len <= inner.len && block outer.len outer.addr == block outer.len inner.addr;
-	parsed = l: lib.filter (p: p.net != null) (map (s: { str = s; net = parseCidr s; }) l);
+	pow2 = n: lib.foldl' (a: _: a * 2) 1 (lib.range 1 n);
+	# The entries that are not an IPv4 address or a canonical IPv4 CIDR (a
+	# CIDR with host bits set included). floor_render.py refused those at
+	# build time while it rendered the list (rule 4's passt mosh-reply
+	# accept); the floor no longer reads it, so the module refuses them
+	# instead, on every image.
+	cpBad = lib.filter (s: let p = parseCidr s; in p == null || lib.mod p.addr (pow2 (32 - p.len)) != 0) cfg.floor.controlPlaneCIDRs;
 
-	# THE @cp / RULE 4 COUPLING, what is left of it. Rule 4 accepts passt's
-	# mosh reply sockets (the passt uid, UDP from the mosh range) towards @cp
-	# ahead of its drops, because once conntrack forgets the inbound flow
-	# those replies to the cogworxd relay are original-direction flows. The
-	# floor cannot tell such a reply from a guest datagram whose source port
-	# passt preserved inside that range, so whatever part of infraDenyCIDRs
-	# controlPlaneCIDRs also covers is open to that one shape of guest UDP
-	# (in rules mode the L4 shim denies it via the seeded private-range rules
-	# unless an owner/admin L4 allow covers that @cp address). A narrow @cp
-	# (the control plane's own source addresses) makes that a few hosts; a
-	# wide one -- e.g. whole internal ranges admitted because the control
-	# source is NATed or unstable -- extends it to all of them, and an empty
-	# one removes it. Warned rather than asserted: admitting
-	# internal ranges as @cp is an accepted fallback, so this is the
-	# operator's call, but it must not be a silent one.
-	cpCoversInfra = lib.concatMap (c:
-		map (i: { cp = c.str; infra = i.str; })
-			(lib.filter (i: covers c.net i.net) (parsed cfg.floor.infraDenyCIDRs)))
-		(parsed cfg.floor.controlPlaneCIDRs);
-	cpWide = lib.filter (c: c.net.len < 16) (parsed cfg.floor.controlPlaneCIDRs);
+	# A [lo, hi] port range, refused at evaluation when it is not one (so
+	# the renderer never sees a reversed or out-of-range pair).
+	portRange = lib.types.addCheck (lib.types.listOf (lib.types.ints.between 1 65535))
+		(r: builtins.length r == 2 && builtins.all builtins.isInt r && builtins.head r <= lib.last r)
+		// { description = "[lo, hi] port range (1 <= lo <= hi <= 65535)"; };
 in
 {
 	imports = [
@@ -172,31 +160,13 @@ in
 				default = [ ];
 				example = [ "198.51.100.0/24" ];
 				description = ''
-					Optional (default [ ]). The destination set (@cp) of floor
-					rule 4's passt mosh-reply accept, and that is its only
-					effect: the source address(es) of cogworxd's mosh relay, as
-					the VM sees them. passt answers a datagram on its mosh `-u`
-					forward from a per-flow socket connected to the relay, and
-					for a mosh flow conntrack has forgotten that answer is an
-					original-direction flow, which rule 4 drops when the relay
-					sits inside infraDenyCIDRs. Listed here, those replies (the
-					passt uid, UDP from the mosh range) are accepted ahead of
-					rule 4's drops; every other flow rule 4 names is dropped
-					towards these addresses like towards any internal address.
-
-					[ ] leaves mosh replies to conntrack's reply direction, which
-					passes them on every flow the relay opened while conntrack
-					still tracks it. There is no ingress filter: the internal
-					network is trusted, and nothing on the VM's input side reads
-					this option.
-
-					Keep it to the control plane's own source addresses: whatever
-					part of infraDenyCIDRs it also covers is open to passt-uid UDP
-					from the mosh port range. Evaluation warns when an entry
-					covers a whole infraDenyCIDRs entry or is wider than /16. IPv4
-					only; each entry is an address or a CIDR, at most /8 wide,
-					overlapping neither 127/8, 169.254/16 nor 0/8 (floor_render.py
-					refuses the build otherwise).
+					Optional (default [ ]). Not a floor input: the floor has no
+					@cp and no ingress filter. It is the upgrade compat doc's
+					controlPlaneCIDRs, where cogworxd's control connections come
+					from as the VM sees them (docs/pve-system-upgrade.md upgrade
+					compat rule ii: cogworxd checks that every control-plane
+					egress address is covered by these CIDRs). Each entry is an
+					IPv4 address or a canonical IPv4 CIDR (asserted).
 				'';
 			};
 			infraDenyCIDRs = lib.mkOption {
@@ -204,19 +174,24 @@ in
 				default = [ ];
 				example = [ "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "100.64.0.0/10" ];
 				description = ''
-					The site's internal ranges. Rule 4 drops NEW flows to them
-					from the passt and L7-proxy uids (guest-originated traffic)
-					and from the nix build users (the nixbld group, under which
-					the daemon runs the builders of in-VM plugin derivations), in
-					the original direction only, so replies on flows the control
-					plane opened still pass. Root is outside rule 4, so root-run
-					plugin evaluation and its eval-time fetches are not covered
-					(README.md, residuals). The exact infraAllow sockets, and
-					passt's mosh replies to controlPlaneCIDRs, are accepted ahead
-					of the drops.
+					The site's internal ranges, closed to the nix build users
+					(decision 2026-10-22). Rule 4 drops NEW flows to them from
+					the build group (nixbld by default, under which the daemon
+					runs the builders of in-VM plugin derivations; only
+					fixed-output builds share the VM's network namespace), in
+					the original direction only, so replies still pass. The
+					exact infraAllow sockets are accepted ahead of the drop.
+					Nothing else is restricted by it: the guest (passt) and the
+					L7 proxy follow each sandbox's own network rules, as on GCE,
+					and root is outside rule 4, so root-run plugin evaluation and
+					its eval-time fetches are not covered (README.md,
+					residuals).
 
-					REQUIRED on a published (CA-baked) image, with no escape. Same
-					per-entry validation as controlPlaneCIDRs.
+					REQUIRED on a published (CA-baked) image, with no escape.
+					Each entry is an IPv4 address or CIDR, canonical (no host
+					bits), at most /8 wide, overlapping neither 127/8,
+					169.254/16 nor 0/8 (floor_render.py refuses the build
+					otherwise).
 				'';
 			};
 			infraAllow = lib.mkOption {
@@ -224,7 +199,7 @@ in
 					options = {
 						address = lib.mkOption {
 							type = lib.types.str;
-							description = "One IPv4 address (a bare address or a /32) inside infraDenyCIDRs that is nevertheless reachable on this port. Not a range: list each host separately.";
+							description = "One IPv4 address (a bare address or a /32) inside infraDenyCIDRs that the nix build users may nevertheless reach on this port. Not a range: list each host separately.";
 						};
 						protocol = lib.mkOption {
 							type = lib.types.enum [ "tcp" "udp" ];
@@ -240,17 +215,59 @@ in
 				default = [ ];
 				example = [ { address = "198.18.0.80"; protocol = "tcp"; port = 443; } ];
 				description = ''
-					Exact (address, protocol, port) exceptions to rule 4, rendered
-					as accepts ahead of its drops: for example an internal git
-					host the guest's git grants must reach through the L7 proxy.
-					One entry per socket, never a range of ports.
+					Exact (address, protocol, port) exceptions to rule 4's
+					internal-range drop for the nix build users, rendered as
+					accepts ahead of it: for example an internal git host a
+					plugin's fixed-output fetch must reach. One entry per
+					socket, never a range of ports. The guest and the L7 proxy
+					do not need one: each sandbox's own network rules decide
+					what they reach.
+				'';
+			};
+			buildDenyLoopbackTCP = lib.mkOption {
+				type = lib.types.listOf portRange;
+				default = [ ];
+				example = [ [ 8500 8500 ] ];
+				description = ''
+					Loopback TCP port ranges, each [lo, hi], closed to the nix
+					build users beside the L7 relays' ports rule 4 derives
+					itself: the build users may neither connect to them on
+					127.0.0.1 or ::1 nor answer from them. They are for a
+					bake's own agents that act for unauthenticated local
+					clients and can be made to send requests to an address the
+					client picks, for example a service-discovery agent's local
+					HTTP API with no ACLs (an HTTP health check it is asked to
+					register is a request it sends). The agent's uid is not
+					rule 4's, so without an entry here it carries a build user
+					around the internal-range drop. A bake that composes such
+					an agent MUST list its ports. Ranges may overlap each other
+					or the L7 window: floor-site.nix sorts and merges them.
+					TCP only: list a UDP agent in buildDenyLoopbackUDP.
+				'';
+			};
+			buildDenyLoopbackUDP = lib.mkOption {
+				type = lib.types.listOf portRange;
+				default = [ ];
+				example = [ [ 7301 7301 ] ];
+				description = ''
+					Loopback UDP port ranges, each [lo, hi], the nix build users
+					may not send to on 127.0.0.1 or ::1: the UDP counterpart of
+					buildDenyLoopbackTCP, for a bake's agents that take
+					unauthenticated datagrams on loopback and can be made to
+					probe or send to addresses a datagram names (a gossip
+					agent's UDP port, for example). The broadcast and multicast
+					drop rule 4 always renders keeps the same datagrams from
+					reaching a wildcard listener by way of a broadcast address
+					(the limited one or the VM segment's). A bake that
+					composes such an agent MUST list its UDP ports. Ranges may
+					overlap: floor-site.nix sorts and merges them.
 				'';
 			};
 			ruleset = lib.mkOption {
 				type = lib.types.package;
 				internal = true;
 				readOnly = true;
-				description = "The rendered nft ruleset (floor_render.py's output for the options above). Set by floor-site.nix; read by checks.nix.";
+				description = "The rendered nft ruleset (floor_render.py's output for cogworx.pve.interface, the options above, the nix build group and the L7 port window). Set by floor-site.nix; read by checks.nix.";
 			};
 		};
 	};
@@ -277,16 +294,25 @@ in
 		# the value it guards -- which is exactly the bake that ships open.
 		assertions = [
 			{
-				# THE EGRESS GATE (no escape). Without the site's internal
-				# ranges rule 4 renders no drop at all, and a guest -- or a
-				# nix build user running a plugin derivation's builder -- can
-				# open flows to every internal service the VM can route to.
+				# THE BUILD-USER EGRESS GATE (no escape). Without the site's
+				# internal ranges rule 4 renders no internal-range drop, and a
+				# nix build user running a plugin derivation's fixed-output
+				# fetch can open flows to every internal service the VM can
+				# route to. (The guest and the L7 proxy are not rule 4's: each
+				# sandbox's own network rules decide what they reach.)
 				assertion = !caBaked || cfg.floor.infraDenyCIDRs != [ ];
 				message = lib.concatStringsSep "\n\n" [
 					"cogworx.pve: this image bakes a control CA -- it is meant to be PUBLISHED -- but cogworx.pve.floor.infraDenyCIDRs is empty."
-					"Floor rule 4 would then drop nothing: guest traffic (the passt and L7-proxy uids) and the nix build users running in-VM plugin builds could open flows to every internal address this VM can route to."
-					"Set cogworx.pve.floor.infraDenyCIDRs to the site's internal ranges, and add exact cogworx.pve.floor.infraAllow entries for the internal services the sandbox genuinely needs."
+					"Floor rule 4 would then drop nothing towards internal ranges: the nix build users running in-VM plugin builds (fixed-output fetches) could open flows to every internal address this VM can route to. The guest and the L7 proxy are not affected either way; each sandbox's own network rules decide what they reach."
+					"Set cogworx.pve.floor.infraDenyCIDRs to the site's internal ranges, and add exact cogworx.pve.floor.infraAllow entries for the internal services the nix build users genuinely need."
 				];
+			}
+			{
+				# Every image, CA-baked or not, as floor_render.py refused a
+				# malformed entry on every image while the floor rendered the
+				# list.
+				assertion = cpBad == [ ];
+				message = "cogworx.pve: cogworx.pve.floor.controlPlaneCIDRs ${if builtins.length cpBad == 1 then "entry" else "entries"} ${lib.concatMapStringsSep ", " (e: "\"${e}\"") cpBad} ${if builtins.length cpBad == 1 then "is" else "are"} not an IPv4 address or a canonical IPv4 CIDR (no host bits). The list is not a floor input; the upgrade compat doc carries it for upgrade compat rule ii, where cogworxd checks that every control-plane egress address is covered by these CIDRs.";
 			}
 			{
 				# On GCE the link-local default resolver is real (the VPC
@@ -331,12 +357,6 @@ in
 		];
 
 		warnings = lib.optional (linkLocal gce.vpcResolver)
-			"cogworx.pve: cogworx.gce.vpcResolver (${gce.vpcResolver}) is link-local, and on Proxmox nothing serves DNS there; this image will resolve no names. Set it to the site's recursive resolver."
-			++ map (w:
-				"cogworx.pve: floor rule 4 only partly applies to infraDenyCIDRs entry ${w.infra}: controlPlaneCIDRs entry ${w.cp} covers all of it, and rule 4 accepts passt-uid UDP from the mosh port range to @cp ahead of its drops (passt's mosh replies to the cogworxd relay). A guest datagram whose source port passt preserved in that range may then reach every address in ${w.infra}. Unless that is intended, narrow controlPlaneCIDRs to the source address(es) cogworxd's control connections actually arrive from.")
-				cpCoversInfra
-			++ map (c:
-				"cogworx.pve: controlPlaneCIDRs entry ${c.str} is wider than /16. Floor rule 4 accepts passt-uid UDP from the mosh port range to all of it, including any part that lies inside infraDenyCIDRs.")
-				cpWide;
+			"cogworx.pve: cogworx.gce.vpcResolver (${gce.vpcResolver}) is link-local, and on Proxmox nothing serves DNS there; this image will resolve no names. Set it to the site's recursive resolver.";
 	};
 }
