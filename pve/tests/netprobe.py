@@ -2,9 +2,9 @@
 """Socket probes for tests/test_floor_site.sh. Stdlib only.
 
 bash's /dev/tcp (what gce/floor.nix's verifier uses) cannot choose a source
-address or port, and the site floor's rule 4 and rule 5 cases are ABOUT the
-source: a reply to a control-plane address, an inbound flow from a neighbour,
-a reply whose local port happens to sit in a guarded range. Hence this helper.
+address or port, and the site floor's rule 4 and open-ingress cases are ABOUT
+the source: a reply to a control-plane address, a mosh reply from a mosh-range
+port, an inbound flow from a neighbour. Hence this helper.
 
     netprobe.py listen tcp ADDR PORT READYFILE
         accept and close connections until killed; touches READYFILE once bound

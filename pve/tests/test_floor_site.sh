@@ -1,28 +1,33 @@
 #!/usr/bin/env bash
 # Behavioural test for the PVE site floor (pve/floor-site.nix, rendered by
-# pve/floor_render.py): nft table inet cogworx_pve_floor, rules 4a, 4 and 5.
+# pve/floor_render.py): nft table inet cogworx_pve_floor, rules 4a and 4. The
+# floor filters no ingress (decision 2026-10-21; floor_render.py's "No ingress
+# filter"), and section 3 shows that too.
 #
 #   1. the validator refuses what it must (IPv4-only, canonical, at most /8,
 #      no overlap with 127/8, 169.254/16 or 0/8, exact infraAllow entries,
-#      plain names) and accepts the boundaries;
+#      plain names, the removed ingress keys) and accepts the boundaries;
 #   2. the rendered ruleset, pinned byte for byte, plus the properties that
 #      matter stated one by one (every uid/gid deny is `ct direction
 #      original`; the mosh-reply and infraAllow accepts come first; the only
-#      @cp accept is passt's mosh replies; rule 4a's input drop opens the
-#      input chain);
+#      @cp accept is passt's mosh replies; the input chain is rule 4a's input
+#      drop alone);
 #   3. LIVE, in a throwaway user+network namespace with real listeners: rule
 #      4a (root reaches link-local, a non-root uid does not; a link-local source
 #      never leaves eth0; a neighbour's datagram for the metadata address,
-#      arriving over a veth from a second namespace, is dropped on input even
-#      from a @cp source), rule 4 ("a passt-uid NEW flow to @infra4 drops", "a
-#      passt NEW tcp flow to @cp drops when @cp sits inside @infra4", "a passt
-#      mosh reply -- udp from the mosh range -- to @cp passes", "a passt-uid
-#      REPLY to a @cp address passes", the same reply to a non-@cp internal
-#      address passes because of the direction scoping, infraAllow is
-#      reachable, the build group is dropped, @cp included), rule 5 (control
-#      ingress only from @cp, replies on the VM's own flows never dropped),
-#      each with a negative control that removes the property and shows the
-#      probe catching it;
+#      arriving over a veth from a second namespace, is dropped on input
+#      whatever its source, @cp included), rule 4 ("a passt-uid NEW flow to
+#      @infra4 drops", "a passt NEW tcp flow to @cp drops when @cp sits inside
+#      @infra4", "a passt mosh reply -- udp from the mosh range -- to @cp
+#      passes", "a passt-uid REPLY to a @cp address passes", the same reply to
+#      a non-@cp internal address passes because of the direction scoping, and
+#      so does passt's mosh reply on a flow a non-@cp relay opened -- what an
+#      empty @cp relies on --, infraAllow is reachable, the build group is
+#      dropped, @cp included), and open ingress (over the same veth, a
+#      neighbour outside @infra4, one inside @infra4 but outside @cp, and one
+#      inside both all reach sshd, a guest SSH forward, a guest HTTP forward
+#      and the mosh range), each with a negative control that removes the
+#      property and shows the probe catching it;
 #   4. with the realized gce floor scripts given, the gce floor and this one
 #      loaded TOGETHER: gce/floor.nix's own verifier passes the probes that run
 #      as the control uid (4 and 5); probes 1, 3, 6, 7 and 8, which name the
@@ -38,9 +43,10 @@
 #                     section 4.
 # Needs python3 and grep for sections 1-2. Sections 3-4 additionally need
 # unshare, ip and nft and a kernel with nftables + conntrack + dummy links, and
-# SKIP loudly when the namespace cannot host them; the rule 4a input probe also
-# needs veth links and nsenter, and skips loudly on its own without them
-# (checks.nix asserts the rule's place on the realized ruleset regardless).
+# SKIP loudly when the namespace cannot host them; the rule 4a input probe and
+# the open-ingress cases also need veth links and nsenter, and skip loudly on
+# their own without them (checks.nix asserts on the realized ruleset that the
+# input chain is rule 4a's input drop alone regardless).
 # Nothing touches the host's own ruleset, addresses or routes.
 #
 # SKUID IN A USER NAMESPACE. nft resolves `meta skuid` against the network
@@ -152,6 +158,9 @@ if [ "${1:-}" = --live-child ]; then
 	listen tcp "$ALLOW" 443
 	listen tcp "$ALLOW" 8443
 	listen tcp "$SELF" 9000
+	# passt's mosh forward: an echo on a mosh-range port, for the replies on
+	# relay-opened flows in rule 4.
+	listen udp-echo "$SELF" 60001
 
 	# --- rule 4a -------------------------------------------------------------
 	expect open "rule 4a: root reaches the metadata address" conn "$MD" 80
@@ -172,9 +181,9 @@ if [ "${1:-}" = --live-child ]; then
 	# namespace behind a veth pair. The metadata address is scope host on lo,
 	# yet Linux's weak host model delivers a datagram for it that arrives on
 	# the NIC -- the negative control shows exactly that -- so the input drop
-	# is what refuses it. The @cp-sourced copy shows the drop sits ahead of
-	# rule 5's @cp accept. UDP to a logging listener, because a TCP probe could
-	# not tell the input drop from rule 4a's egress drop of the SYN-ACK.
+	# is what refuses it. The @cp-sourced copy shows no source is exempt. UDP
+	# to a logging listener, because a TCP probe could not tell the input drop
+	# from rule 4a's egress drop of the SYN-ACK.
 	nb_skip=""
 	unshare -n sleep 600 2>/dev/null &
 	nb=$!
@@ -240,9 +249,17 @@ if [ "${1:-}" = --live-child ]; then
 	# TCP any more, so the @cp case passes on the direction scoping alone.
 	expect open "rule 4: a passt-uid REPLY to a @cp address passes" conn --src "$CP" "$SELF" 9000
 	expect open "rule 4: a passt-uid REPLY to a non-@cp internal address passes (original-direction scoping)" conn --src "$INFRA" "$SELF" 9000
+	# The same for passt's mosh forward: the relay sends first, so passt's
+	# answer from the forward's port is a REPLY and passes rule 4 whatever the
+	# relay's address. That is all an empty @cp leaves mosh. (The @cp copy is
+	# also admitted by the mosh accept; the non-@cp one is direction alone.)
+	expect reply "rule 4: a passt mosh REPLY on a relay-opened flow passes from a non-@cp internal address (direction scoping; what an empty @cp relies on)" udp --src "$INFRA" --expect-reply "$SELF" 60001
+	expect reply "rule 4: a passt mosh REPLY on a relay-opened flow passes from a @cp address" udp --src "$CP" --expect-reply "$SELF" 60001
 	load "$PASST0; /rule4-uid/s/ ct direction original//" >/dev/null
 	expect blocked "rule 4 NEGATIVE CONTROL: without the direction scoping the same reply is dropped" conn --src "$INFRA" "$SELF" 9000
 	expect blocked "rule 4 NEGATIVE CONTROL: without the direction scoping the reply to @cp is dropped too" conn --src "$CP" "$SELF" 9000
+	# The echo's dropped send (EPERM) ends that listener: its last use.
+	expect noreply "rule 4 NEGATIVE CONTROL: without the direction scoping the passt mosh reply to a non-@cp internal address is dropped" udp --src "$INFRA" --expect-reply "$SELF" 60001
 	# The mosh accept's own negative control: passt at uid 0 in the drop, the
 	# accept left on the parked uid. The datagram it admitted above now drops,
 	# so it was that accept, scoped to the passt uid, that admitted it.
@@ -253,39 +270,66 @@ if [ "${1:-}" = --live-child ]; then
 	expect blocked "rule 4: a build-group NEW flow to @cp drops when @cp sits inside @infra4" conn "$CP" 443
 	expect eperm "rule 4: a build-group datagram from the mosh range to @cp drops (the accept names the passt uid only)" udp --src "$SELF" --sport 60013 "$CP" 9
 
-	# --- rule 5 --------------------------------------------------------------
-	# Every packet in this namespace arrives on lo, which rule 5 exempts first.
-	# So the loopback exemption is shown once, and then deleted (a test-only
-	# mutation) to put the rest of rule 5 in the path.
-	listen tcp "$SELF" 22
-	listen tcp "$SELF" 2223
-	listen tcp "$SELF" 8081
-	listen tcp "$OUTSIDE" 7000
-	listen udp-echo "$OUTSIDE" 7001
-	listen udp-log "$SELF" 60001 "$RUN/udp.log"
-	load >/dev/null
-	expect open "rule 5: loopback is exempt (why the cases below delete that line)" conn --src "$OUTSIDE" "$SELF" 22
-	load '/cogworx-pve-floor-rule5-lo/d' >/dev/null
-	expect open "rule 5: @cp reaches sshd" conn --src "$CP" "$SELF" 22
-	expect open "rule 5: @cp reaches a guest SSH forward" conn --src "$CP" "$SELF" 2223
-	expect blocked "rule 5: a neighbour does not reach sshd" conn --src "$OUTSIDE" "$SELF" 22
-	expect blocked "rule 5: a neighbour does not reach a guest SSH forward" conn --src "$OUTSIDE" "$SELF" 2223
-	expect blocked "rule 5: a neighbour does not reach a guest HTTP forward" conn --src "$OUTSIDE" "$SELF" 8081
-	expect open "rule 5: a port outside the guarded set stays reachable (negative control)" conn --src "$OUTSIDE" "$SELF" 9000
-	: > "$RUN/udp.log"
-	udp --src "$OUTSIDE" "$SELF" 60001 >/dev/null
-	udp --src "$CP" "$SELF" 60001 >/dev/null
-	sleep 0.3
-	if grep -qx "$CP" "$RUN/udp.log"; then ok "live: rule 5: @cp reaches the mosh UDP range"; else bad "live: rule 5: @cp's datagram to the mosh range never arrived"; fi
-	if grep -qx "$OUTSIDE" "$RUN/udp.log"; then bad "live: rule 5: a neighbour's datagram reached the mosh range"; else ok "live: rule 5: a neighbour does not reach the mosh UDP range"; fi
-	# Replies on the VM's OWN flows whose local port happens to be guarded: the
-	# kernel's ephemeral range overlaps the mosh range, so this is not
-	# hypothetical for UDP.
-	expect open "rule 5: the reply to a VM-opened TCP flow from a guarded local port passes" conn --src "$SELF" --sport 2224 "$OUTSIDE" 7000
-	expect reply "rule 5: the reply to a VM-opened UDP flow from a mosh-range local port passes" udp --src "$SELF" --sport 60005 --expect-reply "$OUTSIDE" 7001
-	load '/cogworx-pve-floor-rule5-lo/d; /rule5-tcp/s/ct direction original //; /rule5-udp/s/ct direction original //' >/dev/null
-	expect blocked "rule 5 NEGATIVE CONTROL: without the direction scoping that TCP reply is dropped" conn --src "$SELF" --sport 2225 "$OUTSIDE" 7000
-	expect noreply "rule 5 NEGATIVE CONTROL: without the direction scoping that UDP reply is dropped" udp --src "$SELF" --sport 60006 --expect-reply "$OUTSIDE" 7001
+	# --- ingress is open ------------------------------------------------------
+	# No ingress filter (decision 2026-10-21): sshd, the guest SSH and HTTP
+	# forwards and the mosh range are reachable from any neighbour, and rely on
+	# their own authentication. Shown over the rule 4a neighbour's real (non-lo)
+	# veth link -- every packet sent inside this namespace arrives on lo --
+	# from three sources: one outside @infra4, one inside @infra4 but outside
+	# @cp (every internal host when @cp is empty), and one inside both
+	# (the rule 4a neighbour's @cp source), under the base load and with passt
+	# as uid 0 (passt answers its own forwards). The middle one alone catches
+	# an ingress filter that admits @cp but drops the rest of @infra4. The
+	# negative control inserts a test-only input drop on the same ports, which
+	# the same probes must catch.
+	if [ -n "$nb_skip" ]; then
+		echo "SKIP - live: ingress is open ($nb_skip); the input chain is still pinned to rule 4a's drop alone by the golden file and by checks.nix"
+	elif ! { ip route add 198.18.9.20/32 dev ext0 && nsenter -t "$nb" -n -- bash -c 'ip addr add 198.18.9.20/32 dev ext1 && ip route add 192.0.2.0/24 via 198.51.100.1 dev ext1'; } 2>/dev/null; then
+		bad "live: ingress: cannot route the neighbour namespace to $SELF"
+	else
+		listen tcp "$SELF" 22
+		listen tcp "$SELF" 2223
+		listen tcp "$SELF" 8081
+		listen udp-log "$SELF" 60002 "$RUN/udp.log"
+		surface() { case "$1" in 22) echo "sshd" ;; 2223) echo "a guest SSH forward" ;; 8081) echo "a guest HTTP forward" ;; esac; }
+		srcs="198.51.100.2 198.18.9.20 198.18.7.9"
+		where() { case "$1" in 198.51.100.2) echo "outside @infra4" ;; 198.18.9.20) echo "inside @infra4, outside @cp" ;; 198.18.7.9) echo "inside @infra4 and @cp" ;; esac; }
+		nbconn() { nsenter -t "$nb" -n -- python3 "$PROBE" connect --src "$1" "$SELF" "$2"; }
+		nbudp() {
+			: > "$RUN/udp.log"
+			for src in $srcs; do
+				nsenter -t "$nb" -n -- python3 "$PROBE" udp --src "$src" "$SELF" 60002 >/dev/null
+			done
+			sleep 0.3
+		}
+		for ld in "" "$PASST0"; do
+			if [ -n "$ld" ]; then load "$ld" >/dev/null; tag="passt as uid 0"; else load >/dev/null; tag="base load"; fi
+			for src in $srcs; do
+				for p in 22 2223 8081; do
+					expect open "ingress is open ($tag): a neighbour at $src ($(where "$src")) reaches $(surface "$p") ($SELF:$p) over the NIC" nbconn "$src" "$p"
+				done
+			done
+			nbudp
+			missing=""
+			for src in $srcs; do grep -qx "$src" "$RUN/udp.log" || missing="$missing $src"; done
+			if [ -z "$missing" ]; then
+				ok "live: ingress is open ($tag): datagrams from all three neighbour sources reach the mosh range ($SELF:60002) over the NIC"
+			else
+				bad "live: ingress is open ($tag): the datagram to the mosh range from$missing never arrived (logged: $(tr '\n' ' ' < "$RUN/udp.log"))"
+			fi
+		done
+		load 's/\(counter drop comment "cogworx-pve-floor-rule4a-input"\)/\1\n\t\ttcp dport { 22, 2223, 8081 } counter drop comment "test-only"\n\t\tudp dport 60002 counter drop comment "test-only"/' >/dev/null
+		for p in 22 2223 8081; do
+			expect blocked "ingress NEGATIVE CONTROL: a test-only input drop on $(surface "$p") is caught by the same probe" nbconn 198.18.9.20 "$p"
+		done
+		nbudp
+		if [ -s "$RUN/udp.log" ]; then
+			bad "live: ingress NEGATIVE CONTROL: a test-only input drop on the mosh port did not stop the datagrams ($(tr '\n' ' ' < "$RUN/udp.log")); the probe above proves nothing"
+		else
+			ok "live: ingress NEGATIVE CONTROL: a test-only input drop on the mosh port is caught by the same probe"
+		fi
+		load >/dev/null
+	fi
 
 	# --- section 4: beside gce/floor.nix's own table --------------------------
 	if [ -n "$GCE_VERIFY" ] && [ -s "$RUN/gce/cogworx-floor.nft" ]; then
@@ -366,8 +410,6 @@ cat > "$ROOT/base.json" <<'EOF'
 	"passtUser": "cogbox-passt",
 	"proxyUser": "cogbox-proxy",
 	"buildGroup": "nixbld",
-	"ingressTCP": [[22, 22], [2222, 2237], [8080, 8095]],
-	"ingressUDP": [[60000, 60031]],
 	"moshUDP": [[60000, 60031]]
 }
 EOF
@@ -429,8 +471,10 @@ refuses allow-extra-key    'd["infraAllow"][0]["comment"] = "x"'                
 refuses passt-quote        'd["passtUser"] = "cogbox\"passt"'                    'passtUser'
 refuses iface-injection    'd["iface"] = "eth0\" accept"'                        'iface'
 refuses open-ingress-knob  'd["allowOpenIngress"] = True'                        'unknown key'
-refuses ports-reversed     'd["ingressTCP"] = [[2237, 2222]]'                    'lo > hi'
-refuses mosh-reversed      'd["moshUDP"] = [[60031, 60000]]'                     'moshUDP[0]'
+# A spec that still carries rule 5's ports (a stale composer) fails the build.
+refuses stale-ingressTCP   'd["ingressTCP"] = [[22, 22]]'                        'unknown key'
+refuses stale-ingressUDP   'd["ingressUDP"] = [[60000, 60031]]'                  'unknown key'
+refuses mosh-reversed      'd["moshUDP"] = [[60031, 60000]]'                     'moshUDP[0]: [60031, 60000] has lo > hi'
 refuses mosh-not-list      'd["moshUDP"] = 60000'                                'moshUDP'
 refuses mosh-missing       'del d["moshUDP"]'                                    'missing key(s) moshUDP'
 refuses spec-version       'd["version"] = 2'                                    'version'
@@ -476,10 +520,6 @@ table inet cogworx_pve_floor {
 	chain input {
 		type filter hook input priority 0; policy accept;
 		iifname != "lo" ip daddr 169.254.0.0/16 counter drop comment "cogworx-pve-floor-rule4a-input"
-		iifname "lo" accept comment "cogworx-pve-floor-rule5-lo"
-		ip saddr @cp counter accept comment "cogworx-pve-floor-rule5-cp"
-		ct direction original tcp dport { 22, 2222-2237, 8080-8095 } counter drop comment "cogworx-pve-floor-rule5-tcp"
-		ct direction original udp dport 60000-60031 counter drop comment "cogworx-pve-floor-rule5-udp"
 	}
 }
 EOF
@@ -490,7 +530,7 @@ else
 fi
 if [ "$REALIZED" != - ]; then
 	if diff -u "$ROOT/golden.nft" "$REALIZED" >"$ROOT/realized.diff"; then
-		ok "the ruleset floor-site.nix realized for the fixture system is the golden one (ingress ports read from the right options)"
+		ok "the ruleset floor-site.nix realized for the fixture system is the golden one (mosh range read from the right options)"
 	else
 		bad "the realized ruleset differs from the golden file: $(cat "$ROOT/realized.diff")"
 	fi
@@ -532,24 +572,14 @@ if grep -q 'rule4-cp-mosh' "$ROOT/no-mosh.nft" || sed -n '/chain output {/,/^\t}
 else
 	ok "with no mosh range there is no @cp accept at all"
 fi
-i=$(line_of 'rule4a-input"'); l=$(line_of 'rule5-lo"'); c=$(line_of 'rule5-cp"'); t=$(line_of 'rule5-tcp"'); u=$(line_of 'rule5-udp"')
-h=$(grep -n 'type filter hook input' "$nft" | cut -d: -f1)
-if [ -n "$i" ] && [ -n "$h" ] && [ "$i" = $((h + 1)) ] && [ "$i" -lt "$l" ]; then
-	ok "rule 4a's input drop is the first rule of the input chain, ahead of rule 5's @cp accept"
+# The input chain is exactly one rule, rule 4a's input drop: the floor filters
+# no ingress (floor_render.py's "No ingress filter").
+in_rules=$(sed -n '/chain input {/,/^\t}/{/chain input {/d;/type filter hook input/d;/^\t}/d;p}' "$nft")
+if [ "$(printf '%s\n' "$in_rules" | grep -c .)" = 1 ] && printf '%s\n' "$in_rules" | grep -qF 'iifname != "lo" ip daddr 169.254.0.0/16 counter drop comment "cogworx-pve-floor-rule4a-input"'; then
+	ok "the input chain is exactly one rule, rule4a-input (no ingress filter)"
 else
-	bad "rule 4a's input drop is not the first input rule (hook $h, 4a-input $i, lo $l, cp $c)"
+	bad "the input chain is not exactly rule 4a's input drop: $in_rules"
 fi
-if [ -n "$l" ] && [ "$l" -lt "$c" ] && [ "$c" -lt "$t" ] && [ "$c" -lt "$u" ]; then
-	ok "rule 5 exempts loopback, then admits @cp, then drops"
-else
-	bad "rule 5 order is wrong (lo $l, cp $c, tcp $t, udp $u)"
-fi
-for r in rule5-tcp rule5-udp; do
-	case "$(grep -F "$r\"" "$nft")" in
-		*'ct direction original'*) ok "$r is original-direction scoped" ;;
-		*) bad "$r is not original-direction scoped; replies to the VM's own flows from a guarded local port would be dropped" ;;
-	esac
-done
 mkspec empty 'd["controlPlaneCIDRs"] = []; d["infraDenyCIDRs"] = []; d["infraAllow"] = []'
 render empty
 if grep -q 'elements' "$ROOT/empty.nft"; then bad "an empty list rendered an elements line (nft refuses 'elements = { }')"; else ok "empty lists render sets without an elements line"; fi
