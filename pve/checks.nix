@@ -35,6 +35,11 @@ let
 	# key and fingerprints it, so a placeholder blob would fail the build.
 	fixtureCAKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJMmGv60w43igyko8BEEnvP2PPu01MPlwi9Zamq2j/LC control-ca";
 	fixtureCAFingerprint = "SHA256:4fR1sXmorUlWspPK0W8CKAc2aQmmRM9X/JSYyLPQ9GY";
+	# One loopback port a bake's own agent listens on, closed to the build
+	# users beside the L7 relays' ports (buildDenyLoopbackTCP).
+	fixtureExtraHop = 8500;
+	# And one loopback UDP port of the same kind (buildDenyLoopbackUDP).
+	fixtureExtraUDPHop = 7301;
 	fixtureSite = {
 		cogworx.gce.controlCAPublicKey = fixtureCAKey;
 		cogworx.gce.vpcResolver = "192.0.2.1";
@@ -44,6 +49,8 @@ let
 			controlPlaneCIDRs = [ "198.18.7.0/24" ];
 			infraDenyCIDRs = [ "198.18.0.0/15" "203.0.113.0/24" ];
 			infraAllow = [ { address = "203.0.113.80"; protocol = "tcp"; port = 443; } ];
+			buildDenyLoopbackTCP = [ [ fixtureExtraHop fixtureExtraHop ] ];
+			buildDenyLoopbackUDP = [ [ fixtureExtraUDPHop fixtureExtraUDPHop ] ];
 		};
 	};
 	sys = evalPve [ fixtureSite ];
@@ -131,6 +138,32 @@ let
 			(lib.filter (l: builtins.match "[[:space:]]*#.*" l == null && builtins.match ".*(mkfs|mke2fs).*" l != null)
 				(lib.splitString "\n" (builtins.readFile f))))
 		(lib.filter (f: lib.hasSuffix ".nix" f || lib.hasSuffix ".sh" f) (map toString (lib.filesystem.listFilesRecursive gceSrc)));
+	# --- cogbox's L7 port facts, read from the launcher's own sources ---------
+	#
+	# Where the L7 relays listen is the launcher's decision, not an option's:
+	# cogbox-launch.sh seeds every instance at its built-in base (INIT_L7, the
+	# `.l7PortBase // N` fallback for an older config.json, and
+	# next_available_ports' seed one triple below it), which
+	# zig/src/filter.zig mirrors as l7_default_base, and puts the auth proxy
+	# a fixed offset below the base (L7_AUTH_PORT, both assignments,
+	# next_free_l7_base's probe of the auth slot, and filter.zig's
+	# l7_auth_port_offset). Rule 4's expected hop ports are
+	# spelled from these, never read back from floor-site.nix or from
+	# cogworx.gce.l7PortBase, so a floor whose literals drift from the
+	# launcher fails floor-site. Matched line by line, as gceFormatLines reads
+	# gce/.
+	srcInts = file: re: lib.concatMap (l: let m = builtins.match re l; in lib.optional (m != null) (lib.toInt (lib.last m)))
+		(lib.splitString "\n" (builtins.readFile "${flake}/${file}"));
+	l7BaseFacts = srcInts "cogbox-launch.sh" "[[:space:]]*INIT_L7=([0-9]+)"
+		++ srcInts "cogbox-launch.sh" "L7_BASE=[$][(]jq -r '[.]l7PortBase // ([0-9]+)' .*"
+		++ map (seed: seed + 3) (srcInts "cogbox-launch.sh" "[[:space:]]*local max_l7=([0-9]+)")
+		++ srcInts "zig/src/filter.zig" "pub const l7_default_base: u16 = ([0-9]+);";
+	l7AuthFacts = srcInts "cogbox-launch.sh" "(.*[;[:space:]])?L7_AUTH_PORT=[$][(][(] ?L7_BASE - ([0-9]+) ?[)][)].*"
+		++ srcInts "cogbox-launch.sh" ".*port_taken 127[.]0[.]0[.]1 [$][(][(]b - ([0-9]+)[)][)].*"
+		++ srcInts "zig/src/filter.zig" "pub const l7_auth_port_offset: u16 = ([0-9]+);";
+	launcherL7Base = builtins.head l7BaseFacts;
+	launcherAuthOffset = builtins.head l7AuthFacts;
+
 	# The negative control for mkfs-nodiscard.nix's assertion: a format unit
 	# reduced to an environment-only stub.
 	formatStub = failedAssertions (evalPve [ fixtureSite { systemd.services.cogworx-state-disk.serviceConfig.ExecStart = lib.mkForce ""; } ]);
@@ -202,6 +235,15 @@ let
 			environment.etc."ssh/cogworx-control-ca.pub".text = fixtureCAKey;
 			cogworx.pve.floor.infraDenyCIDRs = lib.mkForce [ ];
 		} ]) // { want = "cogworx.pve.floor.infraDenyCIDRs is empty"; })
+		# controlPlaneCIDRs' shape, asserted on every image (the floor no
+		# longer renders it, so no build-time refusal backs it).
+		((gate "a controlPlaneCIDRs entry with host bits" [ { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce [ "198.18.7.1/24" ]; } ]) // { want = "controlPlaneCIDRs entr"; })
+		((gate "a controlPlaneCIDRs entry that is a hostname" [ { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce [ "git.example.com" ]; } ]) // { want = "controlPlaneCIDRs entr"; })
+		# cogworx.gce.l7PortBase only mirrors the launcher's base, and the
+		# L7 window must end inside the port range (floor-site.nix), on
+		# every image.
+		((gate "cogworx.gce.l7PortBase moved off the launcher's base" [ { cogworx.gce.l7PortBase = launcherL7Base + 3; } ]) // { want = "cogworx.gce.l7PortBase is ${toString (launcherL7Base + 3)}, not ${toString launcherL7Base}"; })
+		((gate "an L7 window that ends past port 65535" [ { cogworx.gce.l7PortTriples = 20000; } ]) // { want = "cogworx.gce.l7PortTriples is 20000"; })
 		((gate "a link-local resolver, even affirmed for GCE" [ { cogworx.gce.vpcResolver = lib.mkForce "169.254.169.254"; cogworx.gce.allowMetadataResolver = true; } ]) // { want = "cogworx.gce.allowMetadataResolver does not apply on PVE"; })
 		((gate "a fleet AuthorizedKeysCommand" [ { services.openssh.authorizedKeysCommand = "/run/current-system/sw/bin/true"; } ]) // { want = "services.openssh.authorizedKeysCommand"; })
 		((gate "a metadata client with User=" [ { systemd.services.cogworx-attr-scrub.serviceConfig.User = "nobody"; } ]) // { want = "cogworx-attr-scrub talks to the metadata emulator but sets User=nobody"; })
@@ -227,6 +269,8 @@ let
 		((plainGate "cloud-init a profile forces on" [ { services.cloud-init.enable = lib.mkOverride 10 true; } ]) // { want = "services.cloud-init.enable is true"; })
 		((plainGate "systemd-networkd from a profile" [ { systemd.network.enable = true; } ]) // { want = "systemd.network.enable is true"; })
 		((plainGate "a static hostname" [ { networking.hostName = lib.mkForce "x"; } ]) // { want = "networking.hostName is set"; })
+		((plainGate "a controlPlaneCIDRs entry with host bits" [ { cogworx.pve.floor.controlPlaneCIDRs = [ "198.18.7.1/24" ]; } ]) // { want = "controlPlaneCIDRs entr"; })
+		((plainGate "cogworx.gce.l7PortBase moved off the launcher's base" [ { cogworx.gce.l7PortBase = launcherL7Base + 3; } ]) // { want = "cogworx.gce.l7PortBase is ${toString (launcherL7Base + 3)}, not ${toString launcherL7Base}"; })
 	];
 	# Console autologin is the one gate with an escape, an explicit operator
 	# opt-in: with it, the fixture plus autologin evaluates cleanly and says
@@ -242,12 +286,14 @@ let
 	# Any distro name in the tool's grammar works: grub.nix substitutes it
 	# into install-grub.pl's titles and the compat doc records the same one.
 	otherDistro = evalPve [ fixtureSite { system.nixos.distroName = lib.mkForce "AcmeOS"; } ];
-	# A supported configuration (no ingress filter, decision 2026-10-21): a CA-baked
-	# image with an EMPTY controlPlaneCIDRs evaluates, fails no assertion and
-	# warns about nothing (a bake pins warnings == [ ]). Rule 4's mosh accept
-	# is then left without a target, and passt's mosh replies rely on
-	# conntrack's reply direction.
+	# A supported configuration: a CA-baked image with an EMPTY controlPlaneCIDRs
+	# evaluates, fails no assertion and warns about nothing (a bake pins
+	# warnings == [ ]). The floor does not read the list; the compat doc then
+	# carries [ ].
 	cpEmpty = evalPve [ fixtureSite { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce [ ]; } ];
+	# Bare addresses and /32s are well-formed entries: no assertion, no
+	# warning.
+	cpHosts = evalPve [ fixtureSite { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce [ "198.18.7.5" "198.18.7.6/32" ]; } ];
 	gateFailures =
 		lib.optional (failedAssertions sys != [ ]) "the fixture (publishable) system itself fails assertions: ${lib.concatStringsSep " | " (failedAssertions sys)}"
 		++ lib.optional (!(evaluates sys)) "the fixture (publishable) system's toplevel does not evaluate"
@@ -259,12 +305,26 @@ let
 			"nixosConfigurations.cogbox-x86_64-pve bakes a control CA; the exported default must stay fail-closed"
 		++ lib.optional (evaluates (evalPve [ fixtureSite { cogworx.pve.floor.infraDenyCIDRs = lib.mkForce [ ]; } ]))
 			"a CA-baked image with no infraDenyCIDRs still EVALUATES its toplevel"
+		# buildDenyLoopbackTCP's type: a [lo, hi] pair, lo <= hi.
+		++ lib.optional (evaluates (evalPve [ fixtureSite { cogworx.pve.floor.buildDenyLoopbackTCP = lib.mkForce [ [ 8600 8500 ] ]; } ]))
+			"a reversed buildDenyLoopbackTCP range still EVALUATES its toplevel"
+		++ lib.optional (evaluates (evalPve [ fixtureSite { cogworx.pve.floor.buildDenyLoopbackTCP = lib.mkForce [ [ 8500 ] ]; } ]))
+			"a buildDenyLoopbackTCP entry that is not a [lo, hi] pair still EVALUATES its toplevel"
+		# And buildDenyLoopbackUDP's, the same type.
+		++ lib.optional (evaluates (evalPve [ fixtureSite { cogworx.pve.floor.buildDenyLoopbackUDP = lib.mkForce [ [ 7310 7301 ] ]; } ]))
+			"a reversed buildDenyLoopbackUDP range still EVALUATES its toplevel"
+		++ lib.optional (evaluates (evalPve [ fixtureSite { cogworx.pve.floor.buildDenyLoopbackUDP = lib.mkForce [ [ 7301 ] ]; } ]))
+			"a buildDenyLoopbackUDP entry that is not a [lo, hi] pair still EVALUATES its toplevel"
 		++ lib.optional (failedAssertions cpEmpty != [ ])
 			"the supported configuration (a CA-baked image with controlPlaneCIDRs = [ ]) fails assertions: ${lib.concatStringsSep " | " (failedAssertions cpEmpty)}"
 		++ lib.optional (!(evaluates cpEmpty))
 			"the supported configuration (a CA-baked image with controlPlaneCIDRs = [ ]) does not evaluate its toplevel"
 		++ lib.optional (cpEmpty.config.warnings != [ ])
 			"the supported configuration (a CA-baked image with controlPlaneCIDRs = [ ]) warns: ${lib.concatStringsSep " | " cpEmpty.config.warnings}"
+		++ lib.optional (failedAssertions cpHosts != [ ])
+			"controlPlaneCIDRs of a bare address and a /32 fails assertions: ${lib.concatStringsSep " | " (failedAssertions cpHosts)}"
+		++ lib.optional (cpHosts.config.warnings != cfg.warnings)
+			"controlPlaneCIDRs of a bare address and a /32 changes the warnings (got: ${lib.concatStringsSep " | " cpHosts.config.warnings})"
 		++ lib.optional (failedAssertions autologinOptIn != [ ])
 			"console autologin WITH cogworx.pve.allowConsoleAutologin = true still fails assertions: ${lib.concatStringsSep " | " (failedAssertions autologinOptIn)}"
 		++ lib.optional (autologinOptIn.config.warnings != cfg.warnings)
@@ -281,44 +341,42 @@ let
 			lib.optional (!(lib.any (m: lib.hasInfix c.want m) c.messages))
 				"gate '${c.name}' did not trip (wanted '${c.want}'; got: ${lib.concatStringsSep " | " c.messages})") gateCases;
 
-	# The @cp / rule 4 coupling (pve-host.nix): a controlPlaneCIDRs entry that
-	# covers an infraDenyCIDRs entry opens it to passt-uid UDP from the mosh
-	# port range (rule 4's mosh-reply accept), so evaluation must say so --
-	# and stay quiet for the normal shape (a narrow @cp inside the internal
-	# ranges, as in the fixture). Each case replaces the fixture's @cp and
-	# lists the substrings of EXACTLY the floor warnings it must produce.
-	floorWarnings = s: lib.filter (lib.hasInfix "controlPlaneCIDRs entry") s.config.warnings;
-	warnCase = name: cp: want: { inherit name want; got = floorWarnings (evalPve [ fixtureSite { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce cp; } ]); };
+	# The floor warns about nothing any more. The @cp / rule 4 coupling these
+	# cases once warned about (a controlPlaneCIDRs entry covering an
+	# infraDenyCIDRs entry opened it to passt's mosh-range UDP) went with
+	# rule 4's passt leg: the guest and the L7 proxy follow each sandbox's
+	# own network rules (decision 2026-10-22), and controlPlaneCIDRs only
+	# feeds the upgrade compat doc. So no shape of it, the old warning cases
+	# included, adds a warning to the fixture's, and evaluating them never
+	# throws (malformed entries are the shape assertion's, in publish-gates).
+	floorWarnings = s: lib.subtractLists cfg.warnings s.config.warnings;
+	warnCase = name: cp: { inherit name; got = floorWarnings (evalPve [ fixtureSite { cogworx.pve.floor.controlPlaneCIDRs = lib.mkForce cp; } ]); };
 	warnCases = [
-		(warnCase "the fixture's narrow @cp inside @infra4" [ "198.18.7.0/24" ] [ ])
-		(warnCase "a /16 inside, but not covering, an infraDenyCIDRs /15" [ "198.18.0.0/16" ] [ ])
-		(warnCase "@cp equal to an infraDenyCIDRs entry" [ "203.0.113.0/24" ]
-			[ "rule 4 only partly applies to infraDenyCIDRs entry 203.0.113.0/24: controlPlaneCIDRs entry 203.0.113.0/24 covers" ])
-		(warnCase "@cp containing an infraDenyCIDRs entry" [ "203.0.0.0/16" ]
-			[ "rule 4 only partly applies to infraDenyCIDRs entry 203.0.113.0/24: controlPlaneCIDRs entry 203.0.0.0/16 covers" ])
-		(warnCase "a /8 @cp covering one entry" [ "198.0.0.0/8" ] [
-			"rule 4 only partly applies to infraDenyCIDRs entry 198.18.0.0/15: controlPlaneCIDRs entry 198.0.0.0/8 covers"
-			"controlPlaneCIDRs entry 198.0.0.0/8 is wider than /16"
-		])
-		(warnCase "a wide @cp clear of every infraDenyCIDRs entry" [ "100.64.0.0/10" ] [ "controlPlaneCIDRs entry 100.64.0.0/10 is wider than /16" ])
-		# Malformed entries are the renderer's to refuse at build time; the
-		# warning must neither throw first nor warn about them.
-		(warnCase "malformed entries" [ "git.example.com" "198.018.7.0/24" "300.1.1.0/24" "198.18.7.0/33" "2001:db8::/32" ] [ ])
+		(warnCase "the fixture's narrow controlPlaneCIDRs inside infraDenyCIDRs" [ "198.18.7.0/24" ])
+		(warnCase "an entry equal to an infraDenyCIDRs entry" [ "203.0.113.0/24" ])
+		(warnCase "an entry containing an infraDenyCIDRs entry" [ "203.0.0.0/16" ])
+		(warnCase "a /8 entry covering an infraDenyCIDRs entry" [ "198.0.0.0/8" ])
+		(warnCase "a wide entry clear of every infraDenyCIDRs entry" [ "100.64.0.0/10" ])
+		(warnCase "malformed entries" [ "git.example.com" "198.018.7.0/24" "300.1.1.0/24" "198.18.7.0/33" "2001:db8::/32" ])
 	];
-	warnFailures = lib.concatMap (c:
+	warnFailures = lib.optional (cfg.warnings != [ ]) "the fixture warns: ${lib.concatStringsSep " | " cfg.warnings}"
+		++ lib.concatMap (c:
 		let
 			r = builtins.tryEval (builtins.deepSeq c.got c.got);
-			got = if r.success then r.value else [ ];
-			shown = lib.concatStringsSep " | " got;
 		in
-		lib.optional (!r.success) "floor warnings for '${c.name}' do not evaluate"
-		++ lib.concatMap (w: lib.optional (!(lib.any (lib.hasInfix w) got)) "'${c.name}': no warning containing '${w}' (got: ${shown})") c.want
-		++ lib.optional (r.success && builtins.length got != builtins.length c.want)
-			"'${c.name}': expected ${toString (builtins.length c.want)} floor warning(s), got ${toString (builtins.length got)}: ${shown}") warnCases;
+		lib.optional (!r.success) "warnings for '${c.name}' do not evaluate"
+		++ lib.optional (r.success && r.value != [ ])
+			"'${c.name}': the floor still warns: ${lib.concatStringsSep " | " r.value}") warnCases;
 
 	sysctl = cfg.boot.kernel.sysctl;
 	sysctlConf = discard cfg.environment.etc."sysctl.d/60-nixos.conf".text;
 	valueFailures = lib.concatLists [
+		# The launcher's L7 facts are one value each, in every place they are
+		# spelled (rule 4's hop block is placed from them).
+		(lib.optional (builtins.length l7BaseFacts != 4 || lib.unique l7BaseFacts != [ launcherL7Base ])
+			"cogbox's built-in L7 base is not one value in its four places (cogbox-launch.sh INIT_L7, its .l7PortBase fallback and next_available_ports' seed + 3, zig/src/filter.zig l7_default_base): [${toString l7BaseFacts}]")
+		(lib.optional (builtins.length l7AuthFacts != 4 || lib.unique l7AuthFacts != [ launcherAuthOffset ])
+			"cogbox's L7 auth proxy offset is not one value in its four places (cogbox-launch.sh's two L7_AUTH_PORT assignments and next_free_l7_base's auth-slot probe, zig/src/filter.zig l7_auth_port_offset): [${toString l7AuthFacts}]")
 		(lib.optional cfg.networking.firewall.enable "networking.firewall.enable is true")
 		(lib.optional (gce.stateDevice != "/dev/disk/by-id/virtio-cogworx-state") "stateDevice is ${gce.stateDevice}")
 		(lib.optional (gce.guestDevice != "/dev/disk/by-id/virtio-cogworx-guest") "guestDevice is ${gce.guestDevice}")
@@ -419,10 +477,30 @@ let
 	'';
 
 	hostnameScript = builtins.head (execPaths "cogworx-pve-hostname");
-	# The mosh range as floor_render.py spells a port range.
-	moshSports =
-		if gce.moshUDPPortRange == 1 then toString gce.moshUDPPort
-		else "${toString gce.moshUDPPort}-${toString (gce.moshUDPPort + gce.moshUDPPortRange - 1)}";
+	# Rule 4's local hop ports as floor_render.py spells them, spelled here
+	# from the launcher's own facts (read from its sources above) and the
+	# fixture's own value, never read back from floor-site.nix: the fixture's
+	# extra port (below both bands), then l7PortTriples triples' auth proxies
+	# from base - offset, then the triples from the base (l7proxy's two front
+	# doors and the mitmproxy hop). l7PortTriples is gce/floor.nix's funnel
+	# window, the one control the hop window has to match.
+	hopSpan = 3 * gce.l7PortTriples;
+	authLo = launcherL7Base - launcherAuthOffset;
+	hopPorts = "{ ${toString fixtureExtraHop}, ${toString authLo}-${toString (authLo + hopSpan - 1)}, ${toString launcherL7Base}-${toString (launcherL7Base + hopSpan - 1)} }";
+	# The UDP hop ports: the fixture's one, a single range (no braces).
+	udpHopPorts = toString fixtureExtraUDPHop;
+	# The merge, on a variant: ranges given out of order, overlapping and
+	# touching, and a window of 200 triples, whose auth band runs into the
+	# triple band. They must reach the renderer as ascending, disjoint ranges,
+	# the UDP ones too.
+	mergeSys = evalPve [ fixtureSite {
+		cogworx.gce.l7PortTriples = 200;
+		cogworx.pve.floor.buildDenyLoopbackTCP = lib.mkForce [ [ (authLo - 43) (authLo + 7) ] [ 8501 8501 ] [ 8500 8500 ] ];
+		cogworx.pve.floor.buildDenyLoopbackUDP = lib.mkForce [ [ 7305 7310 ] [ 7301 7302 ] [ 7303 7303 ] [ 7306 7307 ] [ 7400 7400 ] ];
+	} ];
+	mergePorts = "{ 8500-8501, ${toString (authLo - 43)}-${toString (launcherL7Base + 600 - 1)} }";
+	mergeUDPPorts = "{ 7301-7303, 7305-7310, 7400 }";
+	buildGroup = cfg.nix.settings.build-users-group or "nixbld";
 
 	checks = {
 		# The orderings and properties README.md calls the contract, on the
@@ -592,10 +670,21 @@ let
 			#    chain: a frame for 169.254/16 that arrives on eth0 is dropped
 			#    whatever its source, and nothing else filters ingress (no
 			#    ingress filter, decision 2026-10-21);
-			#  - rule 4 accepts @cp ONLY for passt's mosh replies: every rule
-			#    naming @cp in the output chain carries the passt uid, udp and
-			#    the mosh source range, so no uid rule 4 drops gets a blanket
-			#    pass to a @cp inside @infra4.
+			#  - rule 4 names the nix build users and nobody else: the only
+			#    uid selector is rule 4a's root test, the ruleset names
+			#    neither the passt nor the proxy account and has no @cp
+			#    (decision 2026-10-22: the guest and the L7 proxy follow each
+			#    sandbox's own network rules), and every gid selector is the
+			#    build group's;
+			#  - rule 4's local hop drops, both the destination-port and the
+			#    source-port pairs, carry exactly the ports the launcher's
+			#    own facts and the fixture's extra port imply, so the block
+			#    cannot drift from where the relays listen; and floor-site.nix
+			#    merges overlapping and touching ranges before the renderer
+			#    sees them;
+			#  - the UDP hop drops carry exactly the fixture's UDP port (and
+			#    the merge holds for them too), and the broadcast and
+			#    multicast drop is there once.
 			# The rules of one chain, its hook line left out.
 			chain() { awk -v c="chain $1 {" 'index($0, c) { f = 1; next } f && /^\t}/ { f = 0 } f && !/type filter hook/' ${pve.floor.ruleset}; }
 			first=$(chain input | sed -n 1p)
@@ -605,16 +694,68 @@ let
 			esac
 			[ "$(chain input | grep -c .)" = 1 ] || { echo "FAIL: the realized input chain filters more than rule 4a:" >&2; chain input >&2; exit 1; }
 			echo "ok   - realized: the input chain is rule 4a's input drop alone (no ingress filter)"
-			mosh='meta skuid "${gce.passtUser}" ip daddr @cp udp sport ${moshSports} counter accept'
-			cpLines=$(chain output | grep -F '@cp' || true)
-			if [ "$(printf '%s\n' "$cpLines" | grep -c . || true)" != 1 ] || ! printf '%s\n' "$cpLines" | grep -qF -- "$mosh"; then
-				echo "FAIL: the realized output chain names @cp other than in exactly one '$mosh' rule:" >&2
-				printf '%s\n' "$cpLines" >&2
+			uids=$(chain output | grep -F 'meta skuid' || true)
+			if [ "$(printf '%s\n' "$uids" | grep -c . || true)" != 1 ] || ! printf '%s\n' "$uids" | grep -qF 'meta skuid != 0 ct direction original ip daddr 169.254.0.0/16 counter drop'; then
+				echo "FAIL: the realized output chain selects on a uid other than in rule 4a's root test:" >&2
+				printf '%s\n' "$uids" >&2
 				exit 1
 			fi
-			echo "ok   - realized: rule 4's only @cp accept is passt's mosh replies"
+			for pat in ${lib.escapeShellArg gce.passtUser} ${lib.escapeShellArg gce.proxyUser} '@cp' 'set cp ' 'rule4-uid' 'rule4-cp-mosh'; do
+				if grep -qF -- "$pat" ${pve.floor.ruleset}; then
+					echo "FAIL: the realized ruleset names '$pat'; rule 4 names the nix build users only:" >&2
+					grep -F -- "$pat" ${pve.floor.ruleset} >&2
+					exit 1
+				fi
+			done
+			# The source-port pair is the one gid selector without direction
+			# scoping: it drops the SYN-ACK of a flow root opened, a reply.
+			if chain output | grep -F 'meta skgid' | grep -vF 'rule4-build-hop-src' | grep -vqF 'meta skgid "${buildGroup}" ct direction original '; then
+				echo "FAIL: a realized gid selector is not the build group's, original-direction:" >&2
+				chain output | grep -F 'meta skgid' >&2
+				exit 1
+			fi
+			echo "ok   - realized: rule 4 names the nix build users only (no passt or proxy account, no @cp)"
+			hops() {
+				local rs="$1" ports="$2" hop
+				for hop in \
+					'meta skgid "${buildGroup}" ct direction original ip daddr 127.0.0.0/8 tcp dport '"$ports"' counter drop' \
+					'meta skgid "${buildGroup}" ct direction original ip6 daddr ::1 tcp dport '"$ports"' counter drop' \
+					'meta skgid "${buildGroup}" ip saddr 127.0.0.0/8 tcp sport '"$ports"' counter drop' \
+					'meta skgid "${buildGroup}" ip6 saddr ::1 tcp sport '"$ports"' counter drop'; do
+					if [ "$(grep -cF -- "$hop" "$rs" || true)" != 1 ]; then
+						echo "FAIL: $rs has no single '$hop' rule:" >&2
+						grep -F rule4-build-hop "$rs" >&2
+						exit 1
+					fi
+				done
+			}
+			hops ${pve.floor.ruleset} ${lib.escapeShellArg hopPorts}
+			echo "ok   - realized: rule 4's four local hop drops carry the launcher's L7 ports and the fixture's extra port ${hopPorts}"
+			hops ${mergeSys.config.cogworx.pve.floor.ruleset} ${lib.escapeShellArg mergePorts}
+			echo "ok   - realized: out-of-order, overlapping and touching hop ranges, and a 200-triple window, reach the renderer merged as ${mergePorts}"
+			one() {
+				if [ "$(grep -cF -- "$2" "$1" || true)" != 1 ]; then
+					echo "FAIL: $1 has no single '$2' rule:" >&2
+					grep -F 'rule4-build' "$1" >&2
+					exit 1
+				fi
+			}
+			udphops() {
+				one "$1" 'meta skgid "${buildGroup}" ct direction original ip daddr 127.0.0.0/8 udp dport '"$2"' counter drop comment "cogworx-pve-floor-rule4-build-hop-udp"'
+				one "$1" 'meta skgid "${buildGroup}" ct direction original ip6 daddr ::1 udp dport '"$2"' counter drop comment "cogworx-pve-floor-rule4-build-hop-udp6"'
+			}
+			udphops ${pve.floor.ruleset} ${lib.escapeShellArg udpHopPorts}
+			echo "ok   - realized: rule 4's two UDP hop drops carry the fixture's buildDenyLoopbackUDP port ${udpHopPorts}"
+			udphops ${mergeSys.config.cogworx.pve.floor.ruleset} ${lib.escapeShellArg mergeUDPPorts}
+			echo "ok   - realized: out-of-order, overlapping and touching UDP hop ranges reach the renderer merged as ${mergeUDPPorts}"
+			one ${pve.floor.ruleset} 'meta skgid "${buildGroup}" ct direction original meta nfproto ipv4 fib daddr type { broadcast, multicast } counter drop comment "cogworx-pve-floor-rule4-build-bcast"'
+			echo "ok   - realized: rule 4 drops the build users' broadcast and multicast, by address type"
+			# The site floor's own boot verify leg, run live by the test (with
+			# a per-user network namespace standing in for setpriv), and the
+			# gce floor's legs for section 4.
 			bash ${tests}/test_floor_site.sh ${./floor_render.py} ${pve.floor.ruleset} \
-				${svc.cogworx-floor.serviceConfig.ExecStart} ${svc.cogworx-floor.serviceConfig.ExecStartPost}
+				${svc.cogworx-floor.serviceConfig.ExecStart} ${svc.cogworx-floor.serviceConfig.ExecStartPost} \
+				${svc.cogworx-pve-floor.serviceConfig.ExecStartPost}
 			touch $out
 		'';
 
