@@ -50,6 +50,14 @@
 		lib = nixpkgs.lib;
 		illustris-lib = import "${inputs.illustris-lib}/lib" { inherit lib; };
 		linuxSystems = [ "x86_64-linux" "aarch64-linux" "riscv64-linux" ];
+		# zig compiles for the BUILD host's CPU unless told otherwise, and the store
+		# path does not record which CPU that was: two builders put different machine
+		# code under one path, and a shared binary cache serves whichever was pushed
+		# first. Pin a level every supported host runs; avx+aes+pclmul keep zig std's
+		# hardware AES-GCM/GHASH paths. Guarded by checks.x86_64-linux.cogbox-tools-isa.
+		# baseline elsewhere deliberately trades hardware AES (the aarch64 crypto
+		# extension, which some cores lack) for portability.
+		zigCpuFlag = system: "-Dcpu=" + ({ x86_64-linux = "x86_64_v2+avx+aes+pclmul"; }.${system} or "baseline");
 		supportedSystems = linuxSystems ++ [ "aarch64-darwin" ];
 		forLinuxSystems = f: lib.genAttrs linuxSystems f;
 		forAllSystems = f: lib.genAttrs supportedSystems f;
@@ -4806,7 +4814,7 @@
 				dontInstall = true;
 				buildPhase = ''
 					export HOME=$TMPDIR
-					zig build --prefix $out -Doptimize=ReleaseSafe \
+					zig build --prefix $out -Doptimize=ReleaseSafe ${zigCpuFlag system} \
 						--global-cache-dir $TMPDIR/.zig-global-cache
 				'';
 			};
@@ -6214,7 +6222,7 @@
 				dontInstall = true;
 				buildPhase = ''
 					export HOME=$TMPDIR
-					zig build test --global-cache-dir $TMPDIR/.zig-global-cache \
+					zig build test ${zigCpuFlag system} --global-cache-dir $TMPDIR/.zig-global-cache \
 						&& touch $out
 				'';
 			};
@@ -6227,6 +6235,22 @@
 				touch $out
 			'';
 		} // lib.optionalAttrs (system == "x86_64-linux") {
+			# The zig tools must run on every x86 host that may substitute them,
+			# whatever CPU built them: fail on instructions from the extensions
+			# beyond the zigCpuFlag level (the classes listed in the script; static,
+			# so it catches paths a startup smoke never reaches, such as SHA-NI in
+			# std.crypto) and on a lost hardware AES/GHASH path.
+			cogbox-tools-isa = pkgs.runCommand "cogbox-tools-isa" {
+				nativeBuildInputs = [ pkgs.binutils-unwrapped pkgs.qemu-user ];
+			} ''
+				tools=${self.packages.${system}.cogbox-tools}
+				bash ${./tests/check_tools_isa.sh} x86_64_v2_avx $tools/bin/cogbox $tools/lib/libnetfilter.so
+				# the oldest CPU model the level claims must start the binary
+				# (ulimit: on SIGILL qemu-user writes its own core into the CWD)
+				ulimit -c 0
+				HOME=$TMPDIR qemu-x86_64 -cpu SandyBridge-v1 $tools/bin/cogbox help > /dev/null
+				touch $out
+			'';
 			# On the container backend the guest half
 			# (plugin commands/skills/agents + cogbox.packages) is
 			# delivered by the cogbox-brain-materialize oneshot rebuilding the brain
