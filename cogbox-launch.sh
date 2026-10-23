@@ -2421,11 +2421,75 @@ start_l7proxy() {
 # -- Helper: start the L7 terminate backend (mitmproxy) ------------
 # Runs mitmdump in SOCKS5 mode with a PERSISTENT per-instance CA confdir (so
 # the guest-trusted cert survives reboots) and our enforcement addon. The Zig
-# proxy hands vetted terminate-host connections here. After the CA materializes
-# we stage its CERT (never the key) into the fw_cfg slot for guest injection.
+# proxy hands vetted terminate-host connections here. The CA is pre-minted
+# before mitmdump starts (l7ca_premint), and its CERT (never the key) is staged
+# into the fw_cfg slot for guest injection.
+
+# l7ca_premint <ca_dir>: mint the per-instance terminate CA BEFORE mitmdump
+# starts. The guest reads the fw_cfg CA slot once per boot, and a cold first
+# boot's mitmproxy import can outlast start_l7mitm's wait, which launched the
+# guest without the CA for that whole boot.
+#
+# The files are mitmproxy's own confdir format. CertStore.from_store creates a
+# store only when <confdir>/mitmproxy-ca.pem is absent; otherwise it loads the
+# key and certs[0] from that one file, which is why it must hold the key THEN
+# the cert. cogworx's container backend pre-mints the same layout
+# (internal/agent/container/ca.go:43-81) and mitmproxy adopts it there.
+#
+# mitmproxy-ca.pem is renamed into place LAST: its presence is what makes both
+# mitmproxy and this helper adopt instead of mint, so a crash at any step
+# converges on the next boot. A non-empty mitmproxy-ca.pem is never rewritten
+# -- there is no rotation -- so every existing instance keeps its CA
+# fingerprint.
+#
+# The whole script runs as the proxy uid. That is the uid mitmdump runs as
+# (PROXY_RUNAS_ARGS, set above), and gce/supervise.sh has already chowned l7-ca
+# to it, so the dropped mitmdump owns its key, and root never appends to,
+# renames in, or reads through a directory the proxy uid controls. With no
+# runas configured (local, Darwin, k8s pods) PROXY_RUNAS_ARGS is empty and the
+# command line is unchanged.
+#
+# notBefore is backdated 2 days, copying mitmproxy's own CA backdate (certs.py
+# CERT_VALIDITY_OFFSET), so a host clock that steps backwards after the mint
+# does not make the CA "not yet valid" in the guest. If `date` fails, the flag
+# is dropped and notBefore is now.
+#
+# openssl's output is captured and printed only on failure, and a failure means
+# exactly the old behaviour: mitmproxy mints. The derive branch heals the one
+# state mitmproxy cannot: mitmproxy-ca.pem written, the cert not yet written.
+l7ca_premint() {
+	local ca_dir="$1" nb=""
+	nb=$(date -u -d '2 days ago' +%Y%m%d%H%M%SZ 2>/dev/null) || nb=""
+	# shellcheck disable=SC2016
+	"${PROXY_RUNAS_ARGS[@]}" "$BASH" -c '
+		set -e
+		d=$1 openssl=$2 nb=$3
+		if [ ! -s "$d/mitmproxy-ca.pem" ]; then
+			rm -f "$d/.mitmproxy-ca.tmp" "$d/.mitmproxy-ca-cert.tmp"
+			out=$("$openssl" req -quiet -config /dev/null -x509 -newkey rsa:2048 -noenc \
+				${nb:+-not_before "$nb"} -days 3650 -subj "/CN=mitmproxy/O=mitmproxy" \
+				-addext "basicConstraints=critical,CA:TRUE" \
+				-addext "keyUsage=critical,keyCertSign,cRLSign" \
+				-addext "extendedKeyUsage=serverAuth" \
+				-addext "subjectKeyIdentifier=hash" \
+				-keyout "$d/.mitmproxy-ca.tmp" -out "$d/.mitmproxy-ca-cert.tmp" 2>&1) \
+				|| { [ -z "$out" ] || printf "%s\n" "$out" >&2; exit 1; }
+			cat "$d/.mitmproxy-ca-cert.tmp" >> "$d/.mitmproxy-ca.tmp"
+			mv -f "$d/.mitmproxy-ca-cert.tmp" "$d/mitmproxy-ca-cert.pem"
+			mv -f "$d/.mitmproxy-ca.tmp" "$d/mitmproxy-ca.pem"
+		elif [ ! -s "$d/mitmproxy-ca-cert.pem" ]; then
+			rm -f "$d/.mitmproxy-ca-cert.tmp"
+			"$openssl" x509 -in "$d/mitmproxy-ca.pem" -out "$d/.mitmproxy-ca-cert.tmp"
+			mv -f "$d/.mitmproxy-ca-cert.tmp" "$d/mitmproxy-ca-cert.pem"
+		fi
+	' l7ca-premint "$ca_dir" "@openssl@" "$nb" \
+		|| echo "cogbox-launch: warning: could not pre-mint the L7 CA; mitmproxy will mint it" >&2
+}
+
 start_l7mitm() {
 	local ca_dir="$INSTANCE_CONFIG_DIR/l7-ca"
 	mkdir -p "$ca_dir"
+	l7ca_premint "$ca_dir"
 	# connection_strategy=lazy: defer the upstream connection until AFTER the
 	# addon has decided, so a denied request never opens a connection to the
 	# upstream (and a deny to an unreachable upstream still returns 403 rather
@@ -2474,18 +2538,38 @@ start_l7mitm() {
 		kill -0 "$L7MITM_PID" 2>/dev/null || break
 		sleep 0.1
 	done
-	if ! kill -0 "$L7MITM_PID" 2>/dev/null || [ "$mitm_ready" != 1 ]; then
-		echo "cogbox-launch: warning: L7 terminate backend failed to start; terminate hosts will be blocked." >&2
-		# Keep the PID tracked: a slow process may still be importing. The
-		# normal child-first cleanup must reap it even when startup timed out.
-		return
+	# Stage the CA CERT (cert only) for fw_cfg whenever one exists, timeouts
+	# included: the guest reads the slot once per boot, so a cert that is there
+	# must reach it even if mitmdump is still importing. Read it as the proxy
+	# uid, so a link planted in the proxy-owned directory can only expose what
+	# that uid can already read; the runtime file is root's and keeps the mode
+	# the empty seed before the rules render gave it. Guard against ever leaking
+	# the private key into the guest.
+	if [ -s "$ca_dir/mitmproxy-ca-cert.pem" ]; then
+		"${PROXY_RUNAS_ARGS[@]}" cat "$ca_dir/mitmproxy-ca-cert.pem" > "$RUNTIME/system-l7ca" \
+			|| : > "$RUNTIME/system-l7ca"
+		if grep -q "PRIVATE KEY" "$RUNTIME/system-l7ca"; then
+			: > "$RUNTIME/system-l7ca"
+			die "refusing to stage L7 CA: mitmproxy-ca-cert.pem contains a private key" 70
+		fi
 	fi
-	# Stage the CA CERT (cert only) for fw_cfg. Guard against ever leaking the
-	# private key into the guest.
-	if grep -q "PRIVATE KEY" "$ca_dir/mitmproxy-ca-cert.pem"; then
-		die "refusing to stage L7 CA: mitmproxy-ca-cert.pem contains a private key" 70
+	# Then say what is actually wrong, if anything. On Linux, with the CA
+	# pre-minted, the loop above breaks on its first pass, so this liveness
+	# check is best-effort: it runs moments after the fork, exactly as on every
+	# later boot, and a mitmdump that dies a little later is not reported here.
+	if ! kill -0 "$L7MITM_PID" 2>/dev/null; then
+		echo "cogbox-launch: warning: L7 terminate backend (mitmproxy) exited during startup; terminate-tier HTTPS hosts will be refused until the sandbox restarts." >&2
+	elif [ "$mitm_ready" != 1 ]; then
+		if [ -s "$RUNTIME/system-l7ca" ]; then
+			# Darwin's listener wait ran out; the CA is staged.
+			echo "cogbox-launch: warning: L7 terminate backend (mitmproxy) is still starting; terminate-tier HTTPS hosts are refused until it listens." >&2
+		else
+			echo "cogbox-launch: warning: L7 terminate CA did not appear in time; the guest will not trust terminate-tier HTTPS hosts (certificate verification fails) until the sandbox restarts." >&2
+		fi
 	fi
-	cp "$ca_dir/mitmproxy-ca-cert.pem" "$RUNTIME/system-l7ca"
+	# Keep the PID tracked in every case: a slow process may still be
+	# importing. The normal child-first cleanup must reap it even when startup
+	# timed out.
 }
 
 # -- Helper: start the per-sandbox auth proxy ----------------------

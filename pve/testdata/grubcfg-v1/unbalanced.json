@@ -1,0 +1,35 @@
+{
+ "entry0": {
+  "init": "/nix/store/a9450jliqd6a4kiyz4bzjqb9xgry9hq8-nixos-system-unnamed-26.11.20261008.e7439b6",
+  "title": "NixOS"
+ },
+ "errors": [
+  "unbalanced"
+ ],
+ "profiles": {
+  "cogworx_candidate": {
+   "init": "/nix/store/f6nrwdkldggafcpc3rin73axgwn9rpjv-nixos-system-unnamed-26.11.20261008.e7439b6",
+   "path": "NixOS - Profile 'cogworx_candidate'>NixOS - Configuration 1 (2026-10-18 - 26.11.20261008.e7439b6)"
+  }
+ },
+ "submenus": [
+  {
+   "entries": [
+    {
+     "init": "/nix/store/a9450jliqd6a4kiyz4bzjqb9xgry9hq8-nixos-system-unnamed-26.11.20261008.e7439b6",
+     "title": "NixOS - Configuration 1 (2026-10-18 - 26.11.20261008.e7439b6)"
+    }
+   ],
+   "title": "NixOS - All configurations"
+  },
+  {
+   "entries": [
+    {
+     "init": "/nix/store/f6nrwdkldggafcpc3rin73axgwn9rpjv-nixos-system-unnamed-26.11.20261008.e7439b6",
+     "title": "NixOS - Configuration 1 (2026-10-18 - 26.11.20261008.e7439b6)"
+    }
+   ],
+   "title": "NixOS - Profile 'cogworx_candidate'"
+  }
+ ]
+}

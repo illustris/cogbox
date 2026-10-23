@@ -50,6 +50,14 @@
 		lib = nixpkgs.lib;
 		illustris-lib = import "${inputs.illustris-lib}/lib" { inherit lib; };
 		linuxSystems = [ "x86_64-linux" "aarch64-linux" "riscv64-linux" ];
+		# zig compiles for the BUILD host's CPU unless told otherwise, and the store
+		# path does not record which CPU that was: two builders put different machine
+		# code under one path, and a shared binary cache serves whichever was pushed
+		# first. Pin a level every supported host runs; avx+aes+pclmul keep zig std's
+		# hardware AES-GCM/GHASH paths. Guarded by checks.x86_64-linux.cogbox-tools-isa.
+		# baseline elsewhere deliberately trades hardware AES (the aarch64 crypto
+		# extension, which some cores lack) for portability.
+		zigCpuFlag = system: "-Dcpu=" + ({ x86_64-linux = "x86_64_v2+avx+aes+pclmul"; }.${system} or "baseline");
 		supportedSystems = linuxSystems ++ [ "aarch64-darwin" ];
 		forLinuxSystems = f: lib.genAttrs linuxSystems f;
 		forAllSystems = f: lib.genAttrs supportedSystems f;
@@ -532,9 +540,10 @@
 		# The guest's boot stamp, by NAME. The guest writes it at the root of its
 		# 9p data share (/var/lib/cogbox) and gce/supervise.sh reads it at the
 		# root of the same share from the host ($COGBOX_DATA/instances/<name>), so
-		# a name that drifts on one side only leaves every image ready with no
-		# boot proof, which the control plane reads as a fault of the image. Bound
-		# once here; checks.cogbox-guest-boot-stamp pins both sides to it.
+		# a name that drifts on one side only leaves every boot never ready (the
+		# supervisor's readiness waits for the stamp) and none with a boot proof,
+		# which the control plane reads as a fault of the image. Bound once here;
+		# checks.cogbox-guest-boot-stamp pins both sides to it.
 		gceBootStampName = ".cogbox-boot-stamp";
 
 		# What makes a guest the HOSTED one (the nixosConfigurations
@@ -565,6 +574,18 @@
 		hostedGuestModule = { lib, ... }: {
 			cogbox.storage.profile = "hosted";
 			cogbox.runtimeEnvironment.enable = lib.mkDefault hostedRuntimeDefault;
+		};
+
+		# The Proxmox backend HOST system (pve/). Same specialArgs as mkGceHost;
+		# operators pass their base and site modules as extraModules, and those
+		# modules must evaluate on THIS flake's nixpkgs.
+		mkPveHost = system: { extraModules ? [ ] }: nixpkgs.lib.nixosSystem {
+			inherit system;
+			specialArgs = { inherit self inputs system; };
+			modules = [
+				./pve/pve-host.nix
+				{ system.configurationRevision = lib.mkDefault (self.rev or self.dirtyRev or null); }
+			] ++ extraModules;
 		};
 
 		# `userExt` defaults to the no-op userExtensions input but can be
@@ -3604,8 +3625,10 @@
 					# clears that path before every launch, so a stamp present after
 					# it was written by this boot. The guest can only claim facts
 					# about itself; the host binds them to the start epoch, its own
-					# boot and the image's protocol values. VM-only: the container
-					# has no 9p share and no host supervisor reading one.
+					# boot and the image's protocol values. The stamp also gates the
+					# host's readiness: cogworx/ready waits for it, so a guest that
+					# writes none stays Booting. VM-only: the container has no 9p
+					# share and no host supervisor reading one.
 					#
 					# Written to a temp file and renamed with `mv -T`, so the host
 					# never reads half a stamp and a directory squatting at the path
@@ -3621,10 +3644,10 @@
 					# sshd whose FIRST start fails fails this unit's start job with
 					# it, and sshd's own Restart=always then brings sshd back without
 					# re-queueing anything that merely required it: that boot would
-					# never write a stamp, and the control plane would read the
-					# silence as a fault of the image. Wanted by sshd, this unit is
-					# started again with sshd's later start; while it is active,
-					# that start is a no-op.
+					# never write a stamp, so it would never be ready, and the control
+					# plane would read the silence as a fault of the image. Wanted by
+					# sshd, this unit is started again with sshd's later start; while
+					# it is active, that start is a no-op.
 					cogbox-boot-stamp = lib.mkIf isVm {
 						description = "Stamp this guest boot for the host's boot proof";
 						wantedBy = [ "multi-user.target" "sshd.service" ];
@@ -4557,6 +4580,11 @@
 		lib.gceImageLabels = gceImageLabels;
 		nixosModules.gce-host = ./gce/cogbox-host.nix;
 		nixosModules.runtime-environment = ./runtime/module.nix;
+		# The PVE host system (pve/README.md). The module needs specialArgs
+		# `self`, `inputs` and `system`, as mkGceHost's does; lib.mkPveHost is
+		# the supported way to build it, with operator modules as extraModules.
+		lib.mkPveHost = mkPveHost;
+		nixosModules.pve-host = ./pve/pve-host.nix;
 
 		packages = forAllSystems (system: if system == "aarch64-darwin" then
 			import ./darwin/packages.nix {
@@ -4730,6 +4758,7 @@
 					--replace-fail "@harnesses@" "${harnessNames}" \
 					--replace-fail "@mitmdump@" "${pkgs.mitmproxy}/bin/mitmdump" \
 					--replace-fail "@l7addon@" "$out/libexec/l7-mitm-addon.py" \
+					--replace-fail "@openssl@" "${pkgs.openssl.bin}/bin/openssl" \
 					--replace-fail "@flock@" "${pkgs.util-linux}/bin/flock" \
 					--replace-fail "@dumpe2fs@" "${pkgs.e2fsprogs}/bin/dumpe2fs" \
 					--replace-fail "@flakeSource@" "${self}" \
@@ -4791,7 +4820,7 @@
 				dontInstall = true;
 				buildPhase = ''
 					export HOME=$TMPDIR
-					zig build --prefix $out -Doptimize=ReleaseSafe \
+					zig build --prefix $out -Doptimize=ReleaseSafe ${zigCpuFlag system} \
 						--global-cache-dir $TMPDIR/.zig-global-cache
 				'';
 			};
@@ -5067,6 +5096,11 @@
 			# PHASE-0: nixpkgs' postVM tars with the default GNU format. Confirm `gcloud compute
 			# images create` accepts it before the bake is called done.
 			gce-image = self.nixosConfigurations.cogbox-x86_64-gce.config.system.build.googleComputeImage;
+
+			# The PVE template disk (pve/image.nix) of the CA-less
+			# cogbox-x86_64-pve system: fail-closed, a dev image. A publishable
+			# one is built from lib.mkPveHost with the operator's modules.
+			pve-image = self.nixosConfigurations.cogbox-x86_64-pve.config.system.build.pveImage;
 		});
 
 		# `nix run .#push-pod-image [-- <registry-ref>]` streams the sandbox-pod
@@ -6081,6 +6115,20 @@
 				touch $out
 			'';
 
+			# The L7 terminate CA must be in the fw_cfg slot before QEMU launches:
+			# the guest reads it once per boot, and a cold first boot used to time
+			# out waiting on mitmproxy's own mint and launch without it. Runs the
+			# launcher's real start_l7mitm region (the openssl pre-mint, the wait,
+			# the staging) against stub mitmdumps and a real one, plain and under a
+			# runas wrapper. See tests/test_l7ca_stage.sh for what each case guards.
+			launch-l7ca-tests = pkgs.runCommand "cogbox-launch-l7ca-tests" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnugrep gawk openssl mitmproxy curl ];
+			} ''
+				export HOME=$TMPDIR
+				bash ${./tests/test_l7ca_stage.sh} ${./cogbox-launch.sh}
+				touch $out
+			'';
+
 			config-contract-tests = pkgs.runCommand "cogbox-config-contract-tests" {
 				nativeBuildInputs = with pkgs; [ bash coreutils python3 util-linux jq gnugrep gnused diffutils ];
 			} ''
@@ -6180,7 +6228,7 @@
 				dontInstall = true;
 				buildPhase = ''
 					export HOME=$TMPDIR
-					zig build test --global-cache-dir $TMPDIR/.zig-global-cache \
+					zig build test ${zigCpuFlag system} --global-cache-dir $TMPDIR/.zig-global-cache \
 						&& touch $out
 				'';
 			};
@@ -6193,6 +6241,22 @@
 				touch $out
 			'';
 		} // lib.optionalAttrs (system == "x86_64-linux") {
+			# The zig tools must run on every x86 host that may substitute them,
+			# whatever CPU built them: fail on instructions from the extensions
+			# beyond the zigCpuFlag level (the classes listed in the script; static,
+			# so it catches paths a startup smoke never reaches, such as SHA-NI in
+			# std.crypto) and on a lost hardware AES/GHASH path.
+			cogbox-tools-isa = pkgs.runCommand "cogbox-tools-isa" {
+				nativeBuildInputs = [ pkgs.binutils-unwrapped pkgs.qemu-user ];
+			} ''
+				tools=${self.packages.${system}.cogbox-tools}
+				bash ${./tests/check_tools_isa.sh} x86_64_v2_avx $tools/bin/cogbox $tools/lib/libnetfilter.so
+				# the oldest CPU model the level claims must start the binary
+				# (ulimit: on SIGILL qemu-user writes its own core into the CWD)
+				ulimit -c 0
+				HOME=$TMPDIR qemu-x86_64 -cpu SandyBridge-v1 $tools/bin/cogbox help > /dev/null
+				touch $out
+			'';
 			# On the container backend the guest half
 			# (plugin commands/skills/agents + cogbox.packages) is
 			# delivered by the cogbox-brain-materialize oneshot rebuilding the brain
@@ -6337,7 +6401,7 @@
 				has_line "$s" 'out="''${COGBOX_STAMP_OUT:-/var/lib/cogbox/${gceBootStampName}}"' \
 					|| bad "the guest's stamp does not default to /var/lib/cogbox/${gceBootStampName}, where the host supervisor reads it"
 				has_line ${gceSuperviseScript} 'BOOT_STAMP="$COGBOX_DATA/instances/$INSTANCE/${gceBootStampName}"' \
-					|| bad "gce/supervise.sh does not read the stamp at \$COGBOX_DATA/instances/\$INSTANCE/${gceBootStampName}, where the guest writes it; every boot would be ready with no proof"
+					|| bad "gce/supervise.sh does not read the stamp at \$COGBOX_DATA/instances/\$INSTANCE/${gceBootStampName}, where the guest writes it; no boot would ever be ready, and none would carry a proof"
 				w=$TMPDIR/stamp
 				mkdir -p "$w/notmounted"
 				gb=0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0
@@ -10454,7 +10518,12 @@
 				bash ${./tests/test_floor.sh} ${gceFloorInstall} ${gceFloorVerify}
 				touch $out
 			'';
-		}) // {
+		} // lib.optionalAttrs (system == "x86_64-linux") (
+			# The PVE host image's checks (pve/checks.nix) as pve-<name>, the
+			# heavy ones included and the `all` link farm left out.
+			lib.mapAttrs' (name: lib.nameValuePair "pve-${name}")
+				(builtins.removeAttrs (import ./pve/checks.nix { flake = self; inherit system; }) [ "all" ])
+		)) // {
 			aarch64-darwin = import ./darwin/checks.nix {
 				inherit self nixpkgs lib;
 			};
@@ -10515,6 +10584,12 @@
 			# gce-image-* checks assert its closure, userland and unit graph
 			# without needing the image itself.
 			cogbox-x86_64-gce = mkGceHost "x86_64-linux" { };
+
+			# The PVE backend HOST system (see mkPveHost). CA-less, so it is
+			# fail-closed (no control certificate is ever accepted), and its
+			# cogworx.pve.release is null, so it is never an upgrade target.
+			# `packages.pve-image` builds its template disk.
+			cogbox-x86_64-pve = mkPveHost "x86_64-linux" { };
 
 			# Test fixture used by tests/cogbox.nix Phase E. Pre-builds
 			# a runner whose closure includes pkgs.hello, so the offline
