@@ -1,0 +1,19 @@
+{
+ "entry0": {
+  "init": "/nix/store/a9450jliqd6a4kiyz4bzjqb9xgry9hq8-nixos-system-unnamed-26.11.20261008.e7439b6",
+  "title": "NixOS"
+ },
+ "errors": [],
+ "profiles": {},
+ "submenus": [
+  {
+   "entries": [
+    {
+     "init": "/nix/store/a9450jliqd6a4kiyz4bzjqb9xgry9hq8-nixos-system-unnamed-26.11.20261008.e7439b6",
+     "title": "NixOS - Configuration 1 (2026-10-18 - 26.11.20261008.e7439b6)"
+    }
+   ],
+   "title": "NixOS - All configurations"
+  }
+ ]
+}

@@ -55,6 +55,7 @@ let
       --replace-fail '@harnesses@' '${lib.concatStringsSep " " (lib.attrNames (mkHarnesses "aarch64-linux" nixpkgs.legacyPackages.aarch64-linux))}' \
       --replace-fail '@mitmdump@' '${pkgs.mitmproxy}/bin/mitmdump' \
       --replace-fail '@l7addon@' "$out/libexec/l7-mitm-addon.py" \
+      --replace-fail '@openssl@' '${pkgs.openssl.bin}/bin/openssl' \
       --replace-fail '@flock@' '${tools}/bin/cogbox-platform flock' \
       --replace-fail '@dumpe2fs@' '${pkgs.e2fsprogs}/bin/dumpe2fs' \
       --replace-fail '@flakeSource@' '${self}' \
