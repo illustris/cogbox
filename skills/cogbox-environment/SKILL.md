@@ -24,11 +24,6 @@ to discover a URL. Report observed readiness separately from configuration.
 Keep project work in `~/work` (`/root/work`), the sandbox's persistent
 workspace, and load the `cogbox-filesystem` skill for path lifetimes.
 
-Network mode determines egress: `none` blocks outbound access, `full` permits
-it, and `rules` applies the host's configured policy. A connection failure can
-be policy, DNS, credentials or an unavailable service; inspect the actual error.
-Host-managed credential injection keeps the host credential outside the guest
-and may use placeholders inside it. Do not replace a placeholder with a host
-secret or claim missing local credentials prove an unauthenticated connection.
-Changes to host network policy or credential bindings belong to the local host
-CLI or managed cogworx interface for the identified environment.
+Never replace a placeholder credential or add your own for a host the host side authenticates, and do not take a missing local credential as proof a request is unauthenticated.
+
+For outbound network access, blocked connections, certificate errors and credentials the host adds to requests, load the `cogbox-network` skill; for git hosts, `cogbox-git`; for credentials delivered from Vault, `cogbox-vault`; and for SSH, editors, file copy, port forwards and sharing, `cogbox-remote-access`.
