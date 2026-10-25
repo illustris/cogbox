@@ -206,6 +206,27 @@ with subtest("Phase B: --network none blocks all outbound"):
     ))
     machine.fail(probe(None, "10.99.0.1"))
     machine.fail(probe(None, "10.99.0.2"))
+
+    # B2: the guest store is local-overlay, so GC reclaims only guest-built
+    # paths. hello is realized on this (outer) machine and is NOT in the
+    # default guest closure: it sits in the 9p lower unregistered, which a
+    # plain local store would walk and white out.
+    def guest(cmd):
+        return as_user("cogbox ssh " + shlex.quote(cmd))
+    print(machine.succeed(guest(
+        "grep ' /nix/store ' /proc/self/mounts; cat /run/cogbox/nix-store.conf; "
+        "cat /run/cogbox/nix-store.err 2>/dev/null; true"
+    )))
+    machine.succeed(guest("nix store info 2>&1 | grep -qx 'Store URL: local-overlay://'"))
+    hello_dir = machine.succeed("dirname $(dirname $(readlink -f $(command -v hello)))").strip()
+    machine.succeed(guest(f"test -d {hello_dir}/bin && ! nix-store --check-validity {hello_dir}"))
+    garbage = machine.succeed(guest("echo gc-me > /tmp/gc-me && nix-store --add /tmp/gc-me")).strip()
+    machine.succeed(guest(f"nix-store --check-validity {garbage}"))
+    machine.succeed(guest("nix store gc"))
+    machine.succeed(guest(f"test ! -e {garbage}"))
+    machine.succeed(guest(f"test -x {hello_dir}/bin/hello"))
+    machine.succeed(guest("test -z \"$(find /nix/.rw-store/store -maxdepth 1 -type c)\""))
+    machine.succeed(guest("nix-store --check-validity $(readlink -f /run/current-system)"))
     stop_instance("cc-default")
 
 with subtest("Phase C: --network full allows outbound"):

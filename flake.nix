@@ -3124,6 +3124,70 @@
 						"name=opt/system-additional-dirs,file=${runtimeDir}/system-additional-dirs"
 					];
 				};
+				# The guest /nix/store is an overlay whose lower is the HOST's whole
+				# store over 9p, while the guest DB only registers the guest closure.
+				# A plain local store therefore treats every other host path as an
+				# invalid path to delete: `nix store gc` (and nix-collect-garbage,
+				# nix-store --gc) walks each one over 9p, frees nothing, and leaves a
+				# whiteout per path that hides it from the guest until the upper is
+				# wiped. Nix's local-overlay store only ever deletes what is in the
+				# upper layer, so the stock commands become cheap and only reclaim
+				# guest-built paths. Agents keep running the commands they know.
+				#
+				# The lower store needs its own metadata DB. It is built here at boot
+				# from the same regInfo microvm registers (a build-time DB would close
+				# over the toplevel that carries nix.conf: a cycle), on the upper
+				# volume so it is exactly as ephemeral as the upper. mkBefore because
+				# microvm's own `--load-db` reads nix.conf and must already see the
+				# overlay store. The `store` line reaches nix.conf through an
+				# `!include` of a file written only once the store opens, mount check
+				# and all, so any failure falls back to the plain local store (today's
+				# behaviour) with a warning instead of a guest with no working Nix.
+				nix.extraOptions = lib.mkIf isVm ''
+					!include /run/cogbox/nix-store.conf
+				'';
+				boot.postBootCommands = lib.mkIf isVm (lib.mkBefore ''
+					cogbox_overlay_store() {
+						local lower=/nix/.rw-store/lower-state conf=/run/cogbox/nix-store.conf
+						local features="local-overlay-store read-only-local-store"
+						local url
+						rm -f "$conf"
+						[[ "$(cat /proc/cmdline)" =~ regInfo=([^ ]*) ]] || return 1
+						rm -rf "$lower" && mkdir -p "$lower/real" /run/cogbox || return 1
+						# Loaded against a scratch real dir: a writable local store
+						# chowns its store dir, which the read-only 9p lower refuses.
+						# The rows only name logical /nix/store paths, so the DB is
+						# the same one the read-only open over /nix/.ro-store wants.
+						${config.nix.package.out}/bin/nix-store \
+							--store "local?real=$lower/real&state=$lower" \
+							--load-db < "''${BASH_REMATCH[1]}" || return 1
+						# Nix's own check-mount compares the mount's lowerdir and
+						# upperdir verbatim, but stage 1 mounted the overlay under
+						# /sysroot (or /mnt-root) and /proc/mounts keeps those
+						# strings. Make the same check here, prefix-tolerant, and turn
+						# Nix's off: the overlay store over any other layout would
+						# skip deletes it must not skip.
+						# Plain bash: postBootCommands run with no grep on PATH.
+						local m="" line lo_re up_re
+						while IFS= read -r line; do
+							[[ "$line" == "overlay /nix/store overlay "* ]] && m=$line
+						done < /proc/self/mounts
+						lo_re='[, ]lowerdir=(/sysroot|/mnt-root)?/nix/\.ro-store[, ]'
+						up_re='[, ]upperdir=(/sysroot|/mnt-root)?/nix/\.rw-store/store[, ]'
+						[[ "$m" =~ $lo_re && "$m" =~ $up_re ]] || { echo "unexpected /nix/store mount: $m" >&2; return 1; }
+						# The lower URL nests inside the overlay URL, so it is
+						# percent-encoded (?, = and &).
+						url="local-overlay://?lower-store=local%3Freal%3D/nix/.ro-store%26state%3D$lower%26read-only%3Dtrue&upper-layer=/nix/.rw-store/store&check-mount=false"
+						${config.nix.package.out}/bin/nix --extra-experimental-features "nix-command $features" \
+							store info --store "$url" >/dev/null || return 1
+						printf 'extra-experimental-features = %s\nstore = %s\n' "$features" "$url" > "$conf.tmp" \
+							&& mv "$conf.tmp" "$conf"
+					}
+					mkdir -p /run/cogbox
+					cogbox_overlay_store 2>/run/cogbox/nix-store.err \
+						&& rm -f /run/cogbox/nix-store.err \
+						|| echo "cogbox: local-overlay store setup failed (/run/cogbox/nix-store.err); nix store gc will walk the 9p lower" >&2
+				'');
 				# re-run the L7 trust assembly whenever the enforcer (re)publishes
 				# its CA, so a CA that arrives after cogbox-l7-trust's boot window still
 				# gets trusted (else allowed HTTPS silently fails until the next reboot).
