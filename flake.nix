@@ -6095,6 +6095,10 @@
 					assert native.system.build.cogboxBrainUnits.skills.cogbox-environment == ./skills/cogbox-environment;
 					assert native.system.build.cogboxBrainUnits.skills.cogbox-filesystem == ./skills/cogbox-filesystem;
 					assert native.system.build.cogboxBrainUnits.skills.cogbox-packages == ./skills/cogbox-packages;
+					assert native.system.build.cogboxBrainUnits.skills.cogbox-git == ./skills/cogbox-git;
+					assert native.system.build.cogboxBrainUnits.skills.cogbox-network == ./skills/cogbox-network;
+					assert native.system.build.cogboxBrainUnits.skills.cogbox-remote-access == ./skills/cogbox-remote-access;
+					assert native.system.build.cogboxBrainUnits.skills.cogbox-vault == ./skills/cogbox-vault;
 					true;
 			in assert lib.all checkConfig configs;
 				pkgs.runCommand "cogbox-native-app-module" {

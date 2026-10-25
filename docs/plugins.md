@@ -118,6 +118,8 @@ That is **advisory** — the build resolves it and both plugins install. For the
 - **Plugins set no cwd and no `loginShellInit`.** The workdir (`~/work`) and cwd are 100% base-owned, so the cwd fight between plugins is structurally impossible.
 - **Plugins ship no always-on `CLAUDE.md`/`AGENTS.md`.** Orientation is relevance-loaded skills (listed in the cogbox-authored index) plus an optional path-scoped `rules/` channel (a rule with empty `paths` ⇒ always-on). There is no channel for a third party to inject always-on, user-outranking prose.
 
+**The image bakes its own skills.** `app-relay`, `cogbox-environment`, `cogbox-filesystem`, `cogbox-packages`, `cogbox-git`, `cogbox-network`, `cogbox-remote-access` and `cogbox-vault`, plus `cogbox-runtime` where runtime tool environments are enabled, are registered through `cogbox.skills`, so each, as an explicit unit, replaces a discovered plugin skill of the same name; give a plugin's skills names of their own.
+
 ## The workdir: `~/work`
 
 `~/work` is a base-created symlink into the persisted 9p share (`/var/lib/cogbox/work`); HOME stays `/root`. It is the standardized project dir: agents and users land there (`loginShellInit` and the `c`/`oc`/`om`/`cx`/`h`/`p` launchers `cd ~/work`), it survives restarts, and it is host-visible under `~/.local/share/cogbox/instances/<name>/data/work/`.
