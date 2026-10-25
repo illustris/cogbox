@@ -25,6 +25,10 @@ survives a restart, but a reschedule onto another node loses it. Treat neither
 as storage: if a tool has to be there next time, extend the sandbox, as
 `cogbox-packages` describes.
 
+On a VM-backed sandbox the read-only layer under `/nix/store` is the host's
+store, so `nix store gc` frees only what this sandbox built or fetched; host
+paths you can see but that are not in the sandbox's database are left alone.
+
 If `command -v cogbox-env` finds the helper, the tools it selects are the one exception: their closure is archived under `~/work/.cogbox/runtime` (never edit that directory by hand) and restored after a restart, as the `cogbox-runtime` skill describes.
 
 Paths under `/root` are not uniformly one or the other, and they differ between
