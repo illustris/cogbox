@@ -352,7 +352,7 @@ variables -- see [Internals](docs/internals.md#host-side-path-overrides).
 | HTTP | 127.0.0.1:8080 -> 8080 (guest 8080 is reserved for the `app-relay` plugin) |
 | Mosh UDP | off. `COGBOX_MOSH_UDP_FORWARD=lo-hi` adds a `passt -u` forward for that guest range, composed with the bind prefix exactly like the two TCP forwards; the GCE host sets `60000-60031` from `mosh-udp-range.nix`. The guest carries only `mosh-server`, and a session needs the cogworx gateway's UDP relay -- see [network filtering](docs/network-filtering.md#the-mosh-reply-socket-exemption) |
 | Network | rules (private/bogon denied, public allowed) |
-| Docker | enabled |
+| Docker | enabled. Replies to TCP connections and to UDP exchanges with uplink-bound sockets that arrive on the guest uplink leave through the uplink, so a Docker network (or another guest route) overlapping a client's address does not capture them; residuals in [internals](docs/internals.md#guest-reply-routing) |
 | Storage profile | `workstation` (see below) |
 
 ### Storage profiles
@@ -912,3 +912,4 @@ explicitly.
   GCE by passt's `-u` forward -- but nothing forwards UDP into a workstation
   `nix run .` VM or a `--network none` one, so `mosh` against a local cogbox
   does not connect; use `cogbox ssh`.
+- Guest reply routing does not cover UDP servers bound to the wildcard address or IPv6; replies from those still follow the guest's main routing table, so an overlapping Docker network or VPN route can capture them. The other residuals are listed in [internals](docs/internals.md#guest-reply-routing).
