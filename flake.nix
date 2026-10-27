@@ -576,6 +576,19 @@
 			cogbox.runtimeEnvironment.enable = lib.mkDefault hostedRuntimeDefault;
 		};
 
+		# Reply-via-uplink policy routing for VM guests (modules/guest-reply-route.nix):
+		# the ids that module renders and checks.guest-reply-route{,-vm-only} assert.
+		# mark: one connmark/fwmark bit, always set and tested MASKED (bit 28 avoids
+		# the bits docker, kube-proxy, podman/netavark, tailscale, netbird and wg-quick use).
+		# priority 50: after `local` (0), ahead of VPN full-tunnel rules and `main` (32766).
+		# table 1000 / link group 1000: unused by anything in the guest.
+		guestReplyRoute = {
+			mark = "0x10000000";
+			table = 1000;
+			priority = 50;
+			group = 1000;
+		};
+
 		# The Proxmox backend HOST system (pve/). Same specialArgs as mkGceHost;
 		# operators pass their base and site modules as extraModules, and those
 		# modules must evaluate on THIS flake's nixpkgs.
@@ -4618,7 +4631,7 @@
 					}) ephemeralPaths)
 				));
 			})
-		];
+		] ++ lib.optional (target == "vm") (import ./modules/guest-reply-route.nix guestReplyRoute);
 	in {
 		# The GCE bake seam. `packages.gce-image` builds the DEFAULT host config,
 		# whose cogworx.gce.controlCAPublicKey is empty -- fail-closed, and
@@ -6308,6 +6321,64 @@
 				python3 ${./tests/test_remap_deadline.py}
 				touch $out
 			'';
+
+			# Reply-via-uplink policy routing (modules/guest-reply-route.nix) is
+			# VM-only: the container never imports it, so its closure is unchanged.
+			# Every VM profile must carry the networkd half on the uplink's generic
+			# DHCP unit (dropped, the rule and table-1000 route never exist and a
+			# guest route overlapping a client captures the replies again) and run
+			# the SAME ruleset, which matches the uplink by link group: the NIC's
+			# name differs between profiles. Needles come from guestReplyRoute, the
+			# ids the module renders.
+			guest-reply-route-vm-only = let
+				ids = guestReplyRoute;
+				cfg = c: self.nixosConfigurations.${c}.config;
+				vms = [ (configName system) "${configName system}-hosted" ];
+				ct = "${configName system}-container";
+				has = c: (cfg c).systemd.services ? cogbox-reply-route;
+				exec = c: (cfg c).systemd.services.cogbox-reply-route.serviceConfig.ExecStart;
+				unitText = c: pkgs.writeText "${c}-99-ethernet-default-dhcp.network"
+					((cfg c).systemd.network.units."99-ethernet-default-dhcp.network".text or "");
+				needles = [
+					"Group=${toString ids.group}"
+					"FirewallMark=${ids.mark}/${ids.mark}"
+					"Priority=${toString ids.priority}"
+					"Table=${toString ids.table}"
+					"Gateway=_dhcp4"
+					"GatewayOnLink=true"
+				];
+				allHave = lib.all has vms;
+				ruleset = lib.last (lib.splitString " " (exec (lib.head vms)));
+			in pkgs.runCommand "cogbox-guest-reply-route-vm-only" {
+				nativeBuildInputs = [ pkgs.gnugrep ];
+			} ''
+				fails=0
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+				${lib.optionalString (has ct) ''
+					bad "${ct} declares cogbox-reply-route.service; the container must not import modules/guest-reply-route.nix"
+				''}
+				${lib.optionalString ((cfg ct).systemd.network.networks != { }) ''
+					bad "${ct} declares systemd.network.networks (${toString (lib.attrNames (cfg ct).systemd.network.networks)}); the container has no networkd uplink"
+				''}
+				${lib.concatMapStrings (c: if !(has c) then ''
+					bad "${c} does not declare cogbox-reply-route.service; replies to connections from the uplink follow the main table"
+				'' else lib.concatMapStrings (n: ''
+					grep -qxF ${lib.escapeShellArg n} ${unitText c} \
+						|| bad "${c}: 99-ethernet-default-dhcp.network lacks the line ${n}"
+				'') needles) vms}
+				${lib.optionalString allHave ''
+					${lib.optionalString (lib.length (lib.unique (map exec vms)) != 1) ''
+						bad "the VM profiles run different cogbox-reply-route ExecStart lines: ${toString (map exec vms)}"
+					''}
+					grep -qF ${lib.escapeShellArg "iifgroup ${toString ids.group}"} ${ruleset} \
+						|| bad "${ruleset} does not match the uplink by iifgroup ${toString ids.group}"
+					if grep -nE 'iifname|oifname|enp[0-9]|eth[0-9]' ${ruleset} >&2; then
+						bad "${ruleset} names an interface; the uplink's name differs between profiles, match its link group"
+					fi
+				''}
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
 		} // lib.optionalAttrs (system == "x86_64-linux") {
 			# The zig tools must run on every x86 host that may substitute them,
 			# whatever CPU built them: fail on instructions from the extensions
@@ -6854,6 +6925,12 @@
 			runtime-boot-restore = pkgs.testers.runNixOSTest (import ./tests/runtime-boot-restore.nix {
 				inherit self pkgs;
 			});
+			# Reply-via-uplink routing (modules/guest-reply-route.nix) in a real
+			# cogbox VM guest behind passt: a Docker network overlapping the
+			# client's address no longer captures replies on the ssh, app-relay
+			# and mosh forwards; guest egress and container traffic are unchanged;
+			# each half is a working negative control. Needs KVM.
+			guest-reply-route = pkgs.testers.runNixOSTest (import ./tests/guest-reply-route.nix { inherit self pkgs; ids = guestReplyRoute; });
 
 			# --- GCE backend image checks -------------------------------------
 			#
