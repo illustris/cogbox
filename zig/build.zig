@@ -18,6 +18,15 @@ pub fn build(b: *std.Build) void {
 		.optimize = optimize,
 	});
 
+	// Shared `ssh` argv plumbing (the guest endpoint read + the argv builder).
+	// Pure std; imported by the CLI (`cogbox ssh`, `start`'s auto-ssh) and by the
+	// plugin module (the live apply's guest hops).
+	const sshargv_mod = b.createModule(.{
+		.root_source_file = b.path("src/sshargv.zig"),
+		.target = target,
+		.optimize = optimize,
+	});
+
 	const socks5_mod = b.createModule(.{
 		.root_source_file = b.path("src/socks5/main.zig"),
 		.target = target,
@@ -134,6 +143,7 @@ pub fn build(b: *std.Build) void {
 	plugin_mod.addImport("rules_module", rules_mod);
 	plugin_mod.addImport("l7_module", l7_mod);
 	plugin_mod.addImport("secret_module", secret_mod);
+	plugin_mod.addImport("sshargv", sshargv_mod);
 
 	// Top-level cogbox CLI.
 	const cli_mod = b.createModule(.{
@@ -151,6 +161,7 @@ pub fn build(b: *std.Build) void {
 	cli_mod.addImport("authproxy_module", authproxy_mod);
 	cli_mod.addImport("divertshim_module", divertshim_mod);
 	cli_mod.addImport("filter", filter_mod);
+	cli_mod.addImport("sshargv", sshargv_mod);
 
 	const cogbox_exe = b.addExecutable(.{
 		.name = "cogbox",
@@ -162,6 +173,11 @@ pub fn build(b: *std.Build) void {
 		.root_module = filter_mod,
 	});
 	const run_filter_tests = b.addRunArtifact(filter_tests);
+
+	const sshargv_tests = b.addTest(.{
+		.root_module = sshargv_mod,
+	});
+	const run_sshargv_tests = b.addRunArtifact(sshargv_tests);
 
 	const socks5_tests = b.addTest(.{
 		.root_module = socks5_mod,
@@ -255,6 +271,7 @@ pub fn build(b: *std.Build) void {
 	plugin_test_mod.addImport("rules_module", rules_mod);
 	plugin_test_mod.addImport("l7_module", l7_mod);
 	plugin_test_mod.addImport("secret_module", secret_mod);
+	plugin_test_mod.addImport("sshargv", sshargv_mod);
 	const plugin_tests = b.addTest(.{
 		.root_module = plugin_test_mod,
 	});
@@ -297,6 +314,8 @@ pub fn build(b: *std.Build) void {
 	// The `secret` verb re-renders + signals through the rules module (its live
 	// hot-reload path), so its tests need that import as well.
 	cli_verbs_test_mod.addImport("rules_module", rules_mod);
+	// The ssh verb's endpoint read + argv builder live in the shared module.
+	cli_verbs_test_mod.addImport("sshargv", sshargv_mod);
 	const cli_verbs_tests = b.addTest(.{
 		.root_module = cli_verbs_test_mod,
 	});
@@ -313,6 +332,7 @@ pub fn build(b: *std.Build) void {
 
 	const test_step = b.step("test", "Run unit tests");
 	test_step.dependOn(&run_filter_tests.step);
+	test_step.dependOn(&run_sshargv_tests.step);
 	test_step.dependOn(&run_socks5_tests.step);
 	test_step.dependOn(&run_l7proxy_tests.step);
 	test_step.dependOn(&run_divertshim_tests.step);

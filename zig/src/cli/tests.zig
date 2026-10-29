@@ -6,6 +6,7 @@
 
 test {
     _ = @import("launch.zig");
+    _ = @import("config_lock.zig");
     _ = @import("verbs/ssh.zig");
     _ = @import("verbs/status.zig");
     _ = @import("verbs/stop.zig");

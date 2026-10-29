@@ -170,7 +170,31 @@ pub const RunnerBuild = struct {
 	// "" => keep the hardcoded -j1 OOM guard below. Default "" so runner/brain callers,
 	// which never set it, stay byte-identical.
 	build_jobs: []const u8 = "",
+	// reexec_package: the flake PACKAGE ATTRIBUTE the launcher re-execs through
+	// (COGBOX_REEXEC_PACKAGE, baked by mkCogboxAttr; "cogbox" when unset). The RUNNER
+	// build selects its nixosConfiguration from it (configSuffixFor), so the runner it
+	// builds is the one that package's launcher boots. Brain/toplevel builds target
+	// the -container config and ignore it. Default "cogbox" keeps every caller that
+	// does not set it byte-identical.
+	reexec_package: []const u8 = "cogbox",
 };
+
+/// The nixosConfiguration suffix (appended after `cogbox-<arch>`) whose
+/// declaredRunner the launcher of package `reexec_package` boots: `cogbox` -> ""
+/// (the workstation guest), `cogbox-hosted` -> "-hosted" (the GCE/PVE host image's
+/// guest, `cogbox-<arch>-hosted`). This is what keeps the runner a pre-build makes
+/// and the record key it is filed under ("<flakeSource>#<reexecPackage>",
+/// writeRunnerRecord) about the SAME package: the runner build used to target the
+/// workstation config whatever the package, so a pre-build under cogbox-hosted
+/// recorded a workstation runner under the hosted key, and the hosted launcher
+/// would have fast-pathed a guest with the wrong storage layout. Null for any other
+/// attribute: no other package re-execs, and guessing a config would recreate that
+/// mis-key, so the caller skips the pre-build instead (boot evaluates).
+pub fn configSuffixFor(reexec_package: []const u8) ?[]const u8 {
+	if (std.mem.eql(u8, reexec_package, "cogbox")) return "";
+	if (std.mem.eql(u8, reexec_package, "cogbox-hosted")) return "-hosted";
+	return null;
+}
 
 /// Build the `nix build` argv for the runner (everything after `nix
 /// --extra-experimental-features ...`, which runNix prepends). Separated from
@@ -181,9 +205,12 @@ pub const RunnerBuild = struct {
 /// are freed by argvDeinit. Optional substituter/key/netrc knobs are appended
 /// only when non-empty (so an unconfigured worker emits no extra options); a
 /// non-empty base_store_root additionally appends `--extra-experimental-features
-/// read-only-local-store` so nix accepts the frozen CoW lower as a store.
+/// read-only-local-store` so nix accepts the frozen CoW lower as a store. The
+/// config is `cogbox-<arch><configSuffixFor(b.reexec_package)>`, the same one the
+/// launcher of that package re-execs into; an unknown package is refused.
 fn runnerBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayList([]const u8) {
-	return buildArgvFor(allocator, b, "", "config.microvm.declaredRunner");
+	const suffix = configSuffixFor(b.reexec_package) orelse return error.UnknownReexecPackage;
+	return buildArgvFor(allocator, b, suffix, "config.microvm.declaredRunner");
 }
 
 /// The container backend's counterpart: build `config.system.build.cogboxBrain`
@@ -232,8 +259,9 @@ fn toplevelBuildArgv(allocator: std.mem.Allocator, b: RunnerBuild) !std.ArrayLis
 }
 
 /// Shared `nix build` argv builder. `config_suffix` is appended after `cogbox-<arch>` to
-/// select the nixosConfiguration (`""` = the VM config for the runner; `"-container"` = the
-/// container config for the brain and toplevel). `installable_attr` is the leaf attribute. The
+/// select the nixosConfiguration (configSuffixFor's `""`/`"-hosted"` = the VM config for the
+/// runner; `"-container"` = the container config for the brain and toplevel).
+/// `installable_attr` is the leaf attribute. The
 /// interpolated installable/inputs land at argv indices 1/4/7, which argvDeinit frees; the
 /// literal flags are static.
 fn buildArgvFor(allocator: std.mem.Allocator, b: RunnerBuild, config_suffix: []const u8, installable_attr: []const u8) !std.ArrayList([]const u8) {
@@ -665,6 +693,97 @@ test "runnerBuildArgv: substituters only, no keys/netrc" {
 	try expectArgv(&.{
 		"--option", "extra-substituters", "file:///cache", "--option", "require-sigs", "false",
 	}, argv.items[10..]);
+}
+
+// configSuffixFor maps exactly the two packages that re-exec to the config their
+// launcher boots, and nothing else.
+test "configSuffixFor: cogbox is the workstation config, cogbox-hosted the hosted one" {
+	try t.expectEqualStrings("", configSuffixFor("cogbox").?);
+	try t.expectEqualStrings("-hosted", configSuffixFor("cogbox-hosted").?);
+	try t.expect(configSuffixFor("") == null);
+	try t.expect(configSuffixFor("cogbox-tools") == null);
+	try t.expect(configSuffixFor("cogbox-container") == null);
+	try t.expect(configSuffixFor("Cogbox") == null);
+}
+
+// The hosted mis-key: a runner pre-built under COGBOX_REEXEC_PACKAGE=cogbox-hosted
+// must be the HOSTED runner (cogbox-<arch>-hosted), because writeRunnerRecord files
+// it under "<flakeSource>#cogbox-hosted" and the hosted launcher fast-paths it. The
+// rest of the argv (override inputs, knobs) is unchanged.
+test "runnerBuildArgv: cogbox-hosted builds the hosted config's runner" {
+	var argv = try runnerBuildArgv(t.allocator, .{
+		.flake_source = "/nix/store/abc-cogbox-source",
+		.nixpkgs_source = "/nix/store/def-nixpkgs",
+		.plugins_flake_dir = "/var/lib/cogbox/inst/plugins-flake",
+		.arch = "x86_64",
+		.substituters = "",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+		.reexec_package = "cogbox-hosted",
+	});
+	defer argvDeinit(t.allocator, &argv);
+
+	try expectArgv(&.{
+		"build",
+		"path:/nix/store/abc-cogbox-source#nixosConfigurations.cogbox-x86_64-hosted.config.microvm.declaredRunner",
+		"--override-input",
+		"userExtensions",
+		"path:/var/lib/cogbox/inst/plugins-flake",
+		"--override-input",
+		"userExtensions/user/nixpkgs",
+		"path:/nix/store/def-nixpkgs",
+		"--no-link",
+		"--print-out-paths",
+	}, argv.items);
+}
+
+// An explicit "cogbox" is the default's argv; an unknown package is refused
+// rather than built against a guessed config.
+test "runnerBuildArgv: explicit cogbox is the workstation config, unknown is refused" {
+	var argv = try runnerBuildArgv(t.allocator, .{
+		.flake_source = "/src",
+		.nixpkgs_source = "/np",
+		.plugins_flake_dir = "/pf",
+		.arch = "aarch64",
+		.substituters = "",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+		.reexec_package = "cogbox",
+	});
+	defer argvDeinit(t.allocator, &argv);
+	try t.expectEqualStrings("path:/src#nixosConfigurations.cogbox-aarch64.config.microvm.declaredRunner", argv.items[1]);
+
+	try t.expectError(error.UnknownReexecPackage, runnerBuildArgv(t.allocator, .{
+		.flake_source = "/src",
+		.nixpkgs_source = "/np",
+		.plugins_flake_dir = "/pf",
+		.arch = "x86_64",
+		.substituters = "",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+		.reexec_package = "cogbox-other",
+	}));
+}
+
+// The container builds target the -container config whatever the package: the
+// re-exec package selects only the VM runner's config.
+test "brainBuildArgv/toplevelBuildArgv: the re-exec package never moves the container config" {
+	const b: RunnerBuild = .{
+		.flake_source = "/src",
+		.nixpkgs_source = "/np",
+		.plugins_flake_dir = "/pf",
+		.arch = "x86_64",
+		.substituters = "",
+		.trusted_public_keys = "",
+		.netrc_file = "",
+		.reexec_package = "cogbox-hosted",
+	};
+	var brain = try brainBuildArgv(t.allocator, b);
+	defer argvDeinit(t.allocator, &brain);
+	try t.expectEqualStrings("path:/src#nixosConfigurations.cogbox-x86_64-container.config.system.build.cogboxBrain", brain.items[1]);
+	var top = try toplevelBuildArgv(t.allocator, b);
+	defer argvDeinit(t.allocator, &top);
+	try t.expectEqualStrings("path:/src#nixosConfigurations.cogbox-x86_64-container.config.system.build.toplevel", top.items[1]);
 }
 
 // The container brain build must target the `-container` config (never the VM

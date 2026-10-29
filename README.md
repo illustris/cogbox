@@ -72,7 +72,7 @@ Each enabled harness ships a full-auto launcher inside the VM: `c` for `claude-c
 | [Per-instance extensions](docs/extensions.md) | Extending one instance's NixOS config through its `flake/flake.nix` |
 | [Plugins](docs/plugins.md) | Installable, versioned extensions: the flake contract, pinning, plugin-supplied firewall rules, the generated composition flake |
 | [Harnesses](docs/harnesses.md) | The harness model, per-harness full-auto wiring, adding a harness |
-| [Internals](docs/internals.md) | Directory layout, runtime dir + 9p shares, fw_cfg injection, launch-time patching, re-exec mechanism, host path overrides |
+| [Internals](docs/internals.md) | Directory layout, runtime dir + 9p shares, guest Nix store, boot-only units, fw_cfg injection, launch-time patching, re-exec mechanism and fast-path record, boot snapshot, host path overrides |
 | [Runtime tool environments](docs/runtime-environment.md) | `cogbox-env`: select, roll back and restore guest tool bundles at runtime without a restart; enabled on the hosted (GCE) guest; protocol, boot restore, retention, recovery |
 | [PVE system upgrades](docs/pve-system-upgrade.md) | In-place system upgrades of a Proxmox sandbox VM: the `cogworx-pve-upgrade` tool contract, the GRUB guard, the compat doc, power-cut repair |
 

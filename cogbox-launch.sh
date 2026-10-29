@@ -611,6 +611,30 @@ fi
 if [ "$EXCLUSIVE_INIT" -eq 1 ] && [ -e "$INSTANCE_CONFIG_DIR" ]; then
 	die "instance '$EFFECTIVE_NAME' already exists (--exclusive)" 73
 fi
+# Live-apply housekeeping, every pass, under the config lock just taken (the
+# verb inherits CONFIG_LOCK_FD and never takes the lock itself). Today it does
+# one thing, and only with --init-only (passed exactly when INIT_ONLY=1):
+# empty <icd>/apply/trash/, bounded at 30s. The snapshot GC below only RENAMES
+# trees into the trash, because the daemon pass must own a live QEMU within
+# `cogbox start`'s 60s; `start` runs its init pass before that window, so the
+# one O(files) delete happens there. Best-effort: whatever the verb's exit
+# status, the pass continues (it never fails a boot). Bounded from outside too
+# (TERM at 45s, KILL 5s later): the verb's own 30s budget is checked between
+# directory entries, so a single wedged unlink or readdir would escape it.
+if [ -d "$INSTANCE_CONFIG_DIR/apply" ]; then
+	# Unsubstituted source (the no-VM launcher tests) resolves `cogbox` on PATH.
+	_preboot_bin="@cogbox@"
+	case "$_preboot_bin" in @*) _preboot_bin=$(command -v cogbox 2>/dev/null) || _preboot_bin="" ;; esac
+	if [ -n "$_preboot_bin" ]; then
+		_preboot_args=("$INSTANCE_CONFIG_DIR")
+		[ "$INIT_ONLY" -ne 1 ] || _preboot_args+=(--init-only)
+		_preboot_rc=0
+		timeout -k 5 45 "$_preboot_bin" __plugin-apply-preboot "${_preboot_args[@]}" || _preboot_rc=$?
+		[ "$_preboot_rc" -eq 0 ] \
+			|| echo "cogbox-launch: warning: live-apply housekeeping (__plugin-apply-preboot) exited $_preboot_rc; continuing" >&2
+	fi
+	unset _preboot_bin _preboot_args _preboot_rc
+fi
 release_config_lock() { exec {CONFIG_LOCK_FD}>&-; }
 # Retake the config lock after a release (the re-pin confirmation builds
 # without it). No other lock is held at that point, so the lock order holds.
@@ -1233,9 +1257,16 @@ RUNNER_DIR="${RUNNER_DIR:-@runner@}"
 # Self-recorded fast path (plugins only). Once a plugins re-exec has built the
 # composed runner, it writes its out-path here so the NEXT boot can realize
 # that store path directly -- no flake eval. The file lives on the state PVC
-# (under INSTANCE_CONFIG_DIR), so it persists across boots. Two lines:
+# (under INSTANCE_CONFIG_DIR), so it persists across boots. Three lines:
 #   line1 = the RECORD KEY, "<flakeSource>#<reexecPackage>";
-#   line2 = the composed runner out-path.
+#   line2 = the composed runner out-path;
+#   line3 = the comp (below) of the composition bytes that runner was built
+#           from. The fast path requires it to be present and to equal the comp
+#           of the bytes this boot would evaluate, so a record can never vouch
+#           for a runner of a different composition (a plugin op that committed
+#           while a re-exec evaluated, for one). A two-line record from an older
+#           cogbox therefore misses once: the re-exec rewrites it in this form.
+#           Older launchers read only lines 1-2.
 #
 # The key carries the package attribute and not just the image rev, and that is
 # not decoration. @flakeSource@ is BYTE-IDENTICAL for cogbox and cogbox-hosted
@@ -1261,6 +1292,462 @@ RUNNER_DIR="${RUNNER_DIR:-@runner@}"
 RUNNER_KEY="@flakeSource@#@reexecPackage@"
 RUNNER_PATH_FILE="$INSTANCE_CONFIG_DIR/runner.path"
 FAST_PATH=0
+
+# -- Live-apply boot state: snapshot, composition pin, records ------
+# A plugin change on a running sandbox is (in a later phase) applied live, and a
+# change the guest rejects is rolled back to exactly what the guest booted. The
+# launcher records that boot state under <icd>/apply/:
+#
+#   snap/<id>/  a snapshot. composition/{flake.nix,flake.lock} are BYTE copies,
+#               never links (nix rewrites a path: flake's lock in place, so a
+#               linked lock would change under the snapshot); state.json holds
+#               the plugin entries and their tagged L4/L7/inject policy; src/ is
+#               a `cp -al` of plugin-sources/, the only hard-linked part (cogbox
+#               never writes into an existing source file); meta.json
+#               {id, comp, runner, key} is written LAST and is the completeness
+#               marker: a snapshot without it is never used, whatever names it.
+#   booting     the id of the boot snapshot this launcher took most recently
+#               (written once its take completed, cleared when a take fails).
+#   base        -> snap/<id>: what the running guest booted. Flipped (atomic
+#               symlink rename) only after the lifetime lock, by the pass that
+#               boots; unlinked when that pass has no complete snapshot.
+#   pin/<id>/   a plain copy of the composition for a re-exec to evaluate when
+#               there is no complete boot snapshot (init passes, a failed take).
+#   trash/      where the snapshot GC RENAMES trees nothing names (O(1) on one
+#               filesystem). Only `__plugin-apply-preboot --init-only` deletes
+#               them (above), never a daemon pass.
+#
+# comp = sha256(flake.nix || NUL || flake.lock), lowercase hex (the Zig side,
+# snapshot.compOfBytes, pins the same format), or `none` when the boot has no
+# plugin composition. A composition without a flake.lock (a first add whose
+# `nix flake lock` failed only warned) hashes an EMPTY lock, on both sides, so it
+# still has a comp and its record still fast-paths; nix refuses a zero-length
+# lock, so no runner is ever recorded for one that shares that comp. It is
+# runner.path's line 3, booted-runner's line 3 and a snapshot's meta.json comp.
+#
+# Every pass that re-execs with plugins evaluates a COPY of the composition
+# taken under the config lock (the boot snapshot's composition/, else a pin),
+# never plugins-flake/ itself: the lock is released before the eval, and a
+# plugin op that commits meanwhile must not leave a record whose runner was
+# built from bytes other than the ones its line 3 names.
+#
+# None of this may fail a boot that boots today. The launcher has no `set -e`,
+# so every step checks its own result and only warns, falling back to what a
+# launcher without it does: no base (a later live apply answers no_boot_record),
+# a re-exec straight from plugins-flake, or no record.
+APPLY_DIR="$INSTANCE_CONFIG_DIR/apply"
+APPLY_GCROOTS="$INSTANCE_CONFIG_DIR/gcroots"
+# The complete boot snapshot this pass boots ("" = none) and the comp of the
+# composition it boots ("" = unknown: no fast path, no usable record).
+BOOT_SNAP_ID=""
+BOOT_COMP=""
+# Whether the disk holding <icd> is under the free-space floor ("" = not yet
+# checked; see apply_space_low).
+APPLY_LOW_SPACE=""
+# The re-exec hands all three to its second hop; never trusted outside one,
+# and never inherited by passt/QEMU. A first hop that found the disk under the
+# floor (and warned) says so, and the second hop then skips its gcroot without
+# re-checking or warning again.
+if [ -n "${COGBOX_REEXECED:-}" ]; then
+	BOOT_COMP="${COGBOX_BOOT_COMP:-}"
+	[ "$BOOT_COMP" = none ] || [[ $BOOT_COMP =~ ^[0-9a-f]{64}$ ]] || BOOT_COMP=""
+	case "${COGBOX_BOOT_SNAPSHOT:-}" in
+		"$APPLY_DIR"/snap/*)
+			BOOT_SNAP_ID="${COGBOX_BOOT_SNAPSHOT##*/}"
+			[[ $BOOT_SNAP_ID =~ ^[0-9a-f]{16}$ ]] || BOOT_SNAP_ID=""
+			;;
+	esac
+	[ "${COGBOX_BOOT_LOW_SPACE:-}" != 1 ] || APPLY_LOW_SPACE=1
+fi
+unset COGBOX_BOOT_COMP COGBOX_BOOT_SNAPSHOT COGBOX_BOOT_LOW_SPACE
+
+apply_warn() { echo "cogbox-launch: warning: $*" >&2; }
+# Under sudo, hand new live-apply state to the invoking user, like every other
+# file this launcher creates for it. Never recursive: a snapshot's src/ is a
+# `cp -a` and keeps plugin-sources' owners.
+apply_own() { [ "$SUDO_INVOCATION" != 1 ] || chown -h "$REAL_USER" "$@" 2>/dev/null || true; }
+# mkdir each of "$@" in order (a parent before its child); a symlink is refused.
+apply_mkdir() {
+	local _d
+	for _d in "$@"; do
+		[ ! -L "$_d" ] || return 1
+		[ -d "$_d" ] && continue
+		mkdir -- "$_d" 2>/dev/null || [ -d "$_d" ] || return 1
+		apply_own "$_d"
+	done
+}
+# comp of the composition in "$1" (see above; a missing flake.lock hashes as
+# empty, as snapshot.compOfDir's FileNotFound does); fails when a file that
+# exists cannot be read, so a caller never records a comp it did not compute.
+comp_of_dir() {
+	local _c
+	_c=$(set -o pipefail; { cat -- "$1/flake.nix" && printf '\0' \
+		&& { [ ! -e "$1/flake.lock" ] || cat -- "$1/flake.lock"; }; } 2>/dev/null | sha256sum 2>/dev/null) || return 1
+	_c=${_c%% *}
+	[[ $_c =~ ^[0-9a-f]{64}$ ]] || return 1
+	printf '%s\n' "$_c"
+}
+# A random 16-hex-digit snapshot/pin id.
+apply_new_id() {
+	local _id
+	_id=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || return 1
+	[[ $_id =~ ^[0-9a-f]{16}$ ]] || return 1
+	printf '%s\n' "$_id"
+}
+# Seconds one apply_write's fsync may wait. An ext4 fsync can wait on a journal
+# commit that flushes the whole filesystem's dirty data (a big host build), and
+# the daemon pass must own a live QEMU within `cogbox start`'s 60s; a write past
+# it fails like any other, and every caller falls back. The boot snapshot
+# lowers it to what its own bound has left (take_boot_snapshot).
+APPLY_SYNC_BOUND=5
+# Write stdin to "$1" as a NEW file: a tmp name beside it, fsync, rename. Never
+# an in-place write, so no inode another snapshot holds is ever rewritten.
+apply_write() {
+	local _tmp="${1%/*}/.${1##*/}.tmp.$$"
+	if cat > "$_tmp" 2>/dev/null && timeout -k 1 "$APPLY_SYNC_BOUND" sync -- "$_tmp" 2>/dev/null \
+		&& mv -f -- "$_tmp" "$1" 2>/dev/null; then
+		apply_own "$1"
+		return 0
+	fi
+	rm -f -- "$_tmp"
+	return 1
+}
+# Free space on the filesystem that holds <icd>, checked before the boot
+# snapshot, the composition pin and the booted-runner gcroot. Each costs real
+# blocks and inodes there (the snapshot one of each per directory of its
+# `cp -al` tree, plus a few small files), and what a failed or abandoned take
+# used stays used until the next init pass empties the trash -- while the rest
+# of this pass (REAL_DATA's .app-launch, on the same disk on GCE/PVE) still has
+# to write. Below the floor all three are skipped and the pass boots exactly as
+# a launcher without live apply does, with one warning per pass (a first hop
+# that found the disk low hands that verdict to its second hop, which neither
+# re-checks nor warns; one that found it fine leaves the second hop to check
+# afresh, and warn, before its gcroot). Checked once per process. The floor is
+# COGBOX_APPLY_MIN_FREE_MB (64, the floor a live apply checks too) of blocks
+# available to an unprivileged writer, and 16384 free inodes on a filesystem
+# that counts them (btrfs and an unlimited tmpfs report none). A statfs that
+# fails counts as enough: the take's own failure fallback still applies.
+# Passing the floor does not mean a take fits above it: see apply_take_fits.
+APPLY_FLOOR_MB=${COGBOX_APPLY_MIN_FREE_MB:-64}
+[[ $APPLY_FLOOR_MB =~ ^[0-9]{1,6}$ ]] || APPLY_FLOOR_MB=64
+APPLY_FLOOR_INODES=16384
+# The statfs of the filesystem that holds <icd>, read by apply_statfs: blocks
+# available to an unprivileged writer, the block size, inodes (0 where the
+# filesystem counts none), free inodes, blocks, and free blocks (root's reserve
+# included). APPLY_ST_AVAIL is "" when the last read failed.
+APPLY_ST_AVAIL=""
+apply_statfs() {
+	local _st
+	APPLY_ST_AVAIL=""
+	_st=$(stat -f -c '%a %S %c %d %b %f' -- "$INSTANCE_CONFIG_DIR" 2>/dev/null) || return 1
+	[[ $_st =~ ^([0-9]{1,18})\ ([1-9][0-9]{0,8})\ ([0-9]{1,18})\ ([0-9]{1,18})\ ([0-9]{1,18})\ ([0-9]{1,18})$ ]] || return 1
+	APPLY_ST_BSIZE=${BASH_REMATCH[2]} APPLY_ST_FILES=${BASH_REMATCH[3]} APPLY_ST_FFREE=${BASH_REMATCH[4]}
+	APPLY_ST_BLOCKS=${BASH_REMATCH[5]} APPLY_ST_BFREE=${BASH_REMATCH[6]}
+	APPLY_ST_AVAIL=${BASH_REMATCH[1]}
+}
+# The floor in blocks of the last apply_statfs.
+apply_floor_blocks() { echo $(( (APPLY_FLOOR_MB * 1048576 + APPLY_ST_BSIZE - 1) / APPLY_ST_BSIZE )); }
+# Whether the last apply_statfs (which must have succeeded) is under the floor.
+apply_under_floor() {
+	[ "$APPLY_ST_AVAIL" -lt "$(apply_floor_blocks)" ] \
+		|| { [ "$APPLY_ST_FILES" -gt 0 ] && [ "$APPLY_ST_FFREE" -lt "$APPLY_FLOOR_INODES" ]; }
+}
+apply_space_low() {
+	if [ -z "$APPLY_LOW_SPACE" ]; then
+		APPLY_LOW_SPACE=0
+		if apply_statfs && apply_under_floor; then
+			APPLY_LOW_SPACE=1
+			apply_warn "under ${APPLY_FLOOR_MB} MiB or $APPLY_FLOOR_INODES inodes free for $INSTANCE_CONFIG_DIR ($((APPLY_ST_AVAIL * APPLY_ST_BSIZE / 1048576)) MiB, $APPLY_ST_FFREE inodes); skipping the live-apply boot snapshot, composition pin and runner gcroot: this boot has no live-apply base"
+		fi
+	fi
+	[ "$APPLY_LOW_SPACE" = 1 ]
+}
+# state.json: the plugin entries in order, and per plugin the L4 rules, L7 rules
+# and injection specs tagged with its name, where `cogbox plugin` writes them
+# (.network.rules, .network.l7.rules, .network.l7.inject.specs).
+APPLY_STATE_FILTER='(.plugins // []) as $plugins
+	| (if (.network | type) == "object" then .network else {} end) as $net
+	| (if ($net.l7 | type) == "object" then $net.l7 else {} end) as $l7
+	| (if ($l7.inject | type) == "object" then ($l7.inject.specs // []) else [] end) as $inj
+	| {plugins: $plugins,
+		tagged: (reduce ($plugins[] | objects | .name | strings) as $n ({};
+			.[$n] = {
+				l4: [($net.rules // [])[] | objects | select(.plugin == $n)],
+				l7: [($l7.rules // [])[] | objects | select(.plugin == $n)],
+				inject: [$inj[] | objects | select(.plugin == $n)]}))}'
+
+# The whole boot snapshot's bound, in seconds (COGBOX_BOOT_SNAPSHOT_TIMEOUT).
+# The take runs in the daemon pass, inside `cogbox start`'s 60s wait for QEMU,
+# and it is the one step there whose cost grows with the source tree: a large
+# ?dir= plugin on a cold or network-backed disk can make its `cp -al` alone
+# outlast that window. Past the bound the take fails like any other.
+APPLY_TAKE_BOUND=${COGBOX_BOOT_SNAPSHOT_TIMEOUT:-20}
+[[ $APPLY_TAKE_BOUND =~ ^[1-9][0-9]{0,3}$ ]] || APPLY_TAKE_BOUND=20
+# Why the last take failed, for its warning ("" = see the error above it).
+APPLY_TAKE_WHY=""
+# Seconds left of the take's bound, also lowering the next fsync's bound to
+# them; fails once the bound is spent.
+apply_take_left() {
+	APPLY_TAKE_LEFT=$((APPLY_TAKE_END - SECONDS))
+	if [ "$APPLY_TAKE_LEFT" -lt 1 ]; then
+		APPLY_TAKE_WHY="it took over ${APPLY_TAKE_BOUND}s"
+		return 1
+	fi
+	APPLY_SYNC_BOUND=$((APPLY_TAKE_LEFT < 5 ? APPLY_TAKE_LEFT : 5))
+}
+# Room the snapshot's own files need beside src/ (snap/<id>, composition/,
+# flake.nix, flake.lock, state.json, meta.json, booting), on top of the floor.
+APPLY_TAKE_MARGIN_INODES=64
+APPLY_TAKE_MARGIN_KIB=1024
+# Whether a `cp -al` of the tree "$1" fits above the free-space floor, per the
+# statfs apply_space_low just read. Hard links cost no space, so the copy costs
+# what the tree's DIRECTORIES occupy: one inode each, and their blocks. The
+# floor alone does not bound that: a ?dir= plugin brings its whole repo, and a
+# tree with more directories than the room above the floor would use the last
+# inodes or blocks before cp failed, leaving the rest of the pass a full disk.
+# O(1) when the room is at least what the whole filesystem uses (the tree's
+# directories are part of that); otherwise the tree's directories are counted
+# and their blocks summed, stopping once they exceed the room, within the
+# take's bound (the walk also warms the dentries cp then reads). Fails, with
+# APPLY_TAKE_WHY, when the tree does not fit or the walk outlasts the bound; a
+# statfs or walk that cannot be read counts as fitting (the take's failure
+# fallback, apply_undo_take, still applies).
+apply_take_fits() {
+	local _room_k _room_i=0 _icount=0 _lim _out _n _k _rc _re
+	[ -n "$APPLY_ST_AVAIL" ] || return 0
+	_room_k=$(( (APPLY_ST_AVAIL - $(apply_floor_blocks)) * APPLY_ST_BSIZE / 1024 - APPLY_TAKE_MARGIN_KIB ))
+	if [ "$APPLY_ST_FILES" -gt 0 ]; then
+		_icount=1
+		_room_i=$(( APPLY_ST_FFREE - APPLY_FLOOR_INODES - APPLY_TAKE_MARGIN_INODES ))
+	fi
+	if [ $(( (APPLY_ST_BLOCKS - APPLY_ST_BFREE) * APPLY_ST_BSIZE / 1024 )) -le "$_room_k" ] \
+		&& { [ "$_icount" = 0 ] || [ $(( APPLY_ST_FILES - APPLY_ST_FFREE )) -le "$_room_i" ]; }; then
+		return 0
+	fi
+	if [ "$_room_k" -lt 0 ] || { [ "$_icount" = 1 ] && [ "$_room_i" -lt 1 ]; }; then
+		APPLY_TAKE_WHY="no room above the free-space floor (${APPLY_FLOOR_MB} MiB, $APPLY_FLOOR_INODES inodes) for a copy of plugin-sources' directories"
+		return 1
+	fi
+	apply_take_left || return 1
+	_lim=999999999999999
+	[ "$_icount" = 0 ] || _lim=$((_room_i + 1))
+	_out=$(timeout -k 1 "$APPLY_TAKE_LEFT" find "$1" -type d -printf '%k\n' 2>/dev/null \
+		| head -n "$_lim" | jq -rs '"\(length) \(add // 0)"' 2>/dev/null; echo "${PIPESTATUS[0]}")
+	_re=$'^([0-9]+) ([0-9]+)\n([0-9]+)$'
+	[[ $_out =~ $_re ]] || return 0
+	_n=${BASH_REMATCH[1]} _k=${BASH_REMATCH[2]} _rc=${BASH_REMATCH[3]}
+	if { [ "$_icount" = 1 ] && [ "$_n" -gt "$_room_i" ]; } || [ "$_k" -gt "$_room_k" ]; then
+		APPLY_TAKE_WHY="a copy of plugin-sources' directories (at least $_n, $_k KiB) does not fit above the free-space floor (${APPLY_FLOOR_MB} MiB, $APPLY_FLOOR_INODES inodes)"
+		return 1
+	fi
+	case "$_rc" in
+		124|137) APPLY_TAKE_WHY="sizing plugin-sources took over ${APPLY_TAKE_BOUND}s"; return 1 ;;
+	esac
+	return 0
+}
+# Seconds a failed take's partial tree may take to remove (half the take's
+# bound: the tree is at most what cp built within that bound).
+APPLY_UNDO_BOUND=$(( (APPLY_TAKE_BOUND + 1) / 2 ))
+# A failed take that ran the disk out of room (cp said ENOSPC or EDQUOT, or a
+# fresh statfs reads under the floor) removes its partial tree at once: a
+# rename into the trash frees nothing, and the rest of this pass (.app-launch on
+# the same disk on GCE/PVE) still has to write. Bounded; a removal that does not
+# finish leaves the rest to the GC's rename, and this pass then writes nothing
+# more for live apply (no pin, no gcroot), as under the floor. Otherwise the
+# partial tree is left to the GC, as before.
+apply_undo_take() {
+	[ -n "$APPLY_TAKE_DIR" ] && [ -d "$APPLY_TAKE_DIR" ] || return 0
+	if [ "$APPLY_TAKE_FULL" != 1 ]; then
+		apply_statfs && apply_under_floor || return 0
+	fi
+	if timeout -k 1 "$APPLY_UNDO_BOUND" rm -rf --one-file-system -- "$APPLY_TAKE_DIR" 2>/dev/null; then
+		APPLY_TAKE_WHY+="${APPLY_TAKE_WHY:+; }the disk ran out of room for it, so its partial tree was removed"
+	else
+		APPLY_LOW_SPACE=1
+		apply_warn "could not remove the partial live-apply boot snapshot $APPLY_TAKE_DIR within ${APPLY_UNDO_BOUND}s; the rest of it goes to $APPLY_DIR/trash for the next init pass, and this boot writes no composition pin or runner gcroot"
+	fi
+}
+# The daemon pass's boot snapshot, taken under the config lock, within
+# APPLY_TAKE_BOUND. On success sets BOOT_SNAP_ID and BOOT_COMP. A take cut short
+# leaves its partial tree WITHOUT meta.json, which the GC renames into the trash
+# (or apply_undo_take removes, when the disk ran out of room for it).
+take_boot_snapshot() {
+	local _rc=0
+	APPLY_TAKE_WHY=""
+	APPLY_TAKE_DIR=""
+	APPLY_TAKE_FULL=0
+	APPLY_TAKE_END=$((SECONDS + APPLY_TAKE_BOUND))
+	take_boot_snapshot_steps || _rc=$?
+	APPLY_SYNC_BOUND=5
+	[ "$_rc" = 0 ] || apply_undo_take
+	return "$_rc"
+}
+take_boot_snapshot_steps() {
+	local _id _s _comp=none _state _cprc=0 _cperr
+	apply_mkdir "$APPLY_DIR" "$APPLY_DIR/snap" || return 1
+	# The trash too, before anything fills the disk: the GC must still be able
+	# to rename a partial tree on a disk the take filled. Its own failure only
+	# costs the GC (which warns), never the take.
+	apply_mkdir "$APPLY_DIR/trash" || true
+	if [ -d "$INSTANCE_CONFIG_DIR/plugin-sources" ]; then
+		apply_take_fits "$INSTANCE_CONFIG_DIR/plugin-sources" || return 1
+	fi
+	_id=$(apply_new_id) || return 1
+	_s="$APPLY_DIR/snap/$_id"
+	mkdir -- "$_s" || return 1
+	APPLY_TAKE_DIR=$_s
+	apply_own "$_s"
+	if [ "$PLUGIN_COUNT" -gt 0 ] && [ -f "$PLUGINS_FLAKE_DIR/flake.nix" ]; then
+		mkdir -- "$_s/composition" || return 1
+		apply_own "$_s/composition"
+		apply_take_left && apply_write "$_s/composition/flake.nix" < "$PLUGINS_FLAKE_DIR/flake.nix" || return 1
+		# A composition without a lock is copied without one (its comp hashes
+		# an empty lock, above), exactly as the pin copies it.
+		if [ -e "$PLUGINS_FLAKE_DIR/flake.lock" ]; then
+			apply_take_left && apply_write "$_s/composition/flake.lock" < "$PLUGINS_FLAKE_DIR/flake.lock" || return 1
+		fi
+		_comp=$(comp_of_dir "$_s/composition") || return 1
+	fi
+	_state=$(jq -c "$APPLY_STATE_FILTER" "$INSTANCE_CONFIG_DIR/config.json" 2>/dev/null) || return 1
+	apply_take_left && printf '%s\n' "$_state" | apply_write "$_s/state.json" || return 1
+	# The one O(files) step of the daemon pass. ENOSPC, EMLINK or running out of
+	# inodes on a large ?dir= tree fail it, and so does the bound (TERM, then
+	# KILL 2s later), and the boot then goes on without a base (the caller's
+	# fallback). Only cp's first three error lines are shown (a tree that runs
+	# out of room fails every entry after that), in the C locale, so that ENOSPC
+	# and EDQUOT can be told apart from the rest.
+	if [ -d "$INSTANCE_CONFIG_DIR/plugin-sources" ]; then
+		apply_take_left || return 1
+		_cperr=$(LC_ALL=C timeout -k 2 "$APPLY_TAKE_LEFT" cp -al -- "$INSTANCE_CONFIG_DIR/plugin-sources" "$_s/src" 2>&1 >/dev/null \
+			| sed -n 1,3p; exit "${PIPESTATUS[0]}") || _cprc=$?
+		[ -z "$_cperr" ] || printf '%s\n' "$_cperr" >&2
+		case "$_cprc" in
+			0) ;;
+			124|137) APPLY_TAKE_WHY="its cp -al of plugin-sources took over ${APPLY_TAKE_BOUND}s"; return 1 ;;
+			*)
+				case "$_cperr" in
+					*"No space left on device"*|*"Disk quota exceeded"*) APPLY_TAKE_FULL=1 ;;
+				esac
+				return 1 ;;
+		esac
+	else
+		mkdir -- "$_s/src" || return 1
+	fi
+	apply_own "$_s/src"
+	apply_take_left || return 1
+	jq -cn --arg id "$_id" --arg comp "$_comp" '{id: $id, comp: $comp, runner: null, key: null}' \
+		| apply_write "$_s/meta.json" || return 1
+	BOOT_SNAP_ID=$_id
+	BOOT_COMP=$_comp
+}
+
+# A plain copy of the composition (no snapshot) for a re-exec to evaluate.
+# Prints its dir. The GC moves pins into the trash once they are an hour old.
+pin_composition() {
+	local _id _p
+	apply_mkdir "$APPLY_DIR" "$APPLY_DIR/pin" || return 1
+	_id=$(apply_new_id) || return 1
+	_p="$APPLY_DIR/pin/$_id"
+	mkdir -- "$_p" || return 1
+	apply_own "$_p"
+	if apply_write "$_p/flake.nix" < "$PLUGINS_FLAKE_DIR/flake.nix" \
+		&& { [ ! -e "$PLUGINS_FLAKE_DIR/flake.lock" ] || apply_write "$_p/flake.lock" < "$PLUGINS_FLAKE_DIR/flake.lock"; }; then
+		printf '%s\n' "$_p"
+		return 0
+	fi
+	rm -rf -- "$_p"
+	return 1
+}
+
+# The snapshot GC, under the config lock. Renames into apply/trash/ every
+# snapshot without meta.json (incomplete, whatever names it) and every complete
+# one nothing names: base, built, booting, the ids "$@" this pass keeps, and the
+# ids in the files a live apply writes (active, inflight.json, rollback intents;
+# one of those that does not parse keeps every snapshot, the incomplete ones
+# included). Launcher pins older than an hour go too. Renames only: never a
+# tree delete, so it costs O(entries) even in the daemon pass. A rename that
+# fails only warns. The one unlink is of the launcher's own tmp names for
+# booting and base that a killed launcher left: only a config-lock holder
+# writes them, so under the lock every one that exists is stale.
+apply_snapshot_gc() {
+	local _keep=" $* " _f _l _id _d _names _now _mt
+	[ ! -L "$APPLY_DIR" ] && [ -d "$APPLY_DIR" ] || return 0
+	rm -f -- "$APPLY_DIR"/.booting.tmp.* "$APPLY_DIR"/.base.tmp.* 2>/dev/null
+	for _f in base built; do
+		_l=$(readlink -- "$APPLY_DIR/$_f" 2>/dev/null) && _keep+="${_l##*/} "
+	done
+	[ ! -f "$APPLY_DIR/booting" ] || _keep+="$(head -n 1 -- "$APPLY_DIR/booting" 2>/dev/null) "
+	for _f in "$APPLY_DIR/active" "$APPLY_DIR/inflight.json" "$APPLY_DIR"/rollback/*.intent; do
+		[ -e "$_f" ] || continue
+		if ! _names=$(jq -r '[.. | strings | select(test("\\A[0-9a-f]{16}\\z"))] | join(" ")' "$_f" 2>/dev/null); then
+			apply_warn "cannot read $_f; keeping every live-apply snapshot"
+			return 0
+		fi
+		_keep+="$_names "
+	done
+	if ! apply_mkdir "$APPLY_DIR/trash"; then
+		apply_warn "cannot create $APPLY_DIR/trash; old live-apply snapshots stay in place"
+		return 0
+	fi
+	for _d in "$APPLY_DIR"/snap/*; do
+		[ -d "$_d" ] && [ ! -L "$_d" ] || continue
+		_id=${_d##*/}
+		[[ $_id =~ ^[0-9a-f]{16}$ ]] || continue
+		[ -f "$_d/meta.json" ] && [[ $_keep == *" $_id "* ]] && continue
+		mv -T -- "$_d" "$APPLY_DIR/trash/$_id" 2>/dev/null \
+			|| apply_warn "could not move live-apply snapshot $_id into $APPLY_DIR/trash"
+	done
+	_now=$(date +%s)
+	for _d in "$APPLY_DIR"/pin/*; do
+		[ -d "$_d" ] && [ ! -L "$_d" ] || continue
+		_mt=$(stat -c %Y -- "$_d" 2>/dev/null) || continue
+		[ $((_now - _mt)) -ge 3600 ] || continue
+		mv -T -- "$_d" "$APPLY_DIR/trash/pin-${_d##*/}" 2>/dev/null \
+			|| apply_warn "could not move composition pin ${_d##*/} into $APPLY_DIR/trash"
+	done
+	return 0
+}
+
+# A pass without a boot snapshot forgets the one an earlier pass recorded, so
+# the GC retires it (it never booted). Never through a symlinked apply/.
+apply_clear_booting() {
+	[ -L "$APPLY_DIR" ] || rm -f -- "$APPLY_DIR/booting" 2>/dev/null || true
+}
+
+# Point apply/base at this boot's snapshot (only a pass that won the lifetime
+# lock boots, so only it moves base), after recording in its meta.json the
+# runner it boots. With no complete boot snapshot, base is UNLINKED instead: it
+# would otherwise name a snapshot of an earlier boot, not what this guest runs.
+# `built` never survives a boot, `booting` is done once base names it, and the
+# GC then retires the old base.
+promote_boot_snapshot() {
+	local _s="" _meta _tmp="$APPLY_DIR/.base.tmp.$$"
+	# A symlinked apply/ is never written through (as apply_mkdir and the GC
+	# refuse it): under sudo that would be root writing where the link points.
+	[ ! -L "$APPLY_DIR" ] || return 0
+	if [ -n "$BOOT_SNAP_ID" ] && [ -f "$APPLY_DIR/snap/$BOOT_SNAP_ID/meta.json" ]; then
+		_s="$APPLY_DIR/snap/$BOOT_SNAP_ID"
+		# Best-effort: a meta.json without its runner is still complete.
+		if ! { _meta=$(jq -c --arg runner "$RUNNER_DIR" --arg key "$RUNNER_KEY" '.runner = $runner | .key = $key' "$_s/meta.json" 2>/dev/null) \
+			&& printf '%s\n' "$_meta" | apply_write "$_s/meta.json"; }; then
+			apply_warn "could not record the booted runner in live-apply snapshot $BOOT_SNAP_ID"
+		fi
+		rm -f -- "$_tmp"
+		if ln -s -- "snap/$BOOT_SNAP_ID" "$_tmp" 2>/dev/null && mv -T -f -- "$_tmp" "$APPLY_DIR/base" 2>/dev/null; then
+			apply_own "$APPLY_DIR/base"
+		else
+			rm -f -- "$_tmp"
+			apply_warn "could not point $APPLY_DIR/base at this boot's snapshot; this boot has no live-apply base"
+			_s=""
+		fi
+	fi
+	if [ -z "$_s" ] && { [ -e "$APPLY_DIR/base" ] || [ -L "$APPLY_DIR/base" ]; }; then
+		rm -f -- "$APPLY_DIR/base" 2>/dev/null \
+			|| apply_warn "could not unlink $APPLY_DIR/base, which names an earlier boot"
+	fi
+	rm -f -- "$APPLY_DIR/built" "$APPLY_DIR/booting" 2>/dev/null
+	apply_snapshot_gc
+}
 
 if [ -z "${COGBOX_REEXECED:-}" ]; then
 	# Set by `cogbox start` on its daemon pass only (see the re-pin below).
@@ -1569,21 +2056,63 @@ if [ -z "${COGBOX_REEXECED:-}" ]; then
 		unset _nixx _net _prev _mark _fail _failpairs _skipped _fp _p _newpairs _repin _want _repin_name _locked _src _disk _rec _repin_snap _wrote_prev _ready _deadline _rc _failed _n _left _r _why _i _got _old _scratch _brc _hrc
 	fi
 
+	# -- Boot snapshot (daemon pass only) -----------------------------
+	# Taken here, after the re-pin and under the config lock, so it holds
+	# exactly the bytes this boot evaluates or fast-paths. Never in an init-only
+	# pass: that pass boots nothing, and `cogbox init` has no running guard. A
+	# failed take (ENOSPC, EMLINK or no free inodes in the `cp -al` of a large
+	# tree, an I/O error) only warns: `booting` is cleared so the GC below
+	# retires the partial tree, the composition is pinned as an init pass pins it
+	# (never from the partial tree), and the box boots without a base. A disk
+	# under the free-space floor skips the take (and the pin) altogether, as
+	# a failed take, so a nearly full state disk boots as it did before; so does
+	# a take whose copy would not fit above the floor (apply_take_fits), and a
+	# take that ran the disk out of room anyway removes its partial tree before
+	# the pass goes on (apply_undo_take).
+	if [ "$INIT_ONLY" -eq 0 ]; then
+		if apply_space_low; then
+			BOOT_SNAP_ID="" BOOT_COMP=""
+			apply_clear_booting
+		elif take_boot_snapshot; then
+			printf '%s\n' "$BOOT_SNAP_ID" | apply_write "$APPLY_DIR/booting" \
+				|| apply_warn "could not record live-apply boot snapshot $BOOT_SNAP_ID in $APPLY_DIR/booting"
+		else
+			BOOT_SNAP_ID="" BOOT_COMP=""
+			apply_warn "could not take the live-apply boot snapshot under $APPLY_DIR/snap${APPLY_TAKE_WHY:+ ($APPLY_TAKE_WHY)}; booting without a live-apply base (plugin changes need a restart until the next boot)"
+			apply_clear_booting
+		fi
+		# Retires an earlier pass's snapshot that never booted, and this pass's
+		# partial one. This pass's complete snapshot is kept by name.
+		apply_snapshot_gc $BOOT_SNAP_ID
+	fi
+	# The comp of the bytes this pass boots: the snapshot's, else the
+	# composition's own (read under the config lock), else `none`. An empty
+	# BOOT_COMP (the hash failed) only costs the fast path.
+	if [ -z "$BOOT_SNAP_ID" ]; then
+		if [ "$PLUGIN_COUNT" -gt 0 ] && [ -f "$PLUGINS_FLAKE_DIR/flake.nix" ]; then
+			BOOT_COMP=$(comp_of_dir "$PLUGINS_FLAKE_DIR") || BOOT_COMP=""
+		else
+			BOOT_COMP=none
+		fi
+	fi
+
 	# -- Skip-eval fast path (plugins only) ---------------------------
 	# If a previous plugins re-exec recorded a runner out-path for THIS image
 	# rev, realize that store path directly and skip the re-exec/eval entirely.
 	# This is strictly an optimization and MUST be fail-safe: on any problem
-	# (no record, rev marker mismatch, realise fails, run script absent) we
-	# leave FAST_PATH=0 and fall through to the normal re-exec/eval path, which
-	# re-records the (possibly new) rev -- so the path self-heals across image
-	# upgrades.
+	# (no record, rev marker mismatch, a missing or different line 3, realise
+	# fails, run script absent) we leave FAST_PATH=0 and fall through to the
+	# normal re-exec/eval path, which re-records the (possibly new) rev and the
+	# comp -- so the path self-heals across image upgrades.
 	if [ "$PLUGIN_COUNT" -gt 0 ] && [ -f "$RUNNER_PATH_FILE" ]; then
-		FP_REV="" FP_RUNNER=""
-		{ IFS= read -r FP_REV; IFS= read -r FP_RUNNER; } < "$RUNNER_PATH_FILE" || true
+		FP_REV="" FP_RUNNER="" FP_COMP=""
+		{ IFS= read -r FP_REV; IFS= read -r FP_RUNNER; IFS= read -r FP_COMP; } < "$RUNNER_PATH_FILE" || true
 		# Only trust the record when it was written against the current image
 		# rev AND the same package attribute -- see RUNNER_KEY above for why the
-		# rev alone is not a key.
-		if [ "$FP_REV" = "$RUNNER_KEY" ] && [ -n "$FP_RUNNER" ]; then
+		# rev alone is not a key -- AND for exactly the composition bytes this
+		# boot evaluates (line 3; a two-line record never matches).
+		if [ "$FP_REV" = "$RUNNER_KEY" ] && [ -n "$FP_RUNNER" ] \
+			&& [[ $FP_COMP =~ ^[0-9a-f]{64}$ ]] && [ "$FP_COMP" = "$BOOT_COMP" ]; then
 			if [ -e "$FP_RUNNER/bin/microvm-run" ]; then
 				RUNNER_DIR="$FP_RUNNER"
 				FAST_PATH=1
@@ -1597,13 +2126,39 @@ if [ -z "${COGBOX_REEXECED:-}" ]; then
 fi
 
 if [ -z "${COGBOX_REEXECED:-}" ] && [ "$FAST_PATH" -ne 1 ]; then
+	# The second hop learns which snapshot (if any) it boots and the comp of
+	# what it evaluates, for its base promotion and its records.
+	REEXEC_ENV=(COGBOX_REEXECED=1)
+	[ -z "$BOOT_SNAP_ID" ] || REEXEC_ENV+=("COGBOX_BOOT_SNAPSHOT=$APPLY_DIR/snap/$BOOT_SNAP_ID")
 	if [ "$PLUGIN_COUNT" -gt 0 ] && [ -f "$PLUGINS_FLAKE_DIR/flake.nix" ]; then
+		# Evaluate a COPY taken under the config lock, which is released before
+		# the eval: the complete boot snapshot's composition/, else a pin. Only
+		# when the pin cannot be written either does the eval read plugins-flake
+		# itself, exactly as before; BOOT_COMP is then from those bytes under
+		# the lock, so an op committing during the eval can only make line 3
+		# disagree with the bytes at the next boot (a missed fast path, never a
+		# wrong runner). Under the free-space floor no pin is written (that
+		# pass already warned).
+		if [ -n "$BOOT_SNAP_ID" ]; then
+			REEXEC_PIN="$APPLY_DIR/snap/$BOOT_SNAP_ID/composition"
+		elif ! apply_space_low && REEXEC_PIN=$(pin_composition); then
+			BOOT_COMP=$(comp_of_dir "$REEXEC_PIN") || BOOT_COMP=""
+		else
+			[ "$APPLY_LOW_SPACE" = 1 ] \
+				|| apply_warn "could not pin the plugin composition under $APPLY_DIR/pin; evaluating $PLUGINS_FLAKE_DIR directly"
+			REEXEC_PIN=$PLUGINS_FLAKE_DIR
+			BOOT_COMP=$(comp_of_dir "$REEXEC_PIN") || BOOT_COMP=""
+		fi
+		[ -n "$BOOT_COMP" ] \
+			|| apply_warn "could not hash the plugin composition; this boot records no fast-path runner"
+		REEXEC_ENV+=("COGBOX_BOOT_COMP=$BOOT_COMP")
+		[ "$APPLY_LOW_SPACE" != 1 ] || REEXEC_ENV+=(COGBOX_BOOT_LOW_SPACE=1)
 		release_config_lock
-		exec env COGBOX_REEXECED=1 nix \
+		exec env "${REEXEC_ENV[@]}" nix \
 			--extra-experimental-features "nix-command flakes" \
 			"${PLUGIN_SUBST_OPTS[@]}" \
 			run "path:@flakeSource@#@reexecPackage@" \
-			--override-input userExtensions "path:$PLUGINS_FLAKE_DIR" \
+			--override-input userExtensions "path:$REEXEC_PIN" \
 			--override-input userExtensions/user/nixpkgs "path:@nixpkgsSource@" \
 			-- "${ORIG_ARGS[@]}"
 	elif [ "$PLUGIN_COUNT" -gt 0 ]; then
@@ -1612,8 +2167,11 @@ if [ -z "${COGBOX_REEXECED:-}" ] && [ "$FAST_PATH" -ne 1 ]; then
 		exit 70
 	elif [ -f "$INSTANCE_FLAKE_DIR/flake.nix" ] \
 		&& ! printf '%s' "$SCAFFOLD_FLAKE" | cmp -s - "$INSTANCE_FLAKE_DIR/flake.nix"; then
+		# No plugin composition: comp `none`. The user flake is not pinned (it
+		# never was, and this path keeps no fast-path record).
+		REEXEC_ENV+=(COGBOX_BOOT_COMP=none)
 		release_config_lock
-		exec env COGBOX_REEXECED=1 nix \
+		exec env "${REEXEC_ENV[@]}" nix \
 			--extra-experimental-features "nix-command flakes" \
 			"${PLUGIN_SUBST_OPTS[@]}" \
 			run "path:@flakeSource@#@reexecPackage@" \
@@ -1628,10 +2186,12 @@ fi
 # substituted to THIS rev's freshly-built values, so the record is always
 # correct for the current image. Only the plugins case is fast-pathed, so only
 # record when the plugins flake drove this re-exec (a customized 0-plugin flake
-# re-exec stays on the eval path). Best-effort: a write failure must not abort
-# boot, hence the `|| true`.
+# re-exec stays on the eval path). Line 3 is the comp of the pinned bytes the
+# first hop handed over, i.e. of exactly what @runner@ was built from; an empty
+# one (the hash failed) is written as such and never fast-paths. Best-effort: a
+# write failure must not abort boot, hence the `|| true`.
 if [ -n "${COGBOX_REEXECED:-}" ] && [ -f "$PLUGINS_FLAKE_DIR/flake.nix" ]; then
-	printf '%s\n%s\n' "$RUNNER_KEY" "@runner@" > "$RUNNER_PATH_FILE" 2>/dev/null || true
+	printf '%s\n%s\n%s\n' "$RUNNER_KEY" "@runner@" "$BOOT_COMP" > "$RUNNER_PATH_FILE" 2>/dev/null || true
 fi
 
 # -- init-only stops here ------------------------------------------
@@ -1907,6 +2467,14 @@ mkdir -p "$RUNTIME"
 # tty); a hand-run launch keeps writing to its terminal.
 if [ ! -t 1 ]; then
 	exec >>"$RUNTIME/cogbox.log" 2>&1
+fi
+
+# -- Live-apply base: this boot's snapshot ---------------------------
+# Right after winning the lifetime lock (this pass boots) and while the config
+# lock is still held: every pending change is in the booted bytes, so nothing
+# earlier survives. O(1) renames only; the old base goes to the trash.
+if [ -n "$BOOT_SNAP_ID" ] || [ -d "$APPLY_DIR" ]; then
+	promote_boot_snapshot
 fi
 
 # Shutdown handlers + run identity BEFORE the port probe below: a stop request
@@ -2364,6 +2932,37 @@ else
 	# full and rules: connect to passt via unix socket (launched separately)
 	SED_ARGS+=(-e "s|-netdev '[^']*'|-netdev 'stream,id=usernet,server=off,addr.type=unix,addr.path=${PASST_SOCK}'|")
 fi
+
+# -- Record and root the runner this boot runs ------------------------
+# booted-runner (key, runner, comp; replaced atomically) is what a live apply
+# checks the base and the guest against. gcroots/booted roots that runner, so a
+# host GC cannot collect what is running (a fast-path record's runner was never
+# rooted before); only once it is rooted are the runners rooted during the
+# previous boot (gcroots/applied/) released. Both best-effort, and the root is
+# bounded: a wedged nix daemon must not hold the boot past start's 60s.
+if printf '%s\n%s\n%s\n' "$RUNNER_KEY" "$RUNNER_DIR" "$BOOT_COMP" > "$RUNTIME/booted-runner.tmp" 2>/dev/null \
+	&& mv -f -- "$RUNTIME/booted-runner.tmp" "$RUNTIME/booted-runner" 2>/dev/null; then
+	[ "$SUDO_INVOCATION" != 1 ] || chown "$REAL_USER" "$RUNTIME/booted-runner" 2>/dev/null || true
+else
+	rm -f -- "$RUNTIME/booted-runner.tmp"
+	apply_warn "could not record the booted runner in $RUNTIME/booted-runner"
+fi
+_root_err="cannot create $APPLY_GCROOTS"
+if apply_space_low; then
+	# Under the free-space floor (warned above): no new root, as before.
+	:
+elif apply_mkdir "$APPLY_GCROOTS" \
+	&& _root_err=$(timeout -k 2 10 nix-store --add-root "$APPLY_GCROOTS/booted" --realise "$RUNNER_DIR" 2>&1 >/dev/null); then
+	apply_own "$APPLY_GCROOTS/booted"
+	if [ -e "$APPLY_GCROOTS/applied" ] || [ -L "$APPLY_GCROOTS/applied" ]; then
+		{ rm -rf -- "$APPLY_GCROOTS/applied" 2>/dev/null && apply_mkdir "$APPLY_GCROOTS/applied"; } \
+			|| apply_warn "could not clear $APPLY_GCROOTS/applied"
+	fi
+else
+	_root_err=${_root_err%%$'\n'*}
+	apply_warn "could not root the booted runner at $APPLY_GCROOTS/booted (${_root_err:-nix-store failed or timed out}); leaving $APPLY_GCROOTS/applied in place"
+fi
+unset _root_err
 
 sed -E "${SED_ARGS[@]}" "$RUNNER_DIR/bin/microvm-run" > "$RUNTIME/run"
 chmod +x "$RUNTIME/run"

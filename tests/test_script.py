@@ -227,6 +227,22 @@ with subtest("Phase B: --network none blocks all outbound"):
     machine.succeed(guest(f"test -x {hello_dir}/bin/hello"))
     machine.succeed(guest("test -z \"$(find /nix/.rw-store/store -maxdepth 1 -type c)\""))
     machine.succeed(guest("nix-store --check-validity $(readlink -f /run/current-system)"))
+
+    # B3: once-markers. Once the boot settles, cogbox-boot-settled marks the
+    # boot-only units this boot started without failing, and a later start of
+    # a marked unit in the same boot is skipped by its condition. A unit that
+    # is restarted on a running guest carries no marker.
+    machine.wait_until_succeeds(
+        guest("systemctl show -P SubState cogbox-boot-settled.service | grep -qx exited"),
+        timeout=300,
+    )
+    print(machine.succeed(guest("journalctl -b -u cogbox-boot-settled.service --no-pager | tail -n 3; ls -A /run/cogbox/once")))
+    for unit in ["cogbox-vm-sshd-prep", "harness-setup-dirs", "rw-root-.claude"]:
+        machine.succeed(guest(f"test -f /run/cogbox/once/{unit}"))
+    machine.succeed(guest("test ! -e /run/cogbox/once/cogbox-claude-stub"))
+    machine.succeed(guest("systemctl start rw-root-.claude.service"))
+    cond = machine.succeed(guest("systemctl show -P ConditionResult rw-root-.claude.service")).strip()
+    assert cond == "no", f"a marked boot-only unit ran again after the boot settled (ConditionResult={cond!r})"
     stop_instance("cc-default")
 
 with subtest("Phase C: --network full allows outbound"):
