@@ -11,6 +11,7 @@ const parse = @import("../parse.zig");
 const help = @import("../help.zig");
 const exit_codes = @import("../exit.zig");
 const paths = @import("../paths.zig");
+const sshargv = @import("sshargv");
 
 pub fn run(
 	allocator: std.mem.Allocator,
@@ -114,42 +115,17 @@ pub fn run(
 	try exec(allocator, endpoint, identity, extra.items);
 }
 
-/// SSH host:port for a running instance, read from <runtime>/ssh-endpoint.
-/// Both fields are owned by the caller; free via `deinit`.
-pub const Endpoint = struct {
-	port: []const u8,
-	host: []const u8,
-
-	pub fn deinit(self: Endpoint, allocator: std.mem.Allocator) void {
-		allocator.free(self.port);
-		allocator.free(self.host);
-	}
-};
-
-pub const EndpointError = error{ Missing, Malformed, OutOfMemory };
-
-/// Parse <inst_runtime>/ssh-endpoint ("PORT HOST", written by the launch
-/// script when the VM comes up). Returns duped fields. `error.Missing` if the
-/// file is absent/unreadable; `error.Malformed` if it lacks a port or host.
-pub fn readEndpoint(allocator: std.mem.Allocator, io: std.Io, inst_runtime: []const u8) EndpointError!Endpoint {
-	const endpoint_path = std.fs.path.join(allocator, &.{ inst_runtime, "ssh-endpoint" }) catch return error.OutOfMemory;
-	defer allocator.free(endpoint_path);
-	const text = readSmall(allocator, io, endpoint_path) catch return error.Missing;
-	defer allocator.free(text);
-
-	var iter = std.mem.tokenizeAny(u8, text, " \t\r\n");
-	const port = iter.next() orelse return error.Malformed;
-	const host = iter.next() orelse return error.Malformed;
-
-	const port_d = allocator.dupe(u8, port) catch return error.OutOfMemory;
-	errdefer allocator.free(port_d);
-	const host_d = allocator.dupe(u8, host) catch return error.OutOfMemory;
-	return .{ .port = port_d, .host = host_d };
-}
+// The endpoint read and the argv builder are shared with the live plugin
+// apply's guest hops (sshargv); re-exported so `cogbox start` and the tests
+// below keep their names.
+pub const Endpoint = sshargv.Endpoint;
+pub const EndpointError = sshargv.EndpointError;
+pub const readEndpoint = sshargv.readEndpoint;
+const buildArgv = sshargv.buildArgv;
 
 /// Replace this process with `ssh` pointed at `endpoint`. `extra` is the remote
 /// command, appended after the `root@host` target and quoted for the guest shell
-/// (see `appendRemoteCommand`). Host key checking is disabled because the guest's
+/// (see `sshargv.appendRemoteCommand`). Host key checking is disabled because the guest's
 /// root disk is ephemeral and its host keys regenerate on every boot.
 ///
 /// When `identity` is non-null (cogbox's own managed key; see `defaultIdentity`)
@@ -203,116 +179,6 @@ fn wantPty(extra: []const []const u8, stdin_is_tty: bool, stdout_is_tty: bool) b
 	return extra.len > 0 and stdin_is_tty and stdout_is_tty;
 }
 
-/// Append the full `ssh ...` argv for `endpoint` into `argv`. When `force_pty`
-/// is set a single `-t` is inserted just before the `root@host` target (an ssh
-/// option must precede the host) so ssh allocates a remote PTY; see `wantPty`
-/// for when `force_pty` is set. The remote command follows the target, quoted by
-/// `appendRemoteCommand` so ssh's space-join cannot let the guest shell re-parse
-/// it. The target string, the quoted arguments and the list's backing are owned
-/// by `allocator`; on the normal path `exec` hands `argv` straight to execvp, so
-/// they live until this process is replaced. Split out from `exec` so the `-t`
-/// placement and the quoting are unit-testable without a real exec or a local tty.
-fn buildArgv(
-	allocator: std.mem.Allocator,
-	argv: *std.ArrayList([]const u8),
-	endpoint: Endpoint,
-	identity: ?[]const u8,
-	extra: []const []const u8,
-	force_pty: bool,
-) !void {
-	const target = try std.fmt.allocPrint(allocator, "root@{s}", .{endpoint.host});
-	try argv.append(allocator, "ssh");
-	try argv.append(allocator, "-o");
-	try argv.append(allocator, "StrictHostKeyChecking=no");
-	try argv.append(allocator, "-o");
-	try argv.append(allocator, "UserKnownHostsFile=/dev/null");
-	try argv.append(allocator, "-o");
-	try argv.append(allocator, "LogLevel=ERROR");
-	if (identity) |id| {
-		// Pin ssh to *only* the cogbox key and never touch an authentication
-		// agent: IdentitiesOnly stops ssh offering the user's agent / ~/.ssh
-		// keys, and IdentityAgent=none keeps ssh from contacting any agent at
-		// all. The user's agent may be a gpg-agent (ssh support) that prompts
-		// or hangs; the cogbox key is unioned into the guest's authorized_keys
-		// by default, so offering it alone is sufficient and is a single,
-		// deterministic auth attempt. The opt-out path (no cogbox key ->
-		// identity null) skips this and keeps ssh's agent/default-key fallback.
-		try argv.append(allocator, "-o");
-		try argv.append(allocator, "IdentitiesOnly=yes");
-		try argv.append(allocator, "-o");
-		try argv.append(allocator, "IdentityAgent=none");
-		try argv.append(allocator, "-i");
-		try argv.append(allocator, id);
-	}
-	try argv.append(allocator, "-p");
-	try argv.append(allocator, endpoint.port);
-	if (force_pty) try argv.append(allocator, "-t");
-	try argv.append(allocator, target);
-	try appendRemoteCommand(allocator, argv, extra);
-}
-
-/// Append the caller's remote command to an `ssh` argv, quoted for the shell on
-/// the far side.
-///
-/// ssh does NOT execute the words after the target as an argv vector: it joins
-/// them with single spaces into ONE string, and the remote sshd hands that
-/// string to `sh -c`. Forwarded bare, every shell metacharacter in an argument
-/// is reinterpreted remotely and the word boundaries are gone. For example:
-///
-///   cogbox ssh -n <inst> tmux list-sessions -F '#{session_name}\t#{session_attached}'
-///
-/// arrived in the guest as `... -F #{session_name}<TAB>#{session_attached}`,
-/// where `#` opens a comment and tmux receives a bare `-F`.
-///
-/// So a command of TWO OR MORE arguments is an argv vector the caller built,
-/// and every element is single-quoted: each byte reaches the remote command
-/// literally, which is both the correctness fix and the injection fix (an
-/// element may be a plugin URL, an instance name, or anything else the caller
-/// did not vet). This is the same treatment the control plane already gives
-/// its own outer hop.
-///
-/// A LONE argument is passed through VERBATIM, because one argument is ssh's
-/// own remote-command-STRING form and cogbox has always had it -- the guest
-/// test suite is full of `cogbox ssh 'readlink -f $(command -v hello)'`, where
-/// the guest shell is meant to interpret the string. Quoting it would make the
-/// whole line a single command NAME. The two forms do not overlap: a caller who
-/// wants shell syntax with several words either passes it as one string or
-/// spells it `sh -c '<script>'` (which, quoted, still reaches the guest intact).
-///
-/// Empty `extra` appends nothing, so the interactive login is untouched.
-fn appendRemoteCommand(
-	allocator: std.mem.Allocator,
-	argv: *std.ArrayList([]const u8),
-	extra: []const []const u8,
-) !void {
-	if (extra.len < 2) {
-		for (extra) |t| try argv.append(allocator, t);
-		return;
-	}
-	for (extra) |t| try argv.append(allocator, try quoteArg(allocator, t));
-}
-
-/// Single-quote one argument for POSIX sh: inside single quotes every byte is
-/// literal except the quote itself, which is closed, escaped and reopened
-/// (`'\''`). An empty argument becomes `''`, so it survives as a word instead of
-/// vanishing in the join. The returned slice is owned by `allocator`; like
-/// `buildArgv`'s target it lives until execvp replaces the process (tests use an
-/// arena).
-fn quoteArg(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
-	var out: std.ArrayList(u8) = .empty;
-	errdefer out.deinit(allocator);
-	try out.append(allocator, '\'');
-	for (s) |c| {
-		if (c == '\'') {
-			try out.appendSlice(allocator, "'\\''");
-		} else {
-			try out.append(allocator, c);
-		}
-	}
-	try out.append(allocator, '\'');
-	return out.toOwnedSlice(allocator);
-}
-
 /// Path to cogbox's managed SSH identity (`<data>/cogbox_ed25519`), or null if
 /// it does not exist. The launch script generates it host-side and unions its
 /// pubkey into each VM's authorized_keys; `exec` then pins ssh to it exclusively
@@ -341,15 +207,6 @@ fn nameFlag(parsed: *const parse.Parsed, allocator: std.mem.Allocator, io: std.I
 		return n;
 	}
 	return null;
-}
-
-fn readSmall(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-	const cwd = std.Io.Dir.cwd();
-	const file = try cwd.openFile(io, path, .{});
-	defer file.close(io);
-	var buf: [256]u8 = undefined;
-	var reader = file.reader(io, &buf);
-	return try reader.interface.allocRemaining(allocator, .limited(4096));
 }
 
 /// Parse <runtime>/pid into a pid. Null if the file is absent/unreadable/empty

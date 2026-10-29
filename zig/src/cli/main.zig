@@ -25,6 +25,7 @@ const rules_module = @import("rules_module");
 const l7proxy_module = @import("l7proxy_module");
 const authproxy_module = @import("authproxy_module");
 const divertshim_module = @import("divertshim_module");
+const plugin_module = @import("plugin_module");
 const filter_mod = @import("filter");
 const start_verb = @import("verbs/start.zig");
 const attach_verb = @import("verbs/attach_verb.zig");
@@ -43,9 +44,10 @@ const KNOWN_VERBS = [_][]const u8{
 	// "__divertshim" (the separate-pod enforcer's in-pod nft-REDIRECT shim),
 	// "__claude-stub" (the container agent's marker-gated Claude stub-staging),
 	// "__authproxy" (the per-sandbox pluggable auth proxy for migrated git
-	// providers).
+	// providers), "__plugin-apply-preboot" (the launcher's per-pass live-apply
+	// housekeeping).
 	"__launch", "__l7proxy", "__render-rules", "enforce", "__divertshim",
-	"__claude-stub", "__authproxy",
+	"__claude-stub", "__authproxy", "__plugin-apply-preboot",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -95,6 +97,18 @@ pub fn main(init: std.process.Init) !void {
 	if (@import("platform").darwin and
 		(std.mem.eql(u8, verb, "enforce") or std.mem.eql(u8, verb, "__divertshim"))) {
 		util.die(allocator, io, verb, exit_codes.usage, "this container backend requires Linux", .{});
+	}
+
+	// `__plugin-apply-preboot <icd> [--init-only]`: cogbox-launch.sh runs it on
+	// every pass right after taking the instance config lock (whose fd it
+	// inherits; it never takes the lock). It must never fail a boot, so it is
+	// dispatched before the path resolution and the legacy-layout preflight
+	// below, either of which can exit non-zero, and it always exits 0, reporting
+	// problems as warnings. Phase 0: with --init-only, empty <icd>/apply/trash/
+	// (bounded at 30 s); see plugin_module.preboot.
+	if (std.mem.eql(u8, verb, "__plugin-apply-preboot")) {
+		plugin_module.preboot.run(allocator, io, rest);
+		return;
 	}
 
 	// Resolve XDG paths and check for legacy migration before dispatch.

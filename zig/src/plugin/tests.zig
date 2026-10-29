@@ -12,10 +12,14 @@ test {
 	std.testing.refAllDecls(@import("nix.zig"));
 	std.testing.refAllDecls(@import("gitcred.zig"));
 	std.testing.refAllDecls(@import("main.zig"));
+	std.testing.refAllDecls(@import("snapshot.zig"));
+	std.testing.refAllDecls(@import("preboot.zig"));
 	_ = @import("name_test.zig");
 	_ = @import("compose_test.zig");
 	_ = @import("mutate_test.zig");
 	_ = @import("units_test.zig");
 	_ = @import("nix_test.zig");
 	_ = @import("main.zig");
+	_ = @import("snapshot.zig");
+	_ = @import("preboot.zig");
 }

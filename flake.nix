@@ -2645,6 +2645,135 @@
 					[ -e "$marker" ] || exit 0
 					${self.packages.${system}.cogbox-container}/bin/cogbox __claude-stub /root/.claude "$marker"
 				'';
+
+				# The VM guest's local-overlay store setup (see the boot fragment at
+				# boot.postBootCommands below for why the guest runs one). A script of
+				# its own rather than a shell function inside that fragment: these are
+				# the boot's steps, to be parameterized for a later live caller. As it
+				# stands it is NOT safe on a running guest: it removes the active conf
+				# and lower DB that nix-daemon is using, and reads the one regInfo on
+				# /proc/cmdline. The boot fragment calls it with the same stderr file
+				# and the same fallback as before. It inherits the caller's PATH (at
+				# boot that is stage 2's coreutils and util-linux only, hence plain
+				# bash and no grep).
+				cogboxOverlayStore = pkgs.writeShellScript "cogbox-overlay-store" ''
+					lower=/nix/.rw-store/lower-state conf=/run/cogbox/nix-store.conf
+					features="local-overlay-store read-only-local-store"
+					rm -f "$conf"
+					[[ "$(cat /proc/cmdline)" =~ regInfo=([^ ]*) ]] || exit 1
+					rm -rf "$lower" && mkdir -p "$lower/real" /run/cogbox || exit 1
+					# Loaded against a scratch real dir: a writable local store
+					# chowns its store dir, which the read-only 9p lower refuses.
+					# The rows only name logical /nix/store paths, so the DB is
+					# the same one the read-only open over /nix/.ro-store wants.
+					${config.nix.package.out}/bin/nix-store \
+						--store "local?real=$lower/real&state=$lower" \
+						--load-db < "''${BASH_REMATCH[1]}" || exit 1
+					# Nix's own check-mount compares the mount's lowerdir and
+					# upperdir verbatim, but stage 1 mounted the overlay under
+					# /sysroot (or /mnt-root) and /proc/mounts keeps those
+					# strings. Make the same check here, prefix-tolerant, and turn
+					# Nix's off: the overlay store over any other layout would
+					# skip deletes it must not skip.
+					m=""
+					while IFS= read -r line; do
+						[[ "$line" == "overlay /nix/store overlay "* ]] && m=$line
+					done < /proc/self/mounts
+					lo_re='[, ]lowerdir=(/sysroot|/mnt-root)?/nix/\.ro-store[, ]'
+					up_re='[, ]upperdir=(/sysroot|/mnt-root)?/nix/\.rw-store/store[, ]'
+					[[ "$m" =~ $lo_re && "$m" =~ $up_re ]] || { echo "unexpected /nix/store mount: $m" >&2; exit 1; }
+					# The lower URL nests inside the overlay URL, so it is
+					# percent-encoded (?, = and &).
+					url="local-overlay://?lower-store=local%3Freal%3D/nix/.ro-store%26state%3D$lower%26read-only%3Dtrue&upper-layer=/nix/.rw-store/store&check-mount=false"
+					${config.nix.package.out}/bin/nix --extra-experimental-features "nix-command $features" \
+						store info --store "$url" >/dev/null || exit 1
+					printf 'extra-experimental-features = %s\nstore = %s\n' "$features" "$url" > "$conf.tmp" \
+						&& mv "$conf.tmp" "$conf"
+				'';
+
+				# ===== Boot-only units (once-markers) ==========================
+				# A `switch-to-configuration` on a running guest starts every active
+				# target again (switch-to-configuration-ng's "Start all active
+				# targets"), and that start pulls in every unit the target wants that
+				# is not active: a oneshot without RemainAfterExit, one whose condition
+				# skipped it, one that failed. For the units below, that would re-run
+				# work that belongs to the boot alone -- preparing mounts, migrating
+				# data onto the pool, restoring tool generations -- while the system
+				# they prepared is in use.
+				#
+				# Each one therefore gains ConditionPathExists=!${onceDir}/%N, and
+				# cogbox-boot-settled writes that marker once the boot has settled
+				# (the boot job queue drained), for every listed unit whose boot start
+				# this boot attempted and that did not fail. Until then the condition
+				# holds, so the boot runs them exactly as before; afterwards a later
+				# start of a marked unit is skipped (inactive, condition failed). A unit
+				# the boot never started, or one that failed, gets no marker and keeps
+				# today's behaviour, so a box with a broken boot unit is never made to
+				# look settled. The markers live on the /run tmpfs and every boot
+				# starts without them.
+				#
+				# The markers buy availability, not safety: they keep these units out
+				# of a live switch's induced starts, but whether a switch may touch a
+				# unit at all is decided elsewhere. The list is the class of boot-only
+				# units a live switch must never restart: the guest's mount and
+				# directory preparation (nixpkgs' rw-<mount> overlay pre-mount units
+				# among them), the pool migrations and the runtime tool restore. It
+				# deliberately leaves out every unit something restarts on a running
+				# guest (cogbox-claude-stub, which the control plane restarts after a
+				# Claude connect, cogbox-reply-route, cogbox-brain-materialize, sshd).
+				# Each name is gated exactly as its unit is, because a condition for a
+				# unit that does not exist would invent a stray unit carrying nothing
+				# else. VM-only, like every unit it names but the restore.
+				# checks.live-apply-prereqs pins the set and runs the marker script.
+				onceDir = "/run/cogbox/once";
+				onceUnits = lib.optionals isVm (
+					[ "cogbox-additional-dirs" "cogbox-vm-sshd-prep" "harness-setup-dirs" ]
+					++ map (p: "rw-${utils.escapeSystemdPath p.guest}") overlayPaths
+					++ lib.optionals (!hosted) [ "harness-overlay-img" "resize-store-overlay" ]
+					++ lib.optional poolEnabled "cogbox-guest-dirs"
+					++ lib.optionals hosted [ "cogbox-guest-work-migrate" "cogbox-guest-harness-migrate" ]
+					++ lib.optional cfg.runtimeEnvironment.enable "cogbox-runtime-restore");
+				# Best-effort: it always exits 0, so it can never degrade the system,
+				# and a boot that does not settle (shutdown during boot, a job that
+				# never finishes) simply writes no markers. COGBOX_ONCE_DIR is a test
+				# seam only (checks.live-apply-prereqs); the unit sets none.
+				bootSettledScript = pkgs.writeShellScript "cogbox-boot-settled" ''
+					once_dir=''${COGBOX_ONCE_DIR:-${onceDir}}
+					state=$(systemctl is-system-running --wait 2>/dev/null)
+					case "$state" in
+						running|degraded) ;;
+						*)
+							echo "cogbox-boot-settled: the boot did not settle (state '$state'); no once-markers written" >&2
+							exit 0
+							;;
+					esac
+					if ! mkdir -p "$once_dir"; then
+						echo "cogbox-boot-settled: cannot create $once_dir; no once-markers written" >&2
+						exit 0
+					fi
+					marked=()
+					for unit in ${lib.escapeShellArgs onceUnits}; do
+						ts="" result=""
+						while IFS='=' read -r key value; do
+							case "$key" in
+								ConditionTimestampMonotonic) ts=$value ;;
+								Result) result=$value ;;
+							esac
+						done < <(systemctl show -p ConditionTimestampMonotonic,Result -- "$unit.service" 2>/dev/null)
+						# A start this boot attempted checks the conditions first and
+						# stamps the time; a unit whose start job never ran (not wanted,
+						# or a dependency failed) still reads 0.
+						case "$ts" in ""|0) continue ;; esac
+						[ "$result" = success ] || continue
+						if : > "$once_dir/$unit"; then
+							marked+=("$unit")
+						else
+							echo "cogbox-boot-settled: could not write the once-marker for $unit" >&2
+						fi
+					done
+					echo "cogbox-boot-settled: boot settled ($state); once-markers: ''${marked[*]:-none}"
+					exit 0
+				'';
 			in {
 				nixpkgs.config.allowUnfree = true;
 
@@ -3018,6 +3147,10 @@
 				# REFUSE to build, which is a builder failure rather than an eval
 				# throw and therefore invisible to cogboxBrainCollisions.
 				system.build.cogboxBrainUnits = { inherit skills agents commands rules; };
+				# The boot-only units cogbox-boot-settled marks (onceUnits), so a
+				# check can compare the list the script carries with the units that
+				# actually render the once-marker condition.
+				system.build.cogboxOnceUnits = onceUnits;
 
 				microvm = lib.mkIf isVm {
 					writableStoreOverlay = "/nix/.rw-store";
@@ -3156,48 +3289,14 @@
 				# `!include` of a file written only once the store opens, mount check
 				# and all, so any failure falls back to the plain local store (today's
 				# behaviour) with a warning instead of a guest with no working Nix.
+				# The steps are the cogbox-overlay-store script (cogboxOverlayStore
+				# above).
 				nix.extraOptions = lib.mkIf isVm ''
 					!include /run/cogbox/nix-store.conf
 				'';
 				boot.postBootCommands = lib.mkIf isVm (lib.mkBefore ''
-					cogbox_overlay_store() {
-						local lower=/nix/.rw-store/lower-state conf=/run/cogbox/nix-store.conf
-						local features="local-overlay-store read-only-local-store"
-						local url
-						rm -f "$conf"
-						[[ "$(cat /proc/cmdline)" =~ regInfo=([^ ]*) ]] || return 1
-						rm -rf "$lower" && mkdir -p "$lower/real" /run/cogbox || return 1
-						# Loaded against a scratch real dir: a writable local store
-						# chowns its store dir, which the read-only 9p lower refuses.
-						# The rows only name logical /nix/store paths, so the DB is
-						# the same one the read-only open over /nix/.ro-store wants.
-						${config.nix.package.out}/bin/nix-store \
-							--store "local?real=$lower/real&state=$lower" \
-							--load-db < "''${BASH_REMATCH[1]}" || return 1
-						# Nix's own check-mount compares the mount's lowerdir and
-						# upperdir verbatim, but stage 1 mounted the overlay under
-						# /sysroot (or /mnt-root) and /proc/mounts keeps those
-						# strings. Make the same check here, prefix-tolerant, and turn
-						# Nix's off: the overlay store over any other layout would
-						# skip deletes it must not skip.
-						# Plain bash: postBootCommands run with no grep on PATH.
-						local m="" line lo_re up_re
-						while IFS= read -r line; do
-							[[ "$line" == "overlay /nix/store overlay "* ]] && m=$line
-						done < /proc/self/mounts
-						lo_re='[, ]lowerdir=(/sysroot|/mnt-root)?/nix/\.ro-store[, ]'
-						up_re='[, ]upperdir=(/sysroot|/mnt-root)?/nix/\.rw-store/store[, ]'
-						[[ "$m" =~ $lo_re && "$m" =~ $up_re ]] || { echo "unexpected /nix/store mount: $m" >&2; return 1; }
-						# The lower URL nests inside the overlay URL, so it is
-						# percent-encoded (?, = and &).
-						url="local-overlay://?lower-store=local%3Freal%3D/nix/.ro-store%26state%3D$lower%26read-only%3Dtrue&upper-layer=/nix/.rw-store/store&check-mount=false"
-						${config.nix.package.out}/bin/nix --extra-experimental-features "nix-command $features" \
-							store info --store "$url" >/dev/null || return 1
-						printf 'extra-experimental-features = %s\nstore = %s\n' "$features" "$url" > "$conf.tmp" \
-							&& mv "$conf.tmp" "$conf"
-					}
 					mkdir -p /run/cogbox
-					cogbox_overlay_store 2>/run/cogbox/nix-store.err \
+					${cogboxOverlayStore} 2>/run/cogbox/nix-store.err \
 						&& rm -f /run/cogbox/nix-store.err \
 						|| echo "cogbox: local-overlay store setup failed (/run/cogbox/nix-store.err); nix store gc will walk the 9p lower" >&2
 				'');
@@ -3220,7 +3319,15 @@
 				# /sys/firmware/qemu_fw_cfg); gate the whole generated set off so
 				# the container drops them. optionalAttrs (not mkIf) so the keys
 				# vanish entirely rather than evaluate to dropped definitions.
-				systemd.services = lib.optionalAttrs isVm (lib.listToAttrs (map (p:
+				#
+				# The whole set is one mkMerge whose first element is the once-marker
+				# conditions (onceUnits above): MERGED, not `//`-ed, into the
+				# definitions below and into nixpkgs' and runtime/module.nix's own (the
+				# rw-* overlay pre-mount units, cogbox-runtime-restore), whose other
+				# conditions they join.
+				systemd.services = lib.mkMerge [ (lib.genAttrs onceUnits (_: {
+					unitConfig.ConditionPathExists = [ "!${onceDir}/%N" ];
+				})) (lib.optionalAttrs isVm (lib.listToAttrs (map (p:
 					lib.nameValuePair "${p.harness}-${p.pathkey}" {
 						description = "Copy ${p.harness}/${p.pathkey} from fw_cfg";
 						wantedBy = [ "multi-user.target" ];
@@ -3758,6 +3865,28 @@
 									mv -fT "$out.tmp" "$out"
 								'';
 							}}/bin/cogbox-boot-stamp";
+						};
+					};
+					# Writes the once-markers (onceUnits above) once the boot has
+					# settled. Type=exec, so its start job completes as soon as the
+					# script runs and the boot can finish while it waits for exactly
+					# that (`systemctl is-system-running --wait`); a oneshot would be a
+					# boot job waiting for the boot job queue to drain, i.e. for itself.
+					# After= multi-user.target only so it does not start waiting
+					# earlier than it needs to. It orders against, requires and gates
+					# nothing: no unit waits for the markers, and its script reads the
+					# named units' state rather than depending on them (the runtime
+					# restore in particular must never gate another unit, see
+					# checks.runtime-environment). RemainAfterExit keeps it active once
+					# done, so a later start of multi-user.target does not run it again.
+					cogbox-boot-settled = lib.mkIf isVm {
+						description = "Mark the boot-only units this boot has run (once-markers)";
+						wantedBy = [ "multi-user.target" ];
+						after = [ "multi-user.target" ];
+						serviceConfig = {
+							Type = "exec";
+							RemainAfterExit = true;
+							ExecStart = bootSettledScript;
 						};
 					};
 					# The VM host key lives on the late 9p mount; order sshd after
@@ -4341,7 +4470,7 @@
 					# error -- so cogbox-guest-pool-boot-bounded asserts each of these
 					# still carries an ExecStart alongside the bound.
 					"rw-${utils.escapeSystemdPath p.guest}"
-					{ serviceConfig.TimeoutStartSec = 120; }) overlayPaths));
+					{ serviceConfig.TimeoutStartSec = 120; }) overlayPaths))) ];
 
 				virtualisation.docker.enable = lib.mkIf isVm true;
 
@@ -4812,6 +4941,15 @@
 			# instance pays a full eval it had already been spared. The Zig side
 			# defaults to "cogbox" when the variable is absent, which is what an
 			# unwrapped binary and every pre-existing image mean.
+			#
+			# COGBOX_BASE_RUNNER is this package's own runner, the one its launcher
+			# boots when an instance has neither plugins nor a customized
+			# per-instance flake: the image's base guest. No verb reads it yet; it is
+			# there so a host-side caller can name that runner without evaluating
+			# the flake. --set-default rather than --set, like the flake source: a
+			# re-exec's second hop is a cogbox package built from the composed
+			# runner, and it inherits the first hop's environment, so in both hops
+			# the variable keeps naming the base runner rather than the composed one.
 			mkCogboxAttr = reexecAttr: runner': pkgs.runCommand "cogbox" {
 				nativeBuildInputs = [ pkgs.makeWrapper ];
 				meta = { mainProgram = "cogbox"; };
@@ -4859,6 +4997,9 @@
 				cp ${./cogbox-nft-divert.sh} $out/libexec/cogbox-nft-divert.sh
 				chmod +x $out/libexec/cogbox-nft-divert.sh
 
+				# findutils: the launcher sizes plugin-sources' directories with
+				# `find` before its boot snapshot (apply_take_fits), and the
+				# caller's PATH (a pod image's /bin included) need not have it.
 				wrapProgram $out/bin/cogbox \
 					--set COGBOX_LAUNCH_SCRIPT $out/libexec/cogbox-launch.sh \
 					--set COGBOX_APP_HELPER ${self.packages.${system}.cogbox-app}/bin/cogbox-app \
@@ -4867,8 +5008,9 @@
 					--set-default COGBOX_FLAKE_SOURCE "${self}" \
 					--set-default COGBOX_NIXPKGS_SOURCE "${nixpkgs}" \
 					--set-default COGBOX_REEXEC_PACKAGE "${reexecAttr}" \
+					--set-default COGBOX_BASE_RUNNER "${runner'}" \
 					--prefix PATH : "${lib.makeBinPath (with pkgs; [
-						coreutils gnused gnugrep jq diffutils nix bashInteractive openssh
+						coreutils findutils gnused gnugrep jq diffutils nix bashInteractive openssh
 					] ++ [ self.packages.${system}.passt-cc ])}"
 
 				# `cbx` is a short alias for `cogbox`. The wrapper execs an
@@ -6014,7 +6156,10 @@
 					assert !(unit.unitConfig ? RequiresMountsFor);
 					assert unit.unitConfig.ConditionPathIsMountPoint == work;
 					assert unit.unitConfig.ConditionPathIsSymbolicLink == "${work}/.cogbox/runtime/current";
-					assert unit.unitConfig.ConditionPathExists == "!${work}/.cogbox/runtime/disable-boot-restore";
+					# The per-box kill switch, plus (VM guests) the once-marker that
+					# cogbox-boot-settled writes (checks.live-apply-prereqs).
+					assert lib.sort lib.lessThan (lib.toList unit.unitConfig.ConditionPathExists)
+						== lib.sort lib.lessThan [ "!${work}/.cogbox/runtime/disable-boot-restore" "!/run/cogbox/once/%N" ];
 					assert !(unit.serviceConfig ? Restart);
 					assert unit.serviceConfig.OOMScoreAdjust == 500;
 					# The journal gets stderr only (the summary and, on failure, the error
@@ -6095,6 +6240,7 @@
 						'ConditionPathIsMountPoint=${work}' \
 						'ConditionPathIsSymbolicLink=${work}/.cogbox/runtime/current' \
 						'ConditionPathExists=!${work}/.cogbox/runtime/disable-boot-restore' \
+						'ConditionPathExists=!/run/cogbox/once/%N' \
 						'TimeoutStartSec=960' 'TimeoutStopSec=30' 'Nice=10' \
 						'IOSchedulingClass=best-effort' 'IOSchedulingPriority=7' 'OOMScoreAdjust=500' \
 						'StandardOutput=null' 'StandardError=journal' \
@@ -6190,7 +6336,7 @@
 				nativeBuildInputs = with pkgs; [ bash jq coreutils gnugrep python3 util-linux ];
 			} ''
 				export HOME=$TMPDIR
-				bash ${./tests/test_launch_flags.sh} ${./cogbox-launch.sh}
+				bash ${./tests/test_launch_flags.sh} ${./cogbox-launch.sh} ${./cogbox-shutdown.sh}
 				python3 ${./tests/test_runtime_base.py} ${./cogbox-launch.sh} -v
 				python3 ${./tests/test_app_environment.py} ${./cogbox-launch.sh} -v
 				touch $out
@@ -6459,6 +6605,191 @@
 					echo "FAIL: ${c} does not declare cogbox-additional-dirs.service; --add-dir grants would never mount" >&2
 					fails=$((fails + 1))
 				'') [ (configName system) "${configName system}-hosted" ]}
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# The flake half of the live plugin apply prerequisites (the launcher half
+			# is launch-flag-tests):
+			#
+			# 1. COGBOX_BASE_RUNNER: each cogbox wrapper defaults it to its OWN runner
+			#    (cogbox -> the workstation runner, cogbox-hosted -> the hosted one,
+			#    cogbox-container -> its placeholder). Compared in the wrapper's build
+			#    script at eval time, so no runner is built for it.
+			# 2. The guest's local-overlay store setup is the cogbox-overlay-store
+			#    script, which the VM boot fragment runs with the same stderr file and
+			#    the same fallback warning as when it was an inline function; the
+			#    container has neither. What the script does is checks.cogbox-vm Phase
+			#    B's to prove.
+			# 3. Once-markers. In every VM profile the units whose REALIZED unit file
+			#    carries ConditionPathExists=!/run/cogbox/once/%N are exactly the list
+			#    cogbox-boot-settled marks; each of them is a real unit (it has an
+			#    ExecStart, so the condition did not invent a stray); none of the
+			#    units something restarts on a running guest is among them; and
+			#    cogbox-boot-settled is a Type=exec, RemainAfterExit unit wanted by
+			#    multi-user.target that requires, precedes and gates nothing. The
+			#    container has neither. Then the marker script itself, run against a
+			#    stub systemctl: markers for exactly the listed units this boot started
+			#    and that did not fail, none at all for a boot that did not settle, and
+			#    exit 0 whatever happens.
+			live-apply-prereqs = let
+				onceCond = "!/run/cogbox/once/%N";
+				onceLine = "ConditionPathExists=${onceCond}";
+				vmProfiles = { workstation = self.nixosConfigurations.${configName system}.config; } // poolBootProfiles;
+				containerCfg = self.nixosConfigurations."${configName system}-container".config;
+				hasOnce = s: lib.elem onceCond (lib.toList (s.unitConfig.ConditionPathExists or [ ]));
+				onceByOption = cfg: lib.sort lib.lessThan (lib.attrNames (lib.filterAttrs (_: hasOnce) cfg.systemd.services));
+				onceListed = cfg: lib.sort lib.lessThan cfg.system.build.cogboxOnceUnits;
+				# Units something restarts on a running guest: the control plane
+				# (cogbox-claude-stub after a Claude connect), a forced live switch's
+				# repair (cogbox-reply-route), any switch (the brain), the L7 CA
+				# refresh, and sshd. A once-marker would turn each restart into a stop.
+				restartedLive = [ "cogbox-claude-stub" "cogbox-reply-route" "cogbox-brain-materialize" "cogbox-l7-trust" "sshd" ];
+				plain = s: builtins.unsafeDiscardStringContext (toString s);
+				baseRunnerOk = pkg: runner: lib.hasInfix
+					''--set-default COGBOX_BASE_RUNNER "${plain runner}"''
+					(plain self.packages.${system}.${pkg}.buildCommand);
+				hostedProfile = vmProfiles.hosted;
+				settledScript = hostedProfile.systemd.services.cogbox-boot-settled.serviceConfig.ExecStart;
+				hostedOnce = hostedProfile.system.build.cogboxOnceUnits;
+				hostedRw = lib.filter (lib.hasPrefix "rw-") hostedOnce;
+				# The fixture: the first listed unit ran and succeeded, every rw-*
+				# pre-mount unit ran and succeeded (a oneshot without RemainAfterExit
+				# is inactive afterwards, which must not matter), harness-setup-dirs
+				# ran and FAILED, and everything else was never started this boot.
+				expectMarked = lib.sort lib.lessThan ([ "cogbox-additional-dirs" ] ++ hostedRw);
+			in assert lib.elem "cogbox-additional-dirs" hostedOnce && lib.elem "harness-setup-dirs" hostedOnce && hostedRw != [ ];
+				pkgs.runCommand "cogbox-live-apply-prereqs" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnugrep diffutils ];
+			} ''
+				fails=0
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+
+				# 1. COGBOX_BASE_RUNNER defaults to each wrapper's own runner.
+				${lib.concatMapStrings ({ pkg, runner }: lib.optionalString (!(baseRunnerOk pkg runner)) ''
+					bad "packages.${pkg} does not --set-default COGBOX_BASE_RUNNER to its own runner (${plain runner})"
+				'') [
+					{ pkg = "cogbox"; runner = self.nixosConfigurations.${configName system}.config.microvm.declaredRunner; }
+					{ pkg = "cogbox-hosted"; runner = hostedCfg.microvm.declaredRunner; }
+					{ pkg = "cogbox-container"; runner = "/var/empty/cogbox-container-has-no-vm-runner"; }
+				]}
+
+				# 2. The overlay store setup is the factored script, VM-only.
+				${lib.concatStrings (lib.mapAttrsToList (pname: cfg: lib.optionalString
+					(!(lib.hasInfix "-cogbox-overlay-store 2>/run/cogbox/nix-store.err" cfg.boot.postBootCommands)
+						|| !(lib.hasInfix "local-overlay store setup failed (/run/cogbox/nix-store.err)" cfg.boot.postBootCommands)
+						|| lib.hasInfix "cogbox_overlay_store" cfg.boot.postBootCommands) ''
+					bad "${pname}: the boot fragment does not run cogbox-overlay-store with its stderr in /run/cogbox/nix-store.err and the fallback warning"
+				'') vmProfiles)}
+				${lib.optionalString (lib.hasInfix "cogbox-overlay-store" containerCfg.boot.postBootCommands) ''
+					bad "the container runs cogbox-overlay-store; its /nix is not the VM's 9p overlay"
+				''}
+
+				# 3a. The container renders no once-marker machinery at all.
+				${lib.optionalString (onceByOption containerCfg != [ ] || containerCfg.systemd.services ? cogbox-boot-settled) ''
+					bad "the container carries once-markers or cogbox-boot-settled (${toString (onceByOption containerCfg)})"
+				''}
+
+				# 3b. Per VM profile: option level, then what systemd reads.
+				${lib.concatStrings (lib.mapAttrsToList (pname: cfg: let
+					units = serviceUnitsOf "live-apply-once-units-${pname}" cfg;
+				in lib.optionalString (onceByOption cfg != onceListed cfg) ''
+					bad "${pname}: the units carrying the once condition (${toString (onceByOption cfg)}) are not the ones cogbox-boot-settled marks (${toString (onceListed cfg)})"
+				'' + ''
+					want=$(printf '%s\n' ${lib.escapeShellArgs (onceListed cfg)} | sort)
+					got=$(cd ${units} && grep -lxF ${lib.escapeShellArg onceLine} -- *.service | sed 's/\.service$//' | sort)
+					[ "$got" = "$want" ] \
+						|| bad "${pname}: the realized units carrying ${onceLine} differ from the list cogbox-boot-settled marks: $(diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | tr '\n' ' ')"
+					for u in $want; do
+						grep -q '^ExecStart=' "${units}/$u.service" \
+							|| bad "${pname}: $u carries the once condition but no ExecStart; the condition invented a stray unit (its gate in onceUnits no longer matches the unit's own)"
+					done
+					for u in ${lib.escapeShellArgs restartedLive}; do
+						[ -e "${units}/$u.service" ] || continue
+						if grep -qxF ${lib.escapeShellArg onceLine} "${units}/$u.service"; then
+							bad "${pname}: $u carries the once condition, but it is restarted on a running guest; each restart would become a stop"
+						fi
+					done
+					settled=${units}/cogbox-boot-settled.service
+					if [ -e "$settled" ]; then
+						for line in 'Type=exec' 'RemainAfterExit=true' 'After=multi-user.target' 'WantedBy=multi-user.target'; do
+							grep -qxF "$line" "$settled" || bad "${pname}: cogbox-boot-settled.service lacks '$line'"
+						done
+						if grep -qE '^(Before|Requires|Requisite|BindsTo|PartOf|Upholds|RequiredBy|Conflicts)=' "$settled"; then
+							bad "${pname}: cogbox-boot-settled.service gates or requires something: $(grep -E '^(Before|Requires|Requisite|BindsTo|PartOf|Upholds|RequiredBy|Conflicts)=' "$settled" | tr '\n' ' ')"
+						fi
+					else
+						bad "${pname}: no cogbox-boot-settled.service, so no once-marker is ever written"
+					fi
+				'') vmProfiles)}
+
+				# 3c. The marker script, against a stub systemctl.
+				mkdir -p stub fix
+				# <<- strips the leading tabs, which Nix leaves on every line.
+				cat > stub/systemctl <<-'EOF'
+				#!${pkgs.bash}/bin/bash
+				echo "$*" >> "$STUB_LOG"
+				case "$1" in
+					is-system-running)
+						printf '%s\n' "$STUB_STATE"
+						[ "$STUB_STATE" = running ]
+						;;
+					show)
+						unit=''${!#}
+						if [ -f "$STUB_FIX/$unit" ]; then
+							cat "$STUB_FIX/$unit"
+						else
+							printf 'ConditionTimestampMonotonic=0\nResult=success\n'
+						fi
+						;;
+					*) exit 1 ;;
+				esac
+				EOF
+				chmod +x stub/systemctl
+				printf 'ConditionTimestampMonotonic=1234567\nResult=success\n' > fix/cogbox-additional-dirs.service
+				printf 'ConditionTimestampMonotonic=2345678\nResult=exit-code\n' > fix/harness-setup-dirs.service
+				for u in ${lib.escapeShellArgs hostedRw}; do
+					printf 'Result=success\nConditionTimestampMonotonic=3456789\n' > "fix/$u.service"
+				done
+				export STUB_FIX=$PWD/fix STUB_LOG=$PWD/stub.log
+				settled() {
+					: > "$STUB_LOG"
+					STUB_STATE=$1 COGBOX_ONCE_DIR=$2 PATH=$PWD/stub:${pkgs.coreutils}/bin \
+						${settledScript} > out 2> err
+				}
+				expect=$(printf '%s\n' ${lib.escapeShellArgs expectMarked})
+				for state in running degraded; do
+					rc=0; settled "$state" "$PWD/once-$state" || rc=$?
+					[ "$rc" = 0 ] || bad "a $state boot: the marker script exited $rc"
+					got=$(ls -A "once-$state" 2>/dev/null | sort)
+					[ "$got" = "$expect" ] \
+						|| bad "a $state boot marked [$(echo $got)], not exactly the units this boot started without failing [$(echo $expect)]"
+					grep -qF "boot settled ($state)" out || bad "a $state boot: no summary line ($(cat out))"
+					grep -q '^is-system-running --wait$' "$STUB_LOG" || bad "the marker script does not wait for the boot to settle"
+					grep -qxF 'show -p ConditionTimestampMonotonic,Result -- harness-setup-dirs.service' "$STUB_LOG" \
+						|| bad "the marker script does not read the unit's condition stamp and result"
+				done
+				for state in starting stopping maintenance offline ""; do
+					rc=0; settled "$state" "$PWD/once-unsettled" || rc=$?
+					[ "$rc" = 0 ] || bad "a boot in state '$state': the marker script exited $rc"
+					[ ! -e once-unsettled ] || bad "a boot in state '$state' (not settled) wrote once-markers: $(ls -A once-unsettled)"
+					grep -qF 'did not settle' err || bad "a boot in state '$state': no warning ($(cat err))"
+				done
+				# The marker directory cannot be created: a warning, still exit 0.
+				: > not-a-dir
+				rc=0; settled running "$PWD/not-a-dir/once" || rc=$?
+				[ "$rc" = 0 ] || bad "an uncreatable marker directory made the script exit $rc"
+				grep -qF 'cannot create' err || bad "an uncreatable marker directory raised no warning ($(cat err))"
+				# One marker cannot be written: a warning, the others still written.
+				mkdir -p once-squat/cogbox-additional-dirs
+				rc=0; settled running "$PWD/once-squat" || rc=$?
+				[ "$rc" = 0 ] || bad "an unwritable marker made the script exit $rc"
+				grep -qF 'could not write the once-marker for cogbox-additional-dirs' err \
+					|| bad "an unwritable marker raised no warning ($(cat err))"
+				for u in ${lib.escapeShellArgs hostedRw}; do
+					[ -f "once-squat/$u" ] || bad "one unwritable marker stopped the others: once-squat/$u is missing"
+				done
+
 				[ "$fails" -eq 0 ] || exit 1
 				touch $out
 			'';
@@ -9847,8 +10178,15 @@
 					echo "FAIL: the hosted launcher's fast path does not compare the record against RUNNER_KEY" >&2
 					fails=$((fails + 1))
 				fi
-				if ! grep -qF '"$RUNNER_KEY" "${gceHostedRunner}" > "$RUNNER_PATH_FILE"' "$launch"; then
-					echo "FAIL: the hosted launcher does not RECORD RUNNER_KEY plus the hosted runner; a record whose key differs from the one the fast path compares never matches, so every boot pays a full eval" >&2
+				# The record's third line is the comp of the composition the runner
+				# was built from, and the fast path requires it: written AND compared,
+				# for the same reason as the key.
+				if ! grep -qF '"$RUNNER_KEY" "${gceHostedRunner}" "$BOOT_COMP" > "$RUNNER_PATH_FILE"' "$launch"; then
+					echo "FAIL: the hosted launcher does not RECORD RUNNER_KEY, the hosted runner and the composition's comp; a record whose key or line 3 differs from what the fast path compares never matches, so every boot pays a full eval" >&2
+					fails=$((fails + 1))
+				fi
+				if ! grep -qF '[ "$FP_COMP" = "$BOOT_COMP" ]' "$launch"; then
+					echo "FAIL: the hosted launcher's fast path does not require the record's line 3 to equal the comp of the composition it boots; a record of another composition's runner would be booted" >&2
 					fails=$((fails + 1))
 				fi
 

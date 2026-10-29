@@ -80,12 +80,18 @@ class Lifecycle(unittest.TestCase):
         # PATH. This shim marks probe entry and parks the probe while hold-probe
         # exists, then becomes the real timeout -- the only way to hold the
         # launcher inside the (millisecond) loopback probe deterministically.
+        # It keys on the probe's own argv (`timeout 1 bash -c ...`): the
+        # launcher runs other bounded steps through `timeout` before the probe
+        # (the live-apply housekeeping verb, the boot snapshot's fsyncs and
+        # `cp -al`), and those must pass straight through.
         self.hold_probe = self.root / "hold-probe"
         self.probe_entered = self.root / "probe-entered"
         (self.root / "bin").mkdir()
         self.executable(self.root / "bin" / "timeout", f"#!{self.bash}\n"
+                        f"if [ \"$1 $2 $3\" = '1 bash -c' ]; then\n"
                         f"touch {Q(str(self.probe_entered))}\n"
                         f"while [ -e {Q(str(self.hold_probe))} ]; do sleep .01; done\n"
+                        f"fi\n"
                         f"exec {Q(shutil.which('timeout'))} \"$@\"\n")
         self.env = dict(os.environ, HOME=str(self.root), XDG_RUNTIME_DIR=str(self.runtime.parent),
                         XDG_CONFIG_HOME=str(self.root / "config"),
@@ -250,6 +256,41 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual([e for e in environ if e.startswith(b"COGBOX_SKIP_REPIN=")], [])
         self.cli("stop")
         self.ended(identity)
+
+    def test_boot_snapshot_promotion_and_trash_emptied_by_init_pass(self):
+        # Live-apply boot state through the real CLI and the real
+        # __plugin-apply-preboot: every daemon pass snapshots what it boots and
+        # promotes it to apply/base, retiring the previous base into
+        # apply/trash by RENAME; only `cogbox start`'s --init-only pass deletes
+        # the trash. A box with no plugins records comp `none`.
+        icd = self.root / "config" / "cogbox" / "instances" / "demo"
+        apply = icd / "apply"
+        first = self.start()
+        base1 = os.readlink(apply / "base")
+        snap1 = apply / base1
+        meta = json.loads((snap1 / "meta.json").read_text())
+        self.assertEqual((meta["id"], meta["comp"], meta["runner"]),
+                         (snap1.name, "none", str(self.runner)))
+        self.assertEqual(json.loads((snap1 / "state.json").read_text()), {"plugins": [], "tagged": {}})
+        self.assertTrue((snap1 / "src").is_dir())
+        self.assertFalse((apply / "booting").exists())
+        booted = (self.runtime / "booted-runner").read_text().split("\n")
+        self.assertEqual(booted[1:], [str(self.runner), "none", ""])
+        self.cli("stop")
+        self.ended(first)
+        # A tree retired by an earlier boot, as the GC leaves it.
+        planted = apply / "trash" / "00000000000000aa"
+        (planted / "src" / "p").mkdir(parents=True)
+        (planted / "src" / "p" / "f").write_text("x")
+        second = self.start()
+        base2 = os.readlink(apply / "base")
+        self.assertNotEqual(base1, base2)
+        self.assertFalse(planted.exists(), "the init pass did not empty the trash")
+        self.assertTrue((apply / "trash" / snap1.name / "meta.json").exists(),
+                        "the daemon pass did not retire the previous base into the trash")
+        self.assertEqual(sorted(p.name for p in (apply / "snap").iterdir()), [Path(base2).name])
+        self.cli("stop")
+        self.ended(second)
 
     def test_live_lock_blocks_cli_and_direct_launcher(self):
         before = self.start()

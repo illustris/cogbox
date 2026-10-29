@@ -18,6 +18,8 @@ pub const mutate = @import("mutate.zig");
 pub const units = @import("units.zig");
 pub const nix = @import("nix.zig");
 pub const gitcred = @import("gitcred.zig");
+pub const snapshot = @import("snapshot.zig");
+pub const preboot = @import("preboot.zig");
 
 const rules_module = @import("rules_module");
 const config = rules_module.config;
@@ -1242,9 +1244,23 @@ fn materializeSource(ctx: *const Ctx, name: []const u8, meta: *const nix.Meta, u
 	// re-materializes such a tree).
 	const src_dot = try std.fmt.allocPrint(allocator, "{s}/.", .{src});
 	defer allocator.free(src_dot);
-	try runTool(ctx, &.{ "cp", "-a", "--no-preserve=ownership", src_dot, dest });
+	try runTool(ctx, &(materialize_cp_flags ++ [_][]const u8{ src_dot, dest }));
 	try runTool(ctx, &.{ "chmod", "-R", "u+rwX", dest });
 }
+
+/// materializeSource's copy, before its SRC/. and DEST operands.
+///
+/// --remove-destination: a live-apply snapshot holds a `cp -al` of
+/// plugin-sources/, i.e. its files SHARE inodes with this tree, so no verb may
+/// write into an existing source file. The deleteTree before the copy is
+/// best-effort, and a file that survives it (an undeletable directory) must get
+/// a new inode, never a truncate-and-rewrite of the shared one. GNU `cp -a`
+/// already unlinks a destination with more than one link before writing it, but
+/// only as a side effect of preserving hard links (coreutils copy.c); the flag
+/// makes the unlink unconditional and keeps it if the preserve set ever
+/// changes. Where even the unlink fails, cp fails, and the caller warns as for
+/// any failed materialize.
+const materialize_cp_flags = [_][]const u8{ "cp", "-a", "--no-preserve=ownership", "--remove-destination" };
 
 /// Remove a plugin's materialized source dir (del path). Best-effort.
 fn removeSource(ctx: *const Ctx, name: []const u8) void {
@@ -1704,6 +1720,22 @@ fn prebuildAndPushRunner(ctx: *const Ctx) Prebuild {
 	// its tag name (x86_64 / aarch64) matches flake.nix's archSuffix exactly.
 	const arch = if (@import("platform").darwin) "aarch64-darwin" else @tagName(builtin_mod.cpu.arch);
 
+	// The package whose launcher will boot this runner, which picks the config the
+	// runner is built from (nix.configSuffixFor) AND keys the record below, so the
+	// two can never disagree. A package that does not re-exec has no config to
+	// build: skip rather than guess (the boot evaluates).
+	const reexec_package = reexecPackage(ctx);
+	if (nix.configSuffixFor(reexec_package) == null) {
+		warn(ctx, "runner push: unknown COGBOX_REEXEC_PACKAGE '{s}'; skipping pre-build (boot will rebuild)", .{reexec_package}) catch {};
+		return .failed;
+	}
+
+	// The comp of the composition bytes this build reads (runner.path line 3),
+	// taken right before the build and checked again before the record is
+	// written. The dispatcher's config lock keeps them stable; the re-check makes
+	// the record's line 3 provably the comp of what was built.
+	const comp_before = snapshot.compOfDir(ctx.io, ctx.plugins_flake_dir);
+
 	// Combine the per-instance file:// cache with cogworx's remote substituters
 	// so the runner's transitive deps substitute rather than build from source.
 	const extra_subs = env.get("COGBOX_EXTRA_SUBSTITUTERS") orelse "";
@@ -1721,6 +1753,7 @@ fn prebuildAndPushRunner(ctx: *const Ctx) Prebuild {
 		.substituters = substituters,
 		.trusted_public_keys = env.get("COGBOX_EXTRA_TRUSTED_PUBLIC_KEYS") orelse "",
 		.netrc_file = env.get("COGBOX_NETRC_FILE") orelse "",
+		.reexec_package = reexec_package,
 	}) catch {
 		warn(ctx, "runner push: build failed to launch (boot will rebuild)", .{}) catch {};
 		return .failed;
@@ -1760,7 +1793,13 @@ fn prebuildAndPushRunner(ctx: *const Ctx) Prebuild {
 	// self-heals across image bumps and across a different composed package alike
 	// (either one fails the launcher's `[ "$FP_REV" = "$RUNNER_KEY" ]` guard and
 	// re-evals). See writeRunnerRecord for why the package attribute is in there.
-	if (pushed) writeRunnerRecord(ctx, flake_source, first);
+	// Line 3 is the comp of the composition it was built from; the launcher's
+	// fast path requires it to equal the comp of the bytes it is about to boot.
+	if (pushed) switch (prebuiltRecordComp(ctx, comp_before)) {
+		.comp => |comp| writeRunnerRecord(ctx, flake_source, first, &comp),
+		.no_comp => warn(ctx, "runner push: could not hash the composition; not recording the runner (boot will eval)", .{}) catch {},
+		.changed => warn(ctx, "runner push: the composition changed during the pre-build; not recording the runner (boot will eval)", .{}) catch {},
+	};
 	// The composed runner BUILT from the live lock, which is all the launcher's
 	// pre-exec confirmation would prove (the push is only a cache optimization).
 	return .ok;
@@ -2282,32 +2321,61 @@ fn removeToplevelRecord(ctx: *const Ctx) void {
 	}
 }
 
+/// The flake package attribute this cogbox re-execs through
+/// (COGBOX_REEXEC_PACKAGE, baked next to COGBOX_FLAKE_SOURCE by mkCogboxAttr).
+/// Absent (an unwrapped binary, or an image predating it) it means the default
+/// package, "cogbox".
+fn reexecPackage(ctx: *const Ctx) []const u8 {
+	return ctx.parent_env.get("COGBOX_REEXEC_PACKAGE") orelse "cogbox";
+}
+
+/// Whether a pre-built runner may be recorded for the launcher's fast path, and
+/// with which line 3: only when the composition still has the comp
+/// `comp_before` it had right before the build, so line 3 names exactly the
+/// bytes the runner was built from. A composition that cannot be hashed, or
+/// that changed during the build, gets no record (the boot evaluates, which is
+/// always correct).
+const PrebuiltRecord = union(enum) { comp: snapshot.Comp, no_comp, changed };
+
+fn prebuiltRecordComp(ctx: *const Ctx, comp_before: ?snapshot.Comp) PrebuiltRecord {
+	const before = comp_before orelse return .no_comp;
+	const after = snapshot.compOfDir(ctx.io, ctx.plugins_flake_dir) orelse return .no_comp;
+	if (!std.mem.eql(u8, &before, &after)) return .changed;
+	return .{ .comp = after };
+}
+
 /// Best-effort pre-write of cogbox-launch.sh's runner.path fast-path record.
 /// The file lives at <instance_config_dir>/runner.path on the shared state PVC
 /// (the worker pod mounts it at the SAME XDG_CONFIG_HOME the sandbox launcher
 /// does), where instance_config_dir = dirname(plugins_flake_dir). Contents must
-/// byte-match what the launcher writes/reads: `printf '%s\n%s\n' <key> <runner>`
-/// -- two newline-terminated lines, line1 = the record KEY, line2 = the composed
-/// runner out-path. Written atomically (tmp + rename) so a partial write can't
-/// leave a half-record the launcher would misread; any failure is warned and
-/// swallowed (a missing/short record just makes the first boot fall back to
-/// eval, never a failed verb).
+/// byte-match what the launcher writes/reads:
+/// `printf '%s\n%s\n%s\n' <key> <runner> <comp>` -- three newline-terminated
+/// lines, line1 = the record KEY, line2 = the composed runner out-path, line3 =
+/// the comp (snapshot.compOfBytes) of the composition the runner was built from.
+/// The fast path requires line 3 to equal the comp of the bytes it boots, so a
+/// record can never vouch for a runner built from a different composition; a
+/// launcher older than line 3 reads only lines 1-2 and is unaffected. Written
+/// atomically (tmp + rename) so a partial write can't leave a half-record the
+/// launcher would misread; any failure is warned and swallowed (a
+/// missing/short record just makes the first boot fall back to eval, never a
+/// failed verb).
 ///
 /// The key is "<flakeSource>#<reexecPackage>", not the flakeSource alone. One
 /// flake source builds SEVERAL cogbox packages whose composed runners differ
 /// (cogbox vs cogbox-hosted), and their @flakeSource@ is byte-identical, so a
 /// rev-only key let a record written for one validate for the other -- the
 /// launcher would then realize a runner built for a different guest storage
-/// layout and skip the re-exec that would have rebuilt it. COGBOX_REEXEC_PACKAGE
-/// is baked next to COGBOX_FLAKE_SOURCE by mkCogboxAttr; absent (an unwrapped
-/// binary, or an image predating it) it means the default package, "cogbox".
-/// Spelling the key differently from the launcher is not dangerous -- the
-/// launcher simply rejects the record and evals -- but it silently costs a fresh
-/// instance the entire point of this pre-write, so the two must move together.
-fn writeRunnerRecord(ctx: *const Ctx, flake_source: []const u8, runner: []const u8) void {
+/// layout and skip the re-exec that would have rebuilt it. The key comes from
+/// reexecPackage, and prebuildAndPushRunner builds its runner from that same
+/// package's config (nix.configSuffixFor), so the record and the runner it
+/// names always agree on the package. Spelling the key differently from the
+/// launcher is not dangerous -- the launcher simply rejects the record and
+/// evals -- but it silently costs a fresh instance the entire point of this
+/// pre-write, so the two must move together.
+fn writeRunnerRecord(ctx: *const Ctx, flake_source: []const u8, runner: []const u8, comp: []const u8) void {
 	const allocator = ctx.allocator;
 	const cwd = std.Io.Dir.cwd();
-	const reexec_package = ctx.parent_env.get("COGBOX_REEXEC_PACKAGE") orelse "cogbox";
+	const reexec_package = reexecPackage(ctx);
 
 	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse {
 		warn(ctx, "runner push: plugins-flake dir has no parent; skipping record (boot will eval)", .{}) catch {};
@@ -2318,7 +2386,7 @@ fn writeRunnerRecord(ctx: *const Ctx, flake_source: []const u8, runner: []const 
 	const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return;
 	defer allocator.free(tmp_path);
 
-	const contents = std.fmt.allocPrint(allocator, "{s}#{s}\n{s}\n", .{ flake_source, reexec_package, runner }) catch return;
+	const contents = std.fmt.allocPrint(allocator, "{s}#{s}\n{s}\n{s}\n", .{ flake_source, reexec_package, runner, comp }) catch return;
 	defer allocator.free(contents);
 
 	{
@@ -3107,4 +3175,262 @@ test "buildSubstituters: base store prepended, shared cache appended" {
 		defer a.free(s);
 		try t.expectEqualStrings("file:///icd/plugin-cache", s);
 	}
+}
+
+// --- live-apply Phase 0: runner record line 3, materializeSource vs snapshots ---
+
+/// An instance config dir under the cwd for the Ctx-driven tests below, with the
+/// Ctx paths dispatch derives from it. The caller deletes `root`.
+const TestInstance = struct {
+	root: []u8,
+	plugins_flake_dir: []u8,
+	sources_dir: []u8,
+	cache_dir: []u8,
+	env: std.process.Environ.Map,
+
+	fn init(io: std.Io, tag: []const u8) !TestInstance {
+		const a = t.allocator;
+		var rnd: [8]u8 = undefined;
+		io.random(&rnd);
+		const rel = try std.fmt.allocPrint(a, "zig-plugin-test-{s}-{x}", .{ tag, &rnd });
+		defer a.free(rel);
+		const cwd = std.Io.Dir.cwd();
+		try cwd.createDirPath(io, rel);
+		const root_z = try cwd.realPathFileAlloc(io, rel, a);
+		defer a.free(root_z);
+		const root = try a.dupe(u8, root_z);
+		const pf = try std.fmt.allocPrint(a, "{s}/plugins-flake", .{root});
+		try cwd.createDirPath(io, pf);
+		return .{
+			.root = root,
+			.plugins_flake_dir = pf,
+			.sources_dir = try std.fmt.allocPrint(a, "{s}/plugin-sources", .{root}),
+			.cache_dir = try std.fmt.allocPrint(a, "{s}/plugin-cache", .{root}),
+			.env = std.process.Environ.Map.init(a),
+		};
+	}
+
+	fn ctx(self: *const TestInstance, io: std.Io) Ctx {
+		return .{
+			.allocator = t.allocator,
+			.io = io,
+			.parent_env = &self.env,
+			.instance = null,
+			.config_path = "",
+			.runtime_path = "",
+			.user_flake_dir = "",
+			.plugins_flake_dir = self.plugins_flake_dir,
+			.sources_dir = self.sources_dir,
+			.cache_dir = self.cache_dir,
+		};
+	}
+
+	fn deinit(self: *TestInstance, io: std.Io) void {
+		std.Io.Dir.cwd().deleteTree(io, self.root) catch {};
+		const a = t.allocator;
+		a.free(self.root);
+		a.free(self.plugins_flake_dir);
+		a.free(self.sources_dir);
+		a.free(self.cache_dir);
+		self.env.deinit();
+	}
+
+	fn path(self: *const TestInstance, comptime rel: []const u8) ![]u8 {
+		return std.fmt.allocPrint(t.allocator, "{s}/" ++ rel, .{self.root});
+	}
+};
+
+fn testWriteFile(io: std.Io, p: []const u8, bytes: []const u8) !void {
+	const f = try std.Io.Dir.cwd().createFile(io, p, .{ .truncate = true });
+	defer f.close(io);
+	var buf: [256]u8 = undefined;
+	var w = f.writer(io, &buf);
+	try w.interface.writeAll(bytes);
+	try w.flush();
+}
+
+fn testReadFile(io: std.Io, p: []const u8) ![]u8 {
+	return std.Io.Dir.cwd().readFileAlloc(io, p, t.allocator, .limited(1 << 20));
+}
+
+test "runner record: three lines, line 3 the comp of the composition the runner was built from" {
+	var threaded: std.Io.Threaded = .init(t.allocator, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	var inst = try TestInstance.init(io, "record");
+	defer inst.deinit(io);
+	try inst.env.put("COGBOX_REEXEC_PACKAGE", "cogbox-hosted");
+	const c = inst.ctx(io);
+
+	const nix_path = try inst.path("plugins-flake/flake.nix");
+	defer t.allocator.free(nix_path);
+	const lock_path = try inst.path("plugins-flake/flake.lock");
+	defer t.allocator.free(lock_path);
+	const rec_path = try inst.path("runner.path");
+	defer t.allocator.free(rec_path);
+	try testWriteFile(io, nix_path, "{ outputs = _: {}; }\n");
+	try testWriteFile(io, lock_path, "{\"nodes\":{},\"version\":7}\n");
+
+	// Unchanged bytes across the build: recordable, and the record is keyed on
+	// the package with line 3 = comp of exactly those bytes.
+	const before = snapshot.compOfDir(io, inst.plugins_flake_dir);
+	const want_comp = snapshot.compOfBytes("{ outputs = _: {}; }\n", "{\"nodes\":{},\"version\":7}\n");
+	const verdict = prebuiltRecordComp(&c, before);
+	try t.expectEqualStrings(&want_comp, &verdict.comp);
+	writeRunnerRecord(&c, "/nix/store/aaa-cogbox-source", "/nix/store/bbb-microvm-run", &verdict.comp);
+	const rec = try testReadFile(io, rec_path);
+	defer t.allocator.free(rec);
+	const want = try std.fmt.allocPrint(t.allocator, "/nix/store/aaa-cogbox-source#cogbox-hosted\n/nix/store/bbb-microvm-run\n{s}\n", .{&want_comp});
+	defer t.allocator.free(want);
+	try t.expectEqualStrings(want, rec);
+	// A two-line reader (an older launcher) still sees the same key and runner.
+	var lines = std.mem.splitScalar(u8, rec, '\n');
+	try t.expectEqualStrings("/nix/store/aaa-cogbox-source#cogbox-hosted", lines.next().?);
+	try t.expectEqualStrings("/nix/store/bbb-microvm-run", lines.next().?);
+
+	// The bytes changed during the build: not recordable.
+	try testWriteFile(io, lock_path, "{\"nodes\":{\"p-x\":{}},\"version\":7}\n");
+	try t.expect(prebuiltRecordComp(&c, before) == .changed);
+
+	// No comp before the build, or none after it (no flake.nix): not recordable.
+	try t.expect(prebuiltRecordComp(&c, null) == .no_comp);
+	try std.Io.Dir.cwd().deleteFile(io, nix_path);
+	try t.expect(prebuiltRecordComp(&c, before) == .no_comp);
+
+	// A composition without a lock (its `nix flake lock` failed) is recordable,
+	// with the comp of an empty lock, which the launcher computes for it too;
+	// a lock that vanished during the build is a change like any other.
+	try testWriteFile(io, nix_path, "{ outputs = _: {}; }\n");
+	try std.Io.Dir.cwd().deleteFile(io, lock_path);
+	try t.expect(prebuiltRecordComp(&c, before) == .changed);
+	const lockless = snapshot.compOfDir(io, inst.plugins_flake_dir);
+	try t.expectEqualStrings(&snapshot.compOfBytes("{ outputs = _: {}; }\n", ""), &prebuiltRecordComp(&c, lockless).comp);
+}
+
+test "runner record: the key defaults to the cogbox package" {
+	var threaded: std.Io.Threaded = .init(t.allocator, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	var inst = try TestInstance.init(io, "record-default");
+	defer inst.deinit(io);
+	const c = inst.ctx(io);
+	const rec_path = try inst.path("runner.path");
+	defer t.allocator.free(rec_path);
+	const comp = snapshot.compOfBytes("n", "l");
+	writeRunnerRecord(&c, "/src", "/runner", &comp);
+	const rec = try testReadFile(io, rec_path);
+	defer t.allocator.free(rec);
+	const want = try std.fmt.allocPrint(t.allocator, "/src#cogbox\n/runner\n{s}\n", .{&comp});
+	defer t.allocator.free(want);
+	try t.expectEqualStrings(want, rec);
+}
+
+// A live-apply snapshot is a `cp -al` of plugin-sources/: its files share
+// inodes with the live tree. materializeSource and removeSource must therefore
+// never write into an existing source file, including when materialize's
+// best-effort deleteTree fails and leaves files behind.
+test "materializeSource/removeSource never rewrite a file a hard-linked snapshot shares" {
+	if (std.c.geteuid() == 0) return error.SkipZigTest; // root ignores directory modes
+	// The process environment, so runTool's cp/chmod resolve through PATH.
+	var threaded: std.Io.Threaded = .init(t.allocator, .{ .environ = std.testing.environ });
+	defer threaded.deinit();
+	const io = threaded.io();
+	const a = t.allocator;
+	const cwd = std.Io.Dir.cwd();
+	var inst = try TestInstance.init(io, "materialize");
+	defer {
+		// Give the planted read-only directory its write bit back for teardown.
+		if (inst.path("plugin-sources/p/sub")) |locked| {
+			defer a.free(locked);
+			cwd.setFilePermissions(io, locked, .fromMode(0o755), .{}) catch {};
+		} else |_| {}
+		inst.deinit(io);
+	}
+	const c = inst.ctx(io);
+
+	// The plugin's new (v2) source, standing in for its store path.
+	const src = try inst.path("store-src");
+	defer a.free(src);
+	const src_sub = try inst.path("store-src/sub");
+	defer a.free(src_sub);
+	try cwd.createDirPath(io, src_sub);
+	inline for (.{ "store-src/default.nix", "store-src/sub/a.txt" }) |rel| {
+		const p = try inst.path(rel);
+		defer a.free(p);
+		try testWriteFile(io, p, "v2\n");
+	}
+	const meta: nix.Meta = .{ .locked_url = "", .rev = null, .nar_hash = "", .source_path = src };
+
+	// The live v1 tree and a snapshot that hard-links its files (cp -al).
+	const live_sub = try inst.path("plugin-sources/p/sub");
+	defer a.free(live_sub);
+	const snap_sub = try inst.path("snap/src/p/sub");
+	defer a.free(snap_sub);
+	const files = [_][]const u8{ "default.nix", "sub/a.txt" };
+	const plant = struct {
+		fn run(i: *const TestInstance, tio: std.Io, live: []const u8, snap: []const u8) !void {
+			const d = std.Io.Dir.cwd();
+			try d.createDirPath(tio, live);
+			try d.createDirPath(tio, snap);
+			for (files) |rel| {
+				const lp = try std.fmt.allocPrint(t.allocator, "{s}/plugin-sources/p/{s}", .{ i.root, rel });
+				defer t.allocator.free(lp);
+				const sp = try std.fmt.allocPrint(t.allocator, "{s}/snap/src/p/{s}", .{ i.root, rel });
+				defer t.allocator.free(sp);
+				d.deleteFile(tio, sp) catch {};
+				try testWriteFile(tio, lp, "v1\n");
+				try d.hardLink(lp, d, sp, tio, .{});
+			}
+		}
+	}.run;
+	const expectSnapV1 = struct {
+		fn run(i: *const TestInstance, tio: std.Io) !void {
+			for (files) |rel| {
+				const sp = try std.fmt.allocPrint(t.allocator, "{s}/snap/src/p/{s}", .{ i.root, rel });
+				defer t.allocator.free(sp);
+				const got = try testReadFile(tio, sp);
+				defer t.allocator.free(got);
+				try t.expectEqualStrings("v1\n", got);
+			}
+		}
+	}.run;
+
+	// 1. A normal re-materialize: live becomes v2, the snapshot keeps v1.
+	try plant(&inst, io, live_sub, snap_sub);
+	try materializeSource(&c, "p", &meta, "unused");
+	try expectSnapV1(&inst, io);
+	{
+		const lp = try inst.path("plugin-sources/p/sub/a.txt");
+		defer a.free(lp);
+		const got = try testReadFile(io, lp);
+		defer a.free(got);
+		try t.expectEqualStrings("v2\n", got);
+	}
+
+	// 2. removeSource (del) leaves the snapshot's files intact.
+	removeSource(&c, "p");
+	try expectSnapV1(&inst, io);
+
+	// 3. materialize's deleteTree fails: sub/ is read-only, so sub/a.txt survives
+	// it. cp must not truncate that surviving file in place (it is the
+	// snapshot's inode); unable to unlink it, it fails instead, and the caller
+	// warns as for any failed materialize.
+	try plant(&inst, io, live_sub, snap_sub);
+	try cwd.setFilePermissions(io, live_sub, .fromMode(0o555), .{});
+	materializeSource(&c, "p", &meta, "unused") catch {};
+	try expectSnapV1(&inst, io);
+}
+
+// The unlink-before-write must not hinge on cp's link-preserving heuristic
+// (which unlinks only a destination with more than one link): the flag is
+// pinned, next to the -a whose mode preservation the narHash needs.
+test "materializeSource copies with cp -a --remove-destination" {
+	var has_a = false;
+	var has_remove = false;
+	for (materialize_cp_flags) |f| {
+		if (std.mem.eql(u8, f, "-a")) has_a = true;
+		if (std.mem.eql(u8, f, "--remove-destination")) has_remove = true;
+	}
+	try t.expectEqualStrings("cp", materialize_cp_flags[0]);
+	try t.expect(has_a and has_remove);
 }
