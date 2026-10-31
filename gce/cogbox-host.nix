@@ -168,6 +168,20 @@ let
 	#                    until a restart. Default rather than forced for the same
 	#                    reason as the other two: a break-glass operator may need
 	#                    to run the proxies undropped.
+	#   COGBOX_APPLY_TIMEOUT, COGBOX_APPLY_BUILD_TIMEOUT,
+	#   COGBOX_APPLY_MIN_AVAILABLE_MB  --set-default: the live plugin apply's
+	#                    bounds on this image (docs/internals.md, "Live plugin
+	#                    apply"). The whole verb is 5340 s, timed from process
+	#                    start (its legs add up to 5335 s; the control plane's
+	#                    call budget sits above it). The build's 1800 s bound and
+	#                    the 2048 MiB MemAvailable floor are provisional, to be
+	#                    retuned from stage measurements. Defaults, so a caller
+	#                    can still set its own.
+	#                    COGBOX_APPLY_WAIT_MAX (how long a plugin change waits
+	#                    for a live apply that is finishing) is deliberately NOT
+	#                    set here: cogbox's built-in 1200 s applies, and a value
+	#                    the control plane passes in the command's environment
+	#                    (90 s once it drives live apply) must always win.
 	#
 	# The supervisor unit's own Environment= sets all four to these same
 	# values, so forcing XDG_RUNTIME_DIR changes nothing there.
@@ -201,6 +215,9 @@ let
 			--set-default XDG_CONFIG_HOME ${cfg.stateDir}/config \
 			--set-default COGBOX_DATA ${cfg.stateDir}/data/cogbox \
 			--set-default COGBOX_PROXY_RUNAS ${cfg.proxyUser}:${cfg.proxyUser} \
+			--set-default COGBOX_APPLY_TIMEOUT 5340 \
+			--set-default COGBOX_APPLY_BUILD_TIMEOUT 1800 \
+			--set-default COGBOX_APPLY_MIN_AVAILABLE_MB 2048 \
 			--set XDG_RUNTIME_DIR /run/cogbox
 		ln -s cogbox $out/bin/cbx
 	'';

@@ -2648,27 +2648,54 @@
 
 				# The VM guest's local-overlay store setup (see the boot fragment at
 				# boot.postBootCommands below for why the guest runs one). A script of
-				# its own rather than a shell function inside that fragment: these are
-				# the boot's steps, to be parameterized for a later live caller. As it
-				# stands it is NOT safe on a running guest: it removes the active conf
-				# and lower DB that nix-daemon is using, and reads the one regInfo on
-				# /proc/cmdline. The boot fragment calls it with the same stderr file
-				# and the same fallback as before. It inherits the caller's PATH (at
-				# boot that is stage 2's coreutils and util-linux only, hence plain
-				# bash and no grep).
+				# its own rather than a shell function inside that fragment, so the
+				# live switch helper (cogbox-live-switch) reuses the same steps.
+				#
+				# Boot (no arguments): removes the active conf, builds the lower DB at
+				# /nix/.rw-store/lower-state from the one regInfo on /proc/cmdline,
+				# and removes the lower-state.<n> generations an earlier boot's live
+				# applies left on a persistent upper. NOT safe on a running guest: it
+				# removes the conf and lower DB that nix-daemon is using.
+				#
+				# Live (--live /nix/.rw-store/lower-state.<n> REGINFO...): builds a
+				# FRESH lower DB generation at that directory from the given
+				# registrations (the boot regInfo plus every one applied since), and
+				# repoints the conf at it only once the store opens over it; on any
+				# failure the conf, and the generation nix-daemon uses, are untouched.
+				# The caller holds gc.lock, restarts nix-daemon and prunes old
+				# generations. A single overlay --load-db is not an option: it would
+				# whiteout host paths (see docs/internals.md, "Live plugin apply").
+				#
+				# The boot fragment calls it with the same stderr file and the same
+				# fallback as before. It inherits the caller's PATH (at boot that is
+				# stage 2's coreutils and util-linux only, hence plain bash and no
+				# grep).
 				cogboxOverlayStore = pkgs.writeShellScript "cogbox-overlay-store" ''
-					lower=/nix/.rw-store/lower-state conf=/run/cogbox/nix-store.conf
+					conf=/run/cogbox/nix-store.conf
 					features="local-overlay-store read-only-local-store"
-					rm -f "$conf"
-					[[ "$(cat /proc/cmdline)" =~ regInfo=([^ ]*) ]] || exit 1
+					if [ "''${1-}" = --live ]; then
+						lower=''${2-}
+						shift 2 || exit 1
+						[[ "$lower" =~ ^/nix/\.rw-store/lower-state\.[0-9]+$ ]] || { echo "bad live lower dir: $lower" >&2; exit 1; }
+						[ "$#" -gt 0 ] || exit 1
+						reginfos=("$@")
+					else
+						lower=/nix/.rw-store/lower-state
+						rm -f "$conf"
+						[[ "$(cat /proc/cmdline)" =~ regInfo=([^ ]*) ]] || exit 1
+						reginfos=("''${BASH_REMATCH[1]}")
+						rm -rf /nix/.rw-store/lower-state.[0-9]*
+					fi
 					rm -rf "$lower" && mkdir -p "$lower/real" /run/cogbox || exit 1
 					# Loaded against a scratch real dir: a writable local store
 					# chowns its store dir, which the read-only 9p lower refuses.
 					# The rows only name logical /nix/store paths, so the DB is
 					# the same one the read-only open over /nix/.ro-store wants.
-					${config.nix.package.out}/bin/nix-store \
-						--store "local?real=$lower/real&state=$lower" \
-						--load-db < "''${BASH_REMATCH[1]}" || exit 1
+					for reginfo in "''${reginfos[@]}"; do
+						${config.nix.package.out}/bin/nix-store \
+							--store "local?real=$lower/real&state=$lower" \
+							--load-db < "$reginfo" || exit 1
+					done
 					# Nix's own check-mount compares the mount's lowerdir and
 					# upperdir verbatim, but stage 1 mounted the overlay under
 					# /sysroot (or /mnt-root) and /proc/mounts keeps those
@@ -2689,6 +2716,31 @@
 						store info --store "$url" >/dev/null || exit 1
 					printf 'extra-experimental-features = %s\nstore = %s\n' "$features" "$url" > "$conf.tmp" \
 						&& mv "$conf.tmp" "$conf"
+				'';
+
+				# The guest half of a live plugin apply (cogbox-live-switch.sh;
+				# protocol in its header and docs/internals.md, "Live plugin
+				# apply"). VM only: linked into the toplevel, so the host always
+				# runs the BOOTED system's copy as
+				# /run/booted-system/cogbox-live-switch. Its PATH is fixed here
+				# (the guest's own systemd, nix via cogbox-overlay-store, and sshd
+				# for `sshd -t`), and the reply route ids come from the module that
+				# installs them (guestReplyRoute).
+				liveSwitchHelper = pkgs.runCommand "cogbox-live-switch" { } ''
+					substitute ${./cogbox-live-switch.sh} $out \
+						--replace-fail '@bash@' '${pkgs.bash}/bin/bash' \
+						--replace-fail '@path@' '${lib.makeBinPath [
+							pkgs.coreutils pkgs.util-linux pkgs.gnugrep pkgs.gawk pkgs.iproute2 pkgs.nftables
+							config.systemd.package config.services.openssh.package
+							(pkgs.runCommand "cogbox-overlay-store-bin" { } ''
+								mkdir -p $out/bin
+								ln -s ${cogboxOverlayStore} $out/bin/cogbox-overlay-store
+							'')
+						]}' \
+						--replace-fail '@replyGroup@' '${toString guestReplyRoute.group}' \
+						--replace-fail '@replyPriority@' '${toString guestReplyRoute.priority}'
+					chmod +x $out
+					${pkgs.bash}/bin/bash -n $out
 				'';
 
 				# ===== Boot-only units (once-markers) ==========================
@@ -3151,6 +3203,14 @@
 				# check can compare the list the script carries with the units that
 				# actually render the once-marker condition.
 				system.build.cogboxOnceUnits = onceUnits;
+
+				# The live switch helper, at a fixed name in every VM toplevel
+				# (checks.live-switch-helper drives it and pins the link). The
+				# build attribute is for that check; only a VM toplevel links it.
+				system.systemBuilderCommands = lib.mkIf isVm ''
+					ln -s ${liveSwitchHelper} $out/cogbox-live-switch
+				'';
+				system.build.cogboxLiveSwitch = liveSwitchHelper;
 
 				microvm = lib.mkIf isVm {
 					writableStoreOverlay = "/nix/.rw-store";
@@ -5709,6 +5769,10 @@
 				printf 'COGBOX_DATA=%s\n' "''${COGBOX_DATA-<unset>}"
 				printf 'XDG_RUNTIME_DIR=%s\n' "''${XDG_RUNTIME_DIR-<unset>}"
 				printf 'COGBOX_PROXY_RUNAS=%s\n' "''${COGBOX_PROXY_RUNAS-<unset>}"
+				printf 'COGBOX_APPLY_TIMEOUT=%s\n' "''${COGBOX_APPLY_TIMEOUT-<unset>}"
+				printf 'COGBOX_APPLY_BUILD_TIMEOUT=%s\n' "''${COGBOX_APPLY_BUILD_TIMEOUT-<unset>}"
+				printf 'COGBOX_APPLY_MIN_AVAILABLE_MB=%s\n' "''${COGBOX_APPLY_MIN_AVAILABLE_MB-<unset>}"
+				printf 'COGBOX_APPLY_WAIT_MAX=%s\n' "''${COGBOX_APPLY_WAIT_MAX-<unset>}"
 			'';
 			# The bake seam of `lib.mkGceHost`, evaluated (not built) so the
 			# runbook's one supported way to inject a control CA is asserted
@@ -6336,7 +6400,7 @@
 				nativeBuildInputs = with pkgs; [ bash jq coreutils gnugrep python3 util-linux ];
 			} ''
 				export HOME=$TMPDIR
-				bash ${./tests/test_launch_flags.sh} ${./cogbox-launch.sh} ${./cogbox-shutdown.sh}
+				bash ${./tests/test_launch_flags.sh} ${./cogbox-launch.sh} ${./cogbox-shutdown.sh} ${./zig/src/plugin/apply.zig}
 				python3 ${./tests/test_runtime_base.py} ${./cogbox-launch.sh} -v
 				python3 ${./tests/test_app_environment.py} ${./cogbox-launch.sh} -v
 				touch $out
@@ -6794,6 +6858,50 @@
 				touch $out
 			'';
 
+			# The guest half of a live plugin apply, cogbox-live-switch (Phase 1
+			# helper):
+			#
+			# 1. Every VM profile links ITS OWN helper into the toplevel at
+			#    $out/cogbox-live-switch (the host only ever runs
+			#    /run/booted-system/cogbox-live-switch); the container links none.
+			# 2. The helper's protocol (tests/test_live_switch.sh), driven verb by
+			#    verb against stand-ins for systemd, ip, nft, sshd, runuser and the
+			#    store setup, under a scratch root: the state machine (start
+			#    idempotence, busy, superseded, stale boot, tainted, the dead-man
+			#    armed before the apply unit, the tombstoning abort, confirm versus
+			#    revert, sticky terminal states); registration (the lower DB
+			#    generations kept and pruned, gc.lock busy, the fallback store,
+			#    hidden closure paths with the drop_caches retry); the no-op
+			#    refusals; every post-check verdict; settle's phases; revert's
+			#    lock retries, stale guard, taint and legs budgeted inside its
+			#    own bound; `--force-units` exempting
+			#    only the listed units from the InvocationID check; `--repair`
+			#    restarting cogbox-reply-route after the switch and after a forced
+			#    revert; the plan's guest data; and the enum-only reply contract.
+			live-switch-helper = let
+				vmProfiles = { workstation = self.nixosConfigurations.${configName system}.config; } // poolBootProfiles;
+				containerCfg = self.nixosConfigurations."${configName system}-container".config;
+				plain = s: builtins.unsafeDiscardStringContext (toString s);
+				linksOwn = cfg: lib.hasInfix
+					"ln -s ${plain cfg.system.build.cogboxLiveSwitch} $out/cogbox-live-switch"
+					(plain cfg.system.systemBuilderCommands);
+			in pkgs.runCommand "cogbox-live-switch-helper" {
+				nativeBuildInputs = with pkgs; [ bash coreutils gnugrep gnused util-linux ];
+			} ''
+				fails=0
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+				${lib.concatStrings (lib.mapAttrsToList (pname: cfg: lib.optionalString (!(linksOwn cfg)) ''
+					bad "${pname}: the toplevel does not link its own cogbox-live-switch"
+				'') vmProfiles)}
+				${lib.optionalString (lib.hasInfix "cogbox-live-switch" (plain containerCfg.system.systemBuilderCommands)) ''
+					bad "the container toplevel links cogbox-live-switch; the helper is VM-only"
+				''}
+				bash -n ${./tests/test_live_switch.sh} || bad "tests/test_live_switch.sh does not parse"
+				bash ${./tests/test_live_switch.sh} ${vmProfiles.workstation.system.build.cogboxLiveSwitch} || bad "the helper protocol tests failed"
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
 			# The guest half of the GCE boot proof (cogbox-boot-stamp.service; the
 			# host half is gce/supervise.sh leg (h2)). VM-only, ordered after sshd
 			# and the 9p mount it writes to, and after the data pool's mount but
@@ -7237,8 +7345,84 @@
 				[ "$fails" -eq 0 ] || exit 1
 				touch $out
 			'';
-			cogbox-vm = pkgs.testers.runNixOSTest (import ./tests/cogbox.nix {
+			# Phase LA (live plugin apply) builds the runner of every plugin
+			# composition it applies, and the offline test machine can only
+			# realise a runner whose output it already has. So these are those
+			# runners, pre-built in the nested shape compose.zig renders (one
+			# `_file = "p-<name>"` wrapper per plugin in add order, then the
+			# scaffold's no-op user module) from the very module files the phase
+			# installs as plugins (tests/fixtures/live-apply/<dir>/module.nix):
+			# each apply's realise is then a cache hit. A composition the phase
+			# only evaluates (la-bad) or only boots on the fast path needs nothing
+			# more; none is ever re-executed into (that would need its wrapper).
+			# `systems` are toplevels the phase only plans against (the host's
+			# unit plan next to the guest's own dry-activate), never applies.
+			# `hosted` is the same for the hosted guest profile (the GCE/PVE
+			# guest, packages.cogbox-hosted): its base, the runners of the
+			# compositions the phase applies to a hosted instance, and the
+			# toplevels it plans against there.
+			cogbox-vm = let
+				laSystemWith = profileModules: plugins: mkMicrovm "x86_64-linux" "cogbox" {
+					vcpu = 16;
+					mem = 32768;
+					extraModules = cogboxModules "x86_64-linux" {
+						userExt = {
+							imports = map (p: {
+								_file = "p-${p.name}";
+								imports = [ (import (./tests/fixtures/live-apply + "/${p.dir}/module.nix")) ];
+							}) plugins ++ [
+								{ _file = "cogbox-user"; imports = [ ({ pkgs, lib, ... }: { }) ]; }
+							];
+						};
+					} ++ profileModules;
+				};
+				laSystem = laSystemWith [ ];
+				laRunner = plugins: (laSystem plugins).config.microvm.declaredRunner;
+				laToplevel = plugins: (laSystem plugins).config.system.build.toplevel;
+				# The hosted configuration is cogboxModules plus hostedGuestModule,
+				# in that order (nixosConfigurations.<arch>-hosted).
+				laHostedRunner = plugins: (laSystemWith [ hostedGuestModule ] plugins).config.microvm.declaredRunner;
+				laHostedToplevel = plugins: (laSystemWith [ hostedGuestModule ] plugins).config.system.build.toplevel;
+				kit = v: { name = "la-kit"; dir = "la-kit-v${toString v}"; };
+				deny = v: { name = "la-deny"; dir = "la-deny-v${toString v}"; };
+				la = n: { name = n; dir = n; };
+			in pkgs.testers.runNixOSTest (import ./tests/cogbox.nix {
 				inherit self pkgs system;
+				liveApply = {
+					runners = lib.mapAttrs (_: laRunner) {
+						kit1 = [ (kit 1) ];
+						kit2 = [ (kit 2) ];
+						hang = [ (kit 2) (la "la-hang") ];
+						kit3 = [ (kit 3) ];
+						kit4 = [ (kit 4) ];
+						deny1 = [ (kit 2) (deny 1) ];
+						deny2 = [ (kit 2) (deny 2) ];
+						xguard = [ (kit 2) (la "la-x") (la "la-guard") ];
+						guard = [ (kit 2) (la "la-guard") ];
+						lock = [ (kit 2) (la "la-x") (la "la-guard") (la "la-lock") ];
+						user = [ (kit 2) (la "la-x") (la "la-guard") (la "la-user") ];
+						mount = [ (kit 2) (la "la-x") (la "la-guard") (la "la-user") (la "la-mount") ];
+						noboot = [ (kit 2) (la "la-x") (la "la-guard") (la "la-user") (la "la-mount") (la "la-noboot") ];
+						uunit = [ (kit 2) (la "la-x") (la "la-guard") (la "la-user") (la "la-mount") (la "la-uunit") ];
+					};
+					systems = lib.mapAttrs (_: laToplevel) {
+						docker = [ (kit 2) (la "la-docker") ];
+						nft = [ (kit 2) (la "la-nft") ];
+						net = [ (kit 2) (la "la-net") ];
+					};
+					hosted = {
+						cogbox = self.packages.x86_64-linux.cogbox-hosted;
+						runners = lib.mapAttrs (_: laHostedRunner) {
+							kit2 = [ (kit 2) ];
+							hang = [ (kit 2) (la "la-hang") ];
+						};
+						systems = lib.mapAttrs (_: laHostedToplevel) {
+							docker = [ (kit 2) (la "la-docker") ];
+							nft = [ (kit 2) (la "la-nft") ];
+							net = [ (kit 2) (la "la-net") ];
+						};
+					};
+				};
 			});
 			# Standing bypass-test suite for the container-mode nft egress floor
 			# (TODO): loads the real cogbox-nft-divert.sh and probes every
@@ -10829,6 +11013,33 @@
 					fails=$((fails + 1))
 				elif ! grep -qF "COGBOX_PROXY_RUNAS=$runas" ${gceUnits}/cogworx-supervisor.service; then
 					echo "FAIL: the wrapper exports COGBOX_PROXY_RUNAS=$runas but the supervisor unit exports something else; the boot render and the bind render would grant to different groups" >&2
+					fails=$((fails + 1))
+				fi
+
+				# 6. The live plugin apply's bounds are baked as defaults: the whole
+				#    verb's 5340 s (its legs add up to 5335 s; the control plane's
+				#    call budget is sized above it), the build's 1800 s and the
+				#    2048 MiB MemAvailable floor; a caller's value still wins.
+				#    COGBOX_APPLY_WAIT_MAX is NOT baked: a value the control plane
+				#    passes in the command's environment (90 s once it drives live
+				#    apply: an op is to wait at most 90 s behind a finishing apply,
+				#    never the CLI's 20 min) must reach cogbox whatever this image
+				#    ships.
+				baked=$(env -u COGBOX_APPLY_TIMEOUT -u COGBOX_APPLY_BUILD_TIMEOUT -u COGBOX_APPLY_MIN_AVAILABLE_MB -u COGBOX_APPLY_WAIT_MAX ./wrapper)
+				for pair in COGBOX_APPLY_TIMEOUT=5340 COGBOX_APPLY_BUILD_TIMEOUT=1800 COGBOX_APPLY_MIN_AVAILABLE_MB=2048 'COGBOX_APPLY_WAIT_MAX=<unset>'; do
+					if ! printf '%s\n' "$baked" | grep -qxF "$pair"; then
+						echo "FAIL: an empty environment did not yield $pair; got: $(printf '%s' "$baked" | tr '\n' ' ')" >&2
+						fails=$((fails + 1))
+					fi
+				done
+				got=$(COGBOX_APPLY_WAIT_MAX=90 ./wrapper | val COGBOX_APPLY_WAIT_MAX)
+				if [ "$got" != 90 ]; then
+					echo "FAIL: a caller's COGBOX_APPLY_WAIT_MAX=90 reached cogbox as '$got'" >&2
+					fails=$((fails + 1))
+				fi
+				got=$(COGBOX_APPLY_TIMEOUT=60 ./wrapper | val COGBOX_APPLY_TIMEOUT)
+				if [ "$got" != 60 ]; then
+					echo "FAIL: COGBOX_APPLY_TIMEOUT is forced ('$got'); the baked value is only a default" >&2
 					fails=$((fails + 1))
 				fi
 

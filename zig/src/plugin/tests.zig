@@ -14,12 +14,20 @@ test {
 	std.testing.refAllDecls(@import("main.zig"));
 	std.testing.refAllDecls(@import("snapshot.zig"));
 	std.testing.refAllDecls(@import("preboot.zig"));
+	std.testing.refAllDecls(@import("unitplan.zig"));
+	std.testing.refAllDecls(@import("rollback.zig"));
+	std.testing.refAllDecls(@import("apply.zig"));
 	_ = @import("name_test.zig");
 	_ = @import("compose_test.zig");
 	_ = @import("mutate_test.zig");
 	_ = @import("units_test.zig");
 	_ = @import("nix_test.zig");
+	_ = @import("unitplan_test.zig");
+	_ = @import("rollback_test.zig");
+	_ = @import("apply_test.zig");
+	_ = @import("apply_guest_test.zig");
 	_ = @import("main.zig");
 	_ = @import("snapshot.zig");
 	_ = @import("preboot.zig");
+	_ = @import("rollback.zig");
 }

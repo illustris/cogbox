@@ -75,9 +75,14 @@ pub const TOP_LEVEL =
     \\  64  bad CLI args, unknown verb or flag (EX_USAGE)
     \\  65  bad data: invalid value or wrong-type directory input (EX_DATAERR)
     \\  66  missing/unreadable input: config, file, or directory (EX_NOINPUT)
+    \\  69  a plugin change gave up waiting for a live apply that is finishing;
+    \\      nothing changed (EX_UNAVAILABLE)
     \\  70  internal/system error (EX_SOFTWARE)
     \\  73  cannot write file: secret store write failed (EX_CANTCREAT)
     \\  75  already running, port collision (EX_TEMPFAIL)
+    \\  78  an automatic plugin rollback could not be finished: the instance does
+    \\      not start and the plugin changes refuse until disk space is freed or
+    \\      'cogbox plugin apply --abandon-rollback' is run (EX_CONFIG)
     \\
 ;
 
@@ -510,24 +515,54 @@ pub const PLUGIN =
     \\cogbox plugin - manage guest plugins for an instance
     \\
     \\Usage:
-    \\  cogbox plugin [-n NAME] add FLAKE_URL [--as PLUGIN] [-y]
-    \\  cogbox plugin [-n NAME] del PLUGIN [-y]
-    \\  cogbox plugin [-n NAME] update [PLUGIN]
+    \\  cogbox plugin [-n NAME] add FLAKE_URL [--as PLUGIN] [-y] [--apply | --no-apply]
+    \\  cogbox plugin [-n NAME] del PLUGIN [-y] [--apply | --no-apply]
+    \\  cogbox plugin [-n NAME] update [PLUGIN] [--apply | --no-apply]
     \\  cogbox plugin [-n NAME] list
+    \\  cogbox plugin [-n NAME] apply [--json] [--op RUN]
+    \\  cogbox plugin [-n NAME] apply --status [--json] [--since N]
+    \\  cogbox plugin [-n NAME] apply --cancel [--json] [--op RUN]
+    \\  cogbox plugin [-n NAME] apply --log GENERATION
+    \\  cogbox plugin [-n NAME] apply --abandon-rollback [-y]
     \\
     \\Options:
     \\  -n, --name NAME       Instance name (default: "default")
     \\      --as PLUGIN       (add) plugin name override (default: derived from
     \\                        the #attr, the ?dir= basename, or the repo name)
     \\  -y, --yes             Skip confirmation prompts
+    \\      --apply           Load the change into the running instance right
+    \\                        away (the default when stderr is an interactive
+    \\                        terminal and COGBOX_ENVIRONMENT is not cogworx)
+    \\      --no-apply        Leave the change for 'cogbox plugin apply' or the
+    \\                        next restart (the default otherwise, and always
+    \\                        with COGBOX_LIVE_APPLY=0)
     \\  -h, --help            Show this help and exit
+    \\
+    \\apply builds the committed plugin state on the host and loads it into
+    \\the running VM without a restart when it can: the kernel, initrd and
+    \\boot shape must be unchanged, and no unit it would stop, restart or
+    \\reload may end sessions, containers or the network. The guest arms a
+    \\revert before it switches and keeps the new system only once the host
+    \\confirms over a fresh ssh connection. It reports one outcome (applied,
+    \\restart_required with the reason, rejected, undone, failed, ...); a
+    \\change the sandbox proves broken, or whose NixOS configuration does not
+    \\evaluate, is rolled back automatically. Ctrl-C asks the guest to undo
+    \\the switch. --status reports a running apply, the last outcome and the
+    \\rollback records, settling an apply whose process died; --cancel stops
+    \\a running apply (with --op RUN, only the run with that token);
+    \\--log prints a generation's build output;
+    \\--abandon-rollback moves aside a rollback that cannot finish (exit 78)
+    \\so the instance can start again. A plugin change made while an apply
+    \\builds stops that apply; one made during its guest phase waits for it,
+    \\at most COGBOX_APPLY_WAIT_MAX seconds (1200), then exits 69 unchanged.
     \\
     \\A plugin is a flake output `cogboxPlugins.<attr>` (its `module` reference
     \\plus host-side networkRules/l7Rules/inject): `URL#attr` selects it, bare URL
     \\means `default`. One flake can carry many plugins; enable any subset with
     \\repeated adds. FLAKE_URL is any nix flake reference: github:owner/repo,
     \\git+https://..., path:/abs/dir, with ?dir= supported. The module (which
-    \\carries the kit via cogbox.*) is folded into the guest at the next start.
+    \\carries the kit via cogbox.*) is folded into the guest at the next start,
+    \\or loaded into a running VM by apply (above) when that is safe.
     \\
     \\Versioning is per FLAKE, not per plugin: the source is resolved and
     \\pinned at add time (rev + narHash recorded in config.json, inputs
@@ -546,7 +581,8 @@ pub const PLUGIN =
     \\  cogboxPlugins.l7Rules = [ { allow = "api.internal"; terminate = true; } ];
     \\On add/update these are shown for confirmation and inserted AT THE TOP of
     \\their rule lists (first match wins, so plugin allows must precede the
-    \\seeded RFC1918 denies). Rule changes hot-reload; module changes need
+    \\seeded RFC1918 denies). Rule changes hot-reload; module changes load
+    \\live on a running VM when apply can load them, and otherwise need
     \\'cogbox restart'.
     \\
     \\Adding a plugin evaluates and later builds third-party nix code -- only

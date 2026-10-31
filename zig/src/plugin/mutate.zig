@@ -264,6 +264,12 @@ pub fn validatePluginInjectSpec(v: std.json.Value) InjectSpecError!void {
 /// (first match wins; a plugin's allows must precede the seeded RFC1918
 /// denies to be reachable). Each rule is deep-copied into the document arena
 /// and tagged with `"plugin": tag` (overwriting any tag the flake declared).
+///
+/// Any `"approved"` field the flake declared is dropped. That marker belongs to
+/// the approval path alone (`rules add --plugin` / `l7 add --plugin`, which the
+/// control plane runs for an admin-approved rule request), and a live apply's
+/// rollback keeps a tagged allow that carries it; a plugin that could mark its
+/// own rules approved would survive that narrowing.
 pub fn prependTaggedRules(
 	arena: std.mem.Allocator,
 	rules_arr: *std.json.Array,
@@ -276,6 +282,7 @@ pub fn prependTaggedRules(
 		i -= 1;
 		var copied = try deepCopy(arena, incoming[i]);
 		_ = copied.object.orderedRemove("plugin");
+		_ = copied.object.orderedRemove("approved");
 		try copied.object.put(arena, try arena.dupe(u8, "plugin"), .{ .string = try arena.dupe(u8, tag) });
 		try rules_arr.insert(0, copied);
 	}
@@ -308,20 +315,38 @@ pub fn countTaggedRules(rules_arr: *const std.json.Array, tag: []const u8) usize
 	return n;
 }
 
-pub const RuleKind = enum { l4, l7 };
+pub const RuleKind = enum { l4, l7, inject };
 
 /// Structural rule identity for `plugin update --defer-rules`: true when `a`
-/// and `b` enforce the same thing. The "plugin" tag and "comment" never
-/// count. L4: action + the allow/deny string as stored (it carries any
-/// `tcp|udp` prefix and `:PORT`). L7: action, host, path (absent == absent),
-/// methods, pathmode=="exact", service, passthrough, insecure_upstream and the
-/// EFFECTIVE terminate (terminate || path || insecure_upstream || methods ||
-/// exact || service), so `{allow h, insecure_upstream}` equals the stored
+/// and `b` enforce the same thing. The "plugin" tag, "comment" and the
+/// "approved" marker never count. L4: action + the allow/deny string as stored
+/// (it carries any `tcp|udp` prefix and `:PORT`). L7: action, host, path
+/// (absent == absent), methods, pathmode=="exact", service, passthrough,
+/// insecure_upstream and the EFFECTIVE terminate (terminate || path ||
+/// insecure_upstream || methods || exact || service), so
+/// `{allow h, insecure_upstream}` equals the stored
 /// `{allow h, terminate, insecure_upstream}`. Mirrored by cogworx
 /// cogbox.DeferredL4Rule.Same / DeferredL7Rule.Same; keep the two in step.
+///
+/// Inject (a live apply's rollback, which keeps only the injections the
+/// restored version also had): host, secret, style (absent = "bearer"),
+/// cookieName and port, each compared as stored; an absent cookieName or port
+/// equals only an absent one. `stub` is presentation and does not count.
 pub fn sameRule(kind: RuleKind, a: std.json.Value, b: std.json.Value) bool {
 	if (a != .object or b != .object) return false;
 	switch (kind) {
+		.inject => {
+			const ha = stringField(a.object, "host") orelse return false;
+			const hb = stringField(b.object, "host") orelse return false;
+			const sa = stringField(a.object, "secret") orelse return false;
+			const sb = stringField(b.object, "secret") orelse return false;
+			if (!std.mem.eql(u8, ha, hb) or !std.mem.eql(u8, sa, sb)) return false;
+			const ya = injectStyle(a.object) orelse return false;
+			const yb = injectStyle(b.object) orelse return false;
+			if (!std.mem.eql(u8, ya, yb)) return false;
+			if (!optFieldEql(a.object, b.object, "cookieName")) return false;
+			return optFieldEql(a.object, b.object, "port");
+		},
 		.l4 => {
 			const pa = rule.ruleAction(a.object) orelse return false;
 			const pb = rule.ruleAction(b.object) orelse return false;
@@ -385,6 +410,33 @@ fn boolField(obj: std.json.ObjectMap, key: []const u8) bool {
 fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
 	if (a == null or b == null) return a == null and b == null;
 	return std.mem.eql(u8, a.?, b.?);
+}
+
+fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+	const v = obj.get(key) orelse return null;
+	if (v != .string) return null;
+	return v.string;
+}
+
+/// An injection's style as stored; absent means "bearer" (the validator's and
+/// the renderer's default). Null for a non-string style, which equals nothing.
+fn injectStyle(obj: std.json.ObjectMap) ?[]const u8 {
+	const v = obj.get("style") orelse return "bearer";
+	if (v != .string) return null;
+	return v.string;
+}
+
+/// `key` present in both with the same scalar value, or absent from both. A
+/// string compares by bytes, an integer by value; anything else never equals.
+fn optFieldEql(a: std.json.ObjectMap, b: std.json.ObjectMap, key: []const u8) bool {
+	const va = a.get(key);
+	const vb = b.get(key);
+	if (va == null or vb == null) return va == null and vb == null;
+	return switch (va.?) {
+		.string => |s| vb.? == .string and std.mem.eql(u8, s, vb.?.string),
+		.integer => |i| vb.? == .integer and i == vb.?.integer,
+		else => false,
+	};
 }
 
 /// The `incoming` rules with no sameRule match among `existing`'s entries

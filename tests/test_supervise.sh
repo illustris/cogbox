@@ -381,6 +381,8 @@ for a in "$@"; do
 		if=*/.cogbox-boot-stamp) printf 'timeout-read %s\n' "$1" >> "$FAKEMD/events" ;;
 	esac
 done
+# ...and the OOM drain's outer bound on `cogbox stop`, as `timeout-stop <bound>`.
+[ "${2:-} ${3:-}" != "cogbox stop" ] || printf 'timeout-stop %s\n' "$1" >> "$FAKEMD/events"
 exec "$REAL_TIMEOUT" "$@"
 STUB
 } > "$BIN/timeout"
@@ -415,6 +417,10 @@ run_boot() {
 	# whose config the state disk already carries. Off by default, so every other
 	# case runs against the never-booted shape -- the one the maintenance-boot
 	# regression lived on.
+	# A state disk too full (or read-only) for init's log: the state-disk copy
+	# cannot be opened (here it is a directory), so only the tmpfs copy holds
+	# init's output.
+	[ -z "${SEED_INIT_LOG_UNWRITABLE:-}" ] || mkdir -p "$home/state/last-init-error.log"
 	if [ -n "${SEED_INIT_CONFIG:-}" ]; then
 		mkdir -p "$home/state/config/cogbox/instances/$SEED_INIT_CONFIG"
 		printf '{"vcpu":4,"plugins":["obs-plugin"]}\n' \
@@ -1175,6 +1181,26 @@ else
 fi
 unset STUB_INIT_RC STUB_INIT_OUT
 
+# A FULL STATE DISK. The usual reason a boot dies with an automatic plugin
+# rollback that could not be finished (cogbox's exit 78) is a full or read-only
+# state disk -- the disk the state-disk copy of init's output is written to. The
+# summary is read from the tmpfs copy, so the stamped line still becomes the
+# classified boot error instead of the generic string.
+STUB_INIT_RC=78
+STUB_INIT_OUT="cogbox-launch: warning: live-apply housekeeping (__plugin-apply-preboot) exited 1; continuing
+cogbox: an automatic plugin rollback could not be finished (NoSpaceLeft); free disk space, or run 'cogbox plugin apply --abandon-rollback -n demo'"
+rc=$(SEED_INIT_LOG_UNWRITABLE=1 run_boot initfull "${BASE_ATTRS[@]}")
+ga="$ROOT/initfull/md/ga/cogworx_boot-error"
+if [ "$rc" != 0 ] && [ -d "$ROOT/initfull/state/last-init-error.log" ] \
+	&& grep -q "^n0nce-aaaa cogbox: an automatic plugin rollback could not be finished (NoSpaceLeft); free disk space" "$ga" 2>/dev/null \
+	&& ! grep -q 'cogbox-launch' "$ga" \
+	&& grep -q '^cogworx: FAILED: init: cogbox: an automatic plugin rollback could not be finished' "$ROOT/initfull/serial.log" 2>/dev/null; then
+	ok "with the state-disk log unwritable, the summary comes from the tmpfs copy and publishes the stamped rollback line"
+else
+	bad "unwritable state-disk init log: rc=$rc, boot-error '$(cat "$ga" 2>/dev/null)', serial: $(cat "$ROOT/initfull/serial.log" 2>/dev/null)"
+fi
+unset STUB_INIT_RC STUB_INIT_OUT
+
 # CLEARED ON SUCCESS. A boot-error that outlives its failure is worse than
 # none: it would be read as the reason for the next problem.
 rc=$(run_boot initclear "${BASE_ATTRS[@]}")
@@ -1184,10 +1210,10 @@ if [ -n "$(evline "$md" 'DELETE instance/guest-attributes/cogworx/boot-error')" 
 else
 	bad "a successful init left cogworx/boot-error in place; events: $(cat "$md/events")"
 fi
-if [ ! -e "$ROOT/initclear/state/last-init-error.log" ]; then
-	ok "a successful init leaves no stale error log on the state disk"
+if [ ! -e "$ROOT/initclear/state/last-init-error.log" ] && [ ! -e "$ROOT/initclear/run/cogworx-last-init.log" ]; then
+	ok "a successful init leaves no stale error log on the state disk or the tmpfs"
 else
-	bad "last-init-error.log survived a successful init"
+	bad "an init error log survived a successful init: $(ls "$ROOT/initclear/state" "$ROOT/initclear/run" 2>&1 | tr '\n' ' ')"
 fi
 
 # PRESERVED BY A MAINTENANCE BOOT. Clearing the diagnostic is the job of an
@@ -1434,8 +1460,10 @@ ieput=$(evline "$md" 'PUT instance/guest-attributes/cogworx/inner-exit')
 out="$ROOT/inneroom/out.log"
 stopj=$(grep -n '^cogbox-stub: stop --name demo$' "$out" 2>/dev/null | head -1 | cut -d: -f1)
 exitj=$(grep -n 'sandbox is no longer running; exiting so the unit restarts' "$out" 2>/dev/null | head -1 | cut -d: -f1)
+# The drain's outer bound is 75 s: stop's own 65 s guest wait plus at most 5 s
+# for a live plugin apply's stop step before it, with room above both.
 if [ -n "$stop" ] && [ -n "$del" ] && [ -n "$ieput" ] && [ "$del" -lt "$stop" ] && [ "$stop" -lt "$ieput" ] \
-	&& [ "$(evcount "$md" '^cogbox stop ')" = 1 ] \
+	&& [ "$(evcount "$md" '^cogbox stop ')" = 1 ] && [ "$(evcount "$md" '^timeout-stop 75$')" = 1 ] \
 	&& [ -n "$stopj" ] && [ -n "$exitj" ] && [ "$stopj" -lt "$exitj" ] \
 	&& grep -q '^stop-result: run-1 graceful$' "${recs[0]}" 2>/dev/null \
 	&& ! grep -q 'warning: the guest drain' "$out" 2>/dev/null; then

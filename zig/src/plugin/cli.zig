@@ -5,6 +5,14 @@
 //   cogbox plugin ... add FLAKE_URL [--as PLUGIN] [-y]
 //   cogbox plugin ... del PLUGIN [-y]
 //   cogbox plugin ... update [PLUGIN] [--defer-rules]
+//   cogbox plugin ... apply [--json] [--op RUN] [--force | --force-plan ID]
+//   cogbox plugin ... apply --status [--json] [--since N]
+//   cogbox plugin ... apply --cancel [--json] [--op RUN]
+//   cogbox plugin ... apply --log G
+//   cogbox plugin ... apply --abandon-rollback [-y]
+//
+// add, del and update also take --apply / --no-apply (load the change live
+// now, or defer it; see LiveChoice).
 //
 // The plugin-name override is --as (not --name) so it can't collide with the
 // instance selector, which every cogbox verb spells -n/--name.
@@ -24,6 +32,48 @@ pub const Cmd = union(enum) {
 	// boot. Run by the cogbox-toplevel-reconcile oneshot post-boot (egress up). No-op
 	// when nothing changed since the last record; removes the record when no plugins.
 	reconcile,
+	// `cogbox plugin apply`: load the committed plugin state into the running
+	// guest without relaunching it (the live apply, apply.zig), or one of its
+	// status/cancel/log/abandon companions.
+	apply: ApplyArgs,
+};
+
+/// --apply / --no-apply on add, del and update: apply the change live right
+/// after it commits, or leave it for `cogbox plugin apply` or the next start.
+/// Null: the default (an interactive terminal on a running instance applies).
+pub const LiveChoice = ?bool;
+
+pub const ApplyMode = enum {
+	/// Apply whatever is pending.
+	run,
+	/// Report whether an apply is in flight, the last outcome and the rollback
+	/// records.
+	status,
+	/// Stop a running apply (idempotent).
+	cancel,
+	/// Print a generation's build log.
+	log,
+	/// Move every pending rollback intent aside (the escape when a rollback
+	/// cannot finish).
+	abandon,
+};
+
+pub const ApplyArgs = struct {
+	mode: ApplyMode = .run,
+	json: bool = false,
+	/// The control plane's run token (`--op RUN`), echoed into every record of
+	/// the run; with --cancel it selects the holder to signal.
+	op: ?[]const u8 = null,
+	/// --status --since N: only rollback records with seq > N.
+	since: u64 = 0,
+	/// --log G: the generation whose build log to print.
+	gen: ?[]const u8 = null,
+	/// --force / --force-plan ID (Apply anyway). Parsed so the CLI surface is
+	/// stable; the verb refuses both until forced plans are supported.
+	force: bool = false,
+	force_plan: ?[]const u8 = null,
+	/// --abandon-rollback -y: skip the confirmation.
+	yes: bool = false,
 };
 
 pub const AddArgs = struct {
@@ -39,11 +89,13 @@ pub const AddArgs = struct {
 	// through its admin-approval flow. Suppresses the human "suggested rules"
 	// block + the confirm prompt so stdout carries only the JSON line.
 	defer_rules: bool = false,
+	live: LiveChoice = null,
 };
 
 pub const DelArgs = struct {
 	plugin: []const u8,
 	yes: bool = false,
+	live: LiveChoice = null,
 };
 
 pub const UpdateArgs = struct {
@@ -56,6 +108,7 @@ pub const UpdateArgs = struct {
 	// are emitted as one JSON line on stdout for the admin-approval flow. Needs
 	// PLUGIN: the deferred line names exactly one plugin.
 	defer_rules: bool = false,
+	live: LiveChoice = null,
 };
 
 pub const ResolveArgs = struct {
@@ -93,7 +146,109 @@ pub fn parse(argv: []const []const u8) ParseError!Cmd {
 		if (rest.len != 0) return error.InvalidArgs;
 		return .reconcile;
 	}
+	if (std.mem.eql(u8, sub, "apply")) return parseApply(rest);
 	return error.UnknownSubcommand;
+}
+
+/// --apply / --no-apply. True when `a` was one of them (recorded in `live`);
+/// both on one command line is an error.
+fn parseLive(a: []const u8, live: *LiveChoice) ParseError!bool {
+	const v: bool = if (std.mem.eql(u8, a, "--apply")) true else if (std.mem.eql(u8, a, "--no-apply")) false else return false;
+	if (live.*) |prev| if (prev != v) return error.InvalidArgs;
+	live.* = v;
+	return true;
+}
+
+/// A run token: 1-64 of [A-Za-z0-9._-] (what the rollback records accept).
+pub fn isOpToken(s: []const u8) bool {
+	if (s.len == 0 or s.len > 64) return false;
+	for (s) |c| switch (c) {
+		'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => {},
+		else => return false,
+	};
+	return true;
+}
+
+/// A generation or plan id: 16 lowercase hex digits.
+pub fn isHex16(s: []const u8) bool {
+	if (s.len != 16) return false;
+	for (s) |c| switch (c) {
+		'0'...'9', 'a'...'f' => {},
+		else => return false,
+	};
+	return true;
+}
+
+fn parseApply(args: []const []const u8) ParseError!Cmd {
+	var r: ApplyArgs = .{};
+	var mode: ?ApplyMode = null;
+	var since_set = false;
+	var i: usize = 0;
+	while (i < args.len) : (i += 1) {
+		const a = args[i];
+		const Valued = struct {
+			fn take(argv: []const []const u8, idx: *usize, flag: []const u8) ParseError![]const u8 {
+				const cur = argv[idx.*];
+				if (std.mem.eql(u8, cur, flag)) {
+					idx.* += 1;
+					if (idx.* >= argv.len) return error.InvalidArgs;
+					return argv[idx.*];
+				}
+				return cur[flag.len + 1 ..];
+			}
+			fn is(cur: []const u8, flag: []const u8) bool {
+				return std.mem.eql(u8, cur, flag) or (std.mem.startsWith(u8, cur, flag) and cur.len > flag.len and cur[flag.len] == '=');
+			}
+		};
+		var new_mode: ?ApplyMode = null;
+		if (std.mem.eql(u8, a, "--json")) {
+			r.json = true;
+		} else if (Valued.is(a, "--op")) {
+			if (r.op != null) return error.InvalidArgs;
+			const v = try Valued.take(args, &i, "--op");
+			if (!isOpToken(v)) return error.InvalidArgs;
+			r.op = v;
+		} else if (std.mem.eql(u8, a, "--status")) {
+			new_mode = .status;
+		} else if (Valued.is(a, "--since")) {
+			if (since_set) return error.InvalidArgs;
+			r.since = std.fmt.parseInt(u64, try Valued.take(args, &i, "--since"), 10) catch return error.InvalidArgs;
+			since_set = true;
+		} else if (std.mem.eql(u8, a, "--cancel")) {
+			new_mode = .cancel;
+		} else if (Valued.is(a, "--log")) {
+			const v = try Valued.take(args, &i, "--log");
+			if (!isHex16(v)) return error.InvalidArgs;
+			r.gen = v;
+			new_mode = .log;
+		} else if (std.mem.eql(u8, a, "--abandon-rollback")) {
+			new_mode = .abandon;
+		} else if (std.mem.eql(u8, a, "-y") or std.mem.eql(u8, a, "--yes")) {
+			r.yes = true;
+		} else if (std.mem.eql(u8, a, "--force")) {
+			r.force = true;
+		} else if (Valued.is(a, "--force-plan")) {
+			if (r.force_plan != null) return error.InvalidArgs;
+			const v = try Valued.take(args, &i, "--force-plan");
+			if (!isHex16(v)) return error.InvalidArgs;
+			r.force_plan = v;
+		} else {
+			// No positional arguments, and no unknown flags.
+			return error.InvalidArgs;
+		}
+		if (new_mode) |m| {
+			if (mode != null) return error.InvalidArgs;
+			mode = m;
+		}
+	}
+	r.mode = mode orelse .run;
+	if (since_set and r.mode != .status) return error.InvalidArgs;
+	if (r.op != null and r.mode != .run and r.mode != .cancel) return error.InvalidArgs;
+	if ((r.force or r.force_plan != null) and r.mode != .run) return error.InvalidArgs;
+	if (r.force and r.force_plan != null) return error.InvalidArgs;
+	if (r.yes and r.mode != .abandon) return error.InvalidArgs;
+	if (r.json and (r.mode == .log or r.mode == .abandon)) return error.InvalidArgs;
+	return .{ .apply = r };
 }
 
 fn parseAdd(args: []const []const u8) ParseError!Cmd {
@@ -102,6 +257,7 @@ fn parseAdd(args: []const []const u8) ParseError!Cmd {
 	var yes = false;
 	var git_cred = false;
 	var defer_rules = false;
+	var live: LiveChoice = null;
 
 	var i: usize = 0;
 	while (i < args.len) : (i += 1) {
@@ -118,6 +274,8 @@ fn parseAdd(args: []const []const u8) ParseError!Cmd {
 			git_cred = true;
 		} else if (std.mem.eql(u8, a, "--defer-rules")) {
 			defer_rules = true;
+		} else if (try parseLive(a, &live)) {
+			// recorded
 		} else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
 			return error.InvalidArgs;
 		} else {
@@ -127,16 +285,19 @@ fn parseAdd(args: []const []const u8) ParseError!Cmd {
 	}
 
 	const u = url orelse return error.MissingUrl;
-	return .{ .add = .{ .url = u, .as = as, .yes = yes, .git_credential_stdin = git_cred, .defer_rules = defer_rules } };
+	return .{ .add = .{ .url = u, .as = as, .yes = yes, .git_credential_stdin = git_cred, .defer_rules = defer_rules, .live = live } };
 }
 
 fn parseDel(args: []const []const u8) ParseError!Cmd {
 	var plugin: ?[]const u8 = null;
 	var yes = false;
+	var live: LiveChoice = null;
 
 	for (args) |a| {
 		if (std.mem.eql(u8, a, "-y") or std.mem.eql(u8, a, "--yes")) {
 			yes = true;
+		} else if (try parseLive(a, &live)) {
+			// recorded
 		} else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
 			return error.InvalidArgs;
 		} else {
@@ -146,18 +307,21 @@ fn parseDel(args: []const []const u8) ParseError!Cmd {
 	}
 
 	const p = plugin orelse return error.MissingPlugin;
-	return .{ .del = .{ .plugin = p, .yes = yes } };
+	return .{ .del = .{ .plugin = p, .yes = yes, .live = live } };
 }
 
 fn parseUpdate(args: []const []const u8) ParseError!Cmd {
 	var plugin: ?[]const u8 = null;
 	var git_cred = false;
 	var defer_rules = false;
+	var live: LiveChoice = null;
 	for (args) |a| {
 		if (std.mem.eql(u8, a, "--git-credential-stdin")) {
 			git_cred = true;
 		} else if (std.mem.eql(u8, a, "--defer-rules")) {
 			defer_rules = true;
+		} else if (try parseLive(a, &live)) {
+			// recorded
 		} else if (std.mem.startsWith(u8, a, "-") and a.len > 1) {
 			return error.InvalidArgs;
 		} else {
@@ -167,7 +331,7 @@ fn parseUpdate(args: []const []const u8) ParseError!Cmd {
 	}
 	// The deferred line names exactly one plugin.
 	if (defer_rules and plugin == null) return error.InvalidArgs;
-	return .{ .update = .{ .plugin = plugin, .git_credential_stdin = git_cred, .defer_rules = defer_rules } };
+	return .{ .update = .{ .plugin = plugin, .git_credential_stdin = git_cred, .defer_rules = defer_rules, .live = live } };
 }
 
 fn parseResolve(args: []const []const u8) ParseError!Cmd {
@@ -305,4 +469,85 @@ test "resolve parses (url required, optional --git-credential-stdin)" {
 test "unknown / missing subcommand" {
 	try t.expectError(error.UnknownSubcommand, parse(&.{"frob"}));
 	try t.expectError(error.MissingSubcommand, parse(&.{}));
+}
+
+test "apply: a plain run, --json and --op" {
+	const c = try parse(&.{"apply"});
+	try t.expect(c.apply.mode == .run);
+	try t.expect(!c.apply.json);
+	try t.expect(c.apply.op == null);
+	const c2 = try parse(&.{ "apply", "--json", "--op", "42" });
+	try t.expect(c2.apply.json);
+	try t.expectEqualStrings("42", c2.apply.op.?);
+	const c3 = try parse(&.{ "apply", "--op=run-7.a_b" });
+	try t.expectEqualStrings("run-7.a_b", c3.apply.op.?);
+	// A run token is 1-64 of [A-Za-z0-9._-]; it is echoed into records.
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--op", "a b" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--op", "" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--op", "x" ** 65 }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--op" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--op", "1", "--op", "2" }));
+	// No positionals, no unknown flags.
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "myplugin" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--frob" }));
+}
+
+test "apply: --status [--since N], --cancel [--op], --log G, --abandon-rollback [-y]" {
+	const st = try parse(&.{ "apply", "--status", "--json", "--since", "12" });
+	try t.expect(st.apply.mode == .status);
+	try t.expectEqual(@as(u64, 12), st.apply.since);
+	try t.expect(st.apply.json);
+	try t.expectEqual(@as(u64, 0), (try parse(&.{ "apply", "--status" })).apply.since);
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--since", "3" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--status", "--since", "-1" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--status", "--op", "4" }));
+
+	const ca = try parse(&.{ "apply", "--cancel", "--op", "9" });
+	try t.expect(ca.apply.mode == .cancel);
+	try t.expectEqualStrings("9", ca.apply.op.?);
+	try t.expect((try parse(&.{ "apply", "--cancel" })).apply.op == null);
+
+	const lg = try parse(&.{ "apply", "--log", "0123456789abcdef" });
+	try t.expect(lg.apply.mode == .log);
+	try t.expectEqualStrings("0123456789abcdef", lg.apply.gen.?);
+	// G is exactly 16 lowercase hex digits (it names files).
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--log", "../../etc/passwd" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--log", "0123456789ABCDEF" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--log" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--log", "0123456789abcdef", "--json" }));
+
+	const ab = try parse(&.{ "apply", "--abandon-rollback", "-y" });
+	try t.expect(ab.apply.mode == .abandon);
+	try t.expect(ab.apply.yes);
+	try t.expect(!(try parse(&.{ "apply", "--abandon-rollback" })).apply.yes);
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "-y" }));
+
+	// One mode at a time.
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--status", "--cancel" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--status", "--status" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--cancel", "--abandon-rollback" }));
+}
+
+test "apply: --force and --force-plan parse on a plain run only, never together" {
+	try t.expect((try parse(&.{ "apply", "--force" })).apply.force);
+	try t.expectEqualStrings("fedcba9876543210", (try parse(&.{ "apply", "--force-plan", "fedcba9876543210" })).apply.force_plan.?);
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--force", "--force-plan", "fedcba9876543210" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--force-plan", "nothex" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--status", "--force" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "apply", "--cancel", "--force-plan", "fedcba9876543210" }));
+}
+
+test "add, del and update take --apply or --no-apply, not both" {
+	try t.expect((try parse(&.{ "add", "u" })).add.live == null);
+	try t.expect((try parse(&.{ "add", "u", "--apply" })).add.live.? == true);
+	try t.expect((try parse(&.{ "add", "--no-apply", "u", "-y" })).add.live.? == false);
+	try t.expect((try parse(&.{ "del", "p", "--no-apply" })).del.live.? == false);
+	try t.expect((try parse(&.{ "update", "--apply" })).update.live.? == true);
+	try t.expect((try parse(&.{ "update", "p", "--apply", "--apply" })).update.live.? == true);
+	try t.expectError(error.InvalidArgs, parse(&.{ "add", "u", "--apply", "--no-apply" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "del", "p", "--no-apply", "--apply" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "update", "--apply", "--no-apply" }));
+	// list, resolve and reconcile take neither.
+	try t.expectError(error.InvalidArgs, parse(&.{ "list", "--apply" }));
+	try t.expectError(error.InvalidArgs, parse(&.{ "resolve", "u", "--no-apply" }));
 }

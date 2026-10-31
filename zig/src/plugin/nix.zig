@@ -314,6 +314,89 @@ fn argvDeinit(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8)) vo
 	argv.deinit(allocator);
 }
 
+/// Inputs for the live apply's two-stage build (apply.zig). The composition is
+/// the scratch snapshot's byte copy, `<icd>/apply/snap/<S>/composition`, so the
+/// bytes evaluated are exactly the ones the snapshot pinned; everything else is
+/// what the launcher's re-exec passes (cogbox-launch.sh PLUGIN_SUBST_OPTS and
+/// the two --override-input flags), so the runner is the one the next boot
+/// builds from the same bytes.
+pub const ApplyBuild = struct {
+	flake_source: []const u8,
+	nixpkgs_source: []const u8,
+	composition_dir: []const u8,
+	arch: []const u8,
+	reexec_package: []const u8 = "cogbox",
+	// The re-exec's extra-substituters string ("file://<plugin-cache> <extra>"),
+	// already joined; "" emits no substituter options.
+	substituters: []const u8 = "",
+	trusted_public_keys: []const u8 = "",
+	netrc_file: []const u8 = "",
+};
+
+/// The nix prefix every apply argv starts with: the apply spawns nix itself
+/// (a raw fork with a death signal), so the argv is complete.
+const apply_nix_prefix = [_][]const u8{ "nix", "--extra-experimental-features", "nix-command flakes" };
+
+fn appendApplySubstituterOpts(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), b: ApplyBuild) !void {
+	if (b.substituters.len > 0) try argv.appendSlice(arena, &.{ "--option", "extra-substituters", b.substituters, "--option", "require-sigs", "false" });
+	if (b.trusted_public_keys.len > 0) try argv.appendSlice(arena, &.{ "--option", "extra-trusted-public-keys", b.trusted_public_keys });
+	if (b.netrc_file.len > 0) try argv.appendSlice(arena, &.{ "--option", "netrc-file", b.netrc_file });
+}
+
+/// Stage (a), instantiate: the full argv of
+///   nix eval --raw path:<flakeSource>#nixosConfigurations.cogbox-<arch><suffix>
+///     .config.microvm.declaredRunner.drvPath
+///     --override-input userExtensions path:<composition>
+///     --override-input userExtensions/user/nixpkgs path:<nixpkgsSource>
+///     --no-write-lock-file [substituter options]
+/// The config suffix is configSuffixFor(reexec_package), as for the runner
+/// pre-build; an unknown package is error.UnknownReexecPackage. The snapshot's
+/// lock is final (`--no-write-lock-file` keeps nix from ever rewriting it in
+/// place, which would move the snapshot's comp), and it does not change what is
+/// evaluated. No git credential is ever passed. Allocated in `arena`.
+pub fn applyInstantiateArgv(arena: std.mem.Allocator, b: ApplyBuild) ![]const []const u8 {
+	const suffix = configSuffixFor(b.reexec_package) orelse return error.UnknownReexecPackage;
+	var argv: std.ArrayList([]const u8) = .empty;
+	try argv.appendSlice(arena, &apply_nix_prefix);
+	try argv.appendSlice(arena, &.{
+		"eval",
+		"--raw",
+		try std.fmt.allocPrint(arena, "path:{s}#nixosConfigurations.cogbox-{s}{s}.config.microvm.declaredRunner.drvPath", .{ b.flake_source, b.arch, suffix }),
+		"--override-input",
+		"userExtensions",
+		try std.fmt.allocPrint(arena, "path:{s}", .{b.composition_dir}),
+		"--override-input",
+		"userExtensions/user/nixpkgs",
+		try std.fmt.allocPrint(arena, "path:{s}", .{b.nixpkgs_source}),
+		"--no-write-lock-file",
+	});
+	try appendApplySubstituterOpts(arena, &argv, b);
+	return argv.items;
+}
+
+/// Stage (b), realise: the full argv of
+///   nix build '<drv>^out' --out-link <out_link> --max-jobs 1 --option cores 1
+///     [substituter options]
+/// The out-link is the generation's gcroot (gcroots/applied/<G>), so the runner
+/// stays rooted until the next launch clears applied/. Allocated in `arena`.
+pub fn applyRealiseArgv(arena: std.mem.Allocator, b: ApplyBuild, drv: []const u8, out_link: []const u8) ![]const []const u8 {
+	var argv: std.ArrayList([]const u8) = .empty;
+	try argv.appendSlice(arena, &apply_nix_prefix);
+	try argv.appendSlice(arena, &.{
+		"build",
+		try std.fmt.allocPrint(arena, "{s}^out", .{drv}),
+		"--out-link",
+		out_link,
+		"--max-jobs",
+		"1",
+		"--option",
+		"cores",
+		"1",
+	});
+	try appendApplySubstituterOpts(arena, &argv, b);
+	return argv.items;
+}
+
 /// Build the microvm runner the boot path would build -- the SAME flake ref +
 /// the SAME --override-input set as cogbox-launch.sh's re-exec -- so the
 /// resulting out-path is byte-identical to the one boot looks for, then return
@@ -951,4 +1034,81 @@ test "buildArgvFor: no base_store_root emits no read-only-local-store" {
 	defer argvDeinit(t.allocator, &argv);
 
 	for (argv.items) |a| try t.expect(!std.mem.eql(u8, a, "read-only-local-store"));
+}
+
+// The live apply's instantiate must evaluate exactly what the launcher's
+// re-exec evaluates (the same installable config and the same two
+// --override-input flags, the composition being the scratch snapshot's copy),
+// with the re-exec's substituter options, and never write the snapshot's lock.
+test "applyInstantiateArgv: the re-exec's config and override-inputs over the snapshot composition" {
+	var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena_state.deinit();
+	const a = arena_state.allocator();
+	const argv = try applyInstantiateArgv(a, .{
+		.flake_source = "/nix/store/abc-cogbox-source",
+		.nixpkgs_source = "/nix/store/def-nixpkgs",
+		.composition_dir = "/icd/apply/snap/0123456789abcdef/composition",
+		.arch = "x86_64",
+	});
+	try expectArgv(&.{
+		"nix",
+		"--extra-experimental-features",
+		"nix-command flakes",
+		"eval",
+		"--raw",
+		"path:/nix/store/abc-cogbox-source#nixosConfigurations.cogbox-x86_64.config.microvm.declaredRunner.drvPath",
+		"--override-input",
+		"userExtensions",
+		"path:/icd/apply/snap/0123456789abcdef/composition",
+		"--override-input",
+		"userExtensions/user/nixpkgs",
+		"path:/nix/store/def-nixpkgs",
+		"--no-write-lock-file",
+	}, argv);
+
+	const hosted = try applyInstantiateArgv(a, .{
+		.flake_source = "/src",
+		.nixpkgs_source = "/np",
+		.composition_dir = "/c",
+		.arch = "aarch64",
+		.reexec_package = "cogbox-hosted",
+		.substituters = "file:///cache https://cache.example.com",
+		.trusted_public_keys = "cache.example.com-1:KEY=",
+		.netrc_file = "/run/secrets/netrc",
+	});
+	try t.expectEqualStrings("path:/src#nixosConfigurations.cogbox-aarch64-hosted.config.microvm.declaredRunner.drvPath", hosted[5]);
+	try expectArgv(&.{
+		"--option", "extra-substituters",       "file:///cache https://cache.example.com",
+		"--option", "require-sigs",              "false",
+		"--option", "extra-trusted-public-keys", "cache.example.com-1:KEY=",
+		"--option", "netrc-file",                "/run/secrets/netrc",
+	}, hosted[13..]);
+	try t.expectError(error.UnknownReexecPackage, applyInstantiateArgv(a, .{
+		.flake_source = "/src",
+		.nixpkgs_source = "/np",
+		.composition_dir = "/c",
+		.arch = "x86_64",
+		.reexec_package = "cogbox-other",
+	}));
+}
+
+// The realise builds the instantiated derivation's out output into the
+// generation's gcroot, one job and one core (the build-memory guard).
+test "applyRealiseArgv: drv^out into the generation's out-link, one job, one core" {
+	var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena_state.deinit();
+	const a = arena_state.allocator();
+	const b: ApplyBuild = .{ .flake_source = "/src", .nixpkgs_source = "/np", .composition_dir = "/c", .arch = "x86_64" };
+	try expectArgv(&.{
+		"nix",                           "--extra-experimental-features", "nix-command flakes",
+		"build",                         "/nix/store/zzz-microvm-run.drv^out",
+		"--out-link",                    "/icd/gcroots/applied/0123456789abcdef",
+		"--max-jobs",                    "1",
+		"--option",                      "cores",
+		"1",
+	}, try applyRealiseArgv(a, b, "/nix/store/zzz-microvm-run.drv", "/icd/gcroots/applied/0123456789abcdef"));
+	var with_subs = b;
+	with_subs.substituters = "file:///cache";
+	const argv = try applyRealiseArgv(a, with_subs, "/d.drv", "/l");
+	try expectArgv(&.{ "--option", "extra-substituters", "file:///cache", "--option", "require-sigs", "false" }, argv[12..]);
 }

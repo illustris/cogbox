@@ -171,6 +171,13 @@ ga_del() { curl -fsS -o /dev/null -X DELETE -H "$MDHDR" --max-time 10 "$GA/$1" 2
 # not. Written on every init and REMOVED on success, so its presence means the
 # last init failed and its contents are that failure.
 INIT_LOG="$STATE_DIR/last-init-error.log"
+# The same output on a tmpfs, which the summary is read from. The state-disk
+# copy is the one that outlives a reboot, but it is written to the very disk
+# whose being full or read-only is the usual reason a boot dies with the
+# stamped "an automatic plugin rollback could not be finished" line (exit 78):
+# summarized from there, that line would be lost and the box would publish the
+# generic string. Written on every init and removed on success, like INIT_LOG.
+INIT_TMPFS_LOG="${XDG_RUNTIME_DIR:-/run}/cogworx-last-init.log"
 # Restart-scoped dedup state for the serial line below. /run is a tmpfs, so
 # this resets on a real reboot but survives the Restart=always cycle -- exactly
 # the window the dedup is about.
@@ -593,15 +600,17 @@ else
 		init_args+=(--self-addr "$cidr")
 	done
 	emit "initializing instance $INSTANCE"
-	# Tee'd, not swallowed: the journal still gets every line, and the state
-	# disk keeps a copy that outlives the reboot. The status has to come from
-	# PIPESTATUS -- `set -o pipefail` at the top of this file reports the
-	# rightmost failure, so a full state disk would let tee's status stand in
-	# for init's and turn a failed init into a "successful" one.
-	cogbox "${init_args[@]}" 2>&1 | tee "$INIT_LOG"
+	# Tee'd, not swallowed: the journal still gets every line, the state disk
+	# keeps a copy that outlives the reboot, and the tmpfs copy is the one the
+	# summary reads (a full or read-only state disk leaves INIT_LOG empty; tee
+	# keeps writing to its other outputs when one fails). The status has to
+	# come from PIPESTATUS -- `set -o pipefail` at the top of this file reports
+	# the rightmost failure, so a full state disk would let tee's status stand
+	# in for init's and turn a failed init into a "successful" one.
+	cogbox "${init_args[@]}" 2>&1 | tee "$INIT_TMPFS_LOG" "$INIT_LOG"
 	init_rc=${PIPESTATUS[0]}
 	if [ "$init_rc" -ne 0 ]; then
-		init_summary="$(init_error_summary "$INIT_LOG")"
+		init_summary="$(init_error_summary "$INIT_TMPFS_LOG")"
 		# Published as a guest attribute as well as emitted to serial: the
 		# control plane already polls cogworx/ready, so this is the channel that
 		# turns "Booting forever" into a reason without anyone reading a console
@@ -624,7 +633,7 @@ else
 	# reason. Conversely a stale boot-error outliving its failure is worse than
 	# none, since it would be read as the reason for the NEXT problem; an init
 	# that just succeeded is the one event that proves it stale.
-	rm -f "$INIT_LOG"
+	rm -f "$INIT_LOG" "$INIT_TMPFS_LOG"
 	ga_del cogworx/boot-error || true
 fi
 
@@ -929,8 +938,9 @@ while :; do
 		# QEMU is still alive (status just answered), and leg (j)'s non-zero
 		# exit makes systemd skip ExecStop and TERM the whole cgroup, QEMU
 		# included, with no guest drain window. So drain it here the way
-		# ExecStop would, with the same CLI and its own 65 s bound, and under
-		# an outer bound in case the CLI wedges. Readiness goes first, as in
+		# ExecStop would, with the same CLI and its own bound (65 s for the
+		# guest, plus at most 5 s for a live plugin apply's stop step before
+		# it), and under an outer bound in case the CLI wedges. Readiness goes first, as in
 		# leg (j): a guest that is shutting down must not read as Running. No
 		# $STOPPING marker, so leg (j) still records this as `oom-kill`, and
 		# the record's stop-result is this drain's outcome. A drain that fails
@@ -938,7 +948,7 @@ while :; do
 		ga_del cogworx/ready || true
 		ga_del cogworx/boot-proof || true
 		note "draining the guest before the restart"
-		timeout 70 cogbox stop --name "$INSTANCE" \
+		timeout 75 cogbox stop --name "$INSTANCE" \
 			|| note "warning: the guest drain after the OOM kill did not complete (exit $?); the unit's cgroup TERM is the backstop"
 		break
 	fi

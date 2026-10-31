@@ -16,7 +16,7 @@
 #      leak into whatever collects the launcher's stderr (on a cloud VM that is
 #      a provider-retained serial console).
 #
-# Usage: test_launch_flags.sh <path-to-cogbox-launch.sh> <path-to-cogbox-shutdown.sh>
+# Usage: test_launch_flags.sh <path-to-cogbox-launch.sh> <path-to-cogbox-shutdown.sh> <path-to-zig/src/plugin/apply.zig>
 # Needs: bash, jq, coreutils, util-linux (flock). NOT passt/qemu/nix: every case
 # stops at --init-only or fails before the launch, except section 10's daemon
 # passes, which boot a fake runner (`--network none`, stub nix/nix-store/cogbox)
@@ -26,8 +26,10 @@ set -uo pipefail
 
 LAUNCH="${1:?usage: test_launch_flags.sh <cogbox-launch.sh> <cogbox-shutdown.sh>}"
 [ -f "$LAUNCH" ] || { echo "FAIL: no such script: $LAUNCH" >&2; exit 1; }
-SHUTDOWN="${2:?usage: test_launch_flags.sh <cogbox-launch.sh> <cogbox-shutdown.sh>}"
+SHUTDOWN="${2:?usage: test_launch_flags.sh <cogbox-launch.sh> <cogbox-shutdown.sh> <apply.zig>}"
 [ -f "$SHUTDOWN" ] || { echo "FAIL: no such script: $SHUTDOWN" >&2; exit 1; }
+APPLY_ZIG="${3:?usage: test_launch_flags.sh <cogbox-launch.sh> <cogbox-shutdown.sh> <apply.zig>}"
+[ -f "$APPLY_ZIG" ] || { echo "FAIL: no such file: $APPLY_ZIG" >&2; exit 1; }
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -577,7 +579,7 @@ else
 	mv_ln=$(grep -n 'mv "\$RUNTIME/l7-inject-conf.json.tmp" "\$RUNTIME/l7-inject-conf.json"$' "$LAUNCH" | cut -d: -f1)
 	if [ "$(printf '%s\n' "$call_ln" | grep -c .)" = 1 ] && [ "$(printf '%s\n' "$mv_ln" | grep -c .)" = 1 ] \
 		&& [ "$call_ln" -gt "$mv_ln" ] && [ $((call_ln - mv_ln)) -le 20 ] \
-		&& ! sed -n "${mv_ln},${call_ln}p" "$LAUNCH" | grep -q '^\s*else$\|^\s*fi$'; then
+		&& ! grep -q '^\s*else$\|^\s*fi$' <(sed -n "${mv_ln},${call_ln}p" "$LAUNCH"); then
 		ok "the strip runs once, in the merge's success branch, after the conf is published"
 	else
 		bad "the strip's call site moved (mv at '$mv_ln', call at '$call_ln')"
@@ -1006,6 +1008,7 @@ la_runner() {
 	{ printf '#!%s\n' "$BASH_BIN"
 	  printf 'echo %q > "$LA_MARK"\n' "$1"
 	  printf 'cat booted-runner > "$LA_MARK.booted-runner" 2>/dev/null\n'
+	  printf '[ ! -e live-runner ] || cat live-runner > "$LA_MARK.live-runner"\n'
 	  printf 'exit 0\n'; } > "$1/bin/microvm-run"
 	chmod +x "$1/bin/microvm-run"
 }
@@ -1082,9 +1085,12 @@ done
 STUB_EOF
 } > "$la_bin/nix-store"
 # __plugin-apply-preboot: exits LA_PREBOOT_RC, or SIGKILLs itself mid-run when
-# LA_PREBOOT_KILL is set (the launcher must only warn either way).
+# LA_PREBOOT_KILL is set (the launcher must only warn either way); with
+# LA_PREBOOT_FINISH it removes the rollback intents first, as the real verb's
+# finish does once it has rolled them back.
 { echo "#!$BASH_BIN"; cat <<'STUB_EOF'
 echo "cogbox $*" >> "$LA_LOG"
+[ -z "${LA_PREBOOT_FINISH:-}" ] || rm -f "$LA_ICD"/apply/rollback/*.intent
 [ -z "${LA_PREBOOT_KILL:-}" ] || kill -KILL $$
 exit "${LA_PREBOOT_RC:-0}"
 STUB_EOF
@@ -1265,8 +1271,12 @@ la_run() {
 		"$LA_LAUNCH" "${mode[@]}" --yes --name demo >"$WORK/$tag.log" 2>&1
 }
 # Everything the launcher said in a pass: its stdout/stderr and, once it won the
-# lifetime lock, the runtime's cogbox.log it reopened onto.
-la_said() { cat "$WORK/$1.log" "$WORK/$1/run/cogbox-demo/cogbox.log" 2>/dev/null; }
+# lifetime lock, the runtime's cogbox.log it reopened onto. Always status 0:
+# under pipefail, `la_said T | grep -q X` must be grep's verdict, not cat's (a
+# grep -q that matches in the first file exits before cat writes the second,
+# and cat dies of SIGPIPE; a pass that never reopened onto cogbox.log has
+# none, and cat exits 1).
+la_said() { cat "$WORK/$1.log" "$WORK/$1/run/cogbox-demo/cogbox.log" 2>/dev/null; return 0; }
 la_booted() { [ "$(cat "$WORK/$1.mark" 2>/dev/null)" = "$2" ]; }
 la_base_id() { local l; l=$(readlink "$icd/apply/base" 2>/dev/null) && echo "${l##*/}"; }
 la_record() { printf '%s\n%s\n%s\n' "$la_rkey" "$1" "$2" > "$icd/runner.path"; }
@@ -1307,7 +1317,7 @@ if la_setup la-snap; then
 		&& [ "$(cat "$WORK/la-snap.mark.booted-runner")" = "$la_rkey"$'\n'"$WORK/la-snap/fp-runner"$'\n'"$comp" ] \
 		&& [ "$(readlink "$icd/gcroots/booted")" = "$WORK/la-snap/fp-runner" ] \
 		&& [ -d "$icd/gcroots/applied" ] && [ -z "$(ls -A "$icd/gcroots/applied")" ] \
-		&& grep -qx "cogbox __plugin-apply-preboot $icd" "$WORK/la-snap.la.log"; then
+		&& grep -qx "cogbox __plugin-apply-preboot $icd --runtime $WORK/la-snap/run/cogbox-demo --name demo" "$WORK/la-snap.la.log"; then
 		ok "a fast-path daemon pass snapshots exactly what it boots, promotes it to base, and records and roots the booted runner"
 	else
 		bad "fast-path boot snapshot (base=$id snaps=$(la_snaps) trash=$(ls "$icd/apply/trash" 2>&1) meta=$(cat "$m" 2>&1) booted-runner=$(cat "$WORK/la-snap.mark.booted-runner" 2>&1) calls=$(cat "$WORK/la-snap.la.log") said: $(la_said la-snap))"
@@ -1340,7 +1350,7 @@ if la_setup la-line3; then
 		&& [ "$(cat "$WORK/la-line3.la.log.evaluated")" = "$(cat "$icd/plugins-flake/flake.nix" "$icd/plugins-flake/flake.lock")" ] \
 		&& [ "$(cat "$icd/runner.path")" = "$la_rkey"$'\n'"$la_base_runner"$'\n'"$comp" ] \
 		&& [ -z "$(la_snaps)" ] && [ ! -e "$icd/apply/base" ] \
-		&& [ "$(grep -c "^cogbox __plugin-apply-preboot $icd --init-only\$" "$WORK/la-line3.la.log")" = 1 ]; then
+		&& [ "$(grep -c "^cogbox __plugin-apply-preboot $icd --runtime $WORK/la-line3/run/cogbox-demo --name demo --init-only\$" "$WORK/la-line3.la.log")" = 1 ]; then
 		ok "a two-line record misses the fast path; the init pass re-execs from a pinned copy and records three lines"
 	else
 		bad "two-line record (calls: $(cat "$WORK/la-line3.la.log"), record: $(cat "$icd/runner.path" 2>&1), snaps: $(la_snaps), said: $(la_said la-line3))"
@@ -1715,24 +1725,27 @@ if la_setup la-gc; then
 	else
 		bad "the daemon pass emptied the trash or passed --init-only (calls: $(cat "$WORK/la-gc.la.log"))"
 	fi
-	# The pass that boots promotes its own snapshot and retires the old base,
-	# built and the losing pass's snapshot; the intent's target, the live
-	# apply's S and the inflight target stay.
-	la_run la-gc
+	# The pass that boots (its housekeeping finished the rollback, so the
+	# intent is gone and its target is no longer named) promotes its own
+	# snapshot and retires the old base, built, the losing pass's snapshot and
+	# the finished intent's target; the live apply's S and the inflight target
+	# stay.
+	la_run la-gc LA_PREBOOT_FINISH=1
 	id=$(la_base_id)
 	if la_booted la-gc "$la_base_runner" && [ -n "$id" ] && [ "$id" != "$new" ] && [ ! -e "$icd/apply/built" ] \
-		&& [ "$(la_snaps)" = "$(printf '%s\n' 00000000000000a3 00000000000000a8 00000000000000a9 "$id" | sort | tr '\n' ' ')" ] \
+		&& [ "$(la_snaps)" = "$(printf '%s\n' 00000000000000a8 00000000000000a9 "$id" | sort | tr '\n' ' ')" ] \
 		&& [ -d "$icd/apply/trash/00000000000000a1" ] && [ -d "$icd/apply/trash/00000000000000a2" ] \
-		&& [ -d "$icd/apply/trash/$new" ]; then
-		ok "a booting pass promotes its snapshot and retires the old base, built and an unbooted pass's snapshot"
+		&& [ -d "$icd/apply/trash/00000000000000a3" ] && [ -d "$icd/apply/trash/$new" ]; then
+		ok "a booting pass promotes its snapshot and retires the old base, built, an unbooted pass's snapshot and a finished intent's target"
 	else
 		bad "promotion GC (base=$id, snaps=$(la_snaps), trash=$(ls "$icd/apply/trash" | tr '\n' ' '), said: $(la_said la-gc))"
 	fi
 fi
 # ...and when a live apply's file does not parse, the GC cannot know what it
 # names, so it keeps EVERY snapshot, the incomplete ones included, and says so;
-# the pass still boots and promotes its own.
-for f in active inflight.json rollback/3333333333333333.intent; do
+# the pass still boots and promotes its own. (An unparseable rollback intent is
+# an unfinished rollback: section 11 below.)
+for f in active inflight.json; do
 	tag=la-gc-garbage-${f%%[./]*}
 	if la_setup "$tag"; then
 		snapd="$icd/apply/snap"
@@ -1986,6 +1999,173 @@ if la_setup la-undo-slow; then
 		ok "a removal that outlasts its bound on the re-exec evaluates plugins-flake as under the floor, and the box boots"
 	else
 		bad "stalled undo on the re-exec (calls: $(cat "$WORK/la-undo-slow.la.log"), said: $(la_said la-undo-slow))"
+	fi
+fi
+
+# (z) live-runner (what a live apply confirmed during the previous boot) never
+# outlives that boot: the daemon pass recreates the runtime dir under the
+# lifetime lock before QEMU starts, so the runtime dir names only what this
+# boot runs (booted-runner); an init pass, which boots nothing, leaves a
+# running instance's copy alone.
+if la_setup la-liverun; then
+	la_runner "$WORK/la-liverun/fp-runner"
+	comp=$(comp_of "$icd/plugins-flake")
+	la_record "$WORK/la-liverun/fp-runner" "$comp"
+	lr="$WORK/la-liverun/run/cogbox-demo/live-runner"
+	mkdir -p "${lr%/*}"
+	printf '%s\n%s\n%s\n%s\n' "$la_rkey" /nix/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-microvm-run "$comp" 4242 > "$lr"
+	la_run la-liverun --init-only
+	init_kept=0
+	[ -s "$lr" ] && init_kept=1
+	rm -f "$WORK/la-liverun.mark.live-runner"
+	la_run la-liverun
+	if [ "$init_kept" = 1 ] && la_booted la-liverun "$WORK/la-liverun/fp-runner" \
+		&& [ ! -e "$WORK/la-liverun.mark.live-runner" ] && [ ! -e "$lr" ] \
+		&& [ -s "$WORK/la-liverun.mark.booted-runner" ]; then
+		ok "a daemon pass never boots with the previous boot's live-runner; an init pass leaves it"
+	else
+		bad "stale live-runner (init kept: $init_kept, at QEMU start: $(cat "$WORK/la-liverun.mark.live-runner" 2>&1), after: $(cat "$lr" 2>&1), said: $(la_said la-liverun))"
+	fi
+fi
+
+# --- 11. an automatic plugin rollback that could not be finished blocks the boot
+# The launcher never relies on __plugin-apply-preboot's exit status for this:
+# after the verb returns (or crashes, or is killed), it looks for a rollback
+# intent itself. On a stopped instance one left behind exits 78 with the
+# `cogbox: `-stamped line the GCE/PVE supervisor publishes, before any boot
+# snapshot or promotion; on a running instance (an init pass, which boots
+# nothing) a live apply may have just written it, so it only warns.
+la_intent_json='{"G":"0123456789abcdef","reason":"activation_hang","target":"base","target_id":"00000000000000aa","scope":[]}'
+la_intent() {
+	mkdir -p "$icd/apply/rollback"
+	if [ $# -gt 0 ]; then printf '%s' "$1"; else printf '%s' "$la_intent_json"; fi \
+		> "$icd/apply/rollback/0123456789abcdef.intent"
+}
+la_stamped() { la_said "$1" | grep -c "^cogbox: an automatic plugin rollback could not be finished ($2); free disk space, or run 'cogbox plugin apply --abandon-rollback -n demo'\$"; }
+if la_setup la-78; then
+	la_runner "$WORK/la-78/fp-runner"
+	la_record "$WORK/la-78/fp-runner" "$(comp_of "$icd/plugins-flake")"
+	mkdir -p "$icd/apply"
+	for how in "" LA_PREBOOT_KILL=1 LA_PREBOOT_RC=1; do
+		la_intent
+		: > "$WORK/la-78.la.log"
+		before=$(la_snaps)
+		# shellcheck disable=SC2086 # an empty $how adds nothing
+		la_run la-78 $how; rc=$?
+		case "$how" in
+			"") why="the live-apply housekeeping exited 0" ;;
+			LA_PREBOOT_KILL=1) why="the live-apply housekeeping exited 137" ;;
+			*) why="the live-apply housekeeping exited 1" ;;
+		esac
+		if [ "$rc" = 78 ] && [ ! -e "$WORK/la-78.mark" ] && grep -q '^cogbox __plugin-apply-preboot' "$WORK/la-78.la.log" \
+			&& [ "$(la_stamped la-78 "$why")" = 1 ] && [ "$(la_snaps)" = "$before" ] \
+			&& [ ! -e "$icd/apply/base" ] && [ ! -e "$icd/apply/booting" ] && ! grep -q '^run ' "$WORK/la-78.la.log" \
+			&& [ -e "$icd/apply/rollback/0123456789abcdef.intent" ]; then
+			ok "a rollback intent left on a stopped instance (preboot ${how:-exits 0}) exits 78 with the stamped line, before any snapshot"
+		else
+			bad "pending intent, preboot '${how:-exit 0}' (rc=$rc, snaps: $(la_snaps), calls: $(cat "$WORK/la-78.la.log"), said: $(la_said la-78))"
+		fi
+	done
+	# The verb's own 78 carries its own stamped line; the launcher adds none.
+	: > "$WORK/la-78.la.log"
+	la_run la-78 LA_PREBOOT_RC=78; rc=$?
+	if [ "$rc" = 78 ] && [ ! -e "$WORK/la-78.mark" ] && [ "$(la_said la-78 | grep -c '^cogbox: an automatic plugin rollback')" = 0 ] \
+		&& ! la_said la-78 | grep -q 'housekeeping (__plugin-apply-preboot) exited'; then
+		ok "a preboot that exits 78 itself (its message printed) is not repeated or warned about, and the pass exits 78"
+	else
+		bad "preboot exit 78 (rc=$rc, said: $(la_said la-78))"
+	fi
+	# An unparseable (here zero-length) intent is an unfinished rollback too.
+	la_intent ""
+	: > "$WORK/la-78.la.log"
+	la_run la-78; rc=$?
+	if [ "$rc" = 78 ] && [ ! -e "$WORK/la-78.mark" ] && [ "$(la_stamped la-78 "the live-apply housekeeping exited 0")" = 1 ]; then
+		ok "a zero-length intent blocks the boot the same way"
+	else
+		bad "zero-length intent (rc=$rc, said: $(la_said la-78))"
+	fi
+	# An init pass of a stopped instance refuses too (cogbox start never gets
+	# to its daemon pass).
+	: > "$WORK/la-78.la.log"
+	la_run la-78 --init-only; rc=$?
+	if [ "$rc" = 78 ] && grep -q -- '--init-only$' "$WORK/la-78.la.log" && [ "$(la_stamped la-78 "the live-apply housekeeping exited 0")" = 1 ]; then
+		ok "an init pass of a stopped instance with a pending rollback exits 78"
+	else
+		bad "init pass with an intent (rc=$rc, said: $(la_said la-78))"
+	fi
+	# On a running instance (the lifetime lock held) an init pass only warns,
+	# and a daemon pass loses the lifetime lock as before (75, not 78).
+	mkdir -p "$WORK/la-78/run"
+	exec {la_lock}>"$WORK/la-78/run/cogbox-demo.lock"
+	flock -n "$la_lock"
+	: > "$WORK/la-78.la.log"
+	la_run la-78 --init-only; rc_init=$?
+	said_init=$(la_said la-78)
+	la_run la-78; rc_daemon=$?
+	said_daemon=$(la_said la-78)
+	exec {la_lock}>&-
+	if [ "$rc_init" = 0 ] && [ "$rc_daemon" = 75 ] \
+		&& [ "$(printf '%s\n%s\n' "$said_init" "$said_daemon" | grep -c '^cogbox: an automatic plugin rollback')" = 0 ] \
+		&& grep -q 'warning: an automatic plugin rollback is pending' <<<"$said_init" \
+		&& grep -q 'warning: an automatic plugin rollback is pending' <<<"$said_daemon"; then
+		ok "with the instance running, a pending rollback only warns (init 0, daemon 75)"
+	else
+		bad "intent on a running instance (init rc=$rc_init, said: $said_init; daemon rc=$rc_daemon, said: $said_daemon; calls: $(cat "$WORK/la-78.la.log"); rollback: $(ls -la "$icd/apply/rollback" 2>&1))"
+	fi
+	# Once the intent is gone (finished, or moved aside by --abandon-rollback)
+	# the box boots.
+	: > "$WORK/la-78.la.log"
+	la_run la-78 LA_PREBOOT_FINISH=1; rc=$?
+	if [ "$rc" = 0 ] && la_booted la-78 "$WORK/la-78/fp-runner" && [ -n "$(la_base_id)" ]; then
+		ok "a pass whose housekeeping finished the rollback boots"
+	else
+		bad "finished rollback boot (rc=$rc, said: $(la_said la-78))"
+	fi
+	# A tmp name an intent writer left is not an intent.
+	mkdir -p "$icd/apply/rollback"
+	: > "$icd/apply/rollback/.0123456789abcdef.intent.4242.tmp"
+	la_run la-78; rc=$?
+	if [ "$rc" = 0 ] && la_booted la-78 "$WORK/la-78/fp-runner"; then
+		ok "a leftover intent tmp name does not block the boot"
+	else
+		bad "intent tmp name (rc=$rc, said: $(la_said la-78))"
+	fi
+fi
+
+# --- 12. the per-instance flake scaffold: one text in two places ------------
+# The live apply decides `customized_flake` by comparing flake/flake.nix with
+# its own copy of SCAFFOLD_FLAKE (zig/src/plugin/apply.zig scaffold_flake).
+# The launcher boots its base runner only while flake.nix is its scaffold, so
+# the two copies must be the same bytes: an edit to one alone makes every
+# instance created afterwards answer restart_required/customized_flake once its
+# last plugin is gone, or lets an apply build against the base runner while the
+# next boot re-execs from the user flake. The launcher's text is the value its
+# own assignment gives (shell-evaluated, quoting included); the Zig text is the
+# concatenated literal, its escapes decoded.
+launcher_scaffold="$WORK/scaffold.launcher"
+zig_scaffold="$WORK/scaffold.zig"
+assign=$(sed -n "/^SCAFFOLD_FLAKE='/,/^'\$/p" "$LAUNCH")
+if [ -z "$assign" ]; then
+	bad "no SCAFFOLD_FLAKE='...' assignment found in the launcher"
+else
+	( eval "$assign" && printf '%s' "$SCAFFOLD_FLAKE" ) > "$launcher_scaffold"
+	python3 - "$APPLY_ZIG" "$zig_scaffold" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r'pub const scaffold_flake =\n(.*?);\n', src, re.S)
+if not m:
+    sys.exit("no `pub const scaffold_flake = ...;` in " + sys.argv[1])
+parts = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
+esc = {"n": "\n", "t": "\t", '"': '"', "\\": "\\", "'": "'"}
+out = re.sub(r'\\(.)', lambda e: esc[e.group(1)], "".join(parts))
+open(sys.argv[2], "w").write(out)
+PY
+	if [ ! -s "$zig_scaffold" ] || [ ! -s "$launcher_scaffold" ]; then
+		bad "could not extract the scaffold (launcher: $(wc -c < "$launcher_scaffold") bytes, apply.zig: $(wc -c < "$zig_scaffold" 2>/dev/null || echo 0) bytes)"
+	elif cmp -s "$launcher_scaffold" "$zig_scaffold"; then
+		ok "the launcher's SCAFFOLD_FLAKE and apply.zig's scaffold_flake are the same bytes ($(sha256sum < "$zig_scaffold" | cut -c1-16))"
+	else
+		bad "SCAFFOLD_FLAKE (cogbox-launch.sh) and scaffold_flake (apply.zig) differ: $(diff "$launcher_scaffold" "$zig_scaffold" | head -5 | tr '\n' ' ')"
 	fi
 fi
 

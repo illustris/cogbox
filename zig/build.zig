@@ -316,6 +316,8 @@ pub fn build(b: *std.Build) void {
 	cli_verbs_test_mod.addImport("rules_module", rules_mod);
 	// The ssh verb's endpoint read + argv builder live in the shared module.
 	cli_verbs_test_mod.addImport("sshargv", sshargv_mod);
+	// `stop` runs the live plugin apply's stop step (plugin module).
+	cli_verbs_test_mod.addImport("plugin_module", plugin_mod);
 	const cli_verbs_tests = b.addTest(.{
 		.root_module = cli_verbs_test_mod,
 	});

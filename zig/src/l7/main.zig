@@ -183,33 +183,11 @@ fn cmdAdd(
 	loaded: *config.Loaded,
 ) !void {
 	const tree_alloc = loaded.treeAllocator();
-	// The 0-based index of the rule object once inserted, so an optional --plugin
-	// tag can be stamped onto exactly it.
-	var inserted_idx: usize = undefined;
-	// cli.attrsOf, never a struct literal here: cmdReplace projects the same
-	// AddArgs, and a second copy of the mapping is how the two verbs would come to
-	// emit different rule objects for the same input.
-	const attrs = cli.attrsOf(a);
-	if (a.pos) |p| {
-		rule.insertAt(tree_alloc, rules_arr, p, a.action, a.host, attrs) catch |err| switch (err) {
-			error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
-			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
-			else => return err,
-		};
-		inserted_idx = p - 1;
-	} else {
-		const n = rule.append(tree_alloc, rules_arr, a.action, a.host, attrs) catch |err| switch (err) {
-			error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
-			else => return err,
-		};
-		inserted_idx = n - 1;
-	}
-
-	// --plugin NAME: tag the inserted rule so `plugin del NAME` removes exactly it
-	// (the same `"plugin"` field the plugin verb's merge stamps).
-	if (a.plugin) |tag| {
-		try stampPlugin(tree_alloc, &rules_arr.items[inserted_idx], tag);
-	}
+	insertAddRule(tree_alloc, rules_arr, a) catch |err| switch (err) {
+		error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
+		error.InvalidHost => return die(allocator, io, "invalid host pattern: {s}", .{a.host}, 65),
+		else => return err,
+	};
 
 	try config.save(allocator, io, args.config_path, loaded.root().*);
 	const action_str = switch (a.action) {
@@ -235,6 +213,36 @@ fn cmdAdd(
 		try announce(allocator, io, "Added: {s} {s}{s}", .{ action_str, a.host, suffix });
 	}
 	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
+}
+
+/// `l7 add`'s edit of the loaded tree: insert the rule (at `a.pos`, else last)
+/// and, with `--plugin NAME`, tag it so `plugin del NAME` removes exactly it (the
+/// same `"plugin"` field the plugin verb's merge stamps) and mark it
+/// `"approved": true`. The control plane applies an admin-approved L7 rule
+/// request of a plugin through this path, and a live apply's rollback keeps a
+/// tagged allow that carries the marker. Only `add` marks: `replace` shares
+/// stampPlugin but not this, and a plugin's own merge strips the field
+/// (mutate.prependTaggedRules).
+fn insertAddRule(tree_alloc: std.mem.Allocator, rules_arr: *std.json.Array, a: cli.AddArgs) !void {
+	// The 0-based index of the rule object once inserted, so an optional --plugin
+	// tag can be stamped onto exactly it.
+	var inserted_idx: usize = undefined;
+	// cli.attrsOf, never a struct literal here: cmdReplace projects the same
+	// AddArgs, and a second copy of the mapping is how the two verbs would come to
+	// emit different rule objects for the same input.
+	const attrs = cli.attrsOf(a);
+	if (a.pos) |p| {
+		try rule.insertAt(tree_alloc, rules_arr, p, a.action, a.host, attrs);
+		inserted_idx = p - 1;
+	} else {
+		const n = try rule.append(tree_alloc, rules_arr, a.action, a.host, attrs);
+		inserted_idx = n - 1;
+	}
+	if (a.plugin) |tag| {
+		const item = &rules_arr.items[inserted_idx];
+		try stampPlugin(tree_alloc, item, tag);
+		try item.object.put(tree_alloc, try tree_alloc.dupe(u8, "approved"), .{ .bool = true });
+	}
 }
 
 /// Stamp `"plugin": <tag>` onto a rule object. Shared by `l7 add --plugin` and
@@ -659,4 +667,33 @@ test "max_policy_bytes: an over-cap stdin read is a loud StreamTooLong, not a tr
 	@memset(big, 'x');
 	var r = std.Io.Reader.fixed(big);
 	try t.expectError(error.StreamTooLong, r.allocRemaining(t.allocator, .limited(max_policy_bytes)));
+}
+
+test "l7 add --plugin stamps the tag and approved: true; replace's stampPlugin and a plain add do not" {
+	var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator,
+		\\{"network": {"l7": {"rules": []}}}
+	, .{});
+	defer parsed.deinit();
+	const tree = parsed.arena.allocator();
+	const rules_arr = &parsed.value.object.getPtr("network").?.object.getPtr("l7").?.object.getPtr("rules").?.array;
+
+	// The approval path: `l7 add allow HOST --plugin X`.
+	try insertAddRule(tree, rules_arr, .{ .action = .allow, .host = "api.example.com", .plugin = "obs-plugin" });
+	const approved = rules_arr.items[0].object;
+	try t.expectEqualStrings("api.example.com", approved.get("allow").?.string);
+	try t.expectEqualStrings("obs-plugin", approved.get("plugin").?.string);
+	try t.expect((approved.get("approved") orelse return error.TestUnexpectedResult).bool);
+
+	// No --plugin: neither field.
+	try insertAddRule(tree, rules_arr, .{ .action = .deny, .host = "app.example.com", .pos = 1 });
+	try t.expect(rules_arr.items[0].object.get("plugin") == null);
+	try t.expect(rules_arr.items[0].object.get("approved") == null);
+
+	// `l7 replace --plugin` tags through stampPlugin alone: no marker.
+	var item: std.json.Value = .{ .object = .empty };
+	try item.object.put(tree, "allow", .{ .string = "git.example.com" });
+	try stampPlugin(tree, &item, "obs-plugin");
+	try t.expect(item.object.get("approved") == null);
+
+	try t.expectError(error.IndexOutOfRange, insertAddRule(tree, rules_arr, .{ .action = .allow, .host = "x.example.com", .pos = 7 }));
 }
