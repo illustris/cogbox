@@ -14,10 +14,12 @@ const help = @import("../help.zig");
 const exit_codes = @import("../exit.zig");
 const paths = @import("../paths.zig");
 const config_lock = @import("../config_lock.zig");
+const plugin_module = @import("plugin_module");
 
 pub fn run(
 	allocator: std.mem.Allocator,
 	io: std.Io,
+	env: *const std.process.Environ.Map,
 	p: *const paths.Paths,
 	argv: []const []const u8,
 ) !void {
@@ -92,6 +94,15 @@ pub fn run(
 		util.die(allocator, io, "delete", exit_codes.software, "cannot preserve config for a failed delete: {s}", .{@errorName(err)});
 	};
 	defer if (backup) |b| allocator.free(b.bytes);
+
+	// A live plugin apply building for this instance (the unit apply/active
+	// records, on an InvocationID match) is stopped before its inputs go; its
+	// own watch then ends it superseded, and nothing recreates the config dir.
+	{
+		var arena_state = std.heap.ArenaAllocator.init(allocator);
+		defer arena_state.deinit();
+		_ = plugin_module.apply.stopRecordedBuild(arena_state.allocator(), io, env, cfg_dir);
+	}
 
 	// Keep the config discoverable until persistent and runtime cleanup both
 	// succeed. A failed delete must remain visible to inventory clients so the

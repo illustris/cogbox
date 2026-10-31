@@ -1,4 +1,4 @@
-{ self, pkgs, system }:
+{ self, pkgs, system, liveApply ? { runners = { }; systems = { }; hosted = null; } }:
 
 let
 	# Recursively collect every transitive flake input source path. Phase E
@@ -17,6 +17,11 @@ let
 	in inputs: builtins.concatMap walk (builtins.attrValues inputs);
 in {
 	name = "cogbox-vm";
+
+	# Phase LA (live plugin apply) adds about 45 minutes to a run that already
+	# takes about 30, past the driver's one-hour default; a loaded builder can
+	# stretch both.
+	globalTimeout = 3 * 3600;
 
 	nodes.machine = { config, lib, ... }: {
 		virtualisation = {
@@ -45,6 +50,9 @@ in {
 			# Phase Q7 adds a plugin from a git+file:// flake; git is only
 			# needed to create the fixture repo (nix fetches via libgit2).
 			git
+			# Phase LA formats the hosted guest's two volumes (the GCE host
+			# carves and labels them on its disk).
+			e2fsprogs
 		];
 
 		# Phase K (L7 vhost filtering): the host-side L7 proxy re-resolves the
@@ -80,7 +88,22 @@ in {
 				# drv that needs its own pre-built pin.
 				self.nixosConfigurations.cogbox-x86_64-test-plugin.config.microvm.declaredRunner
 				self.packages.x86_64-linux.cogbox-test-plugin
-			];
+			]
+			# Phase LA: the runner of every plugin composition it applies live,
+			# and the toplevels it only plans against (flake.nix, checks.cogbox-vm);
+			# for the hosted guest profile also its cogbox package (whose base
+			# runner it boots). Not on PATH: both packages are `cogbox`.
+			++ lib.attrValues liveApply.runners
+			++ lib.attrValues liveApply.systems
+			++ lib.optionals ((liveApply.hosted or null) != null) ([ liveApply.hosted.cogbox ]
+				++ lib.attrValues liveApply.hosted.runners
+				++ lib.attrValues liveApply.hosted.systems);
+
+		# Phase LA's test plugins (flake + module per plugin and version); the
+		# script copies them to the test user's home and adds them from there.
+		# The store paths above, by name, for its assertions.
+		environment.etc."cogbox-live-apply".source = ./fixtures/live-apply;
+		environment.etc."cogbox-live-apply.json".text = builtins.toJSON liveApply;
 
 		users.users.testuser = {
 			isNormalUser = true;

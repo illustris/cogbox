@@ -20,6 +20,9 @@ pub const nix = @import("nix.zig");
 pub const gitcred = @import("gitcred.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const preboot = @import("preboot.zig");
+pub const rollback = @import("rollback.zig");
+pub const unitplan = @import("unitplan.zig");
+pub const apply = @import("apply.zig");
 
 const rules_module = @import("rules_module");
 const config = rules_module.config;
@@ -37,24 +40,18 @@ pub fn dispatch(
 	user_flake_dir: []const u8,
 	plugins_flake_dir: []const u8,
 	rest: []const []const u8,
+	host: apply.Host,
 ) !void {
 	const cmd = cli.parse(rest) catch |err| {
 		const msg = switch (err) {
-			error.MissingSubcommand => "missing subcommand (list, add, del, update, resolve)",
-			error.UnknownSubcommand => "unknown subcommand (expected list, add, del, update, resolve)",
+			error.MissingSubcommand => "missing subcommand (list, add, del, update, resolve, reconcile, apply)",
+			error.UnknownSubcommand => "unknown subcommand (expected list, add, del, update, resolve, reconcile, apply)",
 			error.MissingUrl => "add requires a FLAKE_URL",
 			error.MissingPlugin => "del requires a plugin name",
 			error.InvalidArgs => "invalid arguments",
 		};
 		die(allocator, io, "{s}", .{msg}, 64);
 	};
-
-	var loaded = config.load(allocator, io, config_path) catch |err| switch (err) {
-		error.FileNotFound => return die(allocator, io, "no config found at {s}", .{config_path}, 66),
-		error.InvalidJson => return die(allocator, io, "invalid JSON in {s}", .{config_path}, 65),
-		else => return err,
-	};
-	defer loaded.deinit();
 
 	// plugin-sources/ and plugin-cache/ are SIBLINGS of plugins-flake/ (under
 	// the instance config dir): putting them INSIDE plugins-flake/ would change
@@ -79,7 +76,53 @@ pub fn dispatch(
 		.plugins_flake_dir = plugins_flake_dir,
 		.sources_dir = sources_dir,
 		.cache_dir = cache_dir,
+		.real_uid = host.real_uid,
+		.host = host,
+		.live = switch (cmd) {
+			inline .add, .del, .update => |a| a.live,
+			else => null,
+		},
 	};
+
+	// The apply subcommands manage their own locks, recovery and rollback
+	// finish (apply.zig), and read config.json themselves.
+	if (cmd == .apply) {
+		const code = apply.run(&ctx, cmd.apply, host);
+		if (code != 0) std.process.exit(code);
+		return;
+	}
+
+	// The apply gate's last step (spec 4.8): the CLI's gate holds the apply
+	// flock, and the config lock is held. An inflight.json its verb left (it
+	// died, releasing the flock) is recovered before this change commits, so a
+	// rejection it still holds is rolled back first; one that cannot be
+	// resolved refuses the change (exit 69), nothing read or written.
+	var gate_arena = std.heap.ArenaAllocator.init(allocator);
+	defer gate_arena.deinit();
+	// The finishPending the recovery's rollback ran: the dispatcher's one
+	// finish (its bound, 240 s, counts one).
+	var rec_fin: ?rollback.FinishResult = null;
+	if (isMutating(cmd) and host.gate_held) {
+		switch (apply.recoverBeforeCommit(gate_arena.allocator(), &ctx, host.ssh_identity, &rec_fin)) {
+			.clear => {},
+			.busy => |g| die(allocator, io, "{s}", .{apply.busyMessage(gate_arena.allocator(), g)}, 69),
+		}
+	}
+
+	// Finish a pending automatic rollback before config.json is read (spec
+	// 4.6, "Finishing a pending intent"), under the config lock the CLI holds
+	// (and, for a mutating verb, the gate's apply flock, so leftover intent tmp
+	// names are swept). One that cannot finish makes the mutating verbs refuse
+	// (exit 78), so no newer commit lands on top of it; list and resolve report
+	// it and go on.
+	finishPendingRollback(&ctx, cmd, host.gate_held, rec_fin);
+
+	var loaded = config.load(allocator, io, config_path) catch |err| switch (err) {
+		error.FileNotFound => return die(allocator, io, "no config found at {s}", .{config_path}, 66),
+		error.InvalidJson => return die(allocator, io, "invalid JSON in {s}", .{config_path}, 65),
+		else => return err,
+	};
+	defer loaded.deinit();
 
 	switch (cmd) {
 		.list => try cmdList(&ctx, &loaded),
@@ -88,7 +131,38 @@ pub fn dispatch(
 		.update => |u| try cmdUpdate(&ctx, &loaded, u),
 		.resolve => |r| try cmdResolve(&ctx, &loaded, r),
 		.reconcile => try cmdReconcile(&ctx, &loaded),
+		.apply => unreachable,
 	}
+	// An inline apply that rolled the change back (finishLive) exits 1, after
+	// the verb's own output (the deferred-rules line included).
+	if (ctx.exit_code != 0) std.process.exit(ctx.exit_code);
+}
+
+/// The subcommands that write plugin entries, sources, tagged policy or the
+/// composition: a rollback that cannot finish blocks them.
+pub fn isMutating(cmd: cli.Cmd) bool {
+	return switch (cmd) {
+		.add, .del, .update, .reconcile => true,
+		.list, .resolve, .apply => false,
+	};
+}
+
+/// rollback.finishPending for the plugin dispatcher (the caller holds the
+/// config lock; `holds_apply_flock` when the apply gate also holds the apply
+/// flock, the only case in which leftover intent tmp names are swept), unless
+/// the gate's recovery already ran one (`prior`, whose warnings it printed).
+/// Warnings go to stderr. An intent that stays makes a mutating subcommand
+/// exit 78 with the stamped message; the others print it and carry on.
+fn finishPendingRollback(ctx: *const Ctx, cmd: cli.Cmd, holds_apply_flock: bool, prior: ?rollback.FinishResult) void {
+	var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+	defer arena_state.deinit();
+	const fin = prior orelse rollback.finishPending(arena_state.allocator(), ctx, .{ .holds_apply_flock = holds_apply_flock });
+	var buf: [4096]u8 = undefined;
+	var w: std.Io.Writer = .fixed(&buf);
+	if (prior == null) rollback.writeWarnings(&w, fin.warnings) catch {};
+	if (fin.pending > 0) rollback.writePendingMessage(&w, fin.pending_error orelse error.RollbackPending, ctx.instance) catch {};
+	writeStderr(ctx.io, w.buffered()) catch {};
+	if (fin.pending > 0 and isMutating(cmd)) std.process.exit(78);
 }
 
 // --- resolve (truthful pre-install preview; no mutation) -----------------
@@ -219,7 +293,7 @@ fn renderResolveJson(
 	return out.toOwnedSlice(allocator);
 }
 
-const Ctx = struct {
+pub const Ctx = struct {
 	allocator: std.mem.Allocator,
 	io: std.Io,
 	// The parent environment, used to clone a per-fetch env when a credential
@@ -246,7 +320,42 @@ const Ctx = struct {
 	// cmdUpdate emits. The control plane parses that line; routing chatter to
 	// stderr keeps it clean. Set by cmdAdd/cmdUpdate/cmdResolve for the run.
 	defer_rules: bool = false,
+	// The invoking user's uid under sudo (null otherwise): the live apply's
+	// snapshot and rollback state is handed to it, as config_lock hands over
+	// the lock files, so later non-sudo verbs can still write it.
+	real_uid: ?u32 = null,
+	// The CLI's lock descriptors and ssh identity (apply.Host): what an inline
+	// apply after add, del or update runs under (finishLive).
+	host: apply.Host = .{},
+	// add/del/update's --apply (true) or --no-apply (false); null: the default.
+	live: cli.LiveChoice = null,
+	// Set by finishLive when an inline apply rolled the change back: the
+	// dispatcher exits with it once the verb has returned.
+	exit_code: u8 = 0,
+	// The inline apply rejected the change (its rollback done or pending):
+	// cmdAdd then withholds its deferred-rules line, which would name rules
+	// of a plugin that is no longer there.
+	live_rejected: bool = false,
 };
+
+/// A Ctx for the instance `name` (null: the default) whose config dir is `icd`
+/// and runtime dir `runtime`, for the verbs outside `cogbox plugin` that run a
+/// live-apply step (`cogbox stop`). Its strings are `arena`'s.
+pub fn instanceCtx(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, name: ?[]const u8, icd: []const u8, runtime: []const u8) !Ctx {
+	const join = std.fs.path.join;
+	return .{
+		.allocator = arena,
+		.io = io,
+		.parent_env = env,
+		.instance = name,
+		.config_path = try join(arena, &.{ icd, "config.json" }),
+		.runtime_path = runtime,
+		.user_flake_dir = try join(arena, &.{ icd, "flake" }),
+		.plugins_flake_dir = try join(arena, &.{ icd, "plugins-flake" }),
+		.sources_dir = try join(arena, &.{ icd, "plugin-sources" }),
+		.cache_dir = try join(arena, &.{ icd, "plugin-cache" }),
+	};
+}
 
 // --- list ---------------------------------------------------------------
 
@@ -523,12 +632,14 @@ fn cmdAdd(ctx: *Ctx, loaded: *config.Loaded, a: cli.AddArgs) !void {
 
 	try announce(ctx, "Plugin '{s}' added at {s}.", .{ plugin_name, pinLabel(&meta) });
 	if (merged_inject) try printBindChecklist(ctx, incoming_inject);
-	try printRestartHint(ctx, "to load its NixOS module");
+	try finishLive(ctx, plugin_name, "to load its NixOS module");
 
 	// Under --defer-rules emit the withheld L4/L7 rules as one JSON line on
 	// stdout (the ONLY stdout output; all human chatter went to stderr). The
 	// control plane parses this and files one admin-approval request per rule.
-	if (a.defer_rules) {
+	// Not after an inline apply (--apply) rolled the add back: the plugin is
+	// gone, and approving its rules would grant them to nothing.
+	if (a.defer_rules and !ctx.live_rejected) {
 		const line = try renderDeferredJson(allocator, plugin_name, incoming_l4, incoming_l7);
 		defer allocator.free(line);
 		try writeStdout(io, line);
@@ -806,7 +917,7 @@ fn writeCompactString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: 
 
 // --- del ----------------------------------------------------------------
 
-fn cmdDel(ctx: *const Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
+fn cmdDel(ctx: *Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 	const allocator = ctx.allocator;
 	const io = ctx.io;
 
@@ -847,7 +958,7 @@ fn cmdDel(ctx: *const Ctx, loaded: *config.Loaded, d: cli.DelArgs) !void {
 	if (removed > 0) try rules_module.maybeReload(allocator, io, ctx.runtime_path, loaded);
 
 	try announce(ctx, "Plugin '{s}' removed ({d} contributed entr(ies) dropped).", .{ d.plugin, removed });
-	try printRestartHint(ctx, "to unload its NixOS module");
+	try finishLive(ctx, d.plugin, "to unload its NixOS module");
 }
 
 // --- update -------------------------------------------------------------
@@ -1139,7 +1250,7 @@ fn cmdUpdate(ctx: *Ctx, loaded: *config.Loaded, u: cli.UpdateArgs) !void {
 	}
 	try regenComposition(ctx, plugins_arr);
 	finalizeComposition(ctx, plugins_arr, if (noop) &baseline else null);
-	if (changed or healed) try printRestartHint(ctx, "to load the updated NixOS modules");
+	if (changed or healed) try finishLive(ctx, u.plugin, "to load the updated NixOS modules");
 	if (failed) std.process.exit(65);
 }
 
@@ -1565,7 +1676,7 @@ fn writeCompositionLock(ctx: *const Ctx, bytes: []const u8) bool {
 /// (same as compose.writeCompositionFlake), so concurrent writers never share
 /// a tmp, and it is always removed: a stray tmp inside plugins-flake/ would
 /// change the composition's own source hash.
-fn writeFileAtomic(ctx: *const Ctx, path: []const u8, bytes: []const u8) bool {
+pub fn writeFileAtomic(ctx: *const Ctx, path: []const u8, bytes: []const u8) bool {
 	const allocator = ctx.allocator;
 	const cwd = std.Io.Dir.cwd();
 	var nonce: [16]u8 = undefined;
@@ -1615,7 +1726,7 @@ fn savePrevLock(ctx: *const Ctx, before: []const u8) void {
 }
 
 /// Drop the unconfirmed-re-pin snapshot: the live lock is confirmed. Best-effort.
-fn clearPrevLock(ctx: *const Ctx) void {
+pub fn clearPrevLock(ctx: *const Ctx) void {
 	const path = prevLockPath(ctx) orelse return;
 	defer ctx.allocator.free(path);
 	std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
@@ -2282,7 +2393,7 @@ fn toplevelRecordCurrent(ctx: *const Ctx) bool {
 /// when that set does. Best-effort: the record is an optimization, so a delete
 /// that fails costs at worst nothing, and a delete that succeeds costs at worst
 /// one eval boot.
-fn removeRunnerRecord(ctx: *const Ctx) void {
+pub fn removeRunnerRecord(ctx: *const Ctx) void {
 	const allocator = ctx.allocator;
 	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse return;
 	const p = std.fs.path.join(allocator, &.{ instance_config_dir, "runner.path" }) catch return;
@@ -2300,7 +2411,7 @@ fn removeRunnerRecord(ctx: *const Ctx) void {
 /// op changes the composition, so its verdict no longer holds and the next boot
 /// must retry. Best-effort: a stale file only keeps already-failed content at its
 /// previous pin until the next op, never pins anything.
-fn clearRepinFailed(ctx: *const Ctx) void {
+pub fn clearRepinFailed(ctx: *const Ctx) void {
 	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse return;
 	const path = std.fs.path.join(ctx.allocator, &.{ instance_config_dir, "composition.repin.failed" }) catch return;
 	defer ctx.allocator.free(path);
@@ -2325,7 +2436,7 @@ fn removeToplevelRecord(ctx: *const Ctx) void {
 /// (COGBOX_REEXEC_PACKAGE, baked next to COGBOX_FLAKE_SOURCE by mkCogboxAttr).
 /// Absent (an unwrapped binary, or an image predating it) it means the default
 /// package, "cogbox".
-fn reexecPackage(ctx: *const Ctx) []const u8 {
+pub fn reexecPackage(ctx: *const Ctx) []const u8 {
 	return ctx.parent_env.get("COGBOX_REEXEC_PACKAGE") orelse "cogbox";
 }
 
@@ -2373,45 +2484,53 @@ fn prebuiltRecordComp(ctx: *const Ctx, comp_before: ?snapshot.Comp) PrebuiltReco
 /// evals -- but it silently costs a fresh instance the entire point of this
 /// pre-write, so the two must move together.
 fn writeRunnerRecord(ctx: *const Ctx, flake_source: []const u8, runner: []const u8, comp: []const u8) void {
+	_ = tryWriteRunnerRecord(ctx, flake_source, runner, comp);
+}
+
+/// writeRunnerRecord that also says whether the record was written (the live
+/// apply's rollback treats a failed write as a failed restore step). Warns on
+/// failure exactly as writeRunnerRecord does.
+pub fn tryWriteRunnerRecord(ctx: *const Ctx, flake_source: []const u8, runner: []const u8, comp: []const u8) bool {
 	const allocator = ctx.allocator;
 	const cwd = std.Io.Dir.cwd();
 	const reexec_package = reexecPackage(ctx);
 
 	const instance_config_dir = std.fs.path.dirname(ctx.plugins_flake_dir) orelse {
 		warn(ctx, "runner push: plugins-flake dir has no parent; skipping record (boot will eval)", .{}) catch {};
-		return;
+		return false;
 	};
-	const path = std.fs.path.join(allocator, &.{ instance_config_dir, "runner.path" }) catch return;
+	const path = std.fs.path.join(allocator, &.{ instance_config_dir, "runner.path" }) catch return false;
 	defer allocator.free(path);
-	const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return;
+	const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch return false;
 	defer allocator.free(tmp_path);
 
-	const contents = std.fmt.allocPrint(allocator, "{s}#{s}\n{s}\n{s}\n", .{ flake_source, reexec_package, runner, comp }) catch return;
+	const contents = std.fmt.allocPrint(allocator, "{s}#{s}\n{s}\n{s}\n", .{ flake_source, reexec_package, runner, comp }) catch return false;
 	defer allocator.free(contents);
 
 	{
 		const f = cwd.createFile(ctx.io, tmp_path, .{ .truncate = true }) catch {
 			warn(ctx, "runner push: could not write runner record (boot will eval)", .{}) catch {};
-			return;
+			return false;
 		};
 		defer f.close(ctx.io);
 		var write_buf: [512]u8 = undefined;
 		var writer = f.writer(ctx.io, &write_buf);
 		writer.interface.writeAll(contents) catch {
 			warn(ctx, "runner push: could not write runner record (boot will eval)", .{}) catch {};
-			return;
+			return false;
 		};
 		writer.flush() catch {
 			warn(ctx, "runner push: could not write runner record (boot will eval)", .{}) catch {};
-			return;
+			return false;
 		};
 		f.sync(ctx.io) catch {};
 	}
 	cwd.rename(tmp_path, cwd, path, ctx.io) catch {
 		cwd.deleteFile(ctx.io, tmp_path) catch {};
 		warn(ctx, "runner push: could not finalize runner record (boot will eval)", .{}) catch {};
-		return;
+		return false;
 	};
+	return true;
 }
 
 /// Best-effort atomic write of agentInit's `toplevel.path` fast-path record: three
@@ -2635,7 +2754,7 @@ fn evalInjectSpecs(ctx: *const Ctx, locked_url: []const u8, attr: ?[]const u8) ?
 
 /// .network.l7.rules, created on demand (merge path; rules mode is already
 /// established by the caller).
-fn ensureL7Rules(loaded: *config.Loaded) !*std.json.Array {
+pub fn ensureL7Rules(loaded: *config.Loaded) !*std.json.Array {
 	const net = try loaded.network();
 	const l7 = try l7_module.ensureL7Object(net, loaded.treeAllocator());
 	return &l7.object.getPtr("rules").?.array;
@@ -2676,7 +2795,7 @@ fn ensureInjectSpecs(loaded: *config.Loaded) !*std.json.Array {
 
 /// .network.l7.inject.specs if it already exists (del/update/count path);
 /// null when inject is absent or still in the legacy bool form.
-fn injectSpecsOrNull(loaded: *config.Loaded) ?*std.json.Array {
+pub fn injectSpecsOrNull(loaded: *config.Loaded) ?*std.json.Array {
 	const net = loaded.network() catch return null;
 	const l7 = net.object.getPtr("l7") orelse return null;
 	if (l7.* != .object) return null;
@@ -2688,7 +2807,7 @@ fn injectSpecsOrNull(loaded: *config.Loaded) ?*std.json.Array {
 }
 
 /// .network.l7.rules if it already exists; never creates it (del/list path).
-fn l7RulesOrNull(loaded: *config.Loaded) ?*std.json.Array {
+pub fn l7RulesOrNull(loaded: *config.Loaded) ?*std.json.Array {
 	const net = loaded.network() catch return null;
 	const l7 = net.object.getPtr("l7") orelse return null;
 	if (l7.* != .object) return null;
@@ -2701,7 +2820,7 @@ fn l7RulesOrNull(loaded: *config.Loaded) ?*std.json.Array {
 /// from the current .plugins array. Pure function of config.json, rebuilt on
 /// every mutation, so a crash between config save and this write self-heals
 /// on the next plugin command.
-fn regenComposition(ctx: *const Ctx, plugins_arr: *std.json.Array) !void {
+pub fn regenComposition(ctx: *const Ctx, plugins_arr: *std.json.Array) !void {
 	const allocator = ctx.allocator;
 
 	// The composition is about to change, so ANY recorded composed runner is now
@@ -2876,15 +2995,119 @@ fn printBindChecklist(ctx: *const Ctx, specs: []const std.json.Value) !void {
 }
 
 fn printRestartHint(ctx: *const Ctx, why: []const u8) !void {
-	if (!isRunning(ctx)) {
-		try announce(ctx, "It will take effect at the next start.", .{});
-		return;
-	}
 	if (ctx.instance) |n| {
 		try announce(ctx, "Restart the instance ('cogbox restart -n {s}') {s}.", .{ n, why });
 	} else {
 		try announce(ctx, "Restart the instance ('cogbox restart') {s}.", .{why});
 	}
+}
+
+pub const LiveDecision = enum {
+	/// The instance is not running: the change loads at the next start.
+	not_running,
+	/// Left for `cogbox plugin apply` or a restart.
+	deferred,
+	/// Applied inline, right after the commit.
+	inline_apply,
+};
+
+/// Whether a committed add, del or update is applied live right away (spec
+/// section 2 step 1, CLI). Only on a running instance, and then only with
+/// --apply, or, without --no-apply, when stderr is an interactive terminal and
+/// COGBOX_ENVIRONMENT is not cogworx (a control plane runs its own apply).
+/// COGBOX_LIVE_APPLY=0 (environment only) defers in every case. Never on a
+/// non-terminal stderr without --apply.
+pub fn liveDecision(running: bool, choice: cli.LiveChoice, stderr_tty: bool, env: *const std.process.Environ.Map) LiveDecision {
+	if (!running) return .not_running;
+	if (env.get("COGBOX_LIVE_APPLY")) |v| if (std.mem.eql(u8, v, "0")) return .deferred;
+	if (choice) |c| return if (c) .inline_apply else .deferred;
+	if (!stderr_tty) return .deferred;
+	if (env.get("COGBOX_ENVIRONMENT")) |e| if (std.mem.eql(u8, e, "cogworx")) return .deferred;
+	return .inline_apply;
+}
+
+/// The end of a committed add, del or update (was printRestartHint; spec
+/// section 6 "Restart hint"): not running, the change loads at the next start
+/// (unchanged); deferred (--no-apply, the default off a terminal, or
+/// COGBOX_LIVE_APPLY=0), the apply-or-restart hint; otherwise the inline live
+/// apply under the gate's locks, worded for this change. A change the inline
+/// apply rolled back sets exit 1 (the dispatcher exits with it after the
+/// verb); the apply's own non-zero exit (78, or the terminate path's) ends the
+/// process at once.
+fn finishLive(ctx: *Ctx, plugin_name: ?[]const u8, why: []const u8) !void {
+	const tty = std.Io.File.stderr().isTty(ctx.io) catch false;
+	var d = liveDecision(isRunning(ctx), ctx.live, tty, ctx.parent_env);
+	// Only a verb that passed the apply gate holds the locks the apply needs.
+	if (d == .inline_apply and !ctx.host.gate_held) d = .deferred;
+	switch (d) {
+		.not_running => return announce(ctx, "It will take effect at the next start.", .{}),
+		.deferred => {
+			if (ctx.instance) |n| return announce(ctx, "Run 'cogbox plugin apply -n {s}' to load it live, or restart the instance ('cogbox restart -n {s}') {s}.", .{ n, n, why });
+			return announce(ctx, "Run 'cogbox plugin apply' to load it live, or restart the instance ('cogbox restart') {s}.", .{why});
+		},
+		.inline_apply => {},
+	}
+	try announce(ctx, "Loading it into the running instance (live apply)...", .{});
+	var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+	defer arena_state.deinit();
+	const arena = arena_state.allocator();
+	const res = apply.runInline(arena, ctx, ctx.host);
+	const rep = res.report orelse {
+		// No report: a rollback that cannot finish blocked the apply (its
+		// stamped message is on stderr), or the apply was interrupted.
+		if (res.code != 0) std.process.exit(res.code);
+		return printRestartHint(ctx, why);
+	};
+	const result = jsonStr(rep.get("result")) orelse "";
+	const reason = jsonStr(rep.get("reason"));
+	const gen = jsonStr(rep.get("gen")) orelse "";
+	const n_opt: []const u8 = if (ctx.instance) |n| try std.fmt.allocPrint(arena, " -n {s}", .{n}) else "";
+	if (std.mem.eql(u8, result, "applied") or std.mem.eql(u8, result, "applied_with_failures") or std.mem.eql(u8, result, "already_live")) {
+		try announce(ctx, "Loaded into the running instance (generation {s}).", .{gen});
+		if (rep.get("units")) |u| if (u == .array and u.array.items.len > 0) {
+			var names: std.ArrayList(u8) = .empty;
+			for (u.array.items, 0..) |item, i| {
+				if (item != .string) continue;
+				if (i > 0) try names.appendSlice(arena, ", ");
+				try names.appendSlice(arena, item.string);
+			}
+			try announce(ctx, "Units that failed to start: {s}.", .{names.items});
+		};
+	} else if (std.mem.eql(u8, result, "rejected")) {
+		try announce(ctx, "{s}", .{try rejectedLine(arena, plugin_name, rep, res.code, n_opt)});
+		ctx.exit_code = 1;
+		ctx.live_rejected = true;
+	} else if (std.mem.eql(u8, result, "not_running")) {
+		try announce(ctx, "It will take effect at the next start.", .{});
+	} else {
+		var detail: std.ArrayList(u8) = .empty;
+		if (rep.get("detail")) |dv| if (dv == .array) for (dv.array.items) |item| {
+			if (item != .string) continue;
+			try detail.appendSlice(arena, if (detail.items.len == 0) ": " else ", ");
+			try detail.appendSlice(arena, item.string);
+		};
+		try announce(ctx, "Not loaded live ({s}{s}{s}{s}).", .{ result, if (reason != null) "/" else "", reason orelse "", detail.items });
+		try printRestartHint(ctx, why);
+	}
+	if (res.code != 0) std.process.exit(res.code);
+}
+
+/// The inline apply's line for a rejected change, from its report `rep` and
+/// exit `code`. Rolled back only when the report's rollback is `done`; any
+/// other state (`removed`, the fail-closed tier; `pending`, or no status; and
+/// pending with exit 78, a finish that could not complete) gets the sentence
+/// `cogbox plugin apply` prints for the same report (apply.rollbackSentence).
+fn rejectedLine(arena: std.mem.Allocator, plugin_name: ?[]const u8, rep: std.json.ObjectMap, code: u8, n_opt: []const u8) ![]const u8 {
+	const text = apply.rejectionText(jsonStr(rep.get("reason")) orelse "");
+	const gen = jsonStr(rep.get("gen")) orelse "";
+	const what: []const u8 = if (plugin_name) |p| try std.fmt.allocPrint(arena, "'{s}'", .{p}) else "The plugin update";
+	if (apply.rollbackSentenceJson(rep.get("rollback"), code == 78)) |state| return std.fmt.allocPrint(arena, "{s} was not applied: {s}. {s}. Build log: cogbox plugin apply{s} --log {s}", .{ what, text, state, n_opt, gen });
+	return std.fmt.allocPrint(arena, "{s} was not applied and has been rolled back: {s}. Build log: cogbox plugin apply{s} --log {s}", .{ what, text, n_opt, gen });
+}
+
+fn jsonStr(v: ?std.json.Value) ?[]const u8 {
+	const x = v orelse return null;
+	return if (x == .string) x.string else null;
 }
 
 /// Same probe as cli/util.zig instanceRunningConservative, inlined because the
@@ -2893,7 +3116,7 @@ fn printRestartHint(ctx: *const Ctx, why: []const u8) !void {
 /// (inherited by QEMU), so a held lock is the verdict; a pid file cannot tell a
 /// dead launch from PID reuse. Fail closed: an uninspectable lock counts as
 /// running, so the hint says "restart" rather than "at the next start".
-fn isRunning(ctx: *const Ctx) bool {
+pub fn isRunning(ctx: *const Ctx) bool {
 	const lock_path = std.fmt.allocPrint(ctx.allocator, "{s}.lock", .{ctx.runtime_path}) catch return true;
 	defer ctx.allocator.free(lock_path);
 	const file = std.Io.Dir.cwd().openFile(ctx.io, lock_path, .{}) catch |err| switch (err) {
@@ -2922,7 +3145,7 @@ fn confirm(ctx: *const Ctx, prompt: []const u8) !bool {
 	return trimmed.len > 0 and (trimmed[0] == 'y' or trimmed[0] == 'Y');
 }
 
-fn rulesOrNull(loaded: *config.Loaded) ?*std.json.Array {
+pub fn rulesOrNull(loaded: *config.Loaded) ?*std.json.Array {
 	return loaded.rules() catch null;
 }
 
@@ -3421,6 +3644,67 @@ test "materializeSource/removeSource never rewrite a file a hard-linked snapshot
 	try expectSnapV1(&inst, io);
 }
 
+// The same guarantee end to end: a snapshot taken by snapshot.take (the
+// apply's S, the shape of the launcher's boot snapshot) keeps the version it
+// took through a later update's re-materialize and a del's removeSource.
+test "a snapshot.take src/ survives materializeSource and removeSource unchanged" {
+	var threaded: std.Io.Threaded = .init(t.allocator, .{ .environ = std.testing.environ });
+	defer threaded.deinit();
+	const io = threaded.io();
+	const a = t.allocator;
+	var inst = try TestInstance.init(io, "snap-take");
+	defer inst.deinit(io);
+	const c = inst.ctx(io);
+
+	const src_sub = try inst.path("store-src/sub");
+	defer a.free(src_sub);
+	try std.Io.Dir.cwd().createDirPath(io, src_sub);
+	inline for (.{ "store-src/flake.nix", "store-src/sub/a.txt" }) |rel| {
+		const p = try inst.path(rel);
+		defer a.free(p);
+		try testWriteFile(io, p, "v2\n");
+	}
+	const src = try inst.path("store-src");
+	defer a.free(src);
+	const meta: nix.Meta = .{ .locked_url = "", .rev = null, .nar_hash = "", .source_path = src };
+
+	const live_sub = try inst.path("plugin-sources/p/sub");
+	defer a.free(live_sub);
+	try std.Io.Dir.cwd().createDirPath(io, live_sub);
+	inline for (.{ "plugin-sources/p/flake.nix", "plugin-sources/p/sub/a.txt" }) |rel| {
+		const p = try inst.path(rel);
+		defer a.free(p);
+		try testWriteFile(io, p, "v1\n");
+	}
+	const cfg = try std.json.parseFromSlice(std.json.Value, a, "{\"plugins\": [{\"name\": \"p\"}]}", .{});
+	defer cfg.deinit();
+	const id = try snapshot.take(a, io, inst.root, cfg.value, .{});
+
+	const expectSnapV1 = struct {
+		fn run(i: *const TestInstance, tio: std.Io, sid: []const u8) !void {
+			for ([_][]const u8{ "flake.nix", "sub/a.txt" }) |rel| {
+				const sp = try std.fmt.allocPrint(t.allocator, "{s}/apply/snap/{s}/src/p/{s}", .{ i.root, sid, rel });
+				defer t.allocator.free(sp);
+				const got = try testReadFile(tio, sp);
+				defer t.allocator.free(got);
+				try t.expectEqualStrings("v1\n", got);
+			}
+		}
+	}.run;
+
+	try materializeSource(&c, "p", &meta, "unused");
+	try expectSnapV1(&inst, io, &id);
+	{
+		const lp = try inst.path("plugin-sources/p/sub/a.txt");
+		defer a.free(lp);
+		const got = try testReadFile(io, lp);
+		defer a.free(got);
+		try t.expectEqualStrings("v2\n", got);
+	}
+	removeSource(&c, "p");
+	try expectSnapV1(&inst, io, &id);
+}
+
 // The unlink-before-write must not hinge on cp's link-preserving heuristic
 // (which unlinks only a destination with more than one link): the flag is
 // pinned, next to the -a whose mode preservation the narHash needs.
@@ -3433,4 +3717,71 @@ test "materializeSource copies with cp -a --remove-destination" {
 	}
 	try t.expectEqualStrings("cp", materialize_cp_flags[0]);
 	try t.expect(has_a and has_remove);
+}
+
+test "liveDecision: inline only on a running instance, with --apply or on a terminal outside cogworx; COGBOX_LIVE_APPLY=0 defers" {
+	var env = std.process.Environ.Map.init(t.allocator);
+	defer env.deinit();
+	// A stopped instance: the change loads at the next start, whatever the flags.
+	for ([_]cli.LiveChoice{ null, true, false }) |c| try t.expectEqual(LiveDecision.not_running, liveDecision(false, c, true, &env));
+	// A terminal applies by default; a non-terminal never does without --apply.
+	try t.expectEqual(LiveDecision.inline_apply, liveDecision(true, null, true, &env));
+	try t.expectEqual(LiveDecision.deferred, liveDecision(true, null, false, &env));
+	// --apply applies on any stderr; --no-apply defers on a terminal.
+	try t.expectEqual(LiveDecision.inline_apply, liveDecision(true, true, false, &env));
+	try t.expectEqual(LiveDecision.deferred, liveDecision(true, false, true, &env));
+	// Under cogworx a terminal is not enough (the control plane runs its own
+	// apply); --apply still applies.
+	try env.put("COGBOX_ENVIRONMENT", "cogworx");
+	try t.expectEqual(LiveDecision.deferred, liveDecision(true, null, true, &env));
+	try t.expectEqual(LiveDecision.inline_apply, liveDecision(true, true, false, &env));
+	// The local off switch defers everything, --apply included.
+	try env.put("COGBOX_LIVE_APPLY", "0");
+	try t.expectEqual(LiveDecision.deferred, liveDecision(true, true, true, &env));
+	try env.put("COGBOX_ENVIRONMENT", "local");
+	try t.expectEqual(LiveDecision.deferred, liveDecision(true, null, true, &env));
+	try env.put("COGBOX_LIVE_APPLY", "1");
+	try t.expectEqual(LiveDecision.inline_apply, liveDecision(true, null, true, &env));
+}
+
+test "rejectedLine: rolled back only when the rollback is done; removed, pending and blocked each say what happened" {
+	var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena_state.deinit();
+	const a = arena_state.allocator();
+	// The report as the inline apply reads it back: the line runApply writes.
+	const Rep = struct {
+		fn of(al: std.mem.Allocator, reason: apply.Reason, out: ?apply.RollbackOut) !std.json.ObjectMap {
+			const line = try apply.reportLine(al, .{ .gen = "0123456789abcdef", .op = "update", .result = .rejected, .reason = reason, .detail = null, .overridable = false, .plan = null, .forced = null, .rollback = out, .runner = null, .toplevel = null, .units = null, .rolled_back_guest = null, .cap = null, .base_id = null, .built_id = null });
+			const v = try std.json.parseFromSliceLeaky(std.json.Value, al, line, .{});
+			return v.object.get("apply").?.object;
+		}
+		fn rb(status: apply.RollbackStatus, names: []const rollback.RecordName) apply.RollbackOut {
+			return .{ .status = status, .target = .base, .target_id = "00000000000000bb", .names = names };
+		}
+	};
+	const upd: []const rollback.RecordName = &.{.{ .name = "x", .action = .restored }};
+	const del: []const rollback.RecordName = &.{.{ .name = "x", .action = .reinserted }};
+
+	try t.expectEqualStrings("'x' was not applied and has been rolled back: its activation did not finish. Build log: cogbox plugin apply -n demo --log 0123456789abcdef", try rejectedLine(a, "x", try Rep.of(a, .activation_hang, Rep.rb(.done, upd)), 0, " -n demo"));
+
+	// The fail-closed tier: an update's plugin is gone, not back at its old
+	// version; a del's plugin is not put back.
+	const removed = try rejectedLine(a, "x", try Rep.of(a, .activation_hang, Rep.rb(.removed, upd)), 0, " -n demo");
+	try t.expect(std.mem.indexOf(u8, removed, "rolled back") == null);
+	try t.expectEqualStrings("'x' was not applied: its activation did not finish. Its previous plugin state could not be restored, so the plugins it added or updated were removed. Build log: cogbox plugin apply -n demo --log 0123456789abcdef", removed);
+	try t.expectEqualStrings("'x' was not applied: its activation did not finish. Its previous plugin state could not be restored, so the plugins it removed stay removed. Build log: cogbox plugin apply -n demo --log 0123456789abcdef", try rejectedLine(a, "x", try Rep.of(a, .activation_hang, Rep.rb(.removed, del)), 0, " -n demo"));
+
+	// Pending (the step-10 config lock could not be had), and a report without
+	// a rollback object, which never reads as done.
+	const pending = "'x' was not applied: its NixOS configuration does not evaluate. Its rollback is pending; the next plugin command or start of the instance finishes it. Build log: cogbox plugin apply --log 0123456789abcdef";
+	try t.expectEqualStrings(pending, try rejectedLine(a, "x", try Rep.of(a, .eval_error, Rep.rb(.pending, &.{})), 0, ""));
+	try t.expectEqualStrings(pending, try rejectedLine(a, "x", try Rep.of(a, .eval_error, null), 0, ""));
+
+	// Exit 78: the finish could not complete, its stamped message is already
+	// on stderr, and the next plugin command or start does not finish it.
+	const blocked = try rejectedLine(a, "x", try Rep.of(a, .activation_hang, Rep.rb(.pending, &.{})), 78, " -n demo");
+	try t.expect(std.mem.indexOf(u8, blocked, "next plugin command") == null);
+	try t.expectEqualStrings("'x' was not applied: its activation did not finish. Its rollback could not be finished (see the message above). Build log: cogbox plugin apply -n demo --log 0123456789abcdef", blocked);
+
+	try t.expect(std.mem.startsWith(u8, try rejectedLine(a, null, try Rep.of(a, .unit_hang, Rep.rb(.pending, &.{})), 0, ""), "The plugin update was not applied: a unit it starts"));
 }

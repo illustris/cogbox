@@ -18,5 +18,7 @@ pub const status_stopped: u8 = 3;
 pub const usage: u8 = 64; // EX_USAGE - bad CLI args, unknown verb, unknown flag
 pub const dataerr: u8 = 65; // EX_DATAERR - bad CIDR, integer, name regex
 pub const noinput: u8 = 66; // EX_NOINPUT - missing config.json
+pub const unavailable: u8 = 69; // EX_UNAVAILABLE - a plugin change gave up waiting for a finishing live apply
 pub const software: u8 = 70; // EX_SOFTWARE - internal error, runner failed, daemon timeout
 pub const tempfail: u8 = 75; // EX_TEMPFAIL - already running, port collision
+pub const config: u8 = 78; // EX_CONFIG - an automatic plugin rollback could not be finished

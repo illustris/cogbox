@@ -993,6 +993,796 @@ NIX_EOF"""))
     assert rc != 0, out
     assert "does not expose cogboxPlugins.nonexistent" in out, out
 
+with subtest("Phase LA: live plugin apply, automatic rollback and serialization"):
+    # `cogbox plugin apply` and the inline apply of add/update/del load a plugin
+    # change into the RUNNING guest without relaunching QEMU (the host builds
+    # the runner the next boot would boot; the guest arms a dead-man revert,
+    # switches in a detached unit and keeps the new system only once the host
+    # confirms over a fresh ssh connection), and roll a change the guest proves
+    # broken back on the host. The test plugins live in
+    # tests/fixtures/live-apply; this offline machine can only realise a runner
+    # it already has, so flake.nix (checks.cogbox-vm) pre-builds the runner of
+    # every composition this phase applies, in add order.
+    #
+    # Instance `la` (rules mode) runs the live legs with a tmux session in the
+    # guest and an ssh session from the host held open across every apply; a
+    # second instance, `lafin`, which only ever boots without plugins, runs the
+    # planted-intent legs that boot a rolled-back config.
+    import json
+
+    la_icd = "/home/testuser/.config/cogbox/instances/la"
+    la_cfg = f"{la_icd}/config.json"
+    la_apply = f"{la_icd}/apply"
+    la_rt = "/run/user/1000/cogbox-la"
+    fixtures = "/etc/cogbox-live-apply"
+    # A 60 s apply-unit bound (so W = 180 s) instead of 840/960 s keeps the
+    # hang legs and the dead-man leg to minutes; the memory floor is lowered
+    # because this 8 GiB machine also runs the inner VM.
+    LA_ENV = "COGBOX_APPLY_SWITCH_TIMEOUT=60 COGBOX_APPLY_MIN_AVAILABLE_MB=512"
+
+    def la(cmd):
+        return as_user(f"{LA_ENV} {cmd}")
+
+    def la_guest(cmd, name="la"):
+        return as_user(f"cogbox ssh --name {name} " + shlex.quote(cmd))
+
+    def install(src, name):
+        # (Re)place ~/<name> with a fixture plugin; `plugin add path:...` derives
+        # the plugin name from the directory's basename.
+        machine.succeed(as_user(
+            f"rm -rf /home/testuser/{name} && "
+            f"cp -rL --no-preserve=mode {fixtures}/{src} /home/testuser/{name}"
+        ))
+
+    def la_diag(apply_dir=la_apply):
+        # Everything a failed leg needs, printed before the assertion fires.
+        print(machine.execute(
+            f"set -x; ls -la {apply_dir} {apply_dir}/rollback {apply_dir}/snap; "
+            f"cat {apply_dir}/last.json {apply_dir}/active {apply_dir}/inflight.json; "
+            f"tail -n 5 {apply_dir}/rollbacks.jsonl; "
+            f"for f in {apply_dir}/*.build.log {apply_dir}/*.guest.log; do echo \"== $f\"; tail -c 6000 $f; done"
+        )[1])
+
+    def check(cond, what, apply_dir=la_apply):
+        if not cond:
+            la_diag(apply_dir)
+            raise AssertionError(what)
+
+    def last(apply_dir=la_apply):
+        return json.loads(machine.succeed(f"cat {apply_dir}/last.json"))["apply"]
+
+    def expect(result, reason=None, apply_dir=la_apply):
+        a = last(apply_dir)
+        check(a["result"] == result and (reason is None or a["reason"] == reason),
+              f"expected {result}/{reason}, got {a}", apply_dir)
+        return a
+
+    def jq(expr, path=la_cfg):
+        return machine.succeed(f"jq -r {shlex.quote(expr)} {path}").strip()
+
+    def tagged(plugin, action, cidr):
+        return jq(f'[.network.rules[] | select(.plugin == "{plugin}" and .{action} == "{cidr}")] | length')
+
+    def guest_system(name="la"):
+        return machine.succeed(la_guest("readlink /run/current-system", name)).strip()
+
+    def system_of(runner):
+        return machine.succeed(f"readlink {runner}/share/microvm/system").strip()
+
+    def runner_record():
+        # runner.path's content plus its mtime and inode: a pass that re-execs
+        # (an evaluation) rewrites it, so an unchanged stat proves the fast path.
+        return machine.succeed(f"stat -c '%y %i' {la_icd}/runner.path; cat {la_icd}/runner.path")
+
+    def booted_runner():
+        return machine.succeed(f"sed -n 2p {la_rt}/booted-runner").strip()
+
+    def hold_sessions():
+        # A tmux session in the guest and an ssh session from the host; every
+        # live apply must leave both running (only a restart ends them).
+        machine.succeed(la_guest("tmux new-session -d -s la-hold 'sleep 100000'"))
+        machine.succeed(as_user(
+            "setsid -f cogbox ssh --name la "
+            + shlex.quote("echo $$ > /run/la-ssh-hold.pid; exec sleep 100000")
+            + " < /dev/null > /dev/null 2>&1"
+        ))
+        machine.wait_until_succeeds(la_guest("kill -0 $(cat /run/la-ssh-hold.pid)"), timeout=60)
+
+    def sessions_survive():
+        machine.succeed(la_guest("tmux has-session -t la-hold"))
+        machine.succeed(la_guest("kill -0 $(cat /run/la-ssh-hold.pid)"))
+        machine.succeed("pgrep -u testuser -f la-ssh-hold.pid")
+
+    def restart_la():
+        machine.succeed(as_user("cogbox restart --no-ssh --name la"))
+        machine.wait_until_succeeds(
+            as_user(f"ssh {SSH_OPTS} -p {la_ssh} root@127.0.0.1 true"), timeout=600
+        )
+
+    def bg(cmd, tag):
+        # Run a plugin command in the background; its output and exit code
+        # land in /tmp/<tag>.out and /tmp/<tag>.rc.
+        machine.succeed(f"rm -f /tmp/{tag}.out /tmp/{tag}.rc")
+        machine.succeed(la(
+            "setsid -f sh -c "
+            + shlex.quote(f"{cmd} > /tmp/{tag}.out 2>&1; echo $? > /tmp/{tag}.rc")
+            + " < /dev/null > /dev/null 2>&1"
+        ))
+
+    def bg_wait(tag, timeout):
+        machine.wait_until_succeeds(f"test -s /tmp/{tag}.rc", timeout=timeout)
+        return int(machine.succeed(f"cat /tmp/{tag}.rc").strip()), machine.succeed(f"cat /tmp/{tag}.out")
+
+    # The runners of the compositions this phase applies, and the toplevels it
+    # only plans against, by name (flake.nix, checks.cogbox-vm).
+    store = json.loads(machine.succeed("cat /etc/cogbox-live-apply.json"))
+
+    def fixture(name):
+        if name in store["systems"]:
+            return store["systems"][name]
+        return system_of(store["runners"][name])
+
+    def plan_agrees(name, inst="la", target=None):
+        # The host's unit plan (zig/src/plugin/unitplan.zig, as the hidden
+        # `cogbox __unitplan P T` prints it) next to the guest's own
+        # `switch-to-configuration dry-activate` for the same switch, from the
+        # system the guest runs to fixture `name`: every unit dry-activate would
+        # act on, the plan acts on the same way (a stop plus a start of one unit
+        # is a restart, as the plan shows it); the units it would not restart
+        # and the systemd re-exec verdict agree. The plan is the superset (it
+        # takes every unit of P as active), so a unit only it lists is new in T
+        # or not active in the guest. A template's instance stands for its
+        # template on the plan's side.
+        p_sys, t_sys = guest_system(inst), target or fixture(name)
+        host, host_skip, host_reexec = {}, set(), None
+        for line in machine.succeed(as_user(f"cogbox __unitplan {p_sys} {t_sys}")).splitlines():
+            f = line.split()
+            if f[0] == "skip":
+                host_skip.add(f[1])
+            elif f[0] == "reexec":
+                host_reexec = f[1] == "yes"
+            else:
+                host[f[1]] = (f[0], f[2])
+        dry = machine.succeed(la_guest(f"{t_sys}/bin/switch-to-configuration dry-activate 2>&1", inst))
+        heads = {
+            "would stop the following units: ": "stop",
+            "would NOT stop the following changed units: ": "skip",
+            "would reload the following units: ": "reload",
+            "would restart the following units: ": "restart",
+            "would start the following units: ": "start",
+        }
+        acts = {k: set() for k in heads.values()}
+        guest_reexec = False
+        for line in dry.splitlines():
+            if line.strip() == "would restart systemd":
+                guest_reexec = True
+            for head, k in heads.items():
+                if line.startswith(head):
+                    acts[k].update(u.strip() for u in line[len(head):].split(",") if u.strip())
+        guest = {}
+        for u in acts["stop"] | acts["start"] | acts["restart"] | acts["reload"]:
+            if u in acts["restart"] or (u in acts["stop"] and u in acts["start"]):
+                guest[u] = "restart"
+            elif u in acts["stop"]:
+                guest[u] = "stop"
+            elif u in acts["start"]:
+                guest[u] = "start"
+            else:
+                guest[u] = "reload"
+
+        def template(u):
+            return u.split("@", 1)[0] + "@." + u.rsplit(".", 1)[1] if "@" in u else u
+
+        problems = []
+        for u, act in sorted(guest.items()):
+            h = host.get(u) or host.get(template(u))
+            if h is None or h[0] != act:
+                problems.append(f"dry-activate would {act} {u}; the plan has {h}")
+        for u in sorted(acts["skip"]):
+            if u not in host_skip and template(u) not in host_skip:
+                problems.append(f"dry-activate would not restart {u}; the plan does not skip it")
+        if guest_reexec != host_reexec:
+            problems.append(f"dry-activate re-execs systemd: {guest_reexec}; the plan: {host_reexec}")
+        covered = set(guest) | {template(u) for u in guest}
+        only = sorted(u for u, (act, why) in host.items() if why != "new" and u not in covered and "@." not in u)
+        if only:
+            shown = machine.succeed(la_guest("systemctl show -p Id,ActiveState -- " + " ".join(only), inst))
+            for block in shown.strip().split("\n\n"):
+                kv = dict(x.split("=", 1) for x in block.splitlines() if "=" in x)
+                if kv.get("ActiveState") not in (None, "inactive", "failed"):
+                    problems.append(f"the plan would {host[kv['Id']][0]} {kv['Id']}, active in the guest, but dry-activate would not")
+        print(f"plan {name}: host {sorted(host.items())} skip {sorted(host_skip)}; dry-activate {sorted(guest.items())} skip {sorted(acts['skip'])}")
+        if problems:
+            print(dry)
+            raise AssertionError(f"unit plan for {name} disagrees with dry-activate: " + "; ".join(problems))
+
+    for src, name in [("la-kit-v1", "la-kit"), ("la-hang", "la-hang"), ("la-x", "la-x"),
+                      ("la-guard", "la-guard"), ("la-lock", "la-lock"), ("la-mount", "la-mount"),
+                      ("la-user", "la-user"), ("la-bad", "la-bad"),
+                      ("la-noboot", "la-noboot"), ("la-uunit", "la-uunit"),
+                      ("la-deny-v1", "la-deny")]:
+        install(src, name)
+
+    machine.succeed(as_user("cogbox init -y --name la --network rules"))
+    machine.succeed(
+        "cp /home/testuser/.ssh/id_ed25519.pub /home/testuser/.config/cogbox/authorized_keys"
+    )
+    la_ssh = jq(".sshPort")
+    boot_and_wait("cc-la", "--name la", ssh_port=la_ssh)
+    hold_sessions()
+    base_sys = guest_system()
+    plan_agrees("kit1")
+
+    # LA1: the first plugin of a fresh instance (no plugin source ever
+    # materialized) goes live: a package, an /etc file, a service and a skill.
+    out = machine.succeed(la("cogbox plugin add path:/home/testuser/la-kit -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("applied")
+    assert "Loaded into the running instance" in out, out
+    assert a["runner"] == store["runners"]["kit1"], (a, store)
+    assert guest_system() == a["toplevel"] == system_of(a["runner"]), (a, base_sys)
+    machine.succeed(la_guest(
+        "command -v hello && grep -qx v1 /etc/la-kit && systemctl is-active la-kit.service "
+        "&& grep -qx v1 /run/la-kit-version"
+    ))
+    machine.wait_until_succeeds(la_guest(
+        "grep -q 'la-kit v1' /var/lib/cogbox/work/.claude/skills/la-kit-skill/SKILL.md"
+    ), timeout=120)
+    sessions_survive()
+    # The next boot boots exactly this: runner.path names R under the comp of
+    # the base, which is now S.
+    rp = machine.succeed(f"cat {la_icd}/runner.path").splitlines()
+    assert rp[1] == a["runner"], (rp, a)
+    base_id = machine.succeed(f"basename $(readlink {la_apply}/base)").strip()
+    assert base_id == a["base_id"], (base_id, a)
+    assert rp[2] == machine.succeed(f"jq -r .comp {la_apply}/snap/{base_id}/meta.json").strip(), rp
+
+    # LA2: an update goes live too (the service restarts with the new script).
+    plan_agrees("kit2")
+    install("la-kit-v2", "la-kit")
+    out = machine.succeed(la("cogbox plugin update la-kit --apply --name la 2>&1"))
+    print(out)
+    a = expect("applied")
+    r2 = a["runner"]
+    sys2 = guest_system()
+    assert sys2 == system_of(r2), (sys2, a)
+    machine.succeed(la_guest("grep -qx v2 /etc/la-kit && grep -qx v2 /run/la-kit-version"))
+    machine.wait_until_succeeds(la_guest(
+        "grep -q 'la-kit v2' /var/lib/cogbox/work/.claude/skills/la-kit-skill/SKILL.md"
+    ), timeout=120)
+    sessions_survive()
+    nar_v2 = jq('.plugins[] | select(.name == "la-kit") | .narHash')
+
+    # LA3: a restart boots the same runner on the fast path (no evaluation:
+    # neither pass re-execs, so nothing rewrites runner.path).
+    before = runner_record()
+    restart_la()
+    assert runner_record() == before, (before, runner_record())
+    assert booted_runner() == r2, (booted_runner(), r2)
+    assert guest_system() == sys2
+    hold_sessions()
+    # The host plan agrees with dry-activate on what the phase applies next
+    # (an activation-only change, a new oneshot, an /etc file) and on the
+    # disruptive kinds it never applies (docker, nftables, the uplink).
+    for name in ["hang", "kit3", "xguard", "docker", "nft", "net"]:
+        plan_agrees(name)
+
+    # LA3b: a rolled-back update keeps the plugin's deny under a broader user
+    # allow. A user allow for 10.99.0.0/24 lets the guest reach 10.99.0.2;
+    # la-deny version 1 denies that host (its deny is merged ahead of the
+    # allow). Version 2 drops the deny, and a login trap planted from guest
+    # root (it fails while /etc/la-deny says v2) makes the switch fail the
+    # guest's login probe: rejected/breaks_base. The rollback restores version
+    # 1, its deny is merged back ahead of the allow, and the host is denied
+    # again.
+    def la_rule_index(cidr):
+        # 1-based position of the untagged user allow `cidr` in .network.rules.
+        return jq(f'[.network.rules | to_entries[] | select(.value.allow == "{cidr}" and (.value.plugin == null)) | .key][0] + 1')
+
+    machine.succeed(as_user("cogbox rules add allow 10.99.0.0/24 --at 1 --name la"))
+    machine.succeed(probe("la", "10.99.0.2"))
+    out = machine.succeed(la("cogbox plugin add path:/home/testuser/la-deny -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("applied")
+    assert a["runner"] == store["runners"]["deny1"], (a, store)
+    sys_deny = guest_system()
+    assert tagged("la-deny", "deny", "10.99.0.2/32") == "1"
+    machine.fail(probe("la", "10.99.0.2"))
+    trap = '[ "$(cat /etc/la-deny 2>/dev/null)" = v2 ] && exit 1'
+    machine.succeed(la_guest(f"printf '%s\\n' {shlex.quote(trap)} > /etc/profile.local && runuser -l root -c true"))
+    install("la-deny-v2", "la-deny")
+    rc, out = machine.execute(la("cogbox plugin update la-deny --apply --name la 2>&1"))
+    print(out)
+    a = expect("rejected", "breaks_base")
+    check(rc == 1 and a["rollback"]["status"] == "done" and a["rollback"]["target"] == "base", (rc, a))
+    assert guest_system() == sys_deny
+    machine.succeed(la_guest("grep -qx v1 /etc/la-deny && runuser -l root -c true"))
+    assert tagged("la-deny", "deny", "10.99.0.2/32") == "1"
+    assert int(jq('[.network.rules | to_entries[] | select(.value.plugin == "la-deny") | .key][0]')) < int(la_rule_index("10.99.0.0/24")) - 1
+    machine.fail(probe("la", "10.99.0.2"))
+    rec = json.loads(machine.succeed(f"tail -n 1 {la_apply}/rollbacks.jsonl"))
+    assert rec["reason"] == "breaks_base", rec
+    assert [(n["name"], n["action"]) for n in rec["names"]] == [("la-deny", "restored")], rec
+    sessions_survive()
+    # Back to la-kit alone (the runner LA4 and later expect), the user allow
+    # dropped: without la-deny's deny that allow alone decides .2.
+    machine.succeed(la_guest("rm -f /etc/profile.local"))
+    out = machine.succeed(la("cogbox plugin del la-deny -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("applied")
+    assert a["runner"] == r2 and guest_system() == sys2, (a, r2, sys2)
+    machine.succeed(probe("la", "10.99.0.2"))
+    machine.succeed(as_user(f"cogbox rules del {la_rule_index('10.99.0.0/24')} --name la"))
+    machine.fail(probe("la", "10.99.0.2"))
+    sessions_survive()
+
+    # LA4: rollback of an add. la-hang's activation never returns: the apply
+    # unit's bound kills it, the guest reports activation_hang and reverts, and
+    # the host restores the base snapshot. Meanwhile a plugin change with
+    # COGBOX_APPLY_WAIT_MAX=5 gives up waiting (exit 69) and changes nothing.
+    bg("cogbox plugin add path:/home/testuser/la-hang -y --apply --name la", "la-hang")
+    machine.wait_until_succeeds(f"jq -e '.phase == \"guest\"' {la_apply}/active", timeout=900)
+    cfg_before = machine.succeed(f"sha256sum < {la_cfg}")
+    rc, out = machine.execute(as_user(
+        "COGBOX_APPLY_WAIT_MAX=5 cogbox plugin update la-kit --no-apply --name la 2>&1"
+    ))
+    assert rc == 69 and "busy: a live apply is finishing" in out, (rc, out)
+    assert machine.succeed(f"sha256sum < {la_cfg}") == cfg_before
+    rc, out = bg_wait("la-hang", 900)
+    print(out)
+    a = expect("rejected", "activation_hang")
+    check(rc == 1 and "'la-hang' was not applied and has been rolled back" in out, (rc, out))
+    check(a["rollback"]["status"] == "done" and a["rollback"]["target"] == "base", a)
+    check(a["rolled_back_guest"] is True, a)
+    # The guest is back on P, /etc included.
+    assert guest_system() == sys2
+    machine.succeed(la_guest(f'[ "$(readlink -f /etc/static)" = "$(readlink -f {sys2}/etc)" ]'))
+    sessions_survive()
+    # The host is back on B: no entry, no rule tagged la-hang (its deny went with
+    # it), the composition is B's bytes and runner.path is the booted runner.
+    assert jq('[.plugins[] | select(.name == "la-hang")] | length') == "0"
+    assert jq('[.network.rules[] | select(.plugin == "la-hang")] | length') == "0"
+    base_id = machine.succeed(f"basename $(readlink {la_apply}/base)").strip()
+    for f in ["flake.nix", "flake.lock"]:
+        machine.succeed(f"cmp {la_icd}/plugins-flake/{f} {la_apply}/snap/{base_id}/composition/{f}")
+    assert machine.succeed(f"sed -n 2p {la_icd}/runner.path").strip() == booted_runner() == r2
+    rec = json.loads(machine.succeed(f"tail -n 1 {la_apply}/rollbacks.jsonl"))
+    assert rec["reason"] == "activation_hang" and rec["names"][0]["name"] == "la-hang", rec
+    assert rec["names"][0]["action"] == "removed", rec
+    # The build log of the generation is available.
+    machine.succeed(as_user(f"cogbox plugin apply --log {a['gen']} --name la"))
+    # ...and the next boot takes the fast path, with no evaluation.
+    before = runner_record()
+    restart_la()
+    assert runner_record() == before
+    assert booted_runner() == r2
+    hold_sessions()
+
+    # LA5: a restart right after the guest reports activation_hang, while the
+    # inline add is still polling: `cogbox stop` ends the apply (its intent is
+    # already on disk) and the next launch finishes the rollback before it
+    # boots, so the box boots without la-hang.
+    bg("cogbox plugin add path:/home/testuser/la-hang -y --apply --name la", "la-hang2")
+    # The intent exists from the verdict until the guest's revert ends and the
+    # add finishes it, which can be a second or two, so it is polled tightly;
+    # should the add win anyway, the restart still follows a rejection.
+    machine.succeed(
+        f"timeout 900 sh -c 'until ls {la_apply}/rollback/*.intent >/dev/null 2>&1 "
+        "|| test -s /tmp/la-hang2.rc; do sleep 0.1; done'"
+    )
+    restart_la()
+    rc, out = bg_wait("la-hang2", 120)
+    # 143: the stop ended the add on its SIGTERM path and the launch finished
+    # the rollback; 1: the add finished it first.
+    print(f"LA5: the inline add exited {rc}", out)
+    assert rc in (1, 143), (rc, out)
+    assert jq('[.plugins[] | select(.name == "la-hang")] | length') == "0"
+    assert jq('[.network.rules[] | select(.plugin == "la-hang")] | length') == "0"
+    machine.fail(f"ls {la_apply}/rollback/*.intent")
+    rec = json.loads(machine.succeed(f"tail -n 1 {la_apply}/rollbacks.jsonl"))
+    assert rec["reason"] == "activation_hang" and rec["names"][0]["name"] == "la-hang", rec
+    assert booted_runner() == r2
+    assert guest_system() == sys2
+    hold_sessions()
+
+    # LA6: rollback of an update. Version 3 adds a oneshot that never finishes
+    # starting: unit_hang. The entry and the tree return to version 2, the rule
+    # only version 3 added is gone, and the rule both versions carry stays.
+    install("la-kit-v3", "la-kit")
+    rc, out = machine.execute(la("cogbox plugin update la-kit --apply --name la 2>&1"))
+    print(out)
+    a = expect("rejected", "unit_hang")
+    check(rc == 1, (rc, out))
+    assert jq('.plugins[] | select(.name == "la-kit") | .narHash') == nar_v2
+    disk = machine.succeed(as_user(
+        f"nix --extra-experimental-features 'nix-command flakes' hash path {la_icd}/plugin-sources/la-kit"
+    )).strip()
+    assert disk == nar_v2, (disk, nar_v2)
+    locked = machine.succeed(
+        "jq -r '.nodes[.nodes.root.inputs[\"p-la-kit\"]].locked.narHash' "
+        f"{la_icd}/plugins-flake/flake.lock"
+    ).strip()
+    assert locked == nar_v2, (locked, nar_v2)
+    assert tagged("la-kit", "allow", "10.99.0.5/32") == "0"
+    assert tagged("la-kit", "allow", "10.99.0.1/32") == "1"
+    assert guest_system() == sys2
+    machine.succeed(la_guest("grep -qx v2 /etc/la-kit && ! systemctl is-active la-kit-wait.service"))
+    sessions_survive()
+    install("la-kit-v2", "la-kit")
+
+    # LA6b: a plugin change waits behind a guest-phase apply and commits on top
+    # of that apply's rollback. `update la-kit` to version 3 (unit_hang again)
+    # runs in the background; once its apply is in the guest phase, a second
+    # `update la-kit` to a working version 4 waits for it (printing why), the
+    # first is rolled back to version 2, and only then does version 4 commit,
+    # from version 2, and apply live. Had it committed on top of version 3,
+    # the rollback (which restores version 2 wholesale) would have erased it.
+    install("la-kit-v3", "la-kit")
+    bg("cogbox plugin update la-kit --apply --name la", "la-v3")
+    machine.wait_until_succeeds(f"jq -e '.phase == \"guest\"' {la_apply}/active", timeout=900)
+    install("la-kit-v4", "la-kit")
+    nar_v4 = machine.succeed(as_user(
+        "nix --extra-experimental-features 'nix-command flakes' hash path /home/testuser/la-kit"
+    )).strip()
+    rc, out = machine.execute(la("cogbox plugin update la-kit --apply --name la 2>&1"))
+    print(out)
+    rc3, out3 = bg_wait("la-v3", 900)
+    print(out3)
+    check(rc3 == 1 and "has been rolled back" in out3, (rc3, out3))
+    check(rc == 0 and "waiting for the live apply of generation" in out and "Loaded into the running instance" in out, (rc, out))
+    a = expect("applied")
+    assert a["runner"] == store["runners"]["kit4"], (a, store)
+    # Version 3's rollback (to version 2) is the newest record: version 4's
+    # commit came after it, not before.
+    rec = json.loads(machine.succeed(f"tail -n 1 {la_apply}/rollbacks.jsonl"))
+    assert rec["reason"] == "unit_hang", rec
+    assert [(n["name"], n["action"]) for n in rec["names"]] == [("la-kit", "restored")], rec
+    assert jq('.plugins[] | select(.name == "la-kit") | .narHash') == nar_v4
+    disk = machine.succeed(as_user(
+        f"nix --extra-experimental-features 'nix-command flakes' hash path {la_icd}/plugin-sources/la-kit"
+    )).strip()
+    assert disk == nar_v4, (disk, nar_v4)
+    locked = machine.succeed(
+        "jq -r '.nodes[.nodes.root.inputs[\"p-la-kit\"]].locked.narHash' "
+        f"{la_icd}/plugins-flake/flake.lock"
+    ).strip()
+    assert locked == nar_v4, (locked, nar_v4)
+    assert tagged("la-kit", "allow", "10.99.0.5/32") == "0"
+    assert tagged("la-kit", "allow", "10.99.0.1/32") == "1"
+    machine.succeed(la_guest(
+        "grep -qx v4 /etc/la-kit && grep -qx v4 /run/la-kit-version && ! systemctl is-active la-kit-wait.service"
+    ))
+    sessions_survive()
+    # Back to version 2 (the runner the later legs expect).
+    install("la-kit-v2", "la-kit")
+    out = machine.succeed(la("cogbox plugin update la-kit --apply --name la 2>&1"))
+    print(out)
+    a = expect("applied")
+    assert a["runner"] == r2 and guest_system() == sys2, (a, r2, sys2)
+    assert jq('.plugins[] | select(.name == "la-kit") | .narHash') == nar_v2
+
+    # LA7: a plugin change during an apply's build supersedes it: the apply ends
+    # `superseded` with the guest untouched, the change commits, and the next
+    # apply brings both changes live.
+    machine.succeed(la("cogbox plugin add path:/home/testuser/la-x -y --no-apply --name la"))
+    bg("cogbox plugin apply --json --name la", "la-sup")
+    machine.wait_until_succeeds(f"jq -e '.phase == \"build\"' {la_apply}/active", timeout=300)
+    machine.succeed(la("cogbox plugin add path:/home/testuser/la-guard -y --no-apply --name la"))
+    rc, out = bg_wait("la-sup", 120)
+    print(out)
+    sup = json.loads([line for line in out.splitlines() if line.startswith('{"apply"')][-1])["apply"]
+    check(rc == 0 and sup["result"] == "superseded", (rc, out))
+    assert guest_system() == sys2
+    assert jq('[.plugins[].name] | join(",")') == "la-kit,la-x,la-guard"
+    out = machine.succeed(la("cogbox plugin apply --json --name la"))
+    print(out)
+    a = expect("applied")
+    sys5 = guest_system()
+    assert sys5 == a["toplevel"]
+    machine.succeed(la_guest("test -f /etc/la-x"))
+    sessions_survive()
+    for name in ["guard", "lock", "user", "mount"]:
+        plan_agrees(name)
+
+    # LA8: rollback of a removal. la-guard's activation hangs once /etc/la-x is
+    # gone, so `del la-x` is rejected: la-x is reinserted with its source, its
+    # tagged deny comes back, and its allow (which the del removed) does not.
+    assert tagged("la-x", "deny", "10.99.0.9/32") == "1"
+    nar_x = jq('.plugins[] | select(.name == "la-x") | .narHash')
+    rc, out = machine.execute(la("cogbox plugin del la-x -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("rejected", "activation_hang")
+    check(rc == 1, (rc, out))
+    assert jq('[.plugins[].name] | join(",")') == "la-kit,la-x,la-guard"
+    disk = machine.succeed(as_user(
+        f"nix --extra-experimental-features 'nix-command flakes' hash path {la_icd}/plugin-sources/la-x"
+    )).strip()
+    assert disk == nar_x, (disk, nar_x)
+    assert tagged("la-x", "deny", "10.99.0.9/32") == "1"
+    assert tagged("la-x", "allow", "10.99.0.8/32") == "0"
+    rec = json.loads(machine.succeed(f"tail -n 1 {la_apply}/rollbacks.jsonl"))
+    assert [(n["name"], n["action"]) for n in rec["names"]] == [("la-x", "reinserted")], rec
+    assert guest_system() == sys5
+    machine.succeed(la_guest("test -f /etc/la-x"))
+    sessions_survive()
+
+    # LA9: a lockout only a fresh connection sees. la-lock refuses every ssh
+    # login at PAM's account stage without restarting sshd, so the guest's own
+    # checks pass; with `ControlMaster auto` in the user's ssh config and a
+    # master connection open, an apply hop that reused it would get in. Every
+    # hop opens its own connection, so the host loses the guest, the dead-man
+    # reverts it at W, and the change is rejected/unreachable and rolled back.
+    machine.succeed(as_user(
+        "mkdir -p ~/.ssh && printf 'Host 127.0.0.1\\n\\tControlMaster auto\\n"
+        "\\tControlPath /tmp/la-cm-%%r@%%h:%%p\\n\\tControlPersist 900\\n' > ~/.ssh/config"
+    ))
+    machine.succeed(as_user("cogbox ssh --name la true"))
+    machine.succeed(f"test -S /tmp/la-cm-root@127.0.0.1:{la_ssh}")
+    rc, out = machine.execute(la("cogbox plugin add path:/home/testuser/la-lock -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("rejected", "unreachable")
+    check(rc == 1 and "recovered" in a["detail"], (rc, a))
+    check(a["rollback"]["status"] == "done", a)
+    machine.succeed(f"test -S /tmp/la-cm-root@127.0.0.1:{la_ssh}")
+    machine.succeed(as_user(
+        f"ssh -O exit -o ControlPath=/tmp/la-cm-root@127.0.0.1:{la_ssh} -p {la_ssh} root@127.0.0.1; rm -f ~/.ssh/config"
+    ))
+    assert jq('[.plugins[] | select(.name == "la-lock")] | length') == "0"
+    assert guest_system() == sys5
+    machine.succeed(as_user(
+        f"ssh {SSH_OPTS} -o IdentitiesOnly=yes -i /home/testuser/.local/share/cogbox/cogbox_ed25519 "
+        f"-p {la_ssh} root@127.0.0.1 true"
+    ))
+    sessions_survive()
+
+    # LA10: `cogbox init` on the running instance leaves the base alone.
+    base_before = machine.succeed(f"readlink {la_apply}/base; cat {la_apply}/base/meta.json")
+    machine.succeed(as_user("cogbox init -y --name la"))
+    assert machine.succeed(f"readlink {la_apply}/base; cat {la_apply}/base/meta.json") == base_before
+    sessions_survive()
+
+    # LA11: never-overridable refusals. A user@ change (skipped_units) and then
+    # a new mount unit (restart_only_units, which a mixed plan reports first)
+    # are not loaded live; each is kept for the next boot (K := S) with its
+    # runner recorded.
+    rc, out = machine.execute(la("cogbox plugin add path:/home/testuser/la-user -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("restart_required", "skipped_units")
+    check(rc == 0 and a["overridable"] is False and a["built_id"], a)
+    rc, out = machine.execute(la("cogbox plugin add path:/home/testuser/la-mount -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("restart_required", "restart_only_units")
+    check(rc == 0 and a["overridable"] is False and a["built_id"], a)
+    built = a["built_id"]
+    r9 = a["runner"]
+    assert r9 == store["runners"]["mount"], (a, store)
+    assert machine.succeed(f"sed -n 2p {la_icd}/runner.path").strip() == r9
+    assert guest_system() == sys5
+    machine.fail(la_guest("mountpoint -q /mnt/la-mount"))
+
+    # LA12: a composition that does not evaluate (an option type error) is
+    # rejected/eval_error before the guest is touched, and rolled back to K, so
+    # the two restart_required changes above survive.
+    rc, out = machine.execute(la("cogbox plugin add path:/home/testuser/la-bad -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("rejected", "eval_error")
+    check(rc == 1 and a["rollback"]["target"] == "built" and a["rollback"]["target_id"] == built, a)
+    assert jq('[.plugins[].name] | join(",")') == "la-kit,la-x,la-guard,la-user,la-mount"
+    assert machine.succeed(f"sed -n 2p {la_icd}/runner.path").strip() == r9
+    assert guest_system() == sys5
+    build_log = machine.succeed(as_user(f"cogbox plugin apply --log {a['gen']} --name la"))
+    assert "is not of type" in build_log, build_log
+    status = json.loads(machine.succeed(as_user("cogbox plugin apply --status --json --name la")))["status"]
+    assert status["records_id"] and len(status["rollbacks"]) >= 5, status
+    sessions_survive()
+
+    # LA13: the kill switch.
+    out = machine.succeed(as_user("COGBOX_LIVE_APPLY=0 cogbox plugin apply --json --name la"))
+    assert json.loads(out)["apply"]["reason"] == "disabled", out
+
+    # LA14: a boot whose snapshot fails (here a tmpfs over apply/snap, so the
+    # take's hard links cross a filesystem) still boots, on the fast path, with
+    # no base: applies answer no_boot_record. The next good boot has a base again.
+    machine.succeed(f"mount -t tmpfs -o size=1m,uid=1000,gid=100,mode=0755 la-snap {la_apply}/snap")
+    restart_la()
+    assert booted_runner() == r9
+    machine.fail(f"test -e {la_apply}/base")
+    out = machine.succeed(la("cogbox plugin apply --json --name la"))
+    a = json.loads(out)["apply"]
+    check(a["result"] == "restart_required" and a["reason"] == "no_boot_record", a)
+    stop_instance("cc-la", name="la")
+    machine.succeed(f"umount {la_apply}/snap")
+    boot_and_wait("cc-la", "--name la", ssh_port=la_ssh)
+    machine.succeed(f"test -f {la_apply}/base/meta.json")
+    out = machine.succeed(la("cogbox plugin apply --json --name la"))
+    print(out)
+    a = expect("already_live")
+
+    # LA14b: what a switch starts beyond its plan. la-noboot turns docker's
+    # enableOnBoot off: only multi-user.target.wants/docker.service goes, so
+    # the add applies live and docker keeps running. With docker then down, as
+    # after a boot with la-noboot, removing it brings the link back, and the
+    # switch's start of multi-user.target would start dockerd although no unit
+    # file changed: refused (disruptive_units, overridable), docker untouched.
+    out = machine.succeed(la("cogbox plugin add path:/home/testuser/la-noboot -y --apply --name la 2>&1"))
+    print(out)
+    expect("applied")
+    machine.succeed(la_guest("systemctl is-active docker.service"))
+    machine.succeed(la_guest("systemctl stop docker.service"))
+    rc, out = machine.execute(la("cogbox plugin del la-noboot -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("restart_required", "disruptive_units")
+    check(rc == 0 and a["overridable"] is True and "docker.service" in a["detail"], a)
+    assert machine.succeed(f"sed -n 2p {la_icd}/runner.path").strip() == r9
+    machine.fail(la_guest("systemctl is-active docker.service"))
+    machine.succeed(la_guest("systemctl start docker.service"))
+
+    # LA14c: a user unit (etc/systemd/user). Adding one applies live; removing
+    # it would have switch-to-configuration's user pass stop it in every
+    # running user manager, which neither the host plan nor dry-activate
+    # shows: refused, never overridable.
+    out = machine.succeed(la("cogbox plugin add path:/home/testuser/la-uunit -y --apply --name la 2>&1"))
+    print(out)
+    expect("applied")
+    machine.succeed(la_guest("test -f /etc/systemd/user/la-uunit.service"))
+    rc, out = machine.execute(la("cogbox plugin del la-uunit -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("restart_required", "restart_only_units")
+    check(rc == 0 and a["overridable"] is False and "la-uunit.service" in a["detail"], a)
+    machine.succeed(la_guest("test -f /etc/systemd/user/la-uunit.service"))
+    stop_instance("cc-la", name="la")
+
+    # LA15-17 (instance lafin, only ever booted without plugins): a pending
+    # rollback intent is finished by the launcher before it boots; a target
+    # snapshot that cannot be read takes the fail-closed tier; and a rollback
+    # that cannot finish at all makes `cogbox start` and the plugin changes exit
+    # 78 until `--abandon-rollback`.
+    fin_icd = "/home/testuser/.config/cogbox/instances/lafin"
+    fin_cfg = f"{fin_icd}/config.json"
+    fin_apply = f"{fin_icd}/apply"
+    machine.succeed(as_user("cogbox init -y --name lafin --network rules"))
+    fin_ssh = jq(".sshPort", fin_cfg)
+    boot_and_wait("cc-lafin", "--name lafin", ssh_port=fin_ssh)
+    stop_instance("cc-lafin", name="lafin")
+
+    def plant(gen, scope):
+        target = machine.succeed(f"basename $(readlink {fin_apply}/base)").strip()
+        intent = json.dumps({"G": gen, "reason": "activation_hang", "target": "base",
+                             "target_id": target, "scope": scope})
+        machine.succeed(as_user(
+            f"mkdir -p {fin_apply}/rollback && printf '%s' {shlex.quote(intent)} > {fin_apply}/rollback/{gen}.intent"
+        ))
+        return target
+
+    # LA15: planted intent, finished by `cogbox start`.
+    machine.succeed(la("cogbox plugin add path:/home/testuser/la-x -y --no-apply --name lafin"))
+    plant("1111111111111111", [{"name": "la-x", "action": "removed"}])
+    boot_and_wait("cc-lafin", "--name lafin", ssh_port=fin_ssh)
+    assert jq(".plugins | length", fin_cfg) == "0"
+    assert jq('[.network.rules[] | select(.plugin == "la-x")] | length', fin_cfg) == "0"
+    rec = json.loads(machine.succeed(f"tail -n 1 {fin_apply}/rollbacks.jsonl"))
+    assert rec["gen"] == "1111111111111111" and rec["status"] == "done", rec
+    machine.fail(la_guest("test -e /etc/la-x", "lafin"))
+    stop_instance("cc-lafin", name="lafin")
+
+    # LA16: the target snapshot is unreadable (incomplete: no meta.json), so the
+    # same finish takes the fail-closed tier: exactly the intent's names go.
+    machine.succeed(la("cogbox plugin add path:/home/testuser/la-x -y --no-apply --name lafin"))
+    target = plant("2222222222222222", [{"name": "la-x", "action": "removed"}])
+    machine.succeed(f"mv {fin_apply}/snap/{target}/meta.json {fin_apply}/snap/{target}/meta.json.off")
+    boot_and_wait("cc-lafin", "--name lafin", ssh_port=fin_ssh)
+    assert jq(".plugins | length", fin_cfg) == "0"
+    rec = json.loads(machine.succeed(f"tail -n 1 {fin_apply}/rollbacks.jsonl"))
+    assert rec["gen"] == "2222222222222222" and rec["status"] == "removed", rec
+    machine.fail(f"test -e {fin_icd}/plugin-sources/la-x")
+    stop_instance("cc-lafin", name="lafin")
+
+    # LA17: a rollback that cannot be saved (a read-only config dir): exit 78
+    # with the stamped line, from the launcher and from a plugin change; `list`
+    # still runs; --abandon-rollback moves the intent aside and the box boots.
+    plant("3333333333333333", [])
+    machine.succeed(f"chmod 0555 {fin_icd}")
+    rc, out = machine.execute(as_user("cogbox start --no-ssh --name lafin 2>&1"))
+    print(out)
+    check(rc == 78 and "cogbox: an automatic plugin rollback could not be finished" in out, (rc, out), fin_apply)
+    rc, out = machine.execute(la("cogbox plugin add path:/home/testuser/la-x -y --no-apply --name lafin 2>&1"))
+    check(rc == 78 and "cogbox: an automatic plugin rollback could not be finished" in out, (rc, out), fin_apply)
+    machine.succeed(as_user("cogbox plugin list --name lafin"))
+    machine.succeed(as_user("cogbox plugin apply --abandon-rollback -y --name lafin"))
+    machine.succeed(f"ls {fin_apply}/abandoned/3333333333333333.intent.*")
+    machine.fail(f"ls {fin_apply}/rollback/*.intent")
+    machine.succeed(f"chmod 0755 {fin_icd}")
+    boot_and_wait("cc-lafin", "--name lafin", ssh_port=fin_ssh)
+    stop_instance("cc-lafin", name="lafin")
+
+    # LA18: a rollback on a network=full instance, whose `.network` is a
+    # string: there is no rules list to restore and no reload, and the rollback
+    # still completes (status done): no pending rollback, and plugin changes
+    # still run afterwards.
+    full_icd = "/home/testuser/.config/cogbox/instances/lafull"
+    full_cfg = f"{full_icd}/config.json"
+    full_apply = f"{full_icd}/apply"
+    machine.succeed(as_user("cogbox init -y --name lafull --network full"))
+    assert jq(".network", full_cfg) == "full"
+    full_ssh = jq(".sshPort", full_cfg)
+    boot_and_wait("cc-lafull", "--name lafull", ssh_port=full_ssh)
+    out = machine.succeed(la("cogbox plugin add path:/home/testuser/la-kit -y --apply --name lafull 2>&1"))
+    print(out)
+    a = expect("applied", apply_dir=full_apply)
+    assert a["runner"] == r2, (a, r2)
+    install("la-kit-v3", "la-kit")
+    rc, out = machine.execute(la("cogbox plugin update la-kit --apply --name lafull 2>&1"))
+    print(out)
+    a = expect("rejected", "unit_hang", apply_dir=full_apply)
+    check(rc == 1 and a["rollback"]["status"] == "done" and a["rollback"]["target"] == "base", (rc, a), full_apply)
+    install("la-kit-v2", "la-kit")
+    assert jq(".network", full_cfg) == "full"
+    assert jq('.plugins[] | select(.name == "la-kit") | .narHash', full_cfg) == nar_v2
+    machine.fail(f"ls {full_apply}/rollback/*.intent")
+    status = json.loads(machine.succeed(as_user("cogbox plugin apply --status --json --name lafull")))["status"]
+    check(status["rollback_pending"] == 0 and not status["in_flight"], status, full_apply)
+    machine.succeed(la_guest("grep -qx v2 /etc/la-kit && ! systemctl is-active la-kit-wait.service", "lafull"))
+    machine.succeed(as_user("cogbox plugin list --name lafull"))
+    machine.succeed(la("cogbox plugin del la-kit -y --no-apply --name lafull"))
+    assert jq(".plugins | length", full_cfg) == "0"
+    stop_instance("cc-lafull", name="lafull")
+
+    # LA19: the hosted guest profile (packages.cogbox-hosted, what the GCE and
+    # PVE hosts boot), whose unit set differs from the workstation's. Its two
+    # volumes, which those hosts carve, format and label on their disk, are
+    # sparse files here behind the same device paths. The host plan agrees
+    # with the hosted guest's own dry-activate; a clean add applies live; an
+    # add whose activation hangs is rejected and rolled back.
+    hosted = store["hosted"]
+    hcogbox = f"{hosted['cogbox']}/bin/cogbox"
+    lah_icd = "/home/testuser/.config/cogbox/instances/lah"
+    lah_cfg = f"{lah_icd}/config.json"
+    lah_apply = f"{lah_icd}/apply"
+
+    def lah(cmd):
+        return as_user(f"{LA_ENV} {hcogbox} {cmd}")
+
+    def hosted_fixture(name):
+        if name in hosted["systems"]:
+            return hosted["systems"][name]
+        return system_of(hosted["runners"][name])
+
+    machine.succeed(
+        "mkdir -p /var/lib/la-hosted /dev/cogworx-guest"
+        " && truncate -s 4G /var/lib/la-hosted/pool.img /var/lib/la-hosted/store.img"
+        " && mkfs.ext4 -q -L cogworx-guest /var/lib/la-hosted/pool.img"
+        " && mkfs.ext4 -q -L cogworx-store-rw /var/lib/la-hosted/store.img"
+        " && chown testuser /var/lib/la-hosted/pool.img /var/lib/la-hosted/store.img"
+        " && ln -sfn /var/lib/la-hosted/pool.img /dev/cogworx-guest/pool"
+        " && ln -sfn /var/lib/la-hosted/store.img /dev/cogworx-guest/store"
+    )
+    machine.succeed(lah("init -y --name lah --network rules"))
+    lah_ssh = jq(".sshPort", lah_cfg)
+    machine.succeed(lah("start --no-ssh --name lah"))
+    machine.wait_until_succeeds(as_user(f"ssh {SSH_OPTS} -p {lah_ssh} root@127.0.0.1 true"), timeout=600)
+    lah_base = machine.succeed("sed -n 2p /run/user/1000/cogbox-lah/booted-runner").strip()
+    assert guest_system("lah") == system_of(lah_base), (guest_system("lah"), lah_base)
+    machine.succeed(la_guest("mountpoint -q /var/lib/cogbox-guest", "lah"))
+    for name in ["kit2", "docker", "nft", "net"]:
+        plan_agrees(f"hosted {name}", inst="lah", target=hosted_fixture(name))
+    out = machine.succeed(lah("plugin add path:/home/testuser/la-kit -y --apply --name lah 2>&1"))
+    print(out)
+    a = expect("applied", apply_dir=lah_apply)
+    check(a["runner"] == hosted["runners"]["kit2"], (a, hosted), lah_apply)
+    sys_h = guest_system("lah")
+    assert sys_h == system_of(a["runner"]), (sys_h, a)
+    machine.succeed(la_guest("grep -qx v2 /etc/la-kit && systemctl is-active la-kit.service && grep -qx v2 /run/la-kit-version", "lah"))
+    rc, out = machine.execute(lah("plugin add path:/home/testuser/la-hang -y --apply --name lah 2>&1"))
+    print(out)
+    a = expect("rejected", "activation_hang", apply_dir=lah_apply)
+    check(rc == 1 and a["rollback"]["status"] == "done" and a["rolled_back_guest"] is True, (rc, a), lah_apply)
+    assert guest_system("lah") == sys_h
+    machine.succeed(la_guest(f'[ "$(readlink -f /etc/static)" = "$(readlink -f {sys_h}/etc)" ]', "lah"))
+    assert jq('[.plugins[] | select(.name == "la-hang")] | length', lah_cfg) == "0"
+    assert machine.succeed(f"sed -n 2p {lah_icd}/runner.path").strip() == hosted["runners"]["kit2"]
+    machine.succeed(lah("stop --name lah"))
+    machine.wait_until_fails("test -e /run/user/1000/cogbox-lah/pid", timeout=30)
+
 with subtest("Phase F: default harnesses wired into the VM (codex/pi opt-in, excluded)"):
     boot_and_wait("cc-default", "", ssh_port=2222)
     # Built-in harness launchers are on $PATH inside the VM unconditionally

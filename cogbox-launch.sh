@@ -611,29 +611,85 @@ fi
 if [ "$EXCLUSIVE_INIT" -eq 1 ] && [ -e "$INSTANCE_CONFIG_DIR" ]; then
 	die "instance '$EFFECTIVE_NAME' already exists (--exclusive)" 73
 fi
+# Whether the instance with runtime dir $1 runs: its lifetime lock
+# (<runtime>.lock, held for the whole life of a launcher and its QEMU) is held.
+# A momentary shared probe, like the CLI's liveness probe (the lifetime lock
+# below waits 0.2s for exactly that). No lock file, or one that cannot be
+# opened: not running, which is the direction that refuses to boot a rejected
+# change.
+apply_instance_running() {
+	local fd rc
+	[ -e "$1.lock" ] || return 1
+	# The braces keep 2>/dev/null to this exec: on a bare `exec` it would
+	# redirect the launcher's own stderr for good.
+	{ exec {fd}<"$1.lock"; } 2>/dev/null || return 1
+	rc=0
+	$CONFIG_FLOCK -n -s "$fd" || rc=$?
+	exec {fd}<&-
+	[ "$rc" -ne 0 ]
+}
 # Live-apply housekeeping, every pass, under the config lock just taken (the
-# verb inherits CONFIG_LOCK_FD and never takes the lock itself). Today it does
-# one thing, and only with --init-only (passed exactly when INIT_ONLY=1):
-# empty <icd>/apply/trash/, bounded at 30s. The snapshot GC below only RENAMES
-# trees into the trash, because the daemon pass must own a live QEMU within
-# `cogbox start`'s 60s; `start` runs its init pass before that window, so the
-# one O(files) delete happens there. Best-effort: whatever the verb's exit
-# status, the pass continues (it never fails a boot). Bounded from outside too
-# (TERM at 45s, KILL 5s later): the verb's own 30s budget is checked between
-# directory entries, so a single wedged unlink or readdir would escape it.
+# verb inherits CONFIG_LOCK_FD and never takes the lock itself). On a stopped
+# instance it signals a live apply's holder, and, when the apply flock is free,
+# stops an orphaned build unit and resolves an interrupted apply's
+# inflight.json; on a running one (`cogbox init` on a live instance) it never
+# interferes with an apply. Then it finishes a pending automatic plugin
+# rollback, and only with --init-only (passed exactly when INIT_ONLY=1) it
+# empties <icd>/apply/trash/, bounded at 30s. The snapshot GC below only
+# RENAMES trees into the trash, because the daemon pass must own a live QEMU
+# within `cogbox start`'s 60s; `start` runs its init pass before that window,
+# so the one O(files) delete happens there. Bounded from outside too (TERM at
+# 360s, KILL 5s later; its own legs add up to 330s: holder 40, unit stop 20,
+# rollback finish 240, trash 30): its budgets are checked between steps, so a
+# single wedged syscall would escape them. Its exit status is only a warning:
+# what decides the boot is the intent check after it.
 if [ -d "$INSTANCE_CONFIG_DIR/apply" ]; then
+	# The instance's runtime dir, as RUNTIME below: <runtime>.lock is the
+	# lifetime lock that says whether the instance runs.
+	_apply_rt="$BASE_RUNTIME"
+	[ -z "$INSTANCE_NAME" ] || _apply_rt="${BASE_RUNTIME}-${INSTANCE_NAME}"
 	# Unsubstituted source (the no-VM launcher tests) resolves `cogbox` on PATH.
 	_preboot_bin="@cogbox@"
 	case "$_preboot_bin" in @*) _preboot_bin=$(command -v cogbox 2>/dev/null) || _preboot_bin="" ;; esac
+	_preboot_rc=none
 	if [ -n "$_preboot_bin" ]; then
-		_preboot_args=("$INSTANCE_CONFIG_DIR")
+		_preboot_args=("$INSTANCE_CONFIG_DIR" --runtime "$_apply_rt")
+		[ -z "$INSTANCE_NAME" ] || _preboot_args+=(--name "$INSTANCE_NAME")
 		[ "$INIT_ONLY" -ne 1 ] || _preboot_args+=(--init-only)
 		_preboot_rc=0
-		timeout -k 5 45 "$_preboot_bin" __plugin-apply-preboot "${_preboot_args[@]}" || _preboot_rc=$?
-		[ "$_preboot_rc" -eq 0 ] \
+		timeout -k 5 360 "$_preboot_bin" __plugin-apply-preboot "${_preboot_args[@]}" || _preboot_rc=$?
+		[ "$_preboot_rc" -eq 0 ] || [ "$_preboot_rc" -eq 78 ] \
 			|| echo "cogbox-launch: warning: live-apply housekeeping (__plugin-apply-preboot) exited $_preboot_rc; continuing" >&2
 	fi
-	unset _preboot_bin _preboot_args _preboot_rc
+	# An automatic plugin rollback that could not be finished (its intent is
+	# still in apply/rollback/, whatever the verb did: it may have crashed, been
+	# killed, or be missing) must never let the rejected change boot. On a
+	# stopped instance the pass exits 78 here, before any snapshot or
+	# promotion, with the message stamped `cogbox: ` (the GCE/PVE supervisor
+	# publishes exactly those lines as the boot error; this script's own die
+	# prefix would not match). The verb printed it when it exited 78; otherwise
+	# it is printed here, naming the verb's exit status. On a running instance
+	# (an init pass, which boots nothing) a live apply may have just written
+	# that intent, so it only warns.
+	_apply_intent=0
+	for _f in "$INSTANCE_CONFIG_DIR"/apply/rollback/*.intent; do
+		if [ -e "$_f" ] || [ -L "$_f" ]; then _apply_intent=1; break; fi
+	done
+	if [ "$_apply_intent" = 1 ]; then
+		if apply_instance_running "$_apply_rt"; then
+			echo "cogbox-launch: warning: an automatic plugin rollback is pending; it finishes before the next plugin change or start" >&2
+		else
+			if [ "$_preboot_rc" != 78 ]; then
+				case "$_preboot_rc" in
+					none) _why="the live-apply housekeeping could not run" ;;
+					*) _why="the live-apply housekeeping exited $_preboot_rc" ;;
+				esac
+				echo "cogbox: an automatic plugin rollback could not be finished ($_why); free disk space, or run 'cogbox plugin apply --abandon-rollback${INSTANCE_NAME:+ -n $INSTANCE_NAME}'" >&2
+			fi
+			exit 78
+		fi
+	fi
+	unset _preboot_bin _preboot_args _preboot_rc _apply_rt _apply_intent _f _why
 fi
 release_config_lock() { exec {CONFIG_LOCK_FD}>&-; }
 # Retake the config lock after a release (the re-pin confirmation builds

@@ -6,6 +6,9 @@ const parse = @import("../parse.zig");
 const help = @import("../help.zig");
 const exit_codes = @import("../exit.zig");
 const paths = @import("../paths.zig");
+const config_lock = @import("../config_lock.zig");
+const ssh_verb = @import("ssh.zig");
+const plugin_module = @import("plugin_module");
 const linux = std.os.linux;
 
 const Identity = struct {
@@ -47,6 +50,7 @@ fn parseRecord(data: []const u8, result: bool) !Record {
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
+    env: *const std.process.Environ.Map,
     p: *const paths.Paths,
     argv: []const []const u8,
 ) !void {
@@ -101,6 +105,11 @@ pub fn run(
         // this an idempotent completed stop. Missing/failed records still fail.
         if (id.start != start) return reportCompleted(allocator, io, result_path, identity);
     }
+    // A live plugin apply's step, before QEMU is signalled (at most 5 s, no
+    // config lock, never a SIGKILL of the apply; skipped with --force): a
+    // rejection the guest recorded must reach the host before the guest
+    // powers off.
+    if (!force and !@import("platform").darwin) applyStep(allocator, io, env, p, name, inst_runtime);
     // Linux signals through a pidfd. Darwin sends a nonce-bound request that
     // the launcher consumes itself; neither path signals a potentially reused PID.
     if (@import("platform").darwin) {
@@ -143,6 +152,29 @@ pub fn run(
         return reportCompleted(allocator, io, result_path, identity);
     }
     util.die(allocator, io, "stop", exit_codes.software, "launcher did not finish shutdown within 65s; termination is unconfirmed", .{});
+}
+
+/// The live apply's lock-free stop step (plugin_module.apply.stopStep, spec
+/// 4.8): when apply/active or inflight.json exists, SIGTERM the apply holder
+/// (at most 2 s), then, holding the apply flock by LOCK_NB, one `status` hop
+/// under a 3 s kill; a rejecting verdict it reads becomes the rollback intent
+/// the next launch finishes. Best-effort and silent: stop goes on regardless.
+fn applyStep(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, p: *const paths.Paths, name: ?[]const u8, runtime: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const icd = paths.instanceConfigDir(arena, p, name) catch return;
+    const cwd = std.Io.Dir.cwd();
+    const active = std.fs.path.join(arena, &.{ icd, "apply", "active" }) catch return;
+    const inflight = std.fs.path.join(arena, &.{ icd, "apply", "inflight.json" }) catch return;
+    const has_active = if (cwd.access(io, active, .{})) |_| true else |_| false;
+    const has_inflight = if (cwd.access(io, inflight, .{})) |_| true else |_| false;
+    if (!has_active and !has_inflight) return;
+    const lock = config_lock.openLockFile(arena, io, p, name, ".apply.lock") catch null;
+    defer if (lock) |f| f.close(io);
+    var ctx = plugin_module.instanceCtx(arena, io, env, name, icd, runtime) catch return;
+    if (std.c.geteuid() == 0 and p.real_uid != 0) ctx.real_uid = p.real_uid;
+    _ = plugin_module.apply.stopStep(arena, &ctx, if (lock) |f| f.handle else -1, ssh_verb.defaultIdentity(arena, io, p), .{});
 }
 
 fn reportCompleted(allocator: std.mem.Allocator, io: std.Io, result_path: []const u8, identity: ?Identity) !void {

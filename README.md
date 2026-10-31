@@ -172,9 +172,11 @@ Additional-directory grants are launch-only and do not change the `config.json` 
 | 64 | EX_USAGE: bad CLI args, unknown verb, unknown flag |
 | 65 | EX_DATAERR: invalid value or wrong-type directory input |
 | 66 | EX_NOINPUT: missing or inaccessible config, file, or directory |
+| 69 | EX_UNAVAILABLE: a plugin change gave up waiting for a live apply that is finishing; nothing changed |
 | 70 | EX_SOFTWARE: internal/system error |
 | 73 | EX_CANTCREAT: exclusive initialization found an existing name |
 | 75 | EX_TEMPFAIL: already running, port collision |
+| 78 | EX_CONFIG: an automatic plugin rollback could not be finished; the instance does not start and plugin changes refuse until disk space is freed or `cogbox plugin apply --abandon-rollback` is run |
 
 ### Examples
 
@@ -335,6 +337,11 @@ Two mechanisms, both folding NixOS modules into the instance's VM:
   cogbox plugin add 'github:org/observability#loki' -n work
   cogbox plugin update
   ```
+
+  On a running VM sandbox a plugin change is loaded live, without a
+  restart, when nothing it would restart ends sessions or the network, and
+  a change the sandbox proves broken is rolled back automatically -- see
+  [Live apply](docs/plugins.md#live-apply-vm-sandboxes).
 
 Host-side data locations can be overridden with `COGBOX_*` environment
 variables -- see [Internals](docs/internals.md#host-side-path-overrides).

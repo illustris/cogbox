@@ -39,6 +39,6 @@ pub fn run(
 		}
 	}
 
-	try stop.run(allocator, io, p, stop_argv.items);
+	try stop.run(allocator, io, env, p, stop_argv.items);
 	try start.run(allocator, io, env, p, argv);
 }

@@ -96,9 +96,16 @@ pub fn dispatch(
 /// the guard above; were it ever reached there, an unresolvable store simply
 /// reports nothing bound and no spec is seeded (fail closed, as today).
 pub fn maybeReload(allocator: std.mem.Allocator, io: std.Io, runtime_path: []const u8, loaded: *config.Loaded) !void {
+	if (try reloadLive(allocator, io, runtime_path, loaded)) try announce(allocator, io, "Rules reloaded.", .{});
+}
+
+/// maybeReload without its stdout line: true when passt was signalled. For a
+/// caller whose stdout is a machine-read report (the live apply's rollback,
+/// which `cogbox plugin apply --json` runs before its one JSON line).
+pub fn reloadLive(allocator: std.mem.Allocator, io: std.Io, runtime_path: []const u8, loaded: *config.Loaded) !bool {
 	const pid_path = try std.fs.path.join(allocator, &.{ runtime_path, "passt.pid" });
 	defer allocator.free(pid_path);
-	std.Io.Dir.cwd().access(io, pid_path, .{}) catch return;
+	std.Io.Dir.cwd().access(io, pid_path, .{}) catch return false;
 
 	const net = try loaded.network();
 	var net_val: std.json.Value = net.*;
@@ -137,7 +144,7 @@ pub fn maybeReload(allocator: std.mem.Allocator, io: std.Io, runtime_path: []con
 	try reload.writeWireFiles(allocator, io, runtime_path, net_val, l7Base(loaded), dirs.global, dirs.instance, null, .preserve);
 	const sent = try reload.maybeSignalPasst(allocator, io, runtime_path);
 	_ = try reload.maybeSignalL7proxy(allocator, io, runtime_path);
-	if (sent) try announce(allocator, io, "Rules reloaded.", .{});
+	return sent;
 }
 
 /// Resolved secret-store directories (caller owns both slices).
@@ -350,30 +357,11 @@ fn cmdAdd(
 		a.cidr;
 	defer if (a.proto != null) allocator.free(spec);
 
-	// The 0-based index of the rule object once inserted, so an optional --plugin
-	// tag can be stamped onto exactly it.
-	var inserted_idx: usize = undefined;
-	if (a.pos) |p| {
-		rule.insertAt(tree_alloc, rules_arr, p, a.action, spec) catch |err| switch (err) {
-			error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
-			error.InvalidCidr => return die(allocator, io, "invalid rule: {s}", .{spec}, 65),
-			else => return err,
-		};
-		inserted_idx = p - 1;
-	} else {
-		const n = rule.append(tree_alloc, rules_arr, a.action, spec) catch |err| switch (err) {
-			error.InvalidCidr => return die(allocator, io, "invalid rule: {s}", .{spec}, 65),
-			else => return err,
-		};
-		inserted_idx = n - 1;
-	}
-
-	// --plugin NAME: tag the inserted rule so `plugin del NAME` removes exactly it
-	// (the same `"plugin"` field the plugin verb's merge stamps).
-	if (a.plugin) |tag| {
-		const obj = &rules_arr.items[inserted_idx].object;
-		try obj.put(tree_alloc, try tree_alloc.dupe(u8, "plugin"), .{ .string = try tree_alloc.dupe(u8, tag) });
-	}
+	insertAddRule(tree_alloc, rules_arr, a, spec) catch |err| switch (err) {
+		error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
+		error.InvalidCidr => return die(allocator, io, "invalid rule: {s}", .{spec}, 65),
+		else => return err,
+	};
 
 	try config.save(allocator, io, args.config_path, loaded.root().*);
 	const action_str = switch (a.action) {
@@ -386,6 +374,32 @@ fn cmdAdd(
 		try announce(allocator, io, "Added: {s} {s}", .{ action_str, spec });
 	}
 	try maybeReload(allocator, io, args.runtime_path, loaded);
+}
+
+/// `rules add`'s edit of the loaded tree: insert the rule `spec` (at `a.pos`,
+/// else last) and, with `--plugin NAME`, stamp it `"plugin": NAME` (so
+/// `plugin del NAME` removes exactly it, the same field the plugin verb's merge
+/// stamps) and `"approved": true`. The control plane applies an admin-approved
+/// rule request of a plugin through this path, and a live apply's rollback keeps
+/// a tagged allow that carries the marker: it was granted by an approval, not by
+/// the plugin change being rolled back. A manual `--plugin` add counts alike. A
+/// plugin's own merge strips the field (mutate.prependTaggedRules).
+fn insertAddRule(tree_alloc: std.mem.Allocator, rules_arr: *std.json.Array, a: cli.AddArgs, spec: []const u8) !void {
+	// The 0-based index of the rule object once inserted, so an optional --plugin
+	// tag can be stamped onto exactly it.
+	var inserted_idx: usize = undefined;
+	if (a.pos) |p| {
+		try rule.insertAt(tree_alloc, rules_arr, p, a.action, spec);
+		inserted_idx = p - 1;
+	} else {
+		const n = try rule.append(tree_alloc, rules_arr, a.action, spec);
+		inserted_idx = n - 1;
+	}
+	if (a.plugin) |tag| {
+		const obj = &rules_arr.items[inserted_idx].object;
+		try obj.put(tree_alloc, try tree_alloc.dupe(u8, "plugin"), .{ .string = try tree_alloc.dupe(u8, tag) });
+		try obj.put(tree_alloc, try tree_alloc.dupe(u8, "approved"), .{ .bool = true });
+	}
 }
 
 fn cmdDel(
@@ -1456,4 +1470,33 @@ test "renderFiles: a CONTAINER-shaped render (no COGBOX_PROXY_RUNAS) touches no 
 	try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOfPath(io, unrelated));
 	try std.testing.expectEqual(before_store_mode, try modeOfPath(io, priv_global));
 	try std.testing.expectEqual(before_store_gid, try gidOfPath(priv_global));
+}
+
+test "rules add --plugin stamps the tag and approved: true; a plain add stamps neither" {
+	const t = std.testing;
+	var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator,
+		\\{"network": {"rules": [{"deny": "10.0.0.0/8"}]}}
+	, .{});
+	defer parsed.deinit();
+	const tree = parsed.arena.allocator();
+	const rules_arr = &parsed.value.object.getPtr("network").?.object.getPtr("rules").?.array;
+
+	// The approval path: `rules add allow CIDR --plugin X` (cogworx applies an
+	// admin-approved rule request of plugin X this way).
+	try insertAddRule(tree, rules_arr, .{ .action = .allow, .cidr = "203.0.113.0/24", .pos = 1, .plugin = "obs-plugin" }, "203.0.113.0/24");
+	const approved = rules_arr.items[0].object;
+	try t.expectEqualStrings("203.0.113.0/24", approved.get("allow").?.string);
+	try t.expectEqualStrings("obs-plugin", approved.get("plugin").?.string);
+	try t.expect((approved.get("approved") orelse return error.TestUnexpectedResult).bool);
+
+	// Appended, without --plugin: neither field.
+	try insertAddRule(tree, rules_arr, .{ .action = .deny, .cidr = "198.51.100.0/24" }, "198.51.100.0/24");
+	const plain = rules_arr.items[2].object;
+	try t.expectEqualStrings("198.51.100.0/24", plain.get("deny").?.string);
+	try t.expect(plain.get("plugin") == null);
+	try t.expect(plain.get("approved") == null);
+
+	// A refused insert changes nothing.
+	try t.expectError(error.IndexOutOfRange, insertAddRule(tree, rules_arr, .{ .action = .allow, .cidr = "192.0.2.0/24", .pos = 9 }, "192.0.2.0/24"));
+	try t.expectEqual(@as(usize, 3), rules_arr.items.len);
 }

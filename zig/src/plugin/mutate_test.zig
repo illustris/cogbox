@@ -472,3 +472,71 @@ test "novelRules leaves existing untouched" {
 		\\[{"allow": "203.0.113.0/24"}, {"allow": "198.51.100.0/24"}]
 	, .l4));
 }
+
+test "prependTaggedRules drops a plugin-declared approved marker" {
+	var parsed = try parseDoc(doc_with_rules);
+	defer parsed.deinit();
+	const arena = parsed.arena.allocator();
+	const rules_arr = rulesOf(&parsed.value);
+
+	// A plugin cannot mark its own rules approved: only `rules add --plugin` and
+	// `l7 add --plugin` (the approval path) write the field, and a live apply's
+	// rollback keeps an allow that carries it.
+	var incoming = try parseDoc(
+		\\[{"allow": "203.0.113.0/24", "approved": true}, {"deny": "198.51.100.0/24", "approved": false}]
+	);
+	defer incoming.deinit();
+	try mutate.prependTaggedRules(arena, rules_arr, "plug", incoming.value.array.items);
+	try t.expect(rules_arr.items[0].object.get("approved") == null);
+	try t.expect(rules_arr.items[1].object.get("approved") == null);
+	try t.expectEqualStrings("plug", mutate.ruleTag(rules_arr.items[0]).?);
+	// The incoming tree is untouched (the strip is on the copy).
+	try t.expect(incoming.value.array.items[0].object.get("approved").?.bool);
+}
+
+test "sameRule ignores the approved marker" {
+	var parsed = try parseDoc(
+		\\[{"allow": "203.0.113.0/24", "plugin": "p", "approved": true}, {"allow": "203.0.113.0/24"},
+		\\ {"allow": "h.test", "approved": true}, {"allow": "h.test", "plugin": "p"}]
+	);
+	defer parsed.deinit();
+	const items = parsed.value.array.items;
+	try t.expect(mutate.sameRule(.l4, items[0], items[1]));
+	try t.expect(mutate.sameRule(.l7, items[2], items[3]));
+}
+
+test "sameRule inject identity: host, secret, style, cookieName, port" {
+	var parsed = try parseDoc(
+		\\[{"host": "api.example.com", "secret": "api-token", "plugin": "p"},
+		\\ {"host": "api.example.com", "secret": "api-token", "style": "bearer", "stub": "x", "comment": "c"},
+		\\ {"host": "api.example.com", "secret": "api-token", "style": "basic"},
+		\\ {"host": "api.example.com", "secret": "other-token"},
+		\\ {"host": "app.example.com", "secret": "api-token"},
+		\\ {"host": "api.example.com", "secret": "api-token", "port": 9200},
+		\\ {"host": "api.example.com", "secret": "api-token", "port": 9201},
+		\\ {"host": "app.example.com", "secret": "app-session", "style": "cookie", "cookieName": "session"},
+		\\ {"host": "app.example.com", "secret": "app-session", "style": "cookie", "cookieName": "other"},
+		\\ {"host": "app.example.com", "secret": "app-session", "style": "cookie"},
+		\\ {"host": "api.example.com", "secret": "api-token", "port": "9200"}]
+	);
+	defer parsed.deinit();
+	const s = parsed.value.array.items;
+	// An absent style is bearer; the tag, stub and comment never count.
+	try t.expect(mutate.sameRule(.inject, s[0], s[1]));
+	try t.expect(mutate.sameRule(.inject, s[1], s[0]));
+	try t.expect(!mutate.sameRule(.inject, s[0], s[2]));
+	try t.expect(!mutate.sameRule(.inject, s[0], s[3]));
+	try t.expect(!mutate.sameRule(.inject, s[0], s[4]));
+	// A port is part of the identity, and an absent one equals only an absent one.
+	try t.expect(!mutate.sameRule(.inject, s[0], s[5]));
+	try t.expect(!mutate.sameRule(.inject, s[5], s[0]));
+	try t.expect(mutate.sameRule(.inject, s[5], s[5]));
+	try t.expect(!mutate.sameRule(.inject, s[5], s[6]));
+	// So is a cookieName.
+	try t.expect(mutate.sameRule(.inject, s[7], s[7]));
+	try t.expect(!mutate.sameRule(.inject, s[7], s[8]));
+	try t.expect(!mutate.sameRule(.inject, s[7], s[9]));
+	try t.expect(!mutate.sameRule(.inject, s[9], s[7]));
+	// A port stored as a string never equals the integer one.
+	try t.expect(!mutate.sameRule(.inject, s[5], s[10]));
+}

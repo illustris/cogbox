@@ -45,9 +45,11 @@ const KNOWN_VERBS = [_][]const u8{
 	// "__claude-stub" (the container agent's marker-gated Claude stub-staging),
 	// "__authproxy" (the per-sandbox pluggable auth proxy for migrated git
 	// providers), "__plugin-apply-preboot" (the launcher's per-pass live-apply
-	// housekeeping).
+	// housekeeping), "__unitplan" (the live apply's host unit plan for two
+	// toplevels, as text; checks.cogbox-vm phase LA compares it with a guest's
+	// dry-activate).
 	"__launch", "__l7proxy", "__render-rules", "enforce", "__divertshim",
-	"__claude-stub", "__authproxy", "__plugin-apply-preboot",
+	"__claude-stub", "__authproxy", "__plugin-apply-preboot", "__unitplan",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -99,15 +101,25 @@ pub fn main(init: std.process.Init) !void {
 		util.die(allocator, io, verb, exit_codes.usage, "this container backend requires Linux", .{});
 	}
 
-	// `__plugin-apply-preboot <icd> [--init-only]`: cogbox-launch.sh runs it on
-	// every pass right after taking the instance config lock (whose fd it
-	// inherits; it never takes the lock). It must never fail a boot, so it is
+	// `__plugin-apply-preboot <icd> [--init-only] [--runtime DIR] [--name NAME]`:
+	// cogbox-launch.sh runs it on every pass right after taking the instance
+	// config lock (whose fd it inherits; it never takes the lock). It is
 	// dispatched before the path resolution and the legacy-layout preflight
-	// below, either of which can exit non-zero, and it always exits 0, reporting
-	// problems as warnings. Phase 0: with --init-only, empty <icd>/apply/trash/
-	// (bounded at 30 s); see plugin_module.preboot.
+	// below, either of which can exit non-zero: its only non-zero exit is 78,
+	// with the stamped message, when an automatic plugin rollback could not be
+	// finished on a stopped instance (the launcher checks for that itself too).
+	// Everything else is a warning. See plugin_module.preboot.
 	if (std.mem.eql(u8, verb, "__plugin-apply-preboot")) {
-		plugin_module.preboot.run(allocator, io, rest);
+		const code = plugin_module.preboot.run(allocator, io, env, rest);
+		if (code != 0) std.process.exit(code);
+		return;
+	}
+
+	// `__unitplan <old-toplevel> <new-toplevel>`: reads only the two unit
+	// directories, so it needs no instance and runs before path resolution.
+	if (std.mem.eql(u8, verb, "__unitplan")) {
+		const code = plugin_module.unitplan.cliMain(allocator, io, rest);
+		if (code != 0) std.process.exit(code);
 		return;
 	}
 
@@ -134,8 +146,8 @@ pub fn main(init: std.process.Init) !void {
 	if (std.mem.eql(u8, verb, "config")) return config_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "list")) return list_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "status")) return status_verb.run(allocator, io, &p, rest);
-	if (std.mem.eql(u8, verb, "stop")) return stop_verb.run(allocator, io, &p, rest);
-	if (std.mem.eql(u8, verb, "delete")) return delete_verb.run(allocator, io, &p, rest);
+	if (std.mem.eql(u8, verb, "stop")) return stop_verb.run(allocator, io, env, &p, rest);
+	if (std.mem.eql(u8, verb, "delete")) return delete_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "restart")) return restart_verb.run(allocator, io, env, &p, rest);
 	if (std.mem.eql(u8, verb, "ssh")) return ssh_verb.run(allocator, io, &p, rest);
 	if (std.mem.eql(u8, verb, "rules")) return rules_verb.run(allocator, io, &p, rest);
