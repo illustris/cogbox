@@ -3088,8 +3088,18 @@ fn finishLive(ctx: *Ctx, plugin_name: ?[]const u8, why: []const u8) !void {
 		};
 		try announce(ctx, "Not loaded live ({s}{s}{s}{s}).", .{ result, if (reason != null) "/" else "", reason orelse "", detail.items });
 		try printRestartHint(ctx, why);
+		if (inlineForceHint(arena, ctx.instance, rep, apply.forceTerminals(ctx.io))) |hint| try announce(ctx, "{s}", .{hint});
 	}
 	if (res.code != 0) std.process.exit(res.code);
+}
+
+/// The inline apply's Apply anyway hint (it never prompts, spec 4.7): only
+/// for a report that offers its plan (`overridable`), worded by
+/// apply.forceHint for a terminal (`tty`: stdin and stderr) or for none.
+fn inlineForceHint(arena: std.mem.Allocator, instance: ?[]const u8, rep: std.json.ObjectMap, tty: bool) ?[]const u8 {
+	const ov = rep.get("overridable") orelse return null;
+	if (ov != .bool or !ov.bool) return null;
+	return apply.forceHint(arena, instance, rep.get("plan") orelse return null, tty);
 }
 
 /// The inline apply's line for a rejected change, from its report `rep` and
@@ -3784,4 +3794,43 @@ test "rejectedLine: rolled back only when the rollback is done; removed, pending
 	try t.expectEqualStrings("'x' was not applied: its activation did not finish. Its rollback could not be finished (see the message above). Build log: cogbox plugin apply -n demo --log 0123456789abcdef", blocked);
 
 	try t.expect(std.mem.startsWith(u8, try rejectedLine(a, null, try Rep.of(a, .unit_hang, Rep.rb(.pending, &.{})), 0, ""), "The plugin update was not applied: a unit it starts"));
+}
+
+test "inlineForceHint: an inline apply hints at Apply anyway only for a report that offers its plan" {
+	var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena_state.deinit();
+	const a = arena_state.allocator();
+	const plan: apply.Plan = .{
+		.id = "0123456789abcdef",
+		.boot_id = "0123abcd-0000-4000-8000-0123456789ab",
+		.comp = "c" ** 64,
+		.P = "/nix/store/pppppppppppppppppppppppppppppppp-nixos-system",
+		.T = "/nix/store/tttttttttttttttttttttttttttttttt-nixos-system",
+		.units = &.{
+			.{ .unit = "docker.service", .action = .stop, .why = "changed", .class = "B" },
+			.{ .unit = "docker.socket", .action = .restart, .why = "changed", .class = "B" },
+		},
+		.repair = &.{},
+		.reexec = false,
+	};
+	// The report as the inline apply reads it back.
+	const Rep = struct {
+		fn of(al: std.mem.Allocator, overridable: bool, p: ?apply.Plan) !std.json.ObjectMap {
+			const line = try apply.reportLine(al, .{ .gen = "0123456789abcdef", .op = null, .result = .restart_required, .reason = if (overridable) .disruptive_units else .restart_only_units, .detail = null, .overridable = overridable, .plan = p, .forced = null, .rollback = null, .runner = null, .toplevel = null, .units = null, .rolled_back_guest = null, .cap = null, .base_id = null, .built_id = null });
+			const v = try std.json.parseFromSliceLeaky(std.json.Value, al, line, .{});
+			return v.object.get("apply").?.object;
+		}
+	};
+	try t.expectEqualStrings("Or run 'cogbox plugin apply --force -n demo' to apply it now anyway; it would: stop docker.service, restart docker.socket.", inlineForceHint(a, "demo", try Rep.of(a, true, plan), true).?);
+	// Off a terminal, where --force refuses: the whole plan, then the plan id.
+	try t.expectEqualStrings("Or apply it now anyway, which would:\n" ++
+		"  stop docker.service (changed; class B): stops every running container\n" ++
+		"  restart docker.socket (changed; class B)\n" ++
+		"To apply it anyway, after reading the plan above: cogbox plugin apply --force-plan 0123456789abcdef -n demo", inlineForceHint(a, "demo", try Rep.of(a, true, plan), false).?);
+	// A mixed refusal lists its plan, which nothing can force; an overridable
+	// reason whose plan could not be stored is not offered.
+	for ([_]bool{ true, false }) |tty| {
+		try t.expect(inlineForceHint(a, "demo", try Rep.of(a, false, plan), tty) == null);
+		try t.expect(inlineForceHint(a, "demo", try Rep.of(a, true, null), tty) == null);
+	}
 }

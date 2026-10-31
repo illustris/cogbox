@@ -825,6 +825,23 @@ test "classify: the deny-list class table" {
 	try t.expect(up.Reason.systemd_reexec.overridable());
 }
 
+test "classify: of the template units only sshd@ is class B or C, so a forced plan names no other template" {
+	// Apply anyway sends the plan's unit names to the guest, which exempts a
+	// forced unit by its exact Id; a template name (`x@.service`) would match
+	// no running instance and silently lose the exemption. sshd@ is the one B
+	// template, and no protected unit in the guest.
+	for ([_]up.Action{ .stop, .start, .restart, .reload }) |action| {
+		try t.expectEqual(@as(?up.Class, .b), up.classify("sshd@.service", action, .{ .direct = true }));
+		for ([_][]const u8{ "docker@.service", "containerd@.service", "systemd-resolved@.service", "systemd-logind@.service", "systemd-networkd@.service", "nftables@.service", "podman@.service", "firewall@.service" }) |u| {
+			const got = up.classify(u, action, .{ .direct = true });
+			if (got == .b or got == .c) {
+				std.debug.print("classify({s}, {s}) = {any}\n", .{ u, action.name(), got });
+				return error.TestUnexpectedResult;
+			}
+		}
+	}
+}
+
 test "verdict: the first never-overridable reason wins and a mix is not overridable" {
 	const h = struct {
 		fn of(c: up.Class) up.Hazard {

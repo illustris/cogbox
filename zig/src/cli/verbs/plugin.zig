@@ -65,6 +65,12 @@ pub fn run(
 	// subcommands pass the apply gate first and keep the blocking acquire, as
 	// do list and resolve.
 	const parsed_cmd: ?plugin_module.cli.Cmd = plugin_module.cli.parse(rest.items) catch null;
+	// An `apply` command line that does not parse (`--force` with
+	// `--force-plan`, a malformed plan id) is refused at once, as the verb
+	// would refuse it, rather than after the blocking acquire below.
+	if (parsed_cmd == null and rest.items.len > 0 and std.mem.eql(u8, rest.items[0], "apply")) {
+		util.die(allocator, io, "plugin", exit_codes.usage, "invalid arguments", .{});
+	}
 	const apply_args: ?plugin_module.cli.ApplyArgs = if (parsed_cmd) |cmd| switch (cmd) {
 		.apply => |a| a,
 		else => null,
@@ -80,11 +86,14 @@ pub fn run(
 	var apply_lock: ?std.Io.File = null;
 	defer if (apply_lock) |f| f.close(io);
 	if (apply_args) |aa| {
-		// Apply anyway is not in this cogbox yet: refused at once, before any
-		// lock is opened or waited for (the config-lock wait below can take
-		// 300 s behind a long plugin op).
-		if (aa.force or aa.force_plan != null) {
-			util.die(allocator, io, "plugin", exit_codes.usage, "{s}", .{plugin_module.apply.force_unsupported});
+		// The interactive Apply anyway shows the plan on stderr and reads the
+		// answer from stdin, one report per round: refused with --json, and
+		// unless both are terminals, at once, before any lock is opened or
+		// waited for (the config-lock wait below can take 300 s behind a long
+		// plugin op). `--force-plan` is a plain run.
+		if (aa.force) {
+			if (aa.json) util.die(allocator, io, "plugin", exit_codes.usage, "{s}", .{plugin_module.apply.force_json_refused});
+			if (!plugin_module.apply.forceTerminals(io)) util.die(allocator, io, "plugin", exit_codes.usage, "{s}", .{plugin_module.apply.force_needs_tty});
 		}
 		apply_lock = config_lock.openLockFile(allocator, io, p, name, ".apply.lock") catch |err| {
 			util.die(allocator, io, "plugin", exit_codes.software, "cannot open the apply lock ({s})", .{@errorName(err)});

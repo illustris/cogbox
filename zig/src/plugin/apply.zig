@@ -133,6 +133,21 @@ pub const Bounds = struct {
 	/// `cogbox stop`'s apply step: SIGTERM to the holder and this grace (no
 	/// SIGKILL), then at most one `status` hop under stop_hop_ms: 5 s in all.
 	pub const stop_term_ms: i64 = 2_000;
+	/// Apply anyway (spec 4.7): a stored plan is valid this long (CLOCK_BOOTTIME
+	/// seconds from its store), and apply/plans/ keeps at most this many (and
+	/// the one a run's --force-plan names); the interactive form runs at most
+	/// this many forced applies, however many of them answered plan_changed
+	/// or plan_expired, and asks about no plan after the last.
+	pub const plan_ttl_s: i64 = 1800;
+	pub const plans_kept: usize = 16;
+	pub const force_rounds: u32 = 3;
+	/// The guest helper's limits on `start --force-units -` (its `head -c
+	/// 65536` and 1..256 names): a plan whose force list exceeds them is never
+	/// offered.
+	pub const force_units_max: usize = 256;
+	pub const force_input_cap: usize = 65536;
+	/// A stored plan file's read cap.
+	pub const plan_file_cap: usize = 4 << 20;
 };
 
 // --- outcome vocabulary -------------------------------------------------------------
@@ -276,7 +291,13 @@ pub const Cap = enum { unit, none };
 /// The phase apply/active advertises to a plugin change waiting at the gate.
 pub const Phase = enum { preflight, build, guest, record };
 
-/// A forced unit set (Apply anyway); always null until forced plans land.
+/// What an Apply anyway run forced (spec 4.7): the confirmed plan's id and the
+/// unit names sent to the guest's `start --force-units -` (forceUnits: sorted,
+/// unique, the units the plan only reloads and the repair unit excluded; empty
+/// for a plan that relaxes no unit, one that only reloads units or
+/// re-executes systemd, so empty never means a re-exec). The report carries it
+/// once a forced `start` was attempted, with or without the list, and so does
+/// inflight.json.
 pub const Forced = struct { plan: []const u8, units: []const []const u8 };
 
 pub const RollbackStatus = enum { done, removed, pending };
@@ -353,8 +374,11 @@ pub const Outcome = struct {
 		return .{ .result = result, .reason = reason, .detail = detail };
 	}
 
+	/// Apply anyway is offered: an overridable reason with a plan to force. A
+	/// plan that could not be stored (or whose force list the guest would
+	/// refuse, buildPlan) is not offered.
 	pub fn overridable(o: Outcome) bool {
-		return o.result == .restart_required and o.reason != null and o.reason.?.overridable();
+		return o.result == .restart_required and o.reason != null and o.reason.?.overridable() and o.plan != null;
 	}
 };
 
@@ -448,6 +472,9 @@ pub const Host = struct {
 	/// stdout). Null: stdout.
 	sink: ?*std.ArrayList(u8) = null,
 	sink_allocator: ?Allocator = null,
+	/// Where report() also hands the Report it built (forceLoop reads the
+	/// plan to ask about from it). Null: nowhere.
+	report_out: ?*?Report = null,
 
 	/// Write `bytes` to the sink, else stdout (never fatal).
 	pub fn emit(h: Host, io: Io, bytes: []const u8) void {
@@ -499,9 +526,13 @@ fn pathExists(io: Io, path: []const u8) bool {
 	return true;
 }
 
+/// A streaming writer: it writes at the descriptor's own offset. The default
+/// positional one starts every new writer at offset 0, so with stdout a file
+/// (`apply --force > out`, which reports once per round) each write would
+/// overwrite the one before.
 fn writeAllTo(io: Io, file: Io.File, bytes: []const u8) void {
 	var buf: [4096]u8 = undefined;
-	var w = file.writer(io, &buf);
+	var w = file.writerStreaming(io, &buf);
 	w.interface.writeAll(bytes) catch return;
 	w.flush() catch {};
 }
@@ -513,17 +544,31 @@ fn out(io: Io, bytes: []const u8) void {
 }
 
 fn errOut(io: Io, bytes: []const u8) void {
+	_ = errOutChecked(io, bytes);
+}
+
+/// errOut that says whether every byte was written: forceLoop never asks about
+/// a plan the person could not have read.
+fn errOutChecked(io: Io, bytes: []const u8) bool {
 	if (stderr_sink) |sk| {
-		sk.appendSlice(stderr_sink_allocator.?, bytes) catch {};
-		return;
+		sk.appendSlice(stderr_sink_allocator.?, bytes) catch return false;
+		if (stderr_sink_hook) |h| h(bytes);
+		return true;
 	}
-	writeAllTo(io, Io.File.stderr(), bytes);
+	var buf: [4096]u8 = undefined;
+	var w = Io.File.stderr().writerStreaming(io, &buf);
+	w.interface.writeAll(bytes) catch return false;
+	w.flush() catch return false;
+	return true;
 }
 
 /// Tests only: where the verb's diagnostics go instead of stderr (the zig test
-/// runner reports a test binary's stderr output as a failed command).
+/// runner reports a test binary's stderr output as a failed command), and what
+/// sees each write once it is there (a terminal's reader, who answers a
+/// question once it is shown).
 pub var stderr_sink: ?*std.ArrayList(u8) = null;
 pub var stderr_sink_allocator: ?Allocator = null;
+pub var stderr_sink_hook: ?*const fn ([]const u8) void = null;
 
 /// The durable writes a classification makes, in the order they land, and
 /// every apply/active write (setActiveStrict).
@@ -698,6 +743,9 @@ pub const ChildSpec = struct {
 	/// (the build records the unit's InvocationID as soon as systemd-run prints
 	/// it).
 	on_stderr: ?Hook = null,
+	/// The child's stdin: these bytes, then EOF (null: /dev/null). Only the
+	/// `start` hop of an Apply anyway run has any (its --force-units -).
+	stdin: ?[]const u8 = null,
 };
 
 pub const Hook = struct {
@@ -733,7 +781,11 @@ pub fn findExe(arena: Allocator, env: *const std.process.Environ.Map, name: []co
 }
 
 /// Run a child to completion (or until the loop stops it), capturing its stdout
-/// and stderr through pipes into bounded buffers, stdin from /dev/null.
+/// and stderr through pipes into bounded buffers. Its stdin is /dev/null, or
+/// `spec.stdin`'s bytes from a memfd filled before the fork (a fresh one per
+/// spawn, read from offset 0, so a retried hop sends the whole input again;
+/// not a pipe, which would need a writer in the wait loop once the input
+/// passes a pipe's capacity).
 ///
 /// The child is forked here, from the calling (main) thread, and makes only raw
 /// syscalls between fork and exec: prctl(PR_SET_PDEATHSIG, SIGKILL), getppid
@@ -786,6 +838,19 @@ fn runChildLinux(arena: Allocator, io: Io, spec: ChildSpec, res: *ChildResult) !
 
 	const devnull = try Io.Dir.cwd().openFile(io, "/dev/null", .{});
 	defer devnull.close(io);
+	// The input, written whole at offset 0 (pwrite leaves the file offset at 0
+	// for the child's reads). Close-on-exec here; the child's dup2 clears it.
+	var in_fds = [1]i32{-1};
+	defer closeAll(&in_fds);
+	if (spec.stdin) |bytes| {
+		in_fds[0] = @intCast(try sysOk(linux.memfd_create("cogbox-apply-stdin", linux.MFD.CLOEXEC)));
+		var off: usize = 0;
+		while (off < bytes.len) {
+			const n = try sysOk(linux.pwrite(in_fds[0], bytes[off..].ptr, bytes.len - off, @intCast(off)));
+			if (n == 0) return error.ShortWrite;
+			off += n;
+		}
+	}
 	// out read, out write, err read, err write; -1 once closed.
 	var pipes = [4]i32{ -1, -1, -1, -1 };
 	defer closeAll(&pipes);
@@ -806,7 +871,7 @@ fn runChildLinux(arena: Allocator, io: Io, spec: ChildSpec, res: *ChildResult) !
 	var dfl: linux.Sigaction = std.mem.zeroes(linux.Sigaction);
 	dfl.handler.handler = linux.SIG.DFL;
 	const parent = linux.getpid();
-	const devnull_fd = devnull.handle;
+	const stdin_fd = if (in_fds[0] >= 0) in_fds[0] else devnull.handle;
 	const out_w = out_fds[1];
 	const err_w = err_fds[1];
 
@@ -817,7 +882,7 @@ fn runChildLinux(arena: Allocator, io: Io, spec: ChildSpec, res: *ChildResult) !
 		_ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0);
 		if (linux.getppid() != parent) linux.exit_group(127);
 		_ = linux.sigaction(.PIPE, &dfl, null);
-		if (linux.errno(linux.dup2(devnull_fd, 0)) != .SUCCESS) linux.exit_group(127);
+		if (linux.errno(linux.dup2(stdin_fd, 0)) != .SUCCESS) linux.exit_group(127);
 		if (linux.errno(linux.dup2(out_w, 1)) != .SUCCESS) linux.exit_group(127);
 		if (linux.errno(linux.dup2(err_w, 2)) != .SUCCESS) linux.exit_group(127);
 		_ = linux.execve(exe.ptr, argv_z.ptr, envp_z.ptr);
@@ -1606,6 +1671,9 @@ pub const HopSpec = struct {
 	watch: ?Watch = null,
 	/// The reply is raw text (`log`), not key=value lines.
 	raw: bool = false,
+	/// What the remote verb reads on stdin (ChildSpec.stdin): only an Apply
+	/// anyway `start`'s force list.
+	stdin: ?[]const u8 = null,
 };
 
 /// One guest hop: ssh (the apply-hop options; `.confirm` adds `-F /dev/null`
@@ -1627,6 +1695,7 @@ pub fn guestHop(arena: Allocator, io: Io, env: *const std.process.Environ.Map, r
 		.honour_supersede = spec.honour_supersede,
 		.ignore_terminate = spec.ignore_terminate,
 		.watch = spec.watch,
+		.stdin = spec.stdin,
 	});
 	if (res.stopped) |s| switch (s) {
 		.terminate, .supersede, .watch => return .{ .failed = true, .stopped = s },
@@ -1887,12 +1956,33 @@ fn hazardWhy(arena: Allocator, t2: Tier2, h: unitplan.Hazard) ![]const u8 {
 	return std.fmt.allocPrint(arena, "propagated:{s}:{s}", .{ edge, try t2.reportName(arena, prev.unit) });
 }
 
+/// A plan unit's `why` as listings and reports may carry it: `changed`,
+/// `removed`, `new`, `target`, `induced`, `guest_reported`, or
+/// `propagated:<edge>:<from>` with an edge of 1-32 of [a-z_] and a `from` the
+/// helper's charset check passes (isUnitToken). `from` is a unit of T or P,
+/// named by plugin code, so a byte outside that set (an escape sequence that
+/// would redraw the listing a person agrees to) makes the plan one no one can
+/// be asked about. The control plane checks the same shape.
+pub fn isPlanWhy(why: []const u8) bool {
+	const seeds = [_][]const u8{ "changed", "removed", "new", "target", "induced", "guest_reported" };
+	for (seeds) |s| if (std.mem.eql(u8, why, s)) return true;
+	const prefix = "propagated:";
+	if (!std.mem.startsWith(u8, why, prefix)) return false;
+	const rest = why[prefix.len..];
+	const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return false;
+	if (colon == 0 or colon > 32) return false;
+	for (rest[0..colon]) |c| if ((c < 'a' or c > 'z') and c != '_') return false;
+	return isUnitToken(rest[colon + 1 ..]);
+}
+
 pub const repair_unit = "cogbox-reply-route.service";
 
 /// The plan of a refusal that has a class B, C or D part (spec 4.7): the class
 /// B and C hazards as units (named as a report shows them, Tier2.reportName),
 /// `reexec` for D, the repair unit when a class C unit or firewall.service is
-/// in it; null when nothing in it can be forced.
+/// in it; null when nothing in it can be forced, or when its force list is one
+/// the guest helper would refuse or a name in it one a listing may not show
+/// (forceUnits), so an offered plan always fits and can always be listed.
 pub fn buildPlan(arena: Allocator, t2: Tier2, boot_id: []const u8, comp: []const u8, p_sys: []const u8, t_sys: []const u8) !?Plan {
 	var units: std.ArrayList(PlanUnit) = .empty;
 	var repair = false;
@@ -1920,6 +2010,10 @@ pub fn buildPlan(arena: Allocator, t2: Tier2, boot_id: []const u8, comp: []const
 		.reexec = t2.reexec,
 	};
 	p.id = try planId(arena, p);
+	_ = forceUnits(arena, p) catch |err| switch (err) {
+		error.OutOfMemory => return error.OutOfMemory,
+		else => return null,
+	};
 	return p;
 }
 
@@ -1996,6 +2090,229 @@ pub fn refusalDetail(arena: Allocator, t2: Tier2, reason: unitplan.Reason) ![]co
 	return names[0..@min(names.len, 64)];
 }
 
+// --- Apply anyway: the force list and the plan store (spec 4.7) ---------------------------
+
+/// The unit names an Apply anyway run relaxes in the guest (`start
+/// --force-units -`): the plan's units that it stops, starts or restarts,
+/// unique and sorted (a unit can be listed with two actions). A unit the plan
+/// only reloads is left out: a reload keeps its InvocationID and its running
+/// state, so it passes every post-check comparison unexempted, and the guest
+/// exempts a listed unit from all of them (a new InvocationID, a stop or start,
+/// a reported failure), not only from what its planned action does. The repair
+/// unit is not among them either (it travels as --repair). The guest exempts
+/// exactly these names (`grep -qxF` against each unit's Id): the plan names
+/// units as a report shows them, and among class B and C units only `sshd@`
+/// can be a template (unitplan.classify), which is no protected unit in the
+/// guest. An error for a plan whose names the helper's charset check refuses
+/// (every unit's, as the report shows them all, and every `why`'s, isPlanWhy),
+/// or a list it would refuse: more than Bounds.force_units_max names, or more
+/// than Bounds.force_input_cap bytes of forceInput.
+pub fn forceUnits(arena: Allocator, p: Plan) ![]const []const u8 {
+	var set: unitplan.StrSet = .empty;
+	for (p.units) |u| {
+		if (!isUnitToken(u.unit) or !isPlanWhy(u.why)) return error.BadUnitName;
+		if (u.action != .reload) try set.put(arena, u.unit, {});
+	}
+	if (set.count() > Bounds.force_units_max) return error.TooManyUnits;
+	const names = try unitplan.sortedKeys(arena, &set);
+	var bytes: usize = 0;
+	for (names) |n| bytes += n.len + 1;
+	if (bytes > Bounds.force_input_cap) return error.TooLong;
+	return names;
+}
+
+/// What `start --force-units -` reads on stdin: each name and a newline.
+pub fn forceInput(arena: Allocator, units: []const []const u8) ![]const u8 {
+	var o: std.ArrayList(u8) = .empty;
+	for (units) |u| {
+		try o.appendSlice(arena, u);
+		try o.append(arena, '\n');
+	}
+	return o.items;
+}
+
+/// `<icd>/apply/plans/<id>.json`: an overridable refusal's plan, kept so a
+/// later `--force-plan <id>` can be bound to it (spec section 2 step 2, "Force
+/// only"). `reason` is the plan's own overridable reason; `created` is
+/// CLOCK_BOOTTIME seconds (a wall-clock step never ages a plan); `nonce` and
+/// `host_boot` are the boot it was made in (qemu.start can repeat across boots
+/// of identical hosts, so the host boot id is compared too); `gen` is the run
+/// that planned it. The guest's boot id and the composition are in `plan`.
+/// Unit names, store paths and ids only: nothing in it is secret.
+pub const StoredPlan = struct {
+	plan: Plan,
+	reason: Reason,
+	created: i64,
+	nonce: []const u8,
+	host_boot: []const u8,
+	gen: []const u8,
+};
+
+const plans_dir = "plans";
+
+/// `<id>.json` for a plan id; null for any other name.
+fn planFileId(name: []const u8) ?[]const u8 {
+	const sfx = ".json";
+	if (name.len != snapshot.id_len + sfx.len or !std.mem.endsWith(u8, name, sfx)) return null;
+	const id = name[0..snapshot.id_len];
+	return if (cli.isHex16(id)) id else null;
+}
+
+/// Write `sp` as a new file (tmp + fsync + rename) under the apply flock. Under
+/// sudo the directory and the file go to `owner`; an existing `plans` that is
+/// not a real directory (a planted symlink) is refused.
+pub fn storePlan(arena: Allocator, io: Io, icd: []const u8, sp: StoredPlan, owner: ?u32) !void {
+	var aw: Io.Writer.Allocating = .init(arena);
+	std.json.Stringify.value(sp, .{}, &aw.writer) catch return error.OutOfMemory;
+	aw.writer.writeByte('\n') catch return error.OutOfMemory;
+	var apply = try applyDir(io, icd, owner);
+	defer apply.close(io);
+	try snapshot.ensureDir(io, apply, plans_dir, owner);
+	var dir = try apply.openDir(io, plans_dir, .{ .follow_symlinks = false });
+	defer dir.close(io);
+	const name = try std.fmt.allocPrint(arena, "{s}.json", .{sp.plan.id});
+	try snapshot.writeNew(io, dir, name, aw.written(), owner);
+}
+
+fn parseStoredPlan(arena: Allocator, bytes: []const u8) !StoredPlan {
+	return std.json.parseFromSliceLeaky(StoredPlan, arena, bytes, .{ .ignore_unknown_fields = true }) catch error.InvalidPlan;
+}
+
+/// The stored plan `id` (FileNotFound when there is none, error.InvalidPlan
+/// when it does not parse). It is only read: planAdmits decides.
+pub fn readStoredPlan(arena: Allocator, io: Io, icd: []const u8, id: []const u8) !StoredPlan {
+	if (!cli.isHex16(id)) return error.InvalidPlan;
+	var dir = try snapshot.openIcd(io, icd);
+	defer dir.close(io);
+	const rel = try std.fmt.allocPrint(arena, "apply/" ++ plans_dir ++ "/{s}.json", .{id});
+	return parseStoredPlan(arena, try snapshot.readNoFollow(arena, io, dir, rel, Bounds.plan_file_cap));
+}
+
+/// What any stored plan must be, whatever boot reads it: filed under its own
+/// id, which is also the id its content hashes to (a hand-edited unit list
+/// cannot keep it), for one of the three overridable reasons, with a force
+/// list the guest takes.
+fn storedPlanValid(arena: Allocator, sp: StoredPlan, id: []const u8) bool {
+	if (!cli.isHex16(id) or !std.mem.eql(u8, sp.plan.id, id)) return false;
+	const hashed = planId(arena, sp.plan) catch return false;
+	if (!std.mem.eql(u8, hashed, id)) return false;
+	if (!sp.reason.overridable()) return false;
+	_ = forceUnits(arena, sp.plan) catch return false;
+	return true;
+}
+
+/// The binding (spec section 2 step 2, "Force only"): `--force-plan id` is
+/// admitted only for a valid stored plan (storedPlanValid) of this boot (the
+/// same qemu.start and host boot), of S's composition, and younger than
+/// Bounds.plan_ttl_s by CLOCK_BOOTTIME `now` (a plan from the future, another
+/// host boot's clock, is not). The guest phase then still runs only when the
+/// re-plan gives this same id.
+pub fn planAdmits(arena: Allocator, sp: StoredPlan, id: []const u8, nonce: []const u8, host_boot: []const u8, comp: []const u8, now: i64) bool {
+	if (!storedPlanValid(arena, sp, id)) return false;
+	if (!std.mem.eql(u8, sp.nonce, nonce) or !std.mem.eql(u8, sp.host_boot, host_boot)) return false;
+	if (!std.mem.eql(u8, sp.plan.comp, comp)) return false;
+	const age = now - sp.created;
+	return age >= 0 and age < Bounds.plan_ttl_s;
+}
+
+/// The plan store's GC, run by the apply verb only (it holds both locks; no
+/// other verb touches apply/plans). Inside apply/plans it deletes every name
+/// starting with `.` (a writer's leftover tmp: every writer holds the apply
+/// flock, so none is live), and every `<id>.json` that does not parse or
+/// validate, is Bounds.plan_ttl_s old or more, is from the future, or carries
+/// another boot nonce or host boot (a null `host_boot`, unreadable here, is not
+/// compared); then all but the Bounds.plans_kept newest of the rest, never
+/// counting `keep` (the plan this run's --force-plan names, which its binding
+/// reads next: the cut would end the run plan_expired). Any other name is left
+/// alone. Best-effort.
+pub fn prunePlans(arena: Allocator, io: Io, icd: []const u8, nonce: []const u8, host_boot: ?[]const u8, keep: ?[]const u8, now: i64) void {
+	var icd_dir = snapshot.openIcd(io, icd) catch return;
+	defer icd_dir.close(io);
+	var apply = icd_dir.openDir(io, "apply", .{ .follow_symlinks = false }) catch return;
+	defer apply.close(io);
+	var dir = apply.openDir(io, plans_dir, .{ .follow_symlinks = false, .iterate = true }) catch return;
+	defer dir.close(io);
+	const Kept = struct {
+		name: []const u8,
+		created: i64,
+		fn newer(_: void, x: @This(), y: @This()) bool {
+			if (x.created != y.created) return x.created > y.created;
+			return std.mem.order(u8, x.name, y.name) == .gt;
+		}
+	};
+	var drop: std.ArrayList([]const u8) = .empty;
+	var kept: std.ArrayList(Kept) = .empty;
+	var it = dir.iterate();
+	while (it.next(io) catch null) |e| {
+		const name = arena.dupe(u8, e.name) catch return;
+		if (name.len > 0 and name[0] == '.') {
+			drop.append(arena, name) catch return;
+			continue;
+		}
+		const id = planFileId(name) orelse continue;
+		const bytes = snapshot.readNoFollow(arena, io, dir, name, Bounds.plan_file_cap) catch {
+			drop.append(arena, name) catch return;
+			continue;
+		};
+		const sp = parseStoredPlan(arena, bytes) catch {
+			drop.append(arena, name) catch return;
+			continue;
+		};
+		const age = now - sp.created;
+		const stale = !storedPlanValid(arena, sp, id) or age < 0 or age >= Bounds.plan_ttl_s or
+			!std.mem.eql(u8, sp.nonce, nonce) or (host_boot != null and !std.mem.eql(u8, sp.host_boot, host_boot.?));
+		if (stale) {
+			drop.append(arena, name) catch return;
+			continue;
+		}
+		if (keep) |k| if (std.mem.eql(u8, id, k)) continue;
+		kept.append(arena, .{ .name = name, .created = sp.created }) catch return;
+	}
+	std.mem.sort(Kept, kept.items, {}, Kept.newer);
+	if (kept.items.len > Bounds.plans_kept) {
+		for (kept.items[Bounds.plans_kept..]) |k| drop.append(arena, k.name) catch return;
+	}
+	for (drop.items) |n| dir.deleteFile(io, n) catch {};
+}
+
+/// One Apply anyway line of apply/audit.log (spec 4.7, "Audit": cogbox appends
+/// the forced run): `admitted` when the binding admitted a plan, under the
+/// config lock and before anything is forced; `done` once the run (or the
+/// recoverer that resolved it, `recovered`) is over, with whether a forced
+/// `start` was attempted (`forced`, also for a plan that relaxes no unit and
+/// sent no list), the units it relaxed and the outcome. `uid` is the invoking
+/// user (the real uid under sudo), `euid` the effective one.
+pub const ForceAudit = struct {
+	event: []const u8 = "force",
+	phase: enum { admitted, done },
+	at: i64,
+	gen: []const u8,
+	op: ?[]const u8 = null,
+	uid: u32,
+	euid: u32,
+	plan: []const u8,
+	forced: ?bool = null,
+	units: []const []const u8,
+	result: ?Result = null,
+	reason: ?Reason = null,
+	recovered: ?bool = null,
+};
+
+/// Append `line` to apply/audit.log (rollback.audit, positional: the caller
+/// holds the config lock). A failure warns and never fails the run.
+fn appendForceAudit(arena: Allocator, io: Io, icd: []const u8, owner: ?u32, line: ForceAudit) void {
+	var aw: Io.Writer.Allocating = .init(arena);
+	std.json.Stringify.value(line, .{ .emit_null_optional_fields = false }, &aw.writer) catch return;
+	aw.writer.writeByte('\n') catch return;
+	rollback.audit(arena, io, icd, aw.written(), owner) catch |err| {
+		warnf(arena, io, "could not write apply/{s} ({s})", .{ rollback.audit_file, @errorName(err) });
+	};
+}
+
+fn auditUid(real_uid: ?u32) u32 {
+	return real_uid orelse std.c.getuid();
+}
+
 // --- the run --------------------------------------------------------------------------------
 
 /// One `cogbox plugin apply` run (the run mode). Everything allocates in
@@ -2062,6 +2379,17 @@ pub const Run = struct {
 	/// the boot could not be told: G keeps inflight.json, so a recoverer
 	/// performs its record.
 	keep_inflight: bool = false,
+	/// The host's boot id, read at preflight (null: unreadable): the plan store
+	/// and inflight.json carry it.
+	host_boot: ?[]const u8 = null,
+	/// Apply anyway: the stored plan `--force-plan` was admitted for at
+	/// preflight (admitForcePlan); its admission is in audit.log.
+	force_admitted: ?StoredPlan = null,
+	/// What this run forces, once the re-plan gave the admitted id (null for a
+	/// plain run, and for a forced run whose re-plan needed no force), and
+	/// whether the guest runs the repair.
+	forced: ?Forced = null,
+	force_repair: bool = false,
 
 	fn env(r: *const Run) *const std.process.Environ.Map {
 		return r.ctx.parent_env;
@@ -2155,7 +2483,7 @@ pub fn run(ctx: *const plugin.Ctx, args: cli.ApplyArgs, host: Host) u8 {
 	defer arena_state.deinit();
 	const arena = arena_state.allocator();
 	return switch (args.mode) {
-		.run => runApply(arena, ctx, args, host),
+		.run => if (args.force) runForce(arena, ctx, args, host) else runApply(arena, ctx, args, host),
 		.status => runStatus(arena, ctx, args, host),
 		.cancel => runCancel(arena, ctx, args, host),
 		.log => runLog(arena, ctx, args, host),
@@ -2178,16 +2506,23 @@ fn currentKey(arena: Allocator, ctx: *const plugin.Ctx) ?[]const u8 {
 	return std.fmt.allocPrint(arena, "{s}#{s}", .{ src, plugin.reexecPackage(ctx) }) catch null;
 }
 
-/// The refusal of `apply --force` and `--force-plan` (exit 64). The dispatcher
-/// prints it before it opens or waits for any lock; the verb checks again.
-pub const force_unsupported = "apply --force and --force-plan (Apply anyway) are not supported by this cogbox yet";
+/// The refusals of `apply --force` (exit 64), the interactive Apply anyway.
+/// It shows the plan on stderr and reads the answer from stdin, so it needs
+/// both on a terminal (stdin alone would let `2>/dev/null` hide the list being
+/// consented to); and it can run up to four applies, so it takes no --json
+/// (one report line per invocation): a caller that is not a person passes the
+/// reported plan id with `--force-plan`, a plain run. The dispatcher prints
+/// them before it opens or waits for any lock; forceLoop checks again.
+pub const force_needs_tty = "apply --force shows the plan and asks on a terminal (stdin and stderr); without one, pass the plan id an apply reported: --force-plan PLAN";
+pub const force_json_refused = "apply --force is interactive and takes no --json; use --force-plan PLAN";
+
+/// Whether stdin and stderr are both terminals, as `apply --force` needs.
+pub fn forceTerminals(io: Io) bool {
+	return (Io.File.stdin().isTty(io) catch false) and (Io.File.stderr().isTty(io) catch false);
+}
 
 fn runApply(arena: Allocator, ctx: *const plugin.Ctx, args: cli.ApplyArgs, host: Host) u8 {
 	const io = ctx.io;
-	if (args.force or args.force_plan != null) {
-		errorf(arena, io, "{s}", .{force_unsupported});
-		return 64;
-	}
 	ignoreSigpipe();
 	const started = host.started orelse Io.Timestamp.now(io, .awake);
 	const whole_s = wholeSeconds(ctx.parent_env);
@@ -2287,6 +2622,11 @@ fn applyFlow(r: *Run) Outcome {
 	if (plugins_n == 0 and userFlakeCustomized(arena, io, r.ctx.user_flake_dir)) return Outcome.of(.restart_required, .customized_flake);
 
 	r.nonce = nonce orelse return Outcome.of(.restart_required, .booting);
+	// The boot this run is in, as the plan store and inflight.json name it;
+	// plans of any other boot (or too old) go now, the one this run's
+	// --force-plan names never for the count alone.
+	r.host_boot = hostBootId(arena, io);
+	prunePlans(arena, io, r.icd, r.nonce, r.host_boot, r.args.force_plan, bootSeconds(io));
 
 	if (r.ctx.parent_env.get("COGBOX_ENVIRONMENT")) |e| {
 		if (std.mem.eql(u8, e, "cogworx")) {
@@ -2337,6 +2677,8 @@ fn applyFlow(r: *Run) Outcome {
 		} else |_| {}
 	}
 
+	if (admitForcePlan(r)) |o| return o;
+
 	// Release the config lock (the apply flock stays held) and enter the build
 	// phase: from here a plugin change supersedes this apply.
 	unlockFd(r.host.config_fd);
@@ -2344,6 +2686,32 @@ fn applyFlow(r: *Run) Outcome {
 	r.setPhase(.build, bootSeconds(io) + @divTrunc(@max(r.wholeLeftMs(), 0), 1000));
 
 	return buildAndPlan(r);
+}
+
+/// Force only (spec section 2 step 2), the last preflight check, under the
+/// config lock: `--force-plan id` needs a stored plan planAdmits takes, else
+/// the run ends restart_required/plan_expired before anything is built or the
+/// guest is asked. The admission is appended to audit.log here, under the
+/// config lock and before anything is forced.
+fn admitForcePlan(r: *Run) ?Outcome {
+	const id = r.args.force_plan orelse return null;
+	const expired = Outcome.of(.restart_required, .plan_expired);
+	const host_boot = r.host_boot orelse return expired;
+	const sp = readStoredPlan(r.arena, r.io, r.icd, id) catch return expired;
+	if (!planAdmits(r.arena, sp, id, r.nonce, host_boot, r.s.?.meta.comp, bootSeconds(r.io))) return expired;
+	r.force_admitted = sp;
+	appendForceAudit(r.arena, r.io, r.icd, r.owner, .{
+		.phase = .admitted,
+		.at = Io.Timestamp.now(r.io, .real).toSeconds(),
+		.gen = &r.gen,
+		.op = r.args.op,
+		.uid = auditUid(r.owner),
+		.euid = std.c.geteuid(),
+		.plan = sp.plan.id,
+		.units = forceUnits(r.arena, sp.plan) catch &.{},
+		.reason = sp.reason,
+	});
+	return null;
 }
 
 fn diskAboveFloor(r: *Run) bool {
@@ -2753,16 +3121,17 @@ fn evalError(r: *Run) Outcome {
 
 /// One guest hop under `kill_ms` (and the whole-verb timer), with the watch.
 fn hop(r: *Run, verb: []const []const u8, kill_ms: i64, out_cap: usize) HopResult {
-	return hopKind(r, verb, kill_ms, out_cap, .apply);
+	return hopKind(r, verb, kill_ms, out_cap, .apply, null);
 }
 
-fn hopKind(r: *Run, verb: []const []const u8, kill_ms: i64, out_cap: usize, kind: sshargv.Hop) HopResult {
+fn hopKind(r: *Run, verb: []const []const u8, kill_ms: i64, out_cap: usize, kind: sshargv.Hop, stdin: ?[]const u8) HopResult {
 	return guestHop(r.arena, r.io, r.env(), r.ctx.runtime_path, r.host.ssh_identity, verb, .{
 		.kind = kind,
 		.deadline_ms = @min(nowMs(r.io) + kill_ms, r.whole_deadline_ms),
 		.out_cap = out_cap,
 		.honour_supersede = r.phase == .build,
 		.watch = r.watch(),
+		.stdin = stdin,
 	});
 }
 
@@ -2860,17 +3229,56 @@ pub fn planAndApplyWith(r: *Run, g: GuestPlan, b_sys: []const u8, p_sys: []const
 	var reexec = unitplan.reexecNeeded(arena, io, b_sys, r.toplevel.?) catch return Outcome.with(.failed, .plan, &.{"unit_plan"});
 	if (!std.mem.eql(u8, p_sys, b_sys)) reexec = reexec or (unitplan.reexecNeeded(arena, io, p_sys, r.toplevel.?) catch return Outcome.with(.failed, .plan, &.{"unit_plan"}));
 	const t2 = mergeTier2(arena, &host_plan, g, reexec) catch return Outcome.with(.failed, .plan, &.{"unit_plan"});
+	var forced: ?Forced = null;
+	var repair = false;
 	if (t2.refusal) |ref| {
-		var o = Outcome.of(.restart_required, Reason.fromPlan(ref.reason));
+		const why = Reason.fromPlan(ref.reason);
+		var o = Outcome.of(.restart_required, why);
 		o.detail = refusalDetail(arena, t2, ref.reason) catch &.{};
 		o.plan = buildPlan(arena, t2, g.boot_id, r.s.?.meta.comp, p_sys, r.toplevel.?) catch null;
-		return o;
+		const want = r.args.force_plan orelse {
+			// An overridable refusal's plan is stored for Apply anyway; a mixed
+			// one only lists its plan.
+			if (o.overridable()) storePlanFor(r, &o, why);
+			return o;
+		};
+		// Spec section 2 step 5, "Forced run": the guest phase never starts
+		// with a stale list. A refusal that is never overridable (a mixed one
+		// included) stays refused under force, unchanged.
+		if (!o.overridable() or r.force_admitted == null) return o;
+		if (!std.mem.eql(u8, o.plan.?.id, want)) {
+			// Another plan than the one confirmed: nothing is forced, and the
+			// new plan (overridable by construction) is stored to be offered.
+			storePlanFor(r, &o, why);
+			o.reason = .plan_changed;
+			return o;
+		}
+		forced = .{ .plan = o.plan.?.id, .units = forceUnits(arena, o.plan.?) catch return o };
+		repair = o.plan.?.repair.len > 0;
 	}
+	// A forced run whose re-plan is clean (the disruption went away) applies
+	// as a plain one: nothing is relaxed.
 
 	// The phase flip's checks (spec section 2 step 6), then the guest phase.
 	if (checkpoint(r)) |o| return o;
 	if (!diskAboveFloor(r)) return Outcome.of(.restart_required, .insufficient_disk);
+	r.forced = forced;
+	r.force_repair = repair;
 	return runGuestPhase(r, g.boot_id, p_sys);
+}
+
+/// Store an overridable refusal's plan (StoredPlan) for Apply anyway. A plan
+/// that cannot be stored is not offered: it warns and drops `o.plan` (the
+/// report then says `overridable: false`; the units stay in `detail`).
+fn storePlanFor(r: *Run, o: *Outcome, why: Reason) void {
+	const p = o.plan orelse return;
+	const err = blk: {
+		const host_boot = r.host_boot orelse break :blk error.NoHostBootId;
+		storePlan(r.arena, r.io, r.icd, .{ .plan = p, .reason = why, .created = bootSeconds(r.io), .nonce = r.nonce, .host_boot = host_boot, .gen = &r.gen }, r.owner) catch |e| break :blk e;
+		return;
+	};
+	warnf(r.arena, r.io, "could not store the plan to apply anyway ({s})", .{@errorName(err)});
+	o.plan = null;
 }
 
 fn realSystem(r: *Run, runner: []const u8) ?[]const u8 {
@@ -3369,6 +3777,10 @@ pub const Inflight = struct {
 	/// CLOCK_BOOTTIME seconds: a wall-clock step never moves it.
 	expires_at: i64,
 	hops: Hops = .{},
+	/// Apply anyway: the plan and the units every `start` of G carried (a
+	/// recovered run reports them, and audits its completion). Absent in a
+	/// file an older cogbox wrote.
+	forced: ?Forced = null,
 };
 
 /// qemu.start's value: the launcher writes QEMU's start tick.
@@ -3397,6 +3809,10 @@ pub fn parseInflight(arena: Allocator, bytes: []const u8) !Inflight {
 	if (inf.op) |op| if (!cli.isOpToken(op)) return error.InvalidInflight;
 	if (inf.hops.seen) |s| if (!isGuestToken(s)) return error.InvalidInflight;
 	for (inf.scope) |e| if (!isScopeName(e.name)) return error.InvalidInflight;
+	if (inf.forced) |f| {
+		if (!cli.isHex16(f.plan) or f.units.len > Bounds.force_units_max) return error.InvalidInflight;
+		for (f.units) |u| if (!isUnitToken(u)) return error.InvalidInflight;
+	}
 	return inf;
 }
 
@@ -3484,6 +3900,13 @@ pub const GuestRun = struct {
 	final: ?Final = null,
 	/// The rejection whose intent this run wrote.
 	intent: ?rollback.Reason = null,
+	/// Apply anyway: what every `start` attempt sends on stdin with
+	/// `--force-units -` (forceInput of Forced.units; null for a plain run and
+	/// for a plan that relaxes no unit, one that only reloads units or
+	/// re-executes systemd, since the helper refuses an empty list), and
+	/// whether it passes `--repair`.
+	force_input: ?[]const u8 = null,
+	repair: bool = false,
 };
 
 /// Spec section 2 steps 6-8: the phase flip, inflight.json, the `start` hop
@@ -3496,7 +3919,7 @@ pub const GuestRun = struct {
 /// reads it; the rollback itself runs in the record step (finish).
 pub fn runGuestPhase(r: *Run, boot_id: []const u8, p_sys: []const u8) Outcome {
 	const reginfo = regInfoOf(r.arena, r.io, r.runner.?) orelse return Outcome.with(.failed, .plan, &.{"no_reginfo"});
-	const host_boot = hostBootId(r.arena, r.io) orelse return Outcome.with(.failed, .snapshot, &.{"no_host_boot_id"});
+	const host_boot = r.host_boot orelse return Outcome.with(.failed, .snapshot, &.{"no_host_boot_id"});
 	return runGuestPhaseWith(r, boot_id, p_sys, reginfo, host_boot);
 }
 
@@ -3504,6 +3927,10 @@ pub fn runGuestPhase(r: *Run, boot_id: []const u8, p_sys: []const u8) Outcome {
 /// id are known. The guest-phase tests enter here.
 pub fn runGuestPhaseWith(r: *Run, boot_id: []const u8, p_sys: []const u8, reginfo: []const u8, host_boot: []const u8) Outcome {
 	const io = r.io;
+	var force_input: ?[]const u8 = null;
+	if (r.forced) |f| if (f.units.len > 0) {
+		force_input = forceInput(r.arena, f.units) catch return Outcome.with(.failed, .plan, &.{"force_input"});
+	};
 	r.setPhase(.guest, bootSeconds(io) + r.gcfg.window_s + Bounds.guest_extra_s);
 	r.guest = .{
 		.inf = .{
@@ -3520,9 +3947,12 @@ pub fn runGuestPhaseWith(r: *Run, boot_id: []const u8, p_sys: []const u8, reginf
 			.P = p_sys,
 			.scope = r.scope_live,
 			.expires_at = 0,
+			.forced = r.forced,
 		},
 		.reginfo = reginfo,
 		.start_until = nowMs(io) + r.gcfg.start_leg_ms,
+		.force_input = force_input,
+		.repair = r.force_repair,
 	};
 	const o = pollGuest(r);
 	if (o.exit_now != null) return o;
@@ -3684,7 +4114,7 @@ fn pollKill(r: *Run, ms: i64) i64 {
 }
 
 fn guestVerbHop(r: *Run, verb: []const []const u8, kill_ms: i64, kind: sshargv.Hop) HopResult {
-	return hopKind(r, verb, kill_ms, 64 << 10, kind);
+	return hopKind(r, verb, kill_ms, 64 << 10, kind, null);
 }
 
 /// Record a status block: the evidence rule, `seen`, the judgement. A rejecting
@@ -3742,7 +4172,9 @@ fn writeLiveIntent(r: *Run, reason: rollback.Reason) ?Outcome {
 
 /// Step 6's `start`, under the start leg. inflight.json is written first, with
 /// a fresh `expires_at`, before every attempt (`start` is idempotent: a G the
-/// guest already recorded answers its state and arms nothing).
+/// guest already recorded answers its state and arms nothing). An Apply anyway
+/// run adds `--force-units -` (the list on stdin) and `--repair`, the same
+/// argv and bytes on every attempt; a plain run's argv is unchanged.
 fn startHop(r: *Run) ?Outcome {
 	const g = &r.guest.?;
 	const io = r.io;
@@ -3762,7 +4194,11 @@ fn startHop(r: *Run) ?Outcome {
 	const bound = std.fmt.allocPrint(r.arena, "{d}", .{cfg.bound_s}) catch return Outcome.of(.failed, .plan);
 	const window = std.fmt.allocPrint(r.arena, "{d}", .{cfg.window_s}) catch return Outcome.of(.failed, .plan);
 	const kill = @min(cfg.hop_ms, @max(g.start_until - now, 1_000));
-	const h = guestVerbHop(r, &.{ "start", g.inf.G, g.inf.T, g.reginfo, "--prev", g.inf.P, "--boot-id", g.inf.boot_id, "--bound", bound, "--window", window }, kill, .apply);
+	var verb: std.ArrayList([]const u8) = .empty;
+	verb.appendSlice(r.arena, &.{ "start", g.inf.G, g.inf.T, g.reginfo, "--prev", g.inf.P, "--boot-id", g.inf.boot_id, "--bound", bound, "--window", window }) catch return Outcome.of(.failed, .plan);
+	if (g.force_input != null) verb.appendSlice(r.arena, &.{ "--force-units", "-" }) catch return Outcome.of(.failed, .plan);
+	if (g.repair) verb.appendSlice(r.arena, &.{ "--repair", repair_unit }) catch return Outcome.of(.failed, .plan);
+	const h = hopKind(r, verb.items, kill, 64 << 10, .apply, g.force_input);
 	if (h.stopped) |s| return hopStopped(r, s);
 	const rep = h.reply orelse {
 		g.start_lost = true;
@@ -4184,9 +4620,26 @@ const Recoverer = struct {
 		return rc.resolve(o);
 	}
 
+	/// Always under the config lock (every caller checks holds_config_lock). A
+	/// forced G's completion goes to audit.log after the file is gone, so a
+	/// crash between the two loses the line rather than writing it twice.
 	fn resolve(rc: *Recoverer, o: Outcome) Recovery {
 		deleteInflight(rc.io(), rc.icd);
 		writeRecovered(rc.arena, rc.ctx, rc.inf, o);
+		if (rc.inf.forced) |f| appendForceAudit(rc.arena, rc.io(), rc.icd, rc.ctx.real_uid, .{
+			.phase = .done,
+			.at = Io.Timestamp.now(rc.io(), .real).toSeconds(),
+			.gen = rc.inf.G,
+			.op = rc.inf.op,
+			.uid = auditUid(rc.ctx.real_uid),
+			.euid = std.c.geteuid(),
+			.plan = f.plan,
+			.forced = true,
+			.units = f.units,
+			.result = o.result,
+			.reason = o.reason,
+			.recovered = true,
+		});
 		return .resolved;
 	}
 
@@ -4214,7 +4667,7 @@ fn writeRecovered(arena: Allocator, ctx: *const plugin.Ctx, inf: ?*const Infligh
 		.detail = if (o.detail.len > 0) o.detail else null,
 		.overridable = false,
 		.plan = null,
-		.forced = null,
+		.forced = if (inf) |x| x.forced else null,
 		.rollback = o.rollback,
 		.runner = if (inf) |x| x.R else null,
 		.toplevel = if (inf) |x| x.T else null,
@@ -4347,11 +4800,48 @@ pub fn finish(r: *Run, o_in: Outcome) u8 {
 		}
 	}
 	if (r.flock_held and in_guest and !r.keep_inflight) deleteInflight(io, r.icd);
+	auditForceDone(r, o);
 	if (r.flock_held and r.config_held and r.s_taken) _ = snapshot.gc(arena, io, r.icd, &.{}, r.owner);
 	// A build unit whose stop was not confirmed keeps apply/active, its record
 	// (terminateBuild).
 	if (r.flock_held and r.active_written and !r.unit_live) clearActive(io, r.icd);
 	return report(r, o);
+}
+
+/// An admitted Apply anyway run's completion line in audit.log, once its
+/// inflight.json is gone (one that keeps it gets the line from the recoverer
+/// that resolves it, Recoverer.resolve): under the config lock when this run
+/// holds it, else after a LOCK_NB try (a try never waits, so the lock order
+/// holds), released right after. A run whose config lock is busy then (a
+/// superseded run behind its superseder, a step-10 wait that ran out) keeps
+/// only its admission line and last.json.
+fn auditForceDone(r: *Run, o: Outcome) void {
+	const sp = r.force_admitted orelse return;
+	if (!r.flock_held or r.keep_inflight) return;
+	var took = false;
+	if (!r.config_held) {
+		took = tryFlock(r.host.config_fd) catch false;
+		if (!took) {
+			warnf(r.arena, r.io, "could not record the end of the apply anyway in apply/{s} (the config lock is busy)", .{rollback.audit_file});
+			return;
+		}
+	}
+	defer if (took) unlockFd(r.host.config_fd);
+	const sent = if (r.inflight_written) r.forced else null;
+	appendForceAudit(r.arena, r.io, r.icd, r.owner, .{
+		.phase = .done,
+		.at = Io.Timestamp.now(r.io, .real).toSeconds(),
+		.gen = &r.gen,
+		.op = r.args.op,
+		.uid = auditUid(r.owner),
+		.euid = std.c.geteuid(),
+		.plan = sp.plan.id,
+		.forced = sent != null,
+		.units = if (sent) |f| f.units else &.{},
+		.result = o.result,
+		.reason = o.reason,
+		.recovered = false,
+	});
 }
 
 /// This run's rollback, from the on-disk intent for G (spec 4.6); exit 78 when
@@ -4537,7 +5027,10 @@ fn report(r: *Run, o: Outcome) u8 {
 		.detail = if (o.detail.len > 0) o.detail else null,
 		.overridable = o.overridable(),
 		.plan = o.plan,
-		.forced = null,
+		// Exactly when a forced `start` was attempted, whether or not it
+		// sent a list (inflight.json, written before every attempt, carries
+		// it too).
+		.forced = if (r.inflight_written) r.forced else null,
 		.rollback = o.rollback,
 		.runner = r.runner,
 		.toplevel = r.toplevel,
@@ -4555,10 +5048,17 @@ fn report(r: *Run, o: Outcome) u8 {
 	}
 	if (r.config_held) unlockFd(r.host.config_fd);
 	if (r.flock_held) unlockFd(r.host.apply_fd);
+	if (r.host.report_out) |dst| {
+		// It outlives this Run: `gen` points into it, everything else into
+		// the arena (or argv).
+		dst.* = rep;
+		dst.*.?.gen = if (rep.gen) |g| (arena.dupe(u8, g) catch null) else null;
+	}
 	if (r.args.json) {
 		r.host.emit(io, line);
 	} else {
-		r.host.emit(io, humanLine(arena, r.ctx.instance, &r.gen, r.exit_code == 78, o));
+		// `--force` asks about the plan itself: no hint to run it.
+		r.host.emit(io, humanLine(arena, r.ctx.instance, &r.gen, r.exit_code == 78, o, rep.forced, !r.args.force));
 		if (o.result == .rejected and r.exit_code == 0) return 1;
 	}
 	return r.exit_code;
@@ -4572,13 +5072,28 @@ fn roleIdOrNull(r: *Run, role: snapshot.Role) ?[]const u8 {
 /// The non-JSON report: one line, plus the units behind a plan refusal.
 /// `instance` and `gen` go into the build-log hint; `blocked` when the run's
 /// own rollback could not be finished (exit 78, its stamped message already on
-/// stderr).
-fn humanLine(arena: Allocator, instance: ?[]const u8, gen: []const u8, blocked: bool, o: Outcome) []const u8 {
+/// stderr). `forced`, the report's: the units an Apply anyway forced get a
+/// line of their own. `hint`: an overridable refusal, and the new plan of a
+/// plan_changed, say how to apply it anyway, on a terminal and off one with
+/// its plan id (`--force-plan`; not for `--force`, which lists the plan and
+/// asks about it next). `detail` names only the units behind the refusal's
+/// own reason, so the plan id comes after the whole plan (writePlanItems: every
+/// unit and action, the re-exec, the repair), never before it; a plan that
+/// cannot be listed gets no hint.
+fn humanLine(arena: Allocator, instance: ?[]const u8, gen: []const u8, blocked: bool, o: Outcome, forced: ?Forced, hint: bool) []const u8 {
 	const tag = if (o.reason) |why| std.fmt.allocPrint(arena, "{s}/{s}", .{ @tagName(o.result), @tagName(why) }) catch "" else @tagName(o.result);
+	const changed = "nothing was applied: the plan changed since it was shown";
 	const text: []const u8 = switch (o.result) {
 		.applied, .applied_with_failures => "the plugin changes are live",
 		.already_live => "the plugin state is already live",
-		.restart_required => if (o.overridable()) "saved; it loads at the next restart (a live apply would disrupt the units listed)" else "saved; it loads at the next restart",
+		.restart_required => if (o.reason == .plan_expired)
+			"nothing was applied: the plan to apply anyway is unknown, older than 30 minutes, or from another boot or plugin state"
+		else if (o.reason == .plan_changed)
+			(if (o.plan != null) changed else changed ++ " (no new plan could be stored)")
+		else if (o.overridable())
+			"saved; it loads at the next restart (a live apply would disrupt the units listed)"
+		else
+			"saved; it loads at the next restart",
 		.rejected => rejectedText(arena, o.rollback, instance, gen, blocked),
 		.undone => "the live apply was undone; the change loads at the next restart",
 		.failed => "saved but could not be applied live; it loads at the next restart",
@@ -4607,6 +5122,30 @@ fn humanLine(arena: Allocator, instance: ?[]const u8, gen: []const u8, blocked: 
 			line.appendSlice(arena, u) catch return "";
 		}
 		line.append(arena, '\n') catch return "";
+	};
+	if (forced) |f| {
+		line.appendSlice(arena, "  forced units: ") catch return "";
+		if (f.units.len == 0) line.appendSlice(arena, "none (it only reloads units or re-executes systemd, which every check still covers)") catch return "";
+		for (f.units, 0..) |u, i| {
+			if (i > 0) line.appendSlice(arena, ", ") catch return "";
+			line.appendSlice(arena, u) catch return "";
+		}
+		line.append(arena, '\n') catch return "";
+	}
+	// The plan a person may apply anyway: an overridable refusal's, or the new
+	// one a plan_changed stored (wholly overridable by construction).
+	const offer: ?Plan = if (o.overridable() or (o.result == .restart_required and o.reason == .plan_changed)) o.plan else null;
+	if (hint) if (offer) |p| {
+		var items: Io.Writer.Allocating = .init(arena);
+		const listed = if (writePlanItems(&items.writer, p, "    ")) |_| items.written().len > 0 else |_| false;
+		if (listed) {
+			const n_opt: []const u8 = if (instance) |n| (std.fmt.allocPrint(arena, " -n {s}", .{n}) catch return "") else "";
+			const which: []const u8 = if (o.overridable()) "it" else "the new plan";
+			line.print(arena, "  to apply it now anyway: cogbox plugin apply --force{s}\n", .{n_opt}) catch return "";
+			line.print(arena, "  applying {s} anyway would:\n", .{which}) catch return "";
+			line.appendSlice(arena, items.written()) catch return "";
+			line.print(arena, "  without a terminal, after reading the plan above: cogbox plugin apply --force-plan {s}{s}\n", .{ p.id, n_opt }) catch return "";
+		}
 	};
 	return line.items;
 }
@@ -5068,6 +5607,310 @@ fn sameNames(a: []const []const u8, b: []const []const u8) bool {
 	if (a.len != b.len) return false;
 	for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
 	return true;
+}
+
+// --- --force (Apply anyway on a terminal) --------------------------------------------------------
+
+/// Where forceLoop asks: whether stdin and stderr are both terminals, and the
+/// reader of stdin, one for the whole loop. `fd`, the terminal `in` reads:
+/// what was typed on it before a question was shown is discarded
+/// (discardTypeahead); null discards only what `in` holds.
+pub const Prompt = struct {
+	tty: bool,
+	in: *Io.Reader,
+	fd: ?std.posix.fd_t = null,
+};
+
+/// One apply of forceLoop: its exit code and the Report it built (null when it
+/// built none: a rollback that cannot finish blocked it).
+pub const Round = struct { code: u8, report: ?Report };
+pub const RoundFn = *const fn (Allocator, *const plugin.Ctx, cli.ApplyArgs, Host) Round;
+
+/// `apply --force`: forceLoop on this process's own terminal.
+fn runForce(arena: Allocator, ctx: *const plugin.Ctx, args: cli.ApplyArgs, host: Host) u8 {
+	var buf: [256]u8 = undefined;
+	var reader = Io.File.stdin().readerStreaming(ctx.io, &buf);
+	return forceLoop(arena, ctx, args, host, .{ .tty = forceTerminals(ctx.io), .in = &reader.interface, .fd = Io.File.stdin().handle }, applyRound);
+}
+
+/// forceLoop's round: one apply, with the Report it built handed back.
+pub fn applyRound(arena: Allocator, ctx: *const plugin.Ctx, args: cli.ApplyArgs, host: Host) Round {
+	var rep: ?Report = null;
+	var h = host;
+	h.report_out = &rep;
+	const code = runApply(arena, ctx, args, h);
+	return .{ .code = code, .report = rep };
+}
+
+/// The interactive Apply anyway (spec 4.7, CLI). Round 0 is a plain apply
+/// (`args.force` only drops its Apply anyway hint). When it ends overridable,
+/// the plan is listed on stderr and asked about on the terminal (never through
+/// confirm(), which says yes off a terminal); a yes runs the apply again bound
+/// to that plan (`force_plan`), which forces it when its re-plan gives the
+/// same id. A plan that changed meanwhile (plan_changed, which stores the new
+/// one) is listed and asked about again. Nothing is held while the person
+/// reads: the round released both locks and cleared apply/active, and nothing
+/// reached the guest (an overridable outcome is decided before `start`), so
+/// TERM, INT and HUP get their default action there and a Ctrl-C simply ends
+/// the process; a plugin change made meanwhile is caught by the binding:
+/// plan_changed, or plan_expired for a changed plugin state (as for a plan
+/// that aged, or a restart, while the question waited), after which a plain
+/// apply plans again, as round 0 did, and the plan it offers is the one asked
+/// about next. There are at most Bounds.force_rounds forced runs, whichever
+/// of the two their binding answered: after the last one's plan_changed or
+/// plan_expired nothing is asked about or planned again, and nothing is
+/// applied anyway. Each round after the first restarts the whole-verb
+/// timer, which bounds one apply, not the time spent reading, and then
+/// retakes the config lock with the dispatcher's bound: the timer counts that
+/// wait, as the dispatcher's does from process start. A decline, EOF and the
+/// abort exit 1; otherwise the last round's exit code.
+pub fn forceLoop(arena: Allocator, ctx: *const plugin.Ctx, args: cli.ApplyArgs, host: Host, p: Prompt, round: RoundFn) u8 {
+	const io = ctx.io;
+	// The dispatcher refused both already, before any lock.
+	if (args.json) {
+		errorf(arena, io, "{s}", .{force_json_refused});
+		return 64;
+	}
+	if (!p.tty) {
+		errorf(arena, io, "{s}", .{force_needs_tty});
+		return 64;
+	}
+	const n_opt: []const u8 = if (ctx.instance) |n| (std.fmt.allocPrint(arena, " -n {s}", .{n}) catch "") else "";
+	const again = std.fmt.allocPrint(arena, "The plan changed again; nothing was applied anyway. Run 'cogbox plugin apply --force{s}' to see the current plan.\n", .{n_opt}) catch "";
+	var h = host;
+	var res = round(arena, ctx, args, h);
+	var forced_rounds: u32 = 0;
+	// Whether `res` is a plain apply's (round 0, or the re-plan after a
+	// forced round's plan_expired), and the id of the plan asked about last.
+	var plain = true;
+	var shown: ?[]const u8 = null;
+	while (true) {
+		const rep = res.report orelse return res.code;
+		if (!plain and rep.reason == .plan_expired) {
+			// The plan expired while the question waited (a plugin change, a
+			// restart, its half hour): plan again with a plain apply, as round
+			// 0 did, and ask about what it offers.
+			if (forced_rounds >= Bounds.force_rounds) {
+				errOut(io, again);
+				return 1;
+			}
+			if (retakeForRound(io, &h)) |code| return code;
+			res = round(arena, ctx, args, h);
+			plain = true;
+			continue;
+		}
+		// A plain apply offers an overridable plan; a forced round only the
+		// new plan of a plan_changed (anything else is its answer).
+		const offered: ?Plan = if (plain)
+			(if (rep.overridable) rep.plan else null)
+		else if (rep.reason == .plan_changed) rep.plan else null;
+		const plan = offered orelse {
+			// A mixed refusal lists its plan, but nothing can force it.
+			if (plain and rep.result == .restart_required and rep.plan != null) {
+				errOut(io, std.fmt.allocPrint(arena, "Apply anyway cannot override this change: {s} is never overridable.\n", .{if (rep.reason) |why| @tagName(why) else "its reason"}) catch "");
+			}
+			return res.code;
+		};
+		if (forced_rounds >= Bounds.force_rounds) {
+			errOut(io, again);
+			return 1;
+		}
+		if (terminate.load(.acquire) != 0) return 128 +| terminate.load(.acquire);
+		// A yes agrees to the listing: none (it could not be made or
+		// written), no question.
+		const changed = if (shown) |id| !std.mem.eql(u8, id, plan.id) else false;
+		const listing = planListing(arena, ctx.instance, plan, changed);
+		if (listing.len == 0 or !errOutChecked(io, listing)) {
+			errOut(io, "Nothing was applied anyway; the change loads at the next restart.\n");
+			return 1;
+		}
+		shown = plan.id;
+		defaultTerminateSignals();
+		const question = std.fmt.allocPrint(arena, "Apply anyway (plan {s})? [y/N] ", .{plan.id}) catch "Apply anyway? [y/N] ";
+		if (!askYes(io, p, question)) {
+			errOut(io, "Nothing was applied anyway; the change loads at the next restart.\n");
+			return 1;
+		}
+		installSignals();
+		if (retakeForRound(io, &h)) |code| return code;
+		forced_rounds += 1;
+		plain = false;
+		var forced_args = args;
+		forced_args.force_plan = plan.id;
+		res = round(arena, ctx, forced_args, h);
+	}
+}
+
+/// Before each forceLoop round after the first, with the verb's handlers
+/// installed: a supersede request the round before got after its last check
+/// is dropped, so it cannot end the next round's build at once (the plugin
+/// change that sent it is caught by that round's binding), the whole-verb
+/// timer restarts, and the config lock is taken again with the dispatcher's
+/// bound (the timer counts that wait). The exit code when a signal ends it,
+/// else null; a lock that stays busy is the round's own failed/busy, as after
+/// the dispatcher's wait.
+fn retakeForRound(io: Io, h: *Host) ?u8 {
+	supersede.store(0, .release);
+	if (terminate.load(.acquire) != 0) return 128 +| terminate.load(.acquire);
+	// The timer first: the whole verb's sum counts the lock wait.
+	h.started = Io.Timestamp.now(io, .awake);
+	h.config_held = false;
+	if (pollFlock(io, h.config_fd, Bounds.dispatcher_lock_ms, &terminate, null)) |_| {
+		h.config_held = true;
+	} else |err| switch (err) {
+		error.Canceled => return 128 +| terminate.load(.acquire),
+		// The round answers failed/busy, as the dispatcher's wait would.
+		else => {},
+	}
+	return null;
+}
+
+/// Ask `question` on stderr and read one line: yes only when it starts with y
+/// or Y (as confirm() and --abandon-rollback's prompt read it); an empty
+/// line, EOF, a read error and a question that could not be written are no.
+/// Only a line typed once the question is shown answers it: what was typed
+/// ahead (during a round, before the listing, or past the last answer) is
+/// discarded first, from the terminal and from the reader's buffer, before
+/// the question is written, so an answer typed on seeing it is never lost.
+pub fn askYes(io: Io, p: Prompt, question: []const u8) bool {
+	p.in.tossBuffered();
+	if (p.fd) |fd| discardTypeahead(fd);
+	if (!errOutChecked(io, question)) return false;
+	const line = (p.in.takeDelimiter('\n') catch return false) orelse {
+		// EOF (Ctrl-D): end the question's line.
+		errOut(io, "\n");
+		return false;
+	};
+	const ans = std.mem.trim(u8, line, " \t\r\n");
+	return ans.len > 0 and (ans[0] == 'y' or ans[0] == 'Y');
+}
+
+/// Drop the input terminal `fd` holds unread (tcflush TCIFLUSH). Linux only:
+/// elsewhere `apply` answers unsupported_platform before anything is asked.
+pub fn discardTypeahead(fd: std.posix.fd_t) void {
+	const tciflush = 0;
+	if (is_linux) _ = linux.ioctl(fd, linux.T.CFLSH, tciflush);
+}
+
+/// TERM, INT and HUP back to their default action, while forceLoop waits for
+/// an answer (installSignals puts the verb's handlers back).
+pub fn defaultTerminateSignals() void {
+	var act: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
+	act.handler.handler = std.posix.SIG.DFL;
+	std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+	std.posix.sigaction(std.posix.SIG.INT, &act, null);
+	std.posix.sigaction(std.posix.SIG.HUP, &act, null);
+}
+
+/// What forceLoop lists before it asks (spec 4.7): every unit of the plan with
+/// its action, why it is in the plan, its class and, for the units whose
+/// effect has a name (unitEffect), what that action ends; then the systemd
+/// re-exec (part of the switch) and the repair (after it), then what they do
+/// to the people using the sandbox and which of the post-checks force relaxes
+/// (forceUnits: the units it stops, starts or restarts, never one it only
+/// reloads). `changed`: the plan the person was shown last changed meanwhile.
+/// The question itself is askYes's. Empty for a plan with a unit name or a
+/// `why` a listing may not show (isUnitToken, isPlanWhy).
+pub fn planListing(arena: Allocator, instance: ?[]const u8, p: Plan, changed: bool) []const u8 {
+	var aw: Io.Writer.Allocating = .init(arena);
+	writePlanListing(&aw.writer, instance, p, changed) catch return "";
+	return aw.written();
+}
+
+fn writePlanListing(w: *Io.Writer, instance: ?[]const u8, p: Plan, changed: bool) Io.Writer.Error!void {
+	try w.writeAll(if (changed) "The plan changed since it was shown. Apply anyway would now act on these units in the running instance" else "Apply anyway would act on these units in the running instance");
+	if (instance) |n| try w.print(" '{s}':\n", .{n}) else try w.writeAll(":\n");
+	try writePlanItems(w, p, "  ");
+	try w.writeAll("They end or interrupt the sessions, containers and connections they serve, for everyone who uses the sandbox, " ++
+		"and they restart again if the change is undone. The units it stops, starts or restarts may end up restarted, stopped or started " ++
+		"without that undoing the change (one that fails undoes it); a unit it only reloads must keep running as it was. " ++
+		"The checks of logins, sshd and the network still run, and a change they prove broken is rolled back.\n");
+}
+
+/// The whole of what plan `p` does, one line each under `indent`: every unit
+/// with its action, why, class and named effect (unitEffect), then the systemd
+/// re-exec and the repair. planListing's body, and what humanLine shows before
+/// the plan id that forces it off a terminal. What reaches a person is checked
+/// text only (buildPlan offers no other plan): error.WriteFailed, before
+/// anything is written, for a unit name or a `why` a listing may not show
+/// (isUnitToken, isPlanWhy), so the caller shows none rather than a listing
+/// that is not what it says.
+fn writePlanItems(w: *Io.Writer, p: Plan, indent: []const u8) Io.Writer.Error!void {
+	for (p.units) |u| if (!isUnitToken(u.unit) or !isPlanWhy(u.why)) return error.WriteFailed;
+	for (p.units) |u| {
+		try w.print("{s}{s} {s} ({s}; class {s})", .{ indent, @tagName(u.action), u.unit, u.why, u.class });
+		if (unitEffect(u.unit, u.action)) |effect| try w.print(": {s}", .{effect});
+		try w.writeByte('\n');
+	}
+	if (p.reexec) try w.print("{s}re-execute systemd\n", .{indent});
+	for (p.repair) |unit| try w.print("{s}then restart {s} (repairs the uplink's reply routing)\n", .{ indent, unit });
+}
+
+/// What a plan action ends for the people using the sandbox (spec 4.2, "Forced
+/// plans say what they end"), in the control plane's words, for the units
+/// whose effect has a name; null for every other unit and action (the listing
+/// names the action alone).
+fn unitEffect(unit: []const u8, action: unitplan.Action) ?[]const u8 {
+	if (std.mem.eql(u8, unit, "docker.service") and (action == .stop or action == .restart)) return "stops every running container";
+	if (std.mem.eql(u8, unit, "sshd.service") and action == .restart) return "existing sessions survive, new logins pause briefly";
+	if (std.mem.eql(u8, unit, "systemd-resolved.service") and action == .restart) return "name lookups fail briefly";
+	return null;
+}
+
+/// Units forceHint's one-line form (on a terminal) names before it counts
+/// the rest.
+const hint_units_max = 8;
+
+/// The inline add/update/del's hint after an overridable refusal (they never
+/// prompt): how to apply it anyway and what that would do, from the report's
+/// `plan` object. `tty`, stdin and stderr are terminals (forceTerminals), so
+/// `--force` runs there: one line naming it, at most 8 units, the re-exec and
+/// the repair (`--force` lists the whole plan before it asks). Off one, where
+/// `--force` refuses: the whole plan as the verb's own human line lists it
+/// (writePlanItems), and only after it the `--force-plan` line with its id.
+/// Null when `plan` is not a well-formed plan (nothing is printed then).
+pub fn forceHint(arena: Allocator, instance: ?[]const u8, plan: std.json.Value, tty: bool) ?[]const u8 {
+	const units = objGet(plan, "units") orelse return null;
+	const reexec = objGet(plan, "reexec") orelse return null;
+	const repair = objGet(plan, "repair") orelse return null;
+	if (units != .array or reexec != .bool or repair != .array) return null;
+	for (repair.array.items) |u| if (u != .string or !isUnitToken(u.string)) return null;
+	const n_opt: []const u8 = if (instance) |n| (std.fmt.allocPrint(arena, " -n {s}", .{n}) catch return null) else "";
+	var aw: Io.Writer.Allocating = .init(arena);
+	const w = &aw.writer;
+	if (!tty) {
+		const p = std.json.parseFromValueLeaky(Plan, arena, plan, .{ .ignore_unknown_fields = true }) catch return null;
+		if (!cli.isHex16(p.id)) return null;
+		w.writeAll("Or apply it now anyway, which would:\n") catch return null;
+		const head = aw.written().len;
+		writePlanItems(w, p, "  ") catch return null;
+		if (aw.written().len == head) return null;
+		w.print("To apply it anyway, after reading the plan above: cogbox plugin apply --force-plan {s}{s}", .{ p.id, n_opt }) catch return null;
+		return aw.written();
+	}
+	w.print("Or run 'cogbox plugin apply --force{s}' to apply it now anyway; it would: ", .{n_opt}) catch return null;
+	var items: usize = 0;
+	for (units.array.items) |u| {
+		const unit = objGet(u, "unit") orelse return null;
+		const action = objGet(u, "action") orelse return null;
+		if (unit != .string or action != .string) return null;
+		if (!isUnitToken(unit.string) or std.meta.stringToEnum(unitplan.Action, action.string) == null) return null;
+		if (items == hint_units_max) continue;
+		w.print("{s}{s} {s}", .{ if (items > 0) ", " else "", action.string, unit.string }) catch return null;
+		items += 1;
+	}
+	if (units.array.items.len > items) w.print(", and {d} more", .{units.array.items.len - items}) catch return null;
+	if (reexec.bool) {
+		w.print("{s}re-execute systemd", .{if (items > 0) ", " else ""}) catch return null;
+		items += 1;
+	}
+	for (repair.array.items) |u| {
+		w.print("{s}restart {s}", .{ if (items > 0) ", then " else "", u.string }) catch return null;
+		items += 1;
+	}
+	if (items == 0) return null;
+	w.writeByte('.') catch return null;
+	return aw.written();
 }
 
 // --- the apply gate of a plugin change (spec 4.8) ------------------------------------------
@@ -5771,6 +6614,17 @@ test "build: an eval_error reproduced, then SIGUSR1: the verb flips to record an
 	try t.expect(std.mem.indexOf(u8, try fx.read("icd/config.json"), "\"x\"") == null);
 }
 
+test "writeAllTo: a stdout redirected to a file gets every write after the one before (apply --force reports once per round)" {
+	var fx: RecordFx = undefined;
+	try fx.init("stdout-file");
+	defer fx.deinit();
+	const f = try Io.Dir.cwd().createFile(fx.io(), fx.path("out"), .{ .truncate = true });
+	defer f.close(fx.io());
+	writeAllTo(fx.io(), f, "plugin apply: restart_required/disruptive_units: saved\n");
+	writeAllTo(fx.io(), f, "plugin apply: applied\n");
+	try t.expectEqualStrings("plugin apply: restart_required/disruptive_units: saved\nplugin apply: applied\n", try fx.read("out"));
+}
+
 test "humanLine: a rejection says rolled back only when it was, and the build-log hint names the instance" {
 	var arena_state = std.heap.ArenaAllocator.init(t.allocator);
 	defer arena_state.deinit();
@@ -5785,36 +6639,158 @@ test "humanLine: a rejection says rolled back only when it was, and the build-lo
 
 	o.rollback = rb(.done);
 	try t.expectEqualStrings("plugin apply: rejected/activation_hang: the change was not applied and has been rolled back. " ++
-		"Build log: cogbox plugin apply -n work --log 0123456789abcdef\n", humanLine(a, "work", gen, false, o));
+		"Build log: cogbox plugin apply -n work --log 0123456789abcdef\n", humanLine(a, "work", gen, false, o, null, false));
 	// The default instance takes no -n.
-	try t.expect(std.mem.endsWith(u8, humanLine(a, null, gen, false, o), "Build log: cogbox plugin apply --log 0123456789abcdef\n"));
+	try t.expect(std.mem.endsWith(u8, humanLine(a, null, gen, false, o, null, false), "Build log: cogbox plugin apply --log 0123456789abcdef\n"));
 
 	// The step-10 config lock could not be had: the intent stays for the next
 	// plugin command or start, and nothing is said to be rolled back.
 	o.rollback = rb(.pending);
-	const pending = humanLine(a, "work", gen, false, o);
+	const pending = humanLine(a, "work", gen, false, o, null, false);
 	try t.expect(std.mem.indexOf(u8, pending, "rolled back") == null);
 	try t.expectEqualStrings("plugin apply: rejected/activation_hang: the change was not applied. Its rollback is pending; " ++
 		"the next plugin command or start of the instance finishes it. Build log: cogbox plugin apply -n work --log 0123456789abcdef\n", pending);
 	// The finish itself could not complete (exit 78; the stamped message is on
 	// stderr), and a rejection without a rollback object is not called done.
-	const blocked = humanLine(a, "work", gen, true, o);
+	const blocked = humanLine(a, "work", gen, true, o, null, false);
 	try t.expect(std.mem.indexOf(u8, blocked, "rolled back") == null);
 	try t.expectEqualStrings("plugin apply: rejected/activation_hang: the change was not applied. Its rollback could not be finished " ++
 		"(see the message above). Build log: cogbox plugin apply -n work --log 0123456789abcdef\n", blocked);
 	o.rollback = null;
-	try t.expect(std.mem.indexOf(u8, humanLine(a, "work", gen, false, o), "Its rollback is pending") != null);
+	try t.expect(std.mem.indexOf(u8, humanLine(a, "work", gen, false, o, null, false), "Its rollback is pending") != null);
 
 	// The fail-closed tier removed what the change added or updated.
 	o.rollback = rb(.removed);
 	o.rollback.?.names = &.{.{ .name = "x", .action = .restored }};
-	const removed = humanLine(a, "work", gen, false, o);
+	const removed = humanLine(a, "work", gen, false, o, null, false);
 	try t.expect(std.mem.indexOf(u8, removed, "rolled back") == null);
 	try t.expectEqualStrings("plugin apply: rejected/activation_hang: the change was not applied. Its previous plugin state could not be restored, " ++
 		"so the plugins it added or updated were removed. Build log: cogbox plugin apply -n work --log 0123456789abcdef\n", removed);
 	// A rolled-back del: the name it removed is not put back.
 	o.rollback.?.names = &.{.{ .name = "x", .action = .reinserted }};
-	try t.expect(std.mem.indexOf(u8, humanLine(a, "work", gen, false, o), "so the plugins it removed stay removed. Build log:") != null);
+	try t.expect(std.mem.indexOf(u8, humanLine(a, "work", gen, false, o, null, false), "so the plugins it removed stay removed. Build log:") != null);
+}
+
+test "humanLine: Apply anyway's own outcomes, the hint to apply anyway, and the units a run forced" {
+	var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena_state.deinit();
+	const a = arena_state.allocator();
+	const gen = "0123456789abcdef";
+	const plan: Plan = .{ .id = "fedcba9876543210", .boot_id = "", .comp = "", .P = "", .T = "", .units = &.{
+		.{ .unit = "docker.service", .action = .restart, .why = "changed", .class = "B" },
+	}, .repair = &.{}, .reexec = false };
+	const docker = "    restart docker.service (changed; class B): stops every running container\n";
+
+	try t.expectEqualStrings("plugin apply: restart_required/plan_expired: nothing was applied: the plan to apply anyway is unknown, older than 30 minutes, " ++
+		"or from another boot or plugin state\n", humanLine(a, "work", gen, false, Outcome.of(.restart_required, .plan_expired), null, true));
+	// A plan_changed's new plan is listed whole before its id, as an
+	// overridable refusal's is; under --force (no hint) forceLoop lists it.
+	var changed = Outcome.with(.restart_required, .plan_changed, &.{ "docker.service", "sshd.service" });
+	changed.plan = plan;
+	const changed_head = "plugin apply: restart_required/plan_changed: nothing was applied: the plan changed since it was shown\n  docker.service, sshd.service\n";
+	try t.expectEqualStrings(changed_head ++ "  to apply it now anyway: cogbox plugin apply --force -n work\n" ++
+		"  applying the new plan anyway would:\n" ++ docker ++
+		"  without a terminal, after reading the plan above: cogbox plugin apply --force-plan fedcba9876543210 -n work\n", humanLine(a, "work", gen, false, changed, null, true));
+	try t.expectEqualStrings(changed_head, humanLine(a, "work", gen, false, changed, null, false));
+	changed.plan = null;
+	try t.expectEqualStrings("plugin apply: restart_required/plan_changed: nothing was applied: the plan changed since it was shown (no new plan could be stored)\n" ++
+		"  docker.service, sshd.service\n", humanLine(a, "work", gen, false, changed, null, true));
+
+	// An overridable refusal says how to apply it anyway, after its units;
+	// not under --force (which asks next), and not for a plan it cannot offer.
+	var offered = Outcome.with(.restart_required, .disruptive_units, &.{"docker.service"});
+	offered.plan = plan;
+	const saved = "plugin apply: restart_required/disruptive_units: saved; it loads at the next restart (a live apply would disrupt the units listed)\n  docker.service\n";
+	// Off a terminal `--force` is refused: the plan id is what --force-plan
+	// takes, and a human line shows it only after the whole plan.
+	try t.expectEqualStrings(saved ++ "  to apply it now anyway: cogbox plugin apply --force -n work\n" ++
+		"  applying it anyway would:\n" ++ docker ++
+		"  without a terminal, after reading the plan above: cogbox plugin apply --force-plan fedcba9876543210 -n work\n", humanLine(a, "work", gen, false, offered, null, true));
+	try t.expectEqualStrings(saved ++ "  to apply it now anyway: cogbox plugin apply --force\n" ++
+		"  applying it anyway would:\n" ++ docker ++
+		"  without a terminal, after reading the plan above: cogbox plugin apply --force-plan fedcba9876543210\n", humanLine(a, null, gen, false, offered, null, true));
+	try t.expectEqualStrings(saved, humanLine(a, "work", gen, false, offered, null, false));
+	// A plan that cannot be listed (a name outside the charset) is offered
+	// nowhere, its id included; nor is one with nothing to list.
+	var unlisted = offered;
+	unlisted.plan.?.units = &.{.{ .unit = "doc\x1b[2Jker.service", .action = .restart, .why = "changed", .class = "B" }};
+	try t.expectEqualStrings(saved, humanLine(a, "work", gen, false, unlisted, null, true));
+	unlisted.plan.?.units = &.{.{ .unit = "docker.service", .action = .restart, .why = "propagated:x:\x1b[2J", .class = "B" }};
+	try t.expectEqualStrings(saved, humanLine(a, "work", gen, false, unlisted, null, true));
+	unlisted.plan.?.units = &.{};
+	try t.expectEqualStrings(saved, humanLine(a, "work", gen, false, unlisted, null, true));
+	var mixed = Outcome.with(.restart_required, .restart_only_units, &.{"docker.service"});
+	mixed.plan = plan;
+	try t.expect(std.mem.indexOf(u8, humanLine(a, "work", gen, false, mixed, null, true), "apply it now anyway") == null);
+
+	// What a forced run forced, whatever its outcome.
+	const forced: Forced = .{ .plan = plan.id, .units = &.{ "docker.service", "docker.socket" } };
+	try t.expectEqualStrings("plugin apply: applied: the plugin changes are live\n  forced units: docker.service, docker.socket\n", humanLine(a, "work", gen, false, Outcome.of(.applied, null), forced, true));
+	var failed = Outcome.with(.undone, .forced_unit_failed, &.{"docker.service"});
+	failed.units = &.{"docker.service"};
+	try t.expectEqualStrings("plugin apply: undone/forced_unit_failed: the live apply was undone; the change loads at the next restart\n  docker.service\n" ++
+		"  failed units: docker.service\n  forced units: docker.service, docker.socket\n", humanLine(a, "work", gen, false, failed, forced, true));
+	// A plan that only reloads units or re-executes systemd relaxes nothing.
+	try t.expectEqualStrings("plugin apply: applied: the plugin changes are live\n  forced units: none (it only reloads units or re-executes systemd, which every check still covers)\n", humanLine(a, "work", gen, false, Outcome.of(.applied, null), .{ .plan = plan.id, .units = &.{} }, true));
+}
+
+test "humanLine: the plan id to apply anyway off a terminal comes after the whole plan, not only the units of the refusal's reason" {
+	var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena_state.deinit();
+	const a = arena_state.allocator();
+	const gen = "0123456789abcdef";
+	// A docker setting (class B) beside a .network change (class C) that also
+	// re-executes systemd (class D): the refusal is disruptive_units, so its
+	// detail names the class B units alone, while the plan also reloads
+	// networkd, re-executes systemd and repairs the reply route.
+	const plan: Plan = .{ .id = "fedcba9876543210", .boot_id = "", .comp = "", .P = "", .T = "", .units = &.{
+		.{ .unit = "docker.service", .action = .stop, .why = "changed", .class = "B" },
+		.{ .unit = "docker.socket", .action = .restart, .why = "induced", .class = "B" },
+		.{ .unit = "systemd-networkd.service", .action = .reload, .why = "changed", .class = "C" },
+	}, .repair = &.{repair_unit}, .reexec = true };
+	const whole = "    stop docker.service (changed; class B): stops every running container\n" ++
+		"    restart docker.socket (induced; class B)\n" ++
+		"    reload systemd-networkd.service (changed; class C)\n" ++
+		"    re-execute systemd\n" ++
+		"    then restart cogbox-reply-route.service (repairs the uplink's reply routing)\n";
+	var o = Outcome.with(.restart_required, .disruptive_units, &.{ "docker.service", "docker.socket" });
+	o.plan = plan;
+	const line = humanLine(a, "la", gen, false, o, null, true);
+	try t.expectEqualStrings("plugin apply: restart_required/disruptive_units: saved; it loads at the next restart (a live apply would disrupt the units listed)\n" ++
+		"  docker.service, docker.socket\n" ++
+		"  to apply it now anyway: cogbox plugin apply --force -n la\n" ++
+		"  applying it anyway would:\n" ++ whole ++
+		"  without a terminal, after reading the plan above: cogbox plugin apply --force-plan fedcba9876543210 -n la\n", line);
+	// Every unit with its action, the re-exec and the repair precede the
+	// --force-plan line, the only mention of the plan's id.
+	const force_plan = std.mem.indexOf(u8, line, "--force-plan").?;
+	try t.expectEqual(force_plan + "--force-plan ".len, std.mem.indexOf(u8, line, plan.id).?);
+	for ([_][]const u8{ "stop docker.service", "restart docker.socket", "reload systemd-networkd.service", "re-execute systemd", "then restart cogbox-reply-route.service" }) |item| {
+		const at = std.mem.indexOf(u8, line, item) orelse return error.TestUnexpectedResult;
+		try t.expect(at < force_plan);
+	}
+
+	// A systemd_reexec-only plan has no units and an empty detail: the
+	// re-exec is still shown before its id.
+	var reexec = Outcome.of(.restart_required, .systemd_reexec);
+	reexec.plan = .{ .id = "0011223344556677", .boot_id = "", .comp = "", .P = "", .T = "", .units = &.{}, .repair = &.{}, .reexec = true };
+	try t.expectEqualStrings("plugin apply: restart_required/systemd_reexec: saved; it loads at the next restart (a live apply would disrupt the units listed)\n" ++
+		"  to apply it now anyway: cogbox plugin apply --force -n la\n" ++
+		"  applying it anyway would:\n    re-execute systemd\n" ++
+		"  without a terminal, after reading the plan above: cogbox plugin apply --force-plan 0011223344556677 -n la\n", humanLine(a, "la", gen, false, reexec, null, true));
+
+	// The new plan of a plan_changed, the same way: its id comes only after
+	// the whole of it, never in the head line.
+	var changed = Outcome.with(.restart_required, .plan_changed, &.{ "docker.service", "docker.socket" });
+	changed.plan = plan;
+	const cl = humanLine(a, "la", gen, false, changed, null, true);
+	try t.expectEqualStrings("plugin apply: restart_required/plan_changed: nothing was applied: the plan changed since it was shown\n" ++
+		"  docker.service, docker.socket\n" ++
+		"  to apply it now anyway: cogbox plugin apply --force -n la\n" ++
+		"  applying the new plan anyway would:\n" ++ whole ++
+		"  without a terminal, after reading the plan above: cogbox plugin apply --force-plan fedcba9876543210 -n la\n", cl);
+	try t.expectEqual(@as(usize, 1), std.mem.count(u8, cl, plan.id));
+	try t.expect(std.mem.indexOf(u8, cl, plan.id).? > std.mem.indexOf(u8, cl, "then restart cogbox-reply-route.service").?);
 }
 
 test "rollbackSentence: each rollback state has its own sentence, and a report read back as JSON gets the same one" {

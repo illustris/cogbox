@@ -18,7 +18,7 @@ let
 in {
 	name = "cogbox-vm";
 
-	# Phase LA (live plugin apply) adds about 45 minutes to a run that already
+	# Phase LA (live plugin apply) adds about 60 minutes to a run that already
 	# takes about 30, past the driver's one-hour default; a loaded builder can
 	# stretch both.
 	globalTimeout = 3 * 3600;

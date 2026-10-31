@@ -344,7 +344,8 @@ test "REGINFO is the runner's regInfo= kernel parameter" {
 /// A fake `ssh` for these tests: it logs its argv, unquotes the remote command
 /// as sshd's `sh -c` would, and answers the helper verb from
 /// $FAKE_DIR/<verb>.<n> (the verb's n-th call), else $FAKE_DIR/<verb>, else it
-/// fails as an unreachable guest does (exit 255). A line starting with '!' is
+/// fails as an unreachable guest does (exit 255). Whatever the verb gets on
+/// stdin is saved first, to $FAKE_DIR/stdin.<verb>.<n>. A line starting with '!' is
 /// an action: `!fail`; `!kill SIG` (the verb, its parent); `!groupsig SIG`
 /// (SIG reaches the verb as a terminal's or the local backend's group signal
 /// does, while this ssh goes on: the verb is held stopped until 0.3 s later,
@@ -365,6 +366,7 @@ const fake_ssh =
 	\\n=$(cat "$F/$verb.n" 2>/dev/null || echo 0)
 	\\n=$((n + 1))
 	\\echo "$n" > "$F/$verb.n"
+\\cat > "$F/stdin.$verb.$n"
 	\\if [ -f "$F/$verb.$n" ]; then r=$F/$verb.$n
 	\\elif [ -f "$F/$verb" ]; then r=$F/$verb
 	\\else exit 255
@@ -576,6 +578,7 @@ const GuestFx = struct {
 			.runner = r_runner,
 			.toplevel = t_sys,
 			.gcfg = fast_cfg,
+			.host_boot = fx.host_boot,
 		};
 	}
 
@@ -633,6 +636,11 @@ const GuestFx = struct {
 	/// inflight.json as the live verb leaves it after `start` (a SIGKILL, or
 	/// its terminate path).
 	fn orphan(fx: *GuestFx, sn: Snaps, hops: Hops, expires_at: i64) !void {
+		return fx.orphanForced(sn, hops, expires_at, null);
+	}
+
+	/// orphan for an Apply anyway run's G, whose starts carried `forced`.
+	fn orphanForced(fx: *GuestFx, sn: Snaps, hops: Hops, expires_at: i64, forced: ?apply.Forced) !void {
 		const s = try snapshot.read(fx.a(), fx.io(), fx.path("icd"), &sn.s);
 		const b = try snapshot.read(fx.a(), fx.io(), fx.path("icd"), &sn.b);
 		try apply.writeInflight(fx.a(), fx.io(), fx.path("icd"), .{
@@ -650,6 +658,7 @@ const GuestFx = struct {
 			.scope = try snapshot.scope(fx.a(), s.plugins, b.plugins),
 			.expires_at = expires_at,
 			.hops = hops,
+			.forced = forced,
 		}, null);
 	}
 
@@ -1332,6 +1341,571 @@ test "phase flip: free space below COGBOX_APPLY_MIN_FREE_MB after the plan is in
 	try t.expectEqualStrings(&sn.s, rep.get("built_id").?.string);
 }
 
+// --- Apply anyway (spec 4.7) ------------------------------------------------------
+
+/// `unit` in P and, changed, in T (a .mount gets a mount section).
+fn changeUnit(fx: *GuestFx, unit: []const u8) !void {
+	const mount = std.mem.endsWith(u8, unit, ".mount");
+	for ([_][]const u8{ "p", "t" }) |v| {
+		const body = if (mount)
+			try std.fmt.allocPrint(fx.a(), "[Mount]\nWhat=/dev/{s}\nWhere=/data\n", .{v})
+		else
+			try std.fmt.allocPrint(fx.a(), "[Service]\nExecStart=/bin/{s}\n", .{v});
+		try fx.write(try std.fmt.allocPrint(fx.a(), "sys-{s}/etc/systemd/system/{s}", .{ v, unit }), body);
+	}
+}
+
+/// `unit` in P and T differing only in its [Unit] X-Reload-Triggers, as NixOS
+/// writes networkd's reloadTriggers: switch-to-configuration reloads it.
+fn reloadUnit(fx: *GuestFx, unit: []const u8) !void {
+	for ([_][]const u8{ "p", "t" }) |v| {
+		const body = try std.fmt.allocPrint(fx.a(), "[Unit]\nX-Reload-Triggers=/nix/store/{s}-network\n[Service]\nExecStart=/bin/networkd\n", .{v});
+		try fx.write(try std.fmt.allocPrint(fx.a(), "sys-{s}/etc/systemd/system/{s}", .{ v, unit }), body);
+	}
+}
+
+/// P and T as planAndApplyWith reads them (the phase-flip test's shape): unit
+/// directories under <root>/sys-p and <root>/sys-t in which every unit of
+/// `changed` differs, and one PID 1 binary both share (with `reexec`, T has
+/// its own, so systemd re-executes). R (<root>/R) gets a bin/microvm-run
+/// naming REGINFO, so the guest phase can start. Points the run's T and R at
+/// them and returns P.
+fn planSystems(fx: *GuestFx, r: *apply.Run, changed: []const []const u8, reexec: bool) ![]const u8 {
+	for ([_][]const u8{ "sys-p", "sys-t" }) |d| {
+		try std.Io.Dir.cwd().createDirPath(fx.io(), fx.path(try std.fmt.allocPrint(fx.a(), "{s}/etc/systemd/system", .{d})));
+	}
+	for (changed) |u| try changeUnit(fx, u);
+	try fx.write("sys-p/systemd/lib/systemd/systemd", "");
+	if (reexec) {
+		try fx.write("sys-t/systemd/lib/systemd/systemd", "new");
+	} else try std.Io.Dir.cwd().symLink(fx.io(), fx.path("sys-p/systemd"), fx.path("sys-t/systemd"), .{});
+	try fx.write("R/bin/microvm-run", "exec qemu -append 'init=/init regInfo=" ++ reginfo ++ "'\n");
+	r.toplevel = fx.path("sys-t");
+	r.runner = fx.path("R");
+	return fx.path("sys-p");
+}
+
+/// The guest's plan data on P: the units it runs, and those it calls inactive.
+fn guestOn(p: []const u8, active: []const []const u8, inactive: []const []const u8) apply.GuestPlan {
+	return .{ .boot_id = boot_id, .booted = p, .current = p, .store_overlay = true, .dry_result = "ok", .active = active, .inactive = inactive };
+}
+
+/// A plain run's plan of `g` (stored, overridable), then that plan admitted
+/// for --force-plan, as admitForcePlan leaves the run at preflight.
+fn admitted(fx: *GuestFx, r: *apply.Run, g: apply.GuestPlan, p: []const u8) !apply.Plan {
+	const o = apply.planAndApplyWith(r, g, p, p);
+	try t.expect(o.overridable());
+	const plan = o.plan.?;
+	r.args.force_plan = plan.id;
+	r.force_admitted = try apply.readStoredPlan(fx.a(), fx.io(), fx.path("icd"), plan.id);
+	return plan;
+}
+
+/// The guest phase up to `applied`, inflight.json copied at the first start.
+fn answerApplied(fx: *GuestFx) !void {
+	try fx.answer("start", 1, try std.mem.concat(fx.a(), u8, &.{ "!copy inflight.json\n", fx.blk("started", "starting", "reached=starting\n") }));
+	try fx.answer("status", 1, fx.blk("ok", "switched", "reached=switched\nexit=0\n"));
+	try fx.answer("confirm", null, fx.blk("confirmed", "confirmed", "exit=0\n"));
+}
+
+const start_argv = "start " ++ gen ++ " {s} " ++ reginfo ++ " --prev {s} --boot-id " ++ boot_id ++ " --bound 840 --window 960";
+
+/// The audit.log lines of an Apply anyway, parsed.
+fn forceLines(fx: *GuestFx) ![]const std.json.ObjectMap {
+	const data = fx.read("icd/apply/audit.log") catch return &.{};
+	var o: std.ArrayList(std.json.ObjectMap) = .empty;
+	var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, data, "\n"), '\n');
+	while (it.next()) |l| {
+		const v = try std.json.parseFromSliceLeaky(std.json.Value, fx.a(), l, .{});
+		const ev = v.object.get("event") orelse continue;
+		if (ev == .string and std.mem.eql(u8, ev.string, "force")) try o.append(fx.a(), v.object);
+	}
+	return o.items;
+}
+
+/// A report field that must be an object: an error, not a panic, otherwise.
+fn objectOf(v: ?std.json.Value) !std.json.ObjectMap {
+	const x = v orelse return error.MissingField;
+	if (x != .object) return error.NotAnObject;
+	return x.object;
+}
+
+/// The last of them: the run's completion line.
+fn lastForceLine(fx: *GuestFx) !std.json.ObjectMap {
+	const lines = try forceLines(fx);
+	if (lines.len == 0) return error.NoForceLine;
+	return lines[lines.len - 1];
+}
+
+fn expectUnits(want: []const []const u8, got: std.json.Value) !void {
+	try t.expectEqual(want.len, got.array.items.len);
+	for (want, got.array.items) |w, g| try t.expectEqualStrings(w, g.string);
+}
+
+fn planJson(a: std.mem.Allocator, p: apply.Plan) ![]const u8 {
+	var aw: std.Io.Writer.Allocating = .init(a);
+	try std.json.Stringify.value(p, .{}, &aw.writer);
+	return aw.written();
+}
+
+test "plan store: an overridable refusal's plan is stored as reported; a mixed one is only listed; one that cannot be stored is not offered" {
+	var fx: GuestFx = undefined;
+	try fx.init("plan-store");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const p = try planSystems(&fx, &r, &.{ "docker.service", "var-data.mount" }, false);
+	const g = guestOn(p, &.{ "sshd.service", "docker.service" }, &.{});
+
+	// Mixed (a mount restarts too): restart_only_units, never overridable;
+	// the plan lists docker for information and is not stored.
+	const mixed = apply.planAndApplyWith(&r, g, p, p);
+	try t.expectEqual(@as(?apply.Reason, .restart_only_units), mixed.reason);
+	try t.expect(!mixed.overridable());
+	try t.expect(mixed.plan != null and mixed.plan.?.units.len > 0);
+	try t.expectEqualStrings("docker.service", mixed.plan.?.units[0].unit);
+	try t.expect(!fx.exists("icd/apply/plans"));
+
+	// docker alone, with apply/plans planted as a file: not offered.
+	for ([_][]const u8{ "sys-p", "sys-t" }) |d| try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path(try std.fmt.allocPrint(fx.a(), "{s}/etc/systemd/system/var-data.mount", .{d})));
+	try fx.write("icd/apply/plans", "planted\n");
+	const unstored = apply.planAndApplyWith(&r, g, p, p);
+	try t.expectEqual(@as(?apply.Reason, .disruptive_units), unstored.reason);
+	try t.expect(unstored.plan == null);
+	try t.expect(!unstored.overridable());
+	try t.expectEqual(@as(usize, 1), unstored.detail.len);
+	try t.expectEqualStrings("docker.service", unstored.detail[0]);
+	try t.expect(std.mem.indexOf(u8, fx.err.items, "could not store the plan to apply anyway (NotDir)") != null);
+
+	// Stored: exactly the plan the report carries, of this run and boot.
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("icd/apply/plans"));
+	const before = apply.bootSeconds(fx.io());
+	const o = apply.planAndApplyWith(&r, g, p, p);
+	try t.expect(o.overridable());
+	const id = o.plan.?.id;
+	const sp = try apply.readStoredPlan(fx.a(), fx.io(), fx.path("icd"), id);
+	try t.expectEqualStrings(try planJson(fx.a(), o.plan.?), try planJson(fx.a(), sp.plan));
+	try t.expectEqual(apply.Reason.disruptive_units, sp.reason);
+	try t.expectEqualStrings(nonce, sp.nonce);
+	try t.expectEqualStrings(fx.host_boot, sp.host_boot);
+	try t.expectEqualStrings(gen, sp.gen);
+	try t.expect(sp.created >= before and sp.created <= apply.bootSeconds(fx.io()));
+	try t.expect(apply.planAdmits(fx.a(), sp, id, nonce, fx.host_boot, r.s.?.meta.comp, apply.bootSeconds(fx.io())));
+	// The guest was only planned with, never started.
+	try t.expectEqual(@as(usize, 0), fx.calls().len);
+	try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+	const rep = try fx.report();
+	try t.expect(rep.get("overridable").?.bool);
+	try t.expectEqualStrings(id, (try objectOf(rep.get("plan"))).get("id").?.string);
+	try t.expect(rep.get("forced").? == .null);
+}
+
+test "report: an overridable refusal's human line says how to apply it anyway, except under --force, which asks next; report_out gets the Report" {
+	var fx: GuestFx = undefined;
+	try fx.init("force-hint");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var first = try fx.run(sn);
+	const p = try planSystems(&fx, &first, &.{"docker.service"}, false);
+	const g = guestOn(p, &.{ "sshd.service", "docker.service" }, &.{});
+	const saved = "plugin apply: restart_required/disruptive_units: saved; it loads at the next restart (a live apply would disrupt the units listed)\n  docker.service\n";
+	for ([_]bool{ false, true }) |force| {
+		fx.sink.clearRetainingCapacity();
+		var r = try fx.run(sn);
+		r.toplevel = first.toplevel;
+		r.runner = first.runner;
+		r.args = .{ .force = force };
+		var got: ?apply.Report = null;
+		r.host.report_out = &got;
+		const o = apply.planAndApplyWith(&r, g, p, p);
+		try t.expect(o.overridable());
+		try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+		// The whole plan, then its id.
+		const hint = try std.fmt.allocPrint(fx.a(), "  to apply it now anyway: cogbox plugin apply --force\n  applying it anyway would:\n" ++
+			"    restart docker.service (changed; class B): stops every running container\n" ++
+			"  without a terminal, after reading the plan above: cogbox plugin apply --force-plan {s}\n", .{o.plan.?.id});
+		try t.expectEqualStrings(if (force) saved else try std.mem.concat(fx.a(), u8, &.{ saved, hint }), fx.sink.items);
+		// The Report the line was made from, for forceLoop to ask about.
+		try t.expect(got.?.overridable);
+		try t.expectEqualStrings(o.plan.?.id, got.?.plan.?.id);
+		try t.expectEqualStrings(gen, got.?.gen.?);
+	}
+}
+
+test "forced run: start carries --force-units - (the list on stdin) and --repair; inflight.json, the report and audit.log say what was forced" {
+	var fx: GuestFx = undefined;
+	try fx.init("forced");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const p = try planSystems(&fx, &r, &.{ "docker.service", "systemd-networkd.service" }, false);
+	const g = guestOn(p, &.{ "sshd.service", "docker.service", "systemd-networkd.service" }, &.{});
+	const plan = try admitted(&fx, &r, g, p);
+	try t.expectEqual(@as(usize, 1), plan.repair.len);
+	const units = try apply.forceUnits(fx.a(), plan);
+	try t.expectEqual(@as(usize, 2), units.len);
+	try answerApplied(&fx);
+	const o = apply.planAndApplyWith(&r, g, p, p);
+	try t.expectEqual(apply.Result.applied, o.result);
+	try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+
+	const c = fx.calls();
+	try t.expectEqualStrings(try std.fmt.allocPrint(fx.a(), start_argv ++ " --force-units - --repair " ++ apply.repair_unit, .{ r.toplevel.?, p }), c[0]);
+	// The list went on the start hop's stdin, and only there.
+	try t.expectEqualStrings(try apply.forceInput(fx.a(), units), try fx.read("fake/stdin.start.1"));
+	var dir = try std.Io.Dir.cwd().openDir(fx.io(), fx.path("fake"), .{ .iterate = true });
+	defer dir.close(fx.io());
+	var it = dir.iterate();
+	var stdins: usize = 0;
+	while (try it.next(fx.io())) |e| {
+		if (!std.mem.startsWith(u8, e.name, "stdin.")) continue;
+		stdins += 1;
+		if (std.mem.eql(u8, e.name, "stdin.start.1")) continue;
+		try t.expectEqualStrings("", try fx.read(try std.fmt.allocPrint(fx.a(), "fake/{s}", .{e.name})));
+	}
+	try t.expectEqual(c.len, stdins);
+
+	// inflight.json named what every start carries, before the first one.
+	const at_start = try std.json.parseFromSliceLeaky(std.json.Value, fx.a(), try fx.read("fake/copy.start.1"), .{});
+	const inf_forced = try objectOf(at_start.object.get("forced"));
+	try t.expectEqualStrings(plan.id, inf_forced.get("plan").?.string);
+	try expectUnits(units, inf_forced.get("units").?);
+	const rep = try fx.report();
+	try t.expectEqualStrings("applied", rep.get("result").?.string);
+	const forced = try objectOf(rep.get("forced"));
+	try t.expectEqualStrings(plan.id, forced.get("plan").?.string);
+	try expectUnits(units, forced.get("units").?);
+	// The end of the run is audited (its admission is preflight's).
+	const done = try lastForceLine(&fx);
+	try t.expectEqualStrings("done", done.get("phase").?.string);
+	try t.expectEqualStrings(plan.id, done.get("plan").?.string);
+	try t.expectEqualStrings("applied", done.get("result").?.string);
+	try t.expect(done.get("forced").?.bool);
+	try t.expect(!done.get("recovered").?.bool);
+	try expectUnits(units, done.get("units").?);
+	try t.expect(!fx.exists("icd/apply/inflight.json"));
+}
+
+test "forced run: the human report names the units it forced" {
+	var fx: GuestFx = undefined;
+	try fx.init("forced-human");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const p = try planSystems(&fx, &r, &.{"docker.service"}, false);
+	const g = guestOn(p, &.{ "sshd.service", "docker.service" }, &.{});
+	_ = try admitted(&fx, &r, g, p);
+	try answerApplied(&fx);
+	r.args.json = false;
+	const o = apply.planAndApplyWith(&r, g, p, p);
+	try t.expectEqual(apply.Result.applied, o.result);
+	try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+	try t.expectEqualStrings("plugin apply: applied: the plugin changes are live\n  forced units: docker.service\n", fx.sink.items);
+}
+
+test "forced run: one that ends before any start was attempted reports nothing forced" {
+	var fx: GuestFx = undefined;
+	try fx.init("forced-unstarted");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const p = try planSystems(&fx, &r, &.{"docker.service"}, false);
+	const g = guestOn(p, &.{ "sshd.service", "docker.service" }, &.{});
+	_ = try admitted(&fx, &r, g, p);
+	// inflight.json cannot be written (a directory is in its place), so no
+	// start goes out.
+	try fx.write("icd/apply/inflight.json/x", "");
+	const o = apply.planAndApplyWith(&r, g, p, p);
+	try t.expectEqual(apply.Result.failed, o.result);
+	try t.expectEqual(@as(usize, 1), o.detail.len);
+	try t.expectEqualStrings("inflight_unwritten", o.detail[0]);
+	try t.expect(r.forced != null);
+	try t.expectEqual(@as(usize, 0), fx.calledVerb("start"));
+	try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+	try t.expect((try fx.report()).get("forced").? == .null);
+	const done = try lastForceLine(&fx);
+	try t.expect(!done.get("forced").?.bool);
+	try t.expectEqual(@as(usize, 0), done.get("units").?.array.items.len);
+}
+
+test "forced run: a lost start is retried with the same argv and the same list" {
+	var fx: GuestFx = undefined;
+	try fx.init("forced-retry");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const p = try planSystems(&fx, &r, &.{ "docker.service", "systemd-networkd.service" }, false);
+	const g = guestOn(p, &.{ "sshd.service", "docker.service", "systemd-networkd.service" }, &.{});
+	const plan = try admitted(&fx, &r, g, p);
+	try fx.answer("start", 1, "!fail\n");
+	try fx.answer("start", 2, fx.blk("started", "starting", "reached=starting\n"));
+	try fx.answer("status", 1, fx.blk("ok", "switched", "reached=switched\nexit=0\n"));
+	try fx.answer("confirm", null, fx.blk("confirmed", "confirmed", "exit=0\n"));
+	const o = apply.planAndApplyWith(&r, g, p, p);
+	try t.expectEqual(apply.Result.applied, o.result);
+	const c = fx.calls();
+	try t.expectEqual(@as(usize, 2), fx.calledVerb("start"));
+	try t.expectEqualStrings(c[0], c[1]);
+	const want = try apply.forceInput(fx.a(), try apply.forceUnits(fx.a(), plan));
+	try t.expectEqualStrings(want, try fx.read("fake/stdin.start.1"));
+	try t.expectEqualStrings(want, try fx.read("fake/stdin.start.2"));
+}
+
+test "forced run: a re-plan with another id is plan_changed, stored and reported, the guest untouched, K := S and no runner record" {
+	var fx: GuestFx = undefined;
+	try fx.init("plan-changed");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const p = try planSystems(&fx, &r, &.{ "docker.service", "sshd.service" }, false);
+	const plan = try admitted(&fx, &r, guestOn(p, &.{ "sshd.service", "docker.service" }, &.{}), p);
+	try t.expectEqual(@as(usize, 2), plan.units.len);
+	// sshd stopped meanwhile: only docker's restart is left, an overridable
+	// plan with another id.
+	const o = apply.planAndApplyWith(&r, guestOn(p, &.{"docker.service"}, &.{"sshd.service"}), p, p);
+	try t.expectEqual(apply.Result.restart_required, o.result);
+	try t.expectEqual(@as(?apply.Reason, .plan_changed), o.reason);
+	try t.expect(!o.overridable());
+	try t.expect(o.plan != null);
+	const new = o.plan.?;
+	try t.expect(!std.mem.eql(u8, plan.id, new.id));
+	try t.expectEqual(@as(usize, 1), new.units.len);
+	const sp = try apply.readStoredPlan(fx.a(), fx.io(), fx.path("icd"), new.id);
+	try t.expectEqual(apply.Reason.disruptive_units, sp.reason);
+	try t.expectEqual(@as(usize, 0), fx.calls().len);
+	try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+	const rep = try fx.report();
+	try t.expectEqualStrings("plan_changed", rep.get("reason").?.string);
+	try t.expect(!rep.get("overridable").?.bool);
+	try t.expectEqualStrings(new.id, (try objectOf(rep.get("plan"))).get("id").?.string);
+	try t.expect(rep.get("forced").? == .null);
+	try t.expectEqualStrings(&sn.s, &snapshot.roleId(fx.io(), fx.path("icd"), .built).?);
+	try t.expect((try snapshot.read(fx.a(), fx.io(), fx.path("icd"), &sn.s)).meta.runner == null);
+	try t.expect(!fx.exists("icd/runner.path"));
+	const done = try lastForceLine(&fx);
+	try t.expectEqualStrings("plan_changed", done.get("reason").?.string);
+	try t.expect(!done.get("forced").?.bool);
+}
+
+test "forced run: a re-plan that needs no force applies as a plain run, nothing forced" {
+	var fx: GuestFx = undefined;
+	try fx.init("forced-clean");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const p = try planSystems(&fx, &r, &.{"docker.service"}, false);
+	_ = try admitted(&fx, &r, guestOn(p, &.{ "sshd.service", "docker.service" }, &.{}), p);
+	try answerApplied(&fx);
+	// docker stopped meanwhile: the change no longer disrupts anything.
+	const o = apply.planAndApplyWith(&r, guestOn(p, &.{"sshd.service"}, &.{"docker.service"}), p, p);
+	try t.expectEqual(apply.Result.applied, o.result);
+	try t.expectEqualStrings(try std.fmt.allocPrint(fx.a(), start_argv, .{ r.toplevel.?, p }), fx.calls()[0]);
+	try t.expectEqualStrings("", try fx.read("fake/stdin.start.1"));
+	try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+	try t.expect((try fx.report()).get("forced").? == .null);
+	const at_start = try std.json.parseFromSliceLeaky(std.json.Value, fx.a(), try fx.read("fake/copy.start.1"), .{});
+	try t.expect(at_start.object.get("forced").? == .null);
+	const done = try lastForceLine(&fx);
+	try t.expectEqualStrings("applied", done.get("result").?.string);
+	try t.expect(!done.get("forced").?.bool);
+}
+
+test "forced run: a re-plan that is never overridable stays refused under force, though its plan has the admitted id" {
+	var fx: GuestFx = undefined;
+	try fx.init("forced-never");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const p = try planSystems(&fx, &r, &.{"docker.service"}, false);
+	const g = guestOn(p, &.{ "sshd.service", "docker.service" }, &.{});
+	const plan = try admitted(&fx, &r, g, p);
+	const stored = try fx.read(try std.fmt.allocPrint(fx.a(), "icd/apply/plans/{s}.json", .{plan.id}));
+	// A mount changes too: class A, which no force overrides. The forceable
+	// part of the plan is the same, so its id is the admitted one.
+	try changeUnit(&fx, "var-data.mount");
+	const o = apply.planAndApplyWith(&r, g, p, p);
+	try t.expectEqual(@as(?apply.Reason, .restart_only_units), o.reason);
+	try t.expect(!o.overridable());
+	try t.expect(o.plan != null);
+	try t.expectEqualStrings(plan.id, o.plan.?.id);
+	try t.expect(r.forced == null);
+	try t.expectEqual(@as(usize, 0), fx.calls().len);
+	// Nothing new was stored.
+	try t.expectEqualStrings(stored, try fx.read(try std.fmt.allocPrint(fx.a(), "icd/apply/plans/{s}.json", .{plan.id})));
+}
+
+test "forced run: a user@ change stays refused under force (skipped_units), as a mount does" {
+	var fx: GuestFx = undefined;
+	try fx.init("forced-session");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const p = try planSystems(&fx, &r, &.{"docker.service"}, false);
+	const g = guestOn(p, &.{ "sshd.service", "docker.service", "user@1000.service" }, &.{});
+	const plan = try admitted(&fx, &r, g, p);
+	// The user managers' template changes too: a switch never restarts a
+	// running user@ (spec 4.2), so no force loads it live. The forceable part
+	// of the plan is the same, so its id is the admitted one.
+	try changeUnit(&fx, "user@.service");
+	const o = apply.planAndApplyWith(&r, g, p, p);
+	try t.expectEqual(@as(?apply.Reason, .skipped_units), o.reason);
+	try t.expect(!o.overridable());
+	try t.expect(o.plan != null);
+	try t.expectEqualStrings(plan.id, o.plan.?.id);
+	try t.expect(r.forced == null);
+	try t.expectEqual(@as(usize, 0), fx.calls().len);
+}
+
+test "forced run: a re-exec-only plan sends neither --force-units nor --repair, and forces no unit" {
+	var fx: GuestFx = undefined;
+	try fx.init("forced-reexec");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const p = try planSystems(&fx, &r, &.{}, true);
+	const g = guestOn(p, &.{"sshd.service"}, &.{});
+	const plan = try admitted(&fx, &r, g, p);
+	try t.expect(plan.reexec);
+	try t.expectEqual(@as(usize, 0), plan.units.len);
+	try answerApplied(&fx);
+	const o = apply.planAndApplyWith(&r, g, p, p);
+	try t.expectEqual(apply.Result.applied, o.result);
+	try t.expectEqualStrings(try std.fmt.allocPrint(fx.a(), start_argv, .{ r.toplevel.?, p }), fx.calls()[0]);
+	try t.expectEqualStrings("", try fx.read("fake/stdin.start.1"));
+	try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+	const forced = try objectOf((try fx.report()).get("forced"));
+	try t.expectEqualStrings(plan.id, forced.get("plan").?.string);
+	try t.expectEqual(@as(usize, 0), forced.get("units").?.array.items.len);
+}
+
+test "forced run: a unit the plan only reloads is not sent to be relaxed, so every post-check comparison still holds it; the units beside it that restart are" {
+	// The guest exempts a listed unit from every comparison, whatever the
+	// plan does to it; a reload keeps its InvocationID and its running state,
+	// so a reload-only unit needs no exemption, and a restart or a stop of it
+	// outside the plan stays unplanned_disruption.
+	for ([_]bool{ false, true }) |with_docker| {
+		var fx: GuestFx = undefined;
+		try fx.init(if (with_docker) "forced-reload-docker" else "forced-reload");
+		defer fx.deinit();
+		try fx.running();
+		const sn = try fx.snaps();
+		var r = try fx.run(sn);
+		const p = try planSystems(&fx, &r, if (with_docker) &.{"docker.service"} else &.{}, false);
+		try reloadUnit(&fx, "systemd-networkd.service");
+		const g = guestOn(p, &.{ "sshd.service", "docker.service", "systemd-networkd.service" }, &.{});
+		const plan = try admitted(&fx, &r, g, p);
+		// network_config (with docker beside it, disruptive_units): the
+		// reload is in the plan, and so is the repair.
+		var reloads: usize = 0;
+		for (plan.units) |u| {
+			if (!std.mem.eql(u8, u.unit, "systemd-networkd.service")) continue;
+			try t.expectEqualStrings("reload", @tagName(u.action));
+			reloads += 1;
+		}
+		try t.expectEqual(@as(usize, 1), reloads);
+		try t.expectEqual(@as(usize, 1), plan.repair.len);
+		// No re-exec: an empty `forced.units` below is a plan that relaxes
+		// no unit, never a sign that systemd was re-executed.
+		try t.expect(!plan.reexec);
+		const want: []const []const u8 = if (with_docker) &.{"docker.service"} else &.{};
+		const units = try apply.forceUnits(fx.a(), plan);
+		try t.expectEqual(want.len, units.len);
+		for (want, units) |w, u| try t.expectEqualStrings(w, u);
+		try answerApplied(&fx);
+		const o = apply.planAndApplyWith(&r, g, p, p);
+		try t.expectEqual(apply.Result.applied, o.result);
+		const argv = if (with_docker)
+			try std.fmt.allocPrint(fx.a(), start_argv ++ " --force-units - --repair " ++ apply.repair_unit, .{ r.toplevel.?, p })
+		else
+			try std.fmt.allocPrint(fx.a(), start_argv ++ " --repair " ++ apply.repair_unit, .{ r.toplevel.?, p });
+		try t.expectEqualStrings(argv, fx.calls()[0]);
+		try t.expectEqualStrings(if (with_docker) "docker.service\n" else "", try fx.read("fake/stdin.start.1"));
+		try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+		// `forced` is there whether or not a list was sent: the start was a
+		// forced one (its --repair, the guest's exemptions), and the audit's
+		// completion line says so too.
+		const forced = try objectOf((try fx.report()).get("forced"));
+		try t.expectEqualStrings(plan.id, forced.get("plan").?.string);
+		try expectUnits(want, forced.get("units").?);
+		const done = try lastForceLine(&fx);
+		try t.expectEqualStrings("done", done.get("phase").?.string);
+		try t.expect(done.get("forced").?.bool);
+		try expectUnits(want, done.get("units").?);
+	}
+}
+
+test "forced run: a forced unit that failed with a healthy base is undone/forced_unit_failed, K := S; an activation hang is rejected and rolled back to B" {
+	{
+		var fx: GuestFx = undefined;
+		try fx.init("forced-failed");
+		defer fx.deinit();
+		try fx.running();
+		const sn = try fx.snaps();
+		var r = try fx.run(sn);
+		const p = try planSystems(&fx, &r, &.{"docker.service"}, false);
+		const g = guestOn(p, &.{ "sshd.service", "docker.service" }, &.{});
+		const plan = try admitted(&fx, &r, g, p);
+		try fx.answer("start", 1, fx.blk("started", "starting", "reached=starting\n"));
+		try fx.answer("status", 1, fx.blk("ok", "failed", "reached=switched\nexit=4\nverdict=forced_unit_failed\ndetail=docker.service\n"));
+		try fx.answer("status", 2, fx.blk("ok", "reverted", "reached=switched\nexit=4\nverdict=forced_unit_failed\ndetail=docker.service\n"));
+		const o = apply.planAndApplyWith(&r, g, p, p);
+		try t.expectEqual(apply.Result.undone, o.result);
+		try t.expectEqual(@as(?apply.Reason, .forced_unit_failed), o.reason);
+		try t.expectEqual(@as(usize, 1), o.detail.len);
+		try t.expectEqualStrings("docker.service", o.detail[0]);
+		try t.expect(!fx.exists(intentRel()));
+		try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+		const rep = try fx.report();
+		try t.expectEqualStrings(plan.id, (try objectOf(rep.get("forced"))).get("plan").?.string);
+		// The commit is kept, and the build is K.
+		try t.expect(try hasX(&fx));
+		try t.expectEqualStrings(&sn.s, &snapshot.roleId(fx.io(), fx.path("icd"), .built).?);
+	}
+	{
+		var fx: GuestFx = undefined;
+		try fx.init("forced-hang");
+		defer fx.deinit();
+		try fx.running();
+		const sn = try fx.snaps();
+		// K from an earlier restart_required: a forced rejection unlinks it too.
+		try snapshot.setRole(fx.io(), fx.path("icd"), .built, &sn.b, null);
+		var r = try fx.run(sn);
+		const p = try planSystems(&fx, &r, &.{"docker.service"}, false);
+		const g = guestOn(p, &.{ "sshd.service", "docker.service" }, &.{});
+		const plan = try admitted(&fx, &r, g, p);
+		try fx.answer("start", 1, fx.blk("started", "starting", "reached=starting\n"));
+		try fx.answer("status", 1, fx.blk("ok", "reverting", "reached=switching\ncause=activation_hang\n"));
+		try fx.answer("status", 2, fx.blk("ok", "reverted", "reached=switching\ncause=activation_hang\n"));
+		const o = apply.planAndApplyWith(&r, g, p, p);
+		try t.expectEqual(apply.Result.rejected, o.result);
+		try t.expectEqual(@as(?apply.Reason, .activation_hang), o.reason);
+		try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+		const rep = try fx.report();
+		const rb = try objectOf(rep.get("rollback"));
+		try t.expectEqualStrings("done", rb.get("status").?.string);
+		try t.expectEqualStrings("base", rb.get("target").?.string);
+		try t.expectEqualStrings(&sn.b, rb.get("target_id").?.string);
+		try t.expectEqualStrings(plan.id, (try objectOf(rep.get("forced"))).get("plan").?.string);
+		try t.expect(!try hasX(&fx));
+		try t.expect(snapshot.roleId(fx.io(), fx.path("icd"), .built) == null);
+		const done = try lastForceLine(&fx);
+		try t.expectEqualStrings("rejected", done.get("result").?.string);
+		try t.expectEqualStrings("activation_hang", done.get("reason").?.string);
+		try t.expect(done.get("forced").?.bool);
+	}
+}
+
 test "record: a flag set inside the step-10 section is acted on after it; one set during the acquire takes the terminate path" {
 	{
 		var fx: GuestFx = undefined;
@@ -1976,6 +2550,99 @@ test "inflight.json: written and read back; a field that fails its check makes t
 		const mutated = try std.mem.replaceOwned(u8, fx.a(), good, b, w);
 		try t.expectError(error.InvalidInflight, apply.parseInflight(fx.a(), mutated));
 	}
+	// A file an older cogbox wrote has no `forced`.
+	try t.expect(std.mem.indexOf(u8, good, ",\"forced\":null") != null);
+	const old = try std.mem.replaceOwned(u8, fx.a(), good, ",\"forced\":null", "");
+	try t.expect((try apply.parseInflight(fx.a(), old)).forced == null);
+
+	// An Apply anyway G's `forced`: a plan id, at most 256 unit names that
+	// pass the helper's charset.
+	try fx.orphanForced(sn, .{}, 1234, .{ .plan = "fedcba9876543210", .units = &.{ "docker.service", "docker.socket" } });
+	const forced = try fx.read("icd/apply/inflight.json");
+	const f = (try apply.parseInflight(fx.a(), forced)).forced.?;
+	try t.expectEqualStrings("fedcba9876543210", f.plan);
+	try t.expectEqual(@as(usize, 2), f.units.len);
+	const fbad = [_][]const u8{ "\"plan\":\"fedcba9876543210\"", "\"docker.service\"" };
+	const frepl = [_][]const u8{ "\"plan\":\"FEDCBA9876543210\"", "\"docker service\"" };
+	for (fbad, frepl) |b, w| {
+		try t.expect(std.mem.indexOf(u8, forced, b) != null);
+		try t.expectError(error.InvalidInflight, apply.parseInflight(fx.a(), try std.mem.replaceOwned(u8, fx.a(), forced, b, w)));
+	}
+	var many: std.ArrayList(u8) = .empty;
+	for (0..257) |i| try many.print(fx.a(), "{s}\"u{d}.service\"", .{ if (i == 0) "" else ",", i });
+	const too_many = try std.mem.replaceOwned(u8, fx.a(), forced, "\"docker.service\",\"docker.socket\"", many.items);
+	try t.expectError(error.InvalidInflight, apply.parseInflight(fx.a(), too_many));
+}
+
+test "recovery: a forced G's last.json carries what was forced, and its completion is audited once, as recovered" {
+	var fx: GuestFx = undefined;
+	try fx.init("r-forced");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	const forced: apply.Forced = .{ .plan = "fedcba9876543210", .units = &.{"docker.service"} };
+	try fx.orphanForced(sn, .{ .seen = "confirmed" }, apply.bootSeconds(fx.io()) + 3600, forced);
+	try fx.answer("status", null, fx.blk("ok", "confirmed", "exit=0\n"));
+	try t.expectEqual(apply.Recovery.resolved, fx.recover(locked));
+	const l = try fx.last();
+	try t.expectEqualStrings("applied", l.get("result").?.string);
+	const lf = try objectOf(l.get("forced"));
+	try t.expectEqualStrings("fedcba9876543210", lf.get("plan").?.string);
+	try expectUnits(forced.units, lf.get("units").?);
+	const lines = try forceLines(&fx);
+	try t.expectEqual(@as(usize, 1), lines.len);
+	try t.expectEqualStrings("done", lines[0].get("phase").?.string);
+	try t.expectEqualStrings(gen, lines[0].get("gen").?.string);
+	try t.expectEqualStrings("7", lines[0].get("op").?.string);
+	try t.expectEqualStrings("fedcba9876543210", lines[0].get("plan").?.string);
+	try t.expectEqualStrings("applied", lines[0].get("result").?.string);
+	try t.expect(lines[0].get("forced").?.bool);
+	try t.expect(lines[0].get("recovered").?.bool);
+	try expectUnits(forced.units, lines[0].get("units").?);
+	// Nothing left to resolve: no second line.
+	try t.expectEqual(apply.Recovery.resolved, fx.recover(locked));
+	try t.expectEqual(@as(usize, 1), (try forceLines(&fx)).len);
+	// A plain G's recovery audits nothing.
+	try fx.orphan(sn, .{ .seen = "confirmed" }, apply.bootSeconds(fx.io()) + 3600);
+	try t.expectEqual(apply.Recovery.resolved, fx.recover(locked));
+	try t.expect((try fx.last()).get("forced").? == .null);
+	try t.expectEqual(@as(usize, 1), (try forceLines(&fx)).len);
+}
+
+test "forced run: one that keeps inflight.json leaves its completion line to the recoverer that resolves it, once" {
+	var fx: GuestFx = undefined;
+	try fx.init("forced-kept");
+	defer fx.deinit();
+	try fx.running();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	const forced: apply.Forced = .{ .plan = "fedcba9876543210", .units = &.{"docker.service"} };
+	r.forced = forced;
+	r.force_admitted = .{
+		.plan = .{ .id = forced.plan, .boot_id = boot_id, .comp = "none", .P = p_sys, .T = t_sys, .units = &.{}, .repair = &.{}, .reexec = false },
+		.reason = .disruptive_units,
+		.created = 0,
+		.nonce = nonce,
+		.host_boot = fx.host_boot,
+		.gen = gen,
+	};
+	const o = try applied(&fx, &r);
+	try t.expectEqualStrings("docker.service\n", try fx.read("fake/stdin.start.1"));
+	// qemu.start reads empty at the record: inflight.json stays, and so does
+	// the completion.
+	try fx.write("run/inst/qemu.start", "");
+	try t.expectEqual(@as(u8, 0), apply.finish(&r, o));
+	try t.expect(fx.exists("icd/apply/inflight.json"));
+	const kept = (try fx.inflight()).forced orelse return error.TestExpectedForced;
+	try t.expectEqualStrings(forced.plan, kept.plan);
+	try t.expectEqual(@as(usize, 0), (try forceLines(&fx)).len);
+	try fx.write("run/inst/qemu.start", nonce ++ "\n");
+	try t.expectEqual(apply.Recovery.resolved, fx.recover(locked));
+	const lines = try forceLines(&fx);
+	try t.expectEqual(@as(usize, 1), lines.len);
+	try t.expect(lines[0].get("recovered").?.bool);
+	try t.expectEqualStrings("applied", lines[0].get("result").?.string);
+	try t.expectEqualStrings(forced.plan, (try objectOf((try fx.last()).get("forced"))).get("plan").?.string);
 }
 
 // --- the apply gate, a plugin change's recovery, cogbox stop and the preboot ------------

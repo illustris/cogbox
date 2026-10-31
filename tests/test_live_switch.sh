@@ -750,6 +750,35 @@ h run "$G1" "$T_TOP" "$REG"
 has "$(status "$G1")" state=failed verdict=unplanned_disruption detail=cogbox-reply-route.service
 [ "$(calls 'restart cogbox-reply-route.service')" = 0 ] || bad "$T: a run without --repair restarted the reply route"
 
+# Force relaxes only the listed units' comparisons, never a base check: a
+# forced sshd may restart, but it must still run and pass `sshd -t`, and one
+# whose restart failed is breaks_base, not forced_unit_failed. The list comes
+# on stdin, as the host sends it.
+printf 'sshd.service\n' > "$work/force.sshd"
+extra=(--force-units -)
+stdin=$work/force.sshd
+postcase "a forced sshd with a new InvocationID" 'activate=1; echo s2 > "$FIX/inv/sshd.service"' state=switched
+postcase "a forced sshd whose sshd -t fails" \
+	'activate=1; echo s2 > "$FIX/inv/sshd.service"; echo 255 > "$FIX/sshd_rc"' state=failed verdict=breaks_base
+postcase "a forced sshd that is down after the switch" 'activate=1; echo sshd.service >> "$FIX/down"' state=failed verdict=breaks_base
+postcase "a forced sshd whose restart failed" \
+	'activate=1; rc=4; out="activating the configuration...
+warning: the following units failed: sshd.service"; echo sshd.service >> "$FIX/down"; echo 255 > "$FIX/sshd_rc"' \
+	state=failed verdict=breaks_base exit=4
+# A forced docker plan stops the socket-activated service and restarts its
+# socket; unforced, each is unplanned_disruption (above).
+printf 'docker.service\ndocker.socket\n' > "$work/force.docker2"
+stdin=$work/force.docker2
+pre='echo "docker.socket loaded active listening sock" >> "$FIX/units"; echo k1 > "$FIX/inv/docker.socket"
+printf "FragmentPath=/etc/systemd/system/docker.socket\n" > "$FIX/show/docker.socket"'
+postcase "a forced docker stop and socket restart" \
+	'activate=1; u=$(< "$FIX/units"); printf "%s\n" "${u//docker.service loaded active running/docker.service loaded inactive dead}" > "$FIX/units"; echo k2 > "$FIX/inv/docker.socket"' \
+	state=switched
+grep -qF "generation $G1: forced units: docker.service docker.socket; repair: none" "$FIX/journal" || bad "$T: the forced units read from stdin were not journaled"
+pre=""
+extra=()
+stdin=""
+
 # ----- settle -----------------------------------------------------------------------
 settlecase() { # NAME SWITCH-OUT JOBS EXPECTED-LINES...
 	T="settle: $1"
