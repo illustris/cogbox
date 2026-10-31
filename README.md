@@ -339,8 +339,9 @@ Two mechanisms, both folding NixOS modules into the instance's VM:
   ```
 
   On a running VM sandbox a plugin change is loaded live, without a
-  restart, when nothing it would restart ends sessions or the network, and
-  a change the sandbox proves broken is rolled back automatically -- see
+  restart, when nothing it would restart ends sessions or the network (or,
+  once the owner accepts what it would disrupt, with Apply anyway), and a
+  change the sandbox proves broken is rolled back automatically -- see
   [Live apply](docs/plugins.md#live-apply-vm-sandboxes).
 
 Host-side data locations can be overridden with `COGBOX_*` environment

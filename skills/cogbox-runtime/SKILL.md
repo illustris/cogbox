@@ -7,7 +7,7 @@ description: Keep command-line tools, or an interpreter with a project's librari
 
 - One-off use: `nix shell nixpkgs#<pkg> -c <cmd>`, as `cogbox-packages` describes. Nothing to clean up, but it is fetched again after a restart.
 - Tools this sandbox should keep across restarts: a `cogbox-env` bundle, below. Takes effect without a restart.
-- A shared, reviewed extension that also carries services, skills or network policy: a plugin, as `cogbox-packages` describes. A plugin needs a sandbox restart to load.
+- A shared, reviewed extension that also carries services, skills or network policy: a plugin, as `cogbox-packages` describes. A plugin loads at the sandbox's next restart, or, where live plugin apply is available, into the running sandbox when that is safe.
 
 A bundle only provides executables. It sets no environment variables, starts no services, supplies no libraries to other programs and changes no network policy. For a language library, bundle an interpreter that already contains it, such as `(pkgs.python3.withPackages (ps: [ ps.requests ]))` in `paths`, or keep a virtualenv or `node_modules` under `~/work`, made with an interpreter from the bundle, and keep that interpreter in the selected bundle so it still works after a restart.
 
