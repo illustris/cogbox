@@ -1009,6 +1009,7 @@ with subtest("Phase LA: live plugin apply, automatic rollback and serialization"
     # second instance, `lafin`, which only ever boots without plugins, runs the
     # planted-intent legs that boot a rolled-back config.
     import json
+    import re
 
     la_icd = "/home/testuser/.config/cogbox/instances/la"
     la_cfg = f"{la_icd}/config.json"
@@ -1200,7 +1201,8 @@ with subtest("Phase LA: live plugin apply, automatic rollback and serialization"
                       ("la-guard", "la-guard"), ("la-lock", "la-lock"), ("la-mount", "la-mount"),
                       ("la-user", "la-user"), ("la-bad", "la-bad"),
                       ("la-noboot", "la-noboot"), ("la-uunit", "la-uunit"),
-                      ("la-deny-v1", "la-deny")]:
+                      ("la-deny-v1", "la-deny"), ("la-docker", "la-docker"),
+                      ("la-net", "la-net"), ("la-sshbad", "la-sshbad")]:
         install(src, name)
 
     machine.succeed(as_user("cogbox init -y --name la --network rules"))
@@ -1263,9 +1265,241 @@ with subtest("Phase LA: live plugin apply, automatic rollback and serialization"
     hold_sessions()
     # The host plan agrees with dry-activate on what the phase applies next
     # (an activation-only change, a new oneshot, an /etc file) and on the
-    # disruptive kinds it never applies (docker, nftables, the uplink).
+    # disruptive kinds it applies only when forced (docker and the uplink,
+    # LA3c) or never (nftables, which changes the initrd).
     for name in ["hang", "kit3", "xguard", "docker", "nft", "net"]:
         plan_agrees(name)
+
+    # Apply anyway (cogbox plugin apply --force / --force-plan PLAN): a change
+    # that can go live only by disrupting units (classes B and C) is planned,
+    # its plan stored and offered; the owner forces exactly that plan.
+    force_hint = "Or apply it now anyway, which would:\n"
+
+    def hinted(out, plan_id, *names):
+        # An inline add, update or del run off a terminal (as here, where
+        # --force refuses) lists the whole plan it would force, each of
+        # `names` in it, and only after it the --force-plan line with its id.
+        if force_hint not in out:
+            return False
+        listing, sep, _ = out.split(force_hint, 1)[1].partition(
+            f"To apply it anyway, after reading the plan above: cogbox plugin apply --force-plan {plan_id} -n la")
+        return bool(sep) and all(n in listing for n in names)
+
+    def la_inv(unit, name="la"):
+        return machine.succeed(la_guest(f"systemctl show -p InvocationID --value {unit}", name)).strip()
+
+    def la_gens():
+        # The generations the guest helper has recorded this boot.
+        return machine.succeed(la_guest("ls /run/cogbox/live-apply/gen 2>/dev/null | wc -l")).strip()
+
+    def plan_units(plan):
+        return [(u["unit"], u["action"], u["class"]) for u in plan["units"]]
+
+    def relaxed(plan):
+        # The units a forced run sends the guest to relax: those the plan
+        # stops, starts or restarts. One it only reloads keeps its InvocationID
+        # and stays running, so it is held to every post-check comparison.
+        return sorted({u for u, act, _ in plan_units(plan) if act != "reload"})
+
+    def forced_journal(gen, name="la"):
+        # The guest's journal line naming what generation `gen` was told to
+        # relax and repair.
+        lines = [line for line in machine.succeed(la_guest("journalctl -t cogbox-live-switch --no-pager", name)).splitlines()
+                 if f"generation {gen}: forced units: " in line]
+        assert len(lines) == 1, lines
+        return lines[0]
+
+    def plan_only(plan, unit, action, cls):
+        # The plan acts on `unit` alone (by `action`, maybe more: the guest's
+        # dry-activate can add a stop and a start beside a restart), class `cls`.
+        units = plan_units(plan)
+        return {u for u, _, _ in units} == {unit} and (unit, action, cls) in units and {c for _, _, c in units} == {cls}
+
+    def reply_route(name="la"):
+        # The reply-via-uplink routing (modules/guest-reply-route.nix) a forced
+        # network change must leave in place: the rule, table 1000's default
+        # route (networkd re-adds it once the reloaded uplink has its lease)
+        # and the nft table, listed with the nft the unit itself runs (the
+        # guest has none on PATH).
+        machine.succeed(la_guest("ip -4 rule show pref 50 | grep -q 'lookup 1000'", name))
+        machine.wait_until_succeeds(la_guest("ip -4 route show table 1000 | grep -q '^default'", name), timeout=60)
+        machine.succeed(la_guest(
+            "nft=$(systemctl show -p ExecStart --value cogbox-reply-route.service | grep -o '/nix/store/[^ ;]*/bin/nft' | head -n 1); "
+            '[ -n "$nft" ] && "$nft" list table ip cogbox_reply > /dev/null', name
+        ))
+
+    def force_audit(plan_id, apply_dir=la_apply):
+        # The Apply anyway lines of apply/audit.log for one plan, in order.
+        recs = []
+        for line in machine.succeed(f"cat {apply_dir}/audit.log 2>/dev/null || true").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("event") == "force" and rec.get("plan") == plan_id:
+                recs.append(rec)
+        return recs
+
+    def la_kit_at(nar):
+        # la-kit's pin in config.json, its source tree and its lock node.
+        assert jq('.plugins[] | select(.name == "la-kit") | .narHash') == nar
+        disk = machine.succeed(as_user(
+            f"nix --extra-experimental-features 'nix-command flakes' hash path {la_icd}/plugin-sources/la-kit"
+        )).strip()
+        assert disk == nar, (disk, nar)
+        locked = machine.succeed(
+            "jq -r '.nodes[.nodes.root.inputs[\"p-la-kit\"]].locked.narHash' "
+            f"{la_icd}/plugins-flake/flake.lock"
+        ).strip()
+        assert locked == nar, (locked, nar)
+
+    # LA3c: a docker daemon setting (docker.service stopped and docker.socket
+    # restarted: class B) and a change to the uplink's .network file
+    # (systemd-networkd reloaded: class C, so the reply route is repaired
+    # after the switch), added together. The inline add only plans: it stores
+    # the plan and says how to force it, and the guest is untouched. --force
+    # refuses without a terminal; an unknown id is plan_expired; once the
+    # guest's state moved, the stored id is plan_changed (the new plan is
+    # stored, the guest untouched); with the guest back as it was, the same
+    # id applies it, the units it stops, starts or restarts exempt only from
+    # the unit comparisons and networkd (only reloaded) held to all of them.
+    # Then the interactive form, on a terminal, takes it back out.
+    inv0 = la_inv("cogbox-reply-route.service")
+    gens0 = la_gens()
+    machine.succeed(la("cogbox plugin add path:/home/testuser/la-docker -y --no-apply --name la"))
+    out = machine.succeed(la("cogbox plugin add path:/home/testuser/la-net -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("restart_required", "disruptive_units")
+    plan = a["plan"]
+    check(a["overridable"] is True and plan is not None and a["forced"] is None, a)
+    acts = {(u, act) for u, act, _ in plan_units(plan)}
+    check(acts >= {("docker.service", "stop"), ("docker.socket", "restart"), ("systemd-networkd.service", "reload")}
+          and all(c in ("B", "C") for _, _, c in plan_units(plan)), plan)
+    check(plan["repair"] == ["cogbox-reply-route.service"] and plan["reexec"] is False, plan)
+    check(plan["P"] == sys2 and plan["T"] == system_of(store["runners"]["netforce"]), (plan, sys2))
+    assert hinted(out, plan["id"], "docker.socket", "then restart cogbox-reply-route.service"), out
+    id1 = plan["id"]
+    stored = json.loads(machine.succeed(f"cat {la_apply}/plans/{id1}.json"))
+    check(stored["plan"] == plan and stored["reason"] == "disruptive_units", stored)
+    assert stored["nonce"] == machine.succeed(f"cat {la_rt}/qemu.start").strip(), stored
+    assert guest_system() == sys2 and la_gens() == gens0
+    # --force asks on a terminal only, and takes no --json; neither touches
+    # last.json.
+    last_before = machine.succeed(f"sha256sum < {la_apply}/last.json")
+    for flags, why in [("--force", "terminal"), ("--force --json", "takes no --json")]:
+        rc, out = machine.execute(la(f"cogbox plugin apply {flags} --name la < /dev/null 2>&1"))
+        check(rc == 64 and why in out, (flags, rc, out))
+        assert machine.succeed(f"sha256sum < {la_apply}/last.json") == last_before
+    machine.succeed(la("cogbox plugin apply --force-plan ffffffffffffffff --json --name la"))
+    a = expect("restart_required", "plan_expired")
+    check(a["overridable"] is False and a["plan"] is None and a["forced"] is None, a)
+    # A stopped docker.service is no longer stopped by the switch (it would be
+    # started instead): another plan.
+    machine.succeed(la_guest("systemctl stop docker.service"))
+    machine.succeed(la(f"cogbox plugin apply --force-plan {id1} --json --name la"))
+    a = expect("restart_required", "plan_changed")
+    check(a["plan"] is not None and a["plan"]["id"] != id1 and a["overridable"] is False and a["forced"] is None, a)
+    machine.succeed(f"test -f {la_apply}/plans/{a['plan']['id']}.json")
+    assert guest_system() == sys2 and la_gens() == gens0
+    machine.succeed(la_guest("systemctl start docker.service"))
+    # The same guest state plans the same id, and Apply anyway applies it.
+    out = machine.succeed(la(f"cogbox plugin apply --force-plan {id1} --json --name la"))
+    print(out)
+    a = expect("applied")
+    check(a["forced"] == {"plan": id1, "units": relaxed(plan)} and "docker.socket" in relaxed(plan)
+          and "systemd-networkd.service" not in relaxed(plan), (a, plan))
+    sys_nf = system_of(store["runners"]["netforce"])
+    check(a["runner"] == store["runners"]["netforce"] and a["toplevel"] == sys_nf, a)
+    assert guest_system() == sys_nf
+    assert machine.succeed(f"sed -n 2p {la_icd}/runner.path").strip() == store["runners"]["netforce"]
+    # docker.socket brings dockerd back with the new setting.
+    machine.succeed(la_guest("timeout 120 docker info > /dev/null"))
+    machine.succeed(la_guest(
+        "conf=$(systemctl show -p ExecStart --value docker.service | grep -o -- '--config-file=[^ ;]*' | head -n 1); "
+        "grep -q '\"warn\"' \"${conf#--config-file=}\""
+    ))
+    reply_route()
+    check(la_inv("cogbox-reply-route.service") != inv0, "the repair did not restart cogbox-reply-route.service")
+    journal = forced_journal(a["gen"])
+    check("docker.service" in journal and "systemd-networkd.service" not in journal
+          and "repair: cogbox-reply-route.service" in journal, journal)
+    recs = force_audit(id1)
+    check(len(recs) >= 2 and recs[-2]["phase"] == "admitted" and recs[-2]["gen"] == a["gen"]
+          and recs[-1]["phase"] == "done" and recs[-1]["gen"] == a["gen"]
+          and recs[-1]["result"] == "applied" and recs[-1]["forced"] is True, recs)
+    machine.succeed(as_user(
+        f"ssh {SSH_OPTS} -o IdentitiesOnly=yes -i /home/testuser/.local/share/cogbox/cogbox_ed25519 "
+        f"-p {la_ssh} root@127.0.0.1 true"
+    ))
+    sessions_survive()
+    # Back to la-kit alone, interactively: the plan is listed on the terminal
+    # and asked about, with neither lock held while the question waits.
+    machine.succeed(la("cogbox plugin del la-net -y --no-apply --name la"))
+    machine.succeed(la("cogbox plugin del la-docker -y --no-apply --name la"))
+    force_pty = r'''
+import os, pty, select, subprocess, sys, time
+# Run argv[1] as testuser with stdin, stdout and stderr on one terminal; once
+# it asks, check the plan it listed and that neither instance lock is held,
+# answer y, and exit with its status after printing what the terminal showed.
+locks = ["/home/testuser/.config/cogbox/.locks/la.lock", "/home/testuser/.config/cogbox/.locks/la.apply.lock"]
+master, slave = pty.openpty()
+proc = subprocess.Popen(["su", "-", "testuser", "-c", sys.argv[1]], stdin=slave, stdout=slave, stderr=slave)
+os.close(slave)
+seen = b""
+def pump(until, secs):
+    global seen
+    end = time.monotonic() + secs
+    while time.monotonic() < end and not until():
+        ready, _, _ = select.select([master], [], [], 0.5)
+        if ready:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                return
+            seen += chunk
+def done(code):
+    sys.stdout.write(seen.decode(errors="replace") + "\nla-force-pty: %d\n" % code)
+    sys.exit(code)
+pump(lambda: b"[y/N] " in seen, 400)
+if b"[y/N] " not in seen:
+    proc.kill()
+    done(90)
+for unit in [b"docker.service", b"systemd-networkd.service", b"cogbox-reply-route.service"]:
+    if unit not in seen:
+        proc.kill()
+        done(91)
+for lock in locks:
+    if subprocess.run(["flock", "-n", lock, "true"]).returncode != 0:
+        proc.kill()
+        done(92)
+os.write(master, b"y\n")
+pump(lambda: False, 400)
+try:
+    rc = proc.wait(timeout=30)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    done(93)
+done(rc if rc >= 0 else 128 - rc)
+'''
+    machine.succeed("cat > /tmp/la-force-pty.py << 'PY_EOF'\n" + force_pty + "\nPY_EOF")
+    rc, out = machine.execute(
+        "python3 /tmp/la-force-pty.py " + shlex.quote(f"{LA_ENV} cogbox plugin apply --force --name la") + " < /dev/null"
+    )
+    print(out)
+    asked = re.search(r"Apply anyway \(plan ([0-9a-f]{16})\)\? \[y/N\] ", out)
+    asked_id = asked.group(1) if asked else None
+    check(rc == 0 and asked_id is not None and "Apply anyway would act on these units in the running instance 'la':" in out
+          and "forced units: " in out, (rc, out))
+    a = expect("applied")
+    check(a["forced"] is not None and a["forced"]["plan"] == asked_id, (a, asked_id))
+    assert guest_system() == sys2
+    assert machine.succeed(f"sed -n 2p {la_icd}/runner.path").strip() == r2
+    # The forced stop left only docker.socket; a stopped docker.service that
+    # multi-user.target wants would make every later plan start it (LA14b).
+    machine.succeed(la_guest("systemctl start docker.service"))
+    sessions_survive()
 
     # LA3b: a rolled-back update keeps the plugin's deny under a broader user
     # allow. A user allow for 10.99.0.0/24 lets the guest reach 10.99.0.2;
@@ -1518,6 +1752,53 @@ with subtest("Phase LA: live plugin apply, automatic rollback and serialization"
     ))
     machine.succeed(as_user("cogbox ssh --name la true"))
     machine.succeed(f"test -S /tmp/la-cm-root@127.0.0.1:{la_ssh}")
+
+    # LA9a: the same through a forced sshd restart, and K after a live
+    # rejection. la-kit version 5 makes sshd deny root: the update plans
+    # sshd.service's restart (disruptive_units), so it is kept for the next
+    # boot (K := S, its runner recorded). Applied anyway, sshd restarts and
+    # passes `sshd -t` and the guest's login probe, and the connections
+    # already open (the master included) survive, but no fresh connection
+    # gets in: rejected/unreachable, rolled back to B. That live rejection
+    # unlinks K, so the eval_error that follows rolls back to B as well,
+    # never to version 5.
+    install("la-kit-v5", "la-kit")
+    out = machine.succeed(la("cogbox plugin update la-kit --apply --name la 2>&1"))
+    print(out)
+    a = expect("restart_required", "disruptive_units")
+    plan = a["plan"]
+    check(a["overridable"] is True and plan is not None and plan_only(plan, "sshd.service", "restart", "B")
+          and plan["repair"] == [] and a["built_id"], a)
+    assert machine.succeed(f"sed -n 2p {la_icd}/runner.path").strip() == store["runners"]["kit5x"]
+    assert hinted(out, plan["id"], "restart sshd.service"), out
+    out = machine.succeed(la(f"cogbox plugin apply --force-plan {plan['id']} --json --name la"))
+    print(out)
+    a = expect("rejected", "unreachable")
+    check("recovered" in a["detail"] and a["forced"] == {"plan": plan["id"], "units": ["sshd.service"]}, a)
+    check(a["rollback"]["status"] == "done" and a["rollback"]["target"] == "base" and a["built_id"] is None, a)
+    machine.fail(f"test -e {la_apply}/built || test -L {la_apply}/built")
+    la_kit_at(nar_v2)
+    assert guest_system() == sys5
+    machine.succeed(f"test -S /tmp/la-cm-root@127.0.0.1:{la_ssh}")
+    # A fresh login with the cogbox key works again (P's sshd_config is back);
+    # -F /dev/null keeps the user's ControlMaster from multiplexing it.
+    machine.succeed(as_user(
+        f"ssh -F /dev/null {SSH_OPTS} -o IdentitiesOnly=yes -i /home/testuser/.local/share/cogbox/cogbox_ed25519 "
+        f"-p {la_ssh} root@127.0.0.1 true"
+    ))
+    sessions_survive()
+    rc, out = machine.execute(la("cogbox plugin add path:/home/testuser/la-bad -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("rejected", "eval_error")
+    base_id = machine.succeed(f"basename $(readlink {la_apply}/base)").strip()
+    check(rc == 1 and a["rollback"]["target"] == "base" and a["rollback"]["target_id"] == base_id, (rc, a))
+    assert jq('[.plugins[] | select(.name == "la-bad")] | length') == "0"
+    la_kit_at(nar_v2)
+    rp = machine.succeed(f"sed -n 2p {la_icd}/runner.path").strip()
+    check(rp == machine.succeed(f"jq -r .runner {la_apply}/base/meta.json").strip() == store["runners"]["xguard"]
+          and rp != store["runners"]["kit5x"], rp)
+    install("la-kit-v2", "la-kit")
+
     rc, out = machine.execute(la("cogbox plugin add path:/home/testuser/la-lock -y --apply --name la 2>&1"))
     print(out)
     a = expect("rejected", "unreachable")
@@ -1535,6 +1816,27 @@ with subtest("Phase LA: live plugin apply, automatic rollback and serialization"
     ))
     sessions_survive()
 
+    # LA9c: a forced sshd whose new config does not load. la-sshbad includes
+    # an option sshd does not know, so sshd's restart fails and so does
+    # `sshd -t`. Force exempts sshd only from the unit comparisons, never from
+    # the base checks: rejected/breaks_base, rolled back, and the human line
+    # names the forced units.
+    rc, out = machine.execute(la("cogbox plugin add path:/home/testuser/la-sshbad -y --apply --name la 2>&1"))
+    print(out)
+    a = expect("restart_required", "disruptive_units")
+    plan = a["plan"]
+    check(rc == 0 and plan is not None and plan_only(plan, "sshd.service", "restart", "B"), (rc, a))
+    rc, out = machine.execute(la(f"cogbox plugin apply --force-plan {plan['id']} --name la 2>&1"))
+    print(out)
+    a = expect("rejected", "breaks_base")
+    check(rc == 1 and "forced units: sshd.service" in out, (rc, out))
+    check(a["rollback"]["status"] == "done" and a["rollback"]["target"] == "base"
+          and a["rolled_back_guest"] is True and a["forced"] == {"plan": plan["id"], "units": ["sshd.service"]}, a)
+    machine.succeed(la_guest("systemctl is-active sshd.service && sshd -t && ! test -e /etc/ssh/la-sshbad.conf"))
+    assert guest_system() == sys5
+    assert jq('[.plugins[] | select(.name == "la-sshbad")] | length') == "0"
+    sessions_survive()
+
     # LA10: `cogbox init` on the running instance leaves the base alone.
     base_before = machine.succeed(f"readlink {la_apply}/base; cat {la_apply}/base/meta.json")
     machine.succeed(as_user("cogbox init -y --name la"))
@@ -1548,11 +1850,13 @@ with subtest("Phase LA: live plugin apply, automatic rollback and serialization"
     rc, out = machine.execute(la("cogbox plugin add path:/home/testuser/la-user -y --apply --name la 2>&1"))
     print(out)
     a = expect("restart_required", "skipped_units")
-    check(rc == 0 and a["overridable"] is False and a["built_id"], a)
+    check(rc == 0 and a["overridable"] is False and a["built_id"] and a["plan"] is None, a)
+    assert "now anyway" not in out, out
     rc, out = machine.execute(la("cogbox plugin add path:/home/testuser/la-mount -y --apply --name la 2>&1"))
     print(out)
     a = expect("restart_required", "restart_only_units")
-    check(rc == 0 and a["overridable"] is False and a["built_id"], a)
+    check(rc == 0 and a["overridable"] is False and a["built_id"] and a["plan"] is None, a)
+    assert "now anyway" not in out, out
     built = a["built_id"]
     r9 = a["runner"]
     assert r9 == store["runners"]["mount"], (a, store)
@@ -1613,6 +1917,8 @@ with subtest("Phase LA: live plugin apply, automatic rollback and serialization"
     print(out)
     a = expect("restart_required", "disruptive_units")
     check(rc == 0 and a["overridable"] is True and "docker.service" in a["detail"], a)
+    check(hinted(out, a["plan"]["id"], "docker.service"), (out, a))
+    machine.succeed(f"test -f {la_apply}/plans/{a['plan']['id']}.json")
     assert machine.succeed(f"sed -n 2p {la_icd}/runner.path").strip() == r9
     machine.fail(la_guest("systemctl is-active docker.service"))
     machine.succeed(la_guest("systemctl start docker.service"))
@@ -1780,6 +2086,28 @@ with subtest("Phase LA: live plugin apply, automatic rollback and serialization"
     machine.succeed(la_guest(f'[ "$(readlink -f /etc/static)" = "$(readlink -f {sys_h}/etc)" ]', "lah"))
     assert jq('[.plugins[] | select(.name == "la-hang")] | length', lah_cfg) == "0"
     assert machine.succeed(f"sed -n 2p {lah_icd}/runner.path").strip() == hosted["runners"]["kit2"]
+    # LA19b: Apply anyway on the hosted guest. The uplink's .network change
+    # alone is network_config (class C, so the repair is on); the stored
+    # plan's id applies it with nothing relaxed (networkd is only reloaded,
+    # so every post-check still holds it), and the reply route is in place
+    # after the repair.
+    inv_h = la_inv("cogbox-reply-route.service", "lah")
+    rc, out = machine.execute(lah("plugin add path:/home/testuser/la-net -y --apply --name lah 2>&1"))
+    print(out)
+    a = expect("restart_required", "network_config", apply_dir=lah_apply)
+    plan = a["plan"]
+    check(rc == 0 and a["overridable"] is True and plan is not None
+          and plan_only(plan, "systemd-networkd.service", "reload", "C")
+          and plan["repair"] == ["cogbox-reply-route.service"], (rc, a), lah_apply)
+    out = machine.succeed(lah(f"plugin apply --force-plan {plan['id']} --json --name lah"))
+    print(out)
+    a = expect("applied", apply_dir=lah_apply)
+    check(a["forced"] == {"plan": plan["id"], "units": []}, a, lah_apply)
+    journal = forced_journal(a["gen"], "lah")
+    check(f"generation {a['gen']}: forced units: none; repair: cogbox-reply-route.service" in journal, journal, lah_apply)
+    assert guest_system("lah") == system_of(hosted["runners"]["net"])
+    reply_route("lah")
+    check(la_inv("cogbox-reply-route.service", "lah") != inv_h, "the repair did not restart cogbox-reply-route.service", lah_apply)
     machine.succeed(lah("stop --name lah"))
     machine.wait_until_fails("test -e /run/user/1000/cogbox-lah/pid", timeout=30)
 

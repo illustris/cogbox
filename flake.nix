@@ -7404,6 +7404,10 @@
 						mount = [ (kit 2) (la "la-x") (la "la-guard") (la "la-user") (la "la-mount") ];
 						noboot = [ (kit 2) (la "la-x") (la "la-guard") (la "la-user") (la "la-mount") (la "la-noboot") ];
 						uunit = [ (kit 2) (la "la-x") (la "la-guard") (la "la-user") (la "la-mount") (la "la-uunit") ];
+						# Applied only with Apply anyway.
+						netforce = [ (kit 2) (la "la-docker") (la "la-net") ];
+						kit5x = [ (kit 5) (la "la-x") (la "la-guard") ];
+						sshbad = [ (kit 2) (la "la-x") (la "la-guard") (la "la-sshbad") ];
 					};
 					systems = lib.mapAttrs (_: laToplevel) {
 						docker = [ (kit 2) (la "la-docker") ];
@@ -7415,11 +7419,11 @@
 						runners = lib.mapAttrs (_: laHostedRunner) {
 							kit2 = [ (kit 2) ];
 							hang = [ (kit 2) (la "la-hang") ];
+							net = [ (kit 2) (la "la-net") ];
 						};
 						systems = lib.mapAttrs (_: laHostedToplevel) {
 							docker = [ (kit 2) (la "la-docker") ];
 							nft = [ (kit 2) (la "la-nft") ];
-							net = [ (kit 2) (la "la-net") ];
 						};
 					};
 				};

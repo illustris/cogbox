@@ -741,29 +741,69 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(list((self.icd() / "apply" / "rollback").glob("*.intent")), [])
         self.assertEqual([(r["gen"], r["status"]) for r in self.records()], [("0123456789abcdef", "done")])
 
-    def test_apply_force_is_refused_at_once_not_after_the_config_lock_wait(self):
-        # `apply --force` and `--force-plan` (Apply anyway) are not supported
-        # yet: the dispatcher refuses them (64) before it opens or waits for
-        # any lock, so a long plugin op holding the config lock (the test holds
-        # it throughout) does not hold the refusal back for the apply's 300 s
-        # lock wait.
+    def test_apply_force_needs_a_terminal_and_no_json_and_force_plan_is_a_plain_run(self):
+        # `apply --force` (Apply anyway on a terminal) shows the plan on
+        # stderr and reads the answer from stdin, so the dispatcher refuses it
+        # (64) with --json, and unless stdin AND stderr are terminals, before
+        # it opens or waits for any lock: a long plugin op holding the config
+        # lock (the test holds it here) does not hold the refusal back for the
+        # apply's 300 s lock wait, and nothing of a run is written. On a
+        # terminal it is not refused: it runs, and on the stopped instance
+        # answers not_running with no question. `--force-plan` (the form the
+        # control plane uses) is a plain run: the stopped instance answers
+        # not_running before any plan is looked at. An apply command line that
+        # does not parse (`--force` with `--force-plan`, a malformed or missing
+        # plan id) is refused (64) before any lock too.
         identity = self.start()
         self.cli("stop")
         self.ended(identity)
+        argv = [str(CLI), "plugin", "-n", "demo", "apply"]
+        needs_tty = ("cogbox plugin: error: apply --force shows the plan and asks on a terminal (stdin and "
+                     "stderr); without one, pass the plan id an apply reported: --force-plan PLAN")
+        no_json = "cogbox plugin: error: apply --force is interactive and takes no --json; use --force-plan PLAN"
+        invalid = "cogbox plugin: error: invalid arguments"
         locks = self.root / "config" / "cogbox" / ".locks"
         with open(locks / "demo.lock", "a") as config_lock:
             fcntl.flock(config_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            for args in (["--force"], ["--force-plan", "0123456789abcdef"]):
+            for args, want in ((["--force"], needs_tty), (["--json", "--force"], no_json),
+                               (["--force", "--json"], no_json),
+                               (["--force", "--force-plan", "0123456789abcdef"], invalid),
+                               (["--json", "--force-plan", "0123456789ABCDEF"], invalid),
+                               (["--json", "--force-plan"], invalid)):
                 with self.subTest(args=args):
                     began = time.monotonic()
-                    result = self.plugin("apply", "--json", *args)
+                    result = subprocess.run(argv + args, env=self.env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=30)
                     took = time.monotonic() - began
                     self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
-                    self.assertIn("cogbox plugin: error: apply --force and --force-plan (Apply anyway) "
-                                  "are not supported by this cogbox yet", result.stderr)
+                    self.assertIn(want, result.stderr)
                     self.assertEqual(result.stdout, "")
                     self.assertLess(took, 10)
+            # One terminal is not enough: stdin alone would let 2>/dev/null
+            # hide the plan being agreed to, stderr alone has no answer.
+            for stdin_on_pty, stderr_on_pty in ((True, False), (False, True)):
+                with self.subTest(stdin_on_pty=stdin_on_pty, stderr_on_pty=stderr_on_pty):
+                    began = time.monotonic()
+                    rc, out, said = self.run_on_pty(argv + ["--force"], self.env, stdin_on_pty=stdin_on_pty,
+                                                    stderr_on_pty=stderr_on_pty)
+                    self.assertEqual(rc, 64, out + said)
+                    self.assertIn(needs_tty, said)
+                    self.assertEqual(out, "")
+                    self.assertLess(time.monotonic() - began, 10)
         self.assertFalse((self.icd() / "apply" / "last.json").exists())
+        rc, out, said = self.run_on_pty(argv + ["--force"], self.env, stdin_on_pty=True)
+        self.assertEqual(rc, 0, out + said)
+        self.assertIn("plugin apply: not_running:", out)
+        self.assertNotIn("[y/N]", said)
+        self.assertNotIn("error", said)
+        self.assertEqual(json.loads((self.icd() / "apply" / "last.json").read_text())["apply"]["result"],
+                         "not_running")
+        result = self.plugin("apply", "--json", "--force-plan", "0123456789abcdef")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads(result.stdout)["apply"]
+        self.assertEqual((report["result"], report["reason"], report["overridable"], report["forced"]),
+                         ("not_running", None, False, None))
+        self.assertEqual(json.loads((self.icd() / "apply" / "last.json").read_text())["apply"], report)
 
 
     # --- live plugin apply: the verb's children, its stdout, the inline default ---
@@ -839,13 +879,14 @@ class Lifecycle(unittest.TestCase):
         self.cli("stop")
         self.ended(identity)
 
-    def run_on_pty(self, argv, env):
-        """Run argv with stderr on a pseudo-terminal (stdout a pipe); returns
-        (exit status, stdout, what reached the terminal)."""
+    def run_on_pty(self, argv, env, stdin_on_pty=False, stderr_on_pty=True):
+        """Run argv with stderr on a pseudo-terminal, and stdin too with
+        stdin_on_pty (else /dev/null); stdout is a pipe. Returns (exit status,
+        stdout, what reached the terminal, then stderr when it was a pipe)."""
         master, slave = pty.openpty()
         try:
-            proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                    stderr=slave)
+            proc = subprocess.Popen(argv, env=env, stdin=slave if stdin_on_pty else subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=slave if stderr_on_pty else subprocess.PIPE)
         finally:
             os.close(slave)
         self.children.append(proc)
@@ -866,8 +907,8 @@ class Lifecycle(unittest.TestCase):
                     break
         finally:
             os.close(master)
-        out, _ = proc.communicate(timeout=10)
-        return proc.returncode, out.decode(), seen.decode(errors="replace")
+        out, err = proc.communicate(timeout=10)
+        return proc.returncode, out.decode(), (seen + (err or b"")).decode(errors="replace")
 
     def test_committed_change_applies_inline_only_when_stderr_is_a_terminal(self):
         # The CLI default (spec section 2 step 1): a committed del on a running

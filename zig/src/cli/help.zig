@@ -519,7 +519,8 @@ pub const PLUGIN =
     \\  cogbox plugin [-n NAME] del PLUGIN [-y] [--apply | --no-apply]
     \\  cogbox plugin [-n NAME] update [PLUGIN] [--apply | --no-apply]
     \\  cogbox plugin [-n NAME] list
-    \\  cogbox plugin [-n NAME] apply [--json] [--op RUN]
+    \\  cogbox plugin [-n NAME] apply [--json] [--op RUN] [--force-plan PLAN]
+    \\  cogbox plugin [-n NAME] apply --force
     \\  cogbox plugin [-n NAME] apply --status [--json] [--since N]
     \\  cogbox plugin [-n NAME] apply --cancel [--json] [--op RUN]
     \\  cogbox plugin [-n NAME] apply --log GENERATION
@@ -536,6 +537,14 @@ pub const PLUGIN =
     \\      --no-apply        Leave the change for 'cogbox plugin apply' or the
     \\                        next restart (the default otherwise, and always
     \\                        with COGBOX_LIVE_APPLY=0)
+    \\      --force           (apply) When the change can go live only by
+    \\                        stopping, restarting or reloading units that end
+    \\                        or interrupt sessions, containers or the network,
+    \\                        or by re-executing systemd, list what it would do
+    \\                        and ask on the terminal whether to apply it anyway
+    \\      --force-plan PLAN (apply) Apply anyway without asking: PLAN is the
+    \\                        plan id an earlier apply reported (at most 30
+    \\                        minutes old, this boot, the same plugin state)
     \\  -h, --help            Show this help and exit
     \\
     \\apply builds the committed plugin state on the host and loads it into
@@ -555,6 +564,13 @@ pub const PLUGIN =
     \\so the instance can start again. A plugin change made while an apply
     \\builds stops that apply; one made during its guest phase waits for it,
     \\at most COGBOX_APPLY_WAIT_MAX seconds (1200), then exits 69 unchanged.
+    \\
+    \\Apply anyway (--force, --force-plan) relaxes the post-checks only for
+    \\the units the plan stops, starts or restarts (a unit it only reloads
+    \\stays checked): a change to the kernel, initrd, mounts, boot-only or
+    \\login units is never applied live, the checks of logins, sshd and the
+    \\network still run, and a change they prove broken is rolled back like
+    \\any other.
     \\
     \\A plugin is a flake output `cogboxPlugins.<attr>` (its `module` reference
     \\plus host-side networkRules/l7Rules/inject): `URL#attr` selects it, bare URL

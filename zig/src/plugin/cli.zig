@@ -68,8 +68,11 @@ pub const ApplyArgs = struct {
 	since: u64 = 0,
 	/// --log G: the generation whose build log to print.
 	gen: ?[]const u8 = null,
-	/// --force / --force-plan ID (Apply anyway). Parsed so the CLI surface is
-	/// stable; the verb refuses both until forced plans are supported.
+	/// --force / --force-plan ID (Apply anyway). `--force-plan` runs the apply
+	/// bound to the stored plan ID; `--force` asks on a terminal (apply.zig
+	/// forceLoop). `--force --json` parses, so the dispatcher refuses it with
+	/// its own message; it refuses an apply line that does not parse too
+	/// (`invalid arguments`), both before any lock wait.
 	force: bool = false,
 	force_plan: ?[]const u8 = null,
 	/// --abandon-rollback -y: skip the confirmation.
