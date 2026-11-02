@@ -85,6 +85,9 @@ pub const Bounds = struct {
 	pub const busy_wait_ms: i64 = 420_000;
 	/// One systemctl call (show, stop).
 	pub const systemctl_ms: i64 = 10_000;
+	/// A stopper's wait, after its stop of a build unit was queued, for the
+	/// unit to end (polled every child_poll_ms).
+	pub const stop_settle_ms: i64 = 10_000;
 	/// The child-wait loop's poll slice: a flag is seen within it.
 	pub const child_poll_ms: i32 = 250;
 	/// Signalling a holder: SIGTERM, wait, then (with the config lock) SIGKILL.
@@ -1043,11 +1046,29 @@ fn detectCap(env: *const std.process.Environ.Map) ?Cap {
 
 /// `cogbox-apply-build-<first 12 hex of sha256(icd)>`: one per instance, so an
 /// orphan of this instance is found by name, and two instances never collide.
+/// The icd is hashed as normalIcd spells it, so the launcher's bash spelling
+/// (`//` after a trailing slash in XDG_CONFIG_HOME or HOME) and the verb's
+/// (path.join) name one unit; a canonical icd hashes as itself.
 pub fn buildUnitName(arena: Allocator, icd: []const u8) ![]const u8 {
 	var h: [32]u8 = undefined;
-	std.crypto.hash.sha2.Sha256.hash(icd, &h, .{});
+	std.crypto.hash.sha2.Sha256.hash(try normalIcd(arena, icd), &h, .{});
 	const hex = std.fmt.bytesToHex(h, .lower);
 	return std.fmt.allocPrint(arena, "cogbox-apply-build-{s}", .{hex[0..12]});
+}
+
+/// `p` lexically normalized: repeated and trailing `/` and `.` components
+/// dropped. `..` is kept: across a symlink it names another directory, and
+/// two instances must never share a unit name.
+fn normalIcd(arena: Allocator, p: []const u8) ![]const u8 {
+	var n: std.ArrayList(u8) = .empty;
+	if (std.mem.startsWith(u8, p, "/")) try n.append(arena, '/');
+	var it = std.mem.tokenizeScalar(u8, p, '/');
+	while (it.next()) |c| {
+		if (std.mem.eql(u8, c, ".")) continue;
+		if (n.items.len > 0 and n.items[n.items.len - 1] != '/') try n.append(arena, '/');
+		try n.appendSlice(arena, c);
+	}
+	return n.items;
 }
 
 /// The environment variables passed into the build unit by name (systemd-run
@@ -1522,11 +1543,36 @@ pub fn writeActive(arena: Allocator, io: Io, icd: []const u8, a: Active, owner: 
 	try writeApplyFile(arena, io, icd, "active", aw.written(), owner);
 }
 
-pub fn readActive(arena: Allocator, io: Io, icd: []const u8) ?Active {
-	var dir = snapshot.openIcd(io, icd) catch return null;
+/// apply/active as a stopper reads it: absent (nothing can be recorded
+/// there), a record, or a file that is there but cannot be read or parsed
+/// (EACCES, too large, malformed), whose unit may still run.
+pub const ActiveRead = union(enum) {
+	absent,
+	record: Active,
+	unreadable: anyerror,
+};
+
+pub fn readActiveForStop(arena: Allocator, io: Io, icd: []const u8) ActiveRead {
+	var dir = snapshot.openIcd(io, icd) catch |err| return switch (err) {
+		error.FileNotFound, error.NotDir, error.RelativeInstanceDir => .absent,
+		else => .{ .unreadable = err },
+	};
 	defer dir.close(io);
-	const bytes = snapshot.readNoFollow(arena, io, dir, "apply/active", 64 << 10) catch return null;
-	return std.json.parseFromSliceLeaky(Active, arena, bytes, .{ .ignore_unknown_fields = true }) catch null;
+	const bytes = snapshot.readNoFollow(arena, io, dir, "apply/active", 64 << 10) catch |err| return switch (err) {
+		error.FileNotFound, error.NotDir => .absent,
+		else => .{ .unreadable = err },
+	};
+	const a = std.json.parseFromSliceLeaky(Active, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err| return .{ .unreadable = err };
+	return .{ .record = a };
+}
+
+/// apply/active, or null when it is absent or cannot be read (readers that
+/// stop nothing: the gate, `--status`, the snapshot GC).
+pub fn readActive(arena: Allocator, io: Io, icd: []const u8) ?Active {
+	return switch (readActiveForStop(arena, io, icd)) {
+		.record => |a| a,
+		else => null,
+	};
 }
 
 pub fn clearActive(io: Io, icd: []const u8) void {
@@ -2807,13 +2853,12 @@ fn stopOutcome(r: *Run, stopped: ?Stop, deadline_is_build: bool) ?Outcome {
 }
 
 /// Preflight, under the apply flock: stop the build unit a dead apply's
-/// apply/active still names, by that name (stopBuildUnit). True when no record
-/// names a unit, or nothing of it can run any more; false keeps the record,
-/// which this apply must not overwrite.
+/// apply/active still names, by that name (stopActiveUnit; an unreadable
+/// record by this instance's own unit name). True when no record names a
+/// unit, or nothing of it can run any more; false keeps the record, which
+/// this apply must not overwrite.
 fn stopOrphanBuild(r: *Run) bool {
-	const old = readActive(r.arena, r.io, r.icd) orelse return true;
-	const unit = old.unit orelse return true;
-	return stopBuildUnit(r.arena, r.io, r.env(), r.icd, unit) != .failed;
+	return stopActiveUnit(r.arena, r.io, r.env(), r.icd, readActiveForStop(r.arena, r.io, r.icd)) != .failed;
 }
 
 /// Under unit containment, the build unit's name, set before anything records
@@ -5390,16 +5435,14 @@ fn runCancel(arena: Allocator, ctx: *const plugin.Ctx, args: cli.ApplyArgs, host
 		if (tryFlock(host.apply_fd) catch false) {
 			defer unlockFd(host.apply_fd);
 			// The holder is gone: stop the build unit its apply/active names,
-			// by that name (holding the flock proves no live apply owns it). A
-			// stop that cannot be confirmed keeps apply/active, the unit's only
+			// by that name (holding the flock proves no live apply owns it; an
+			// unreadable record, by this instance's own unit name). A stop
+			// that cannot be confirmed keeps apply/active, the unit's only
 			// record, for the next stopper. The record is read again under the
 			// flock: before it ended, the holder may have rewritten it, or
 			// cleared it once its own stop was accepted.
-			var unit_settled = true;
-			const cur = readActive(arena, io, icd);
-			if (cur) |a| {
-				if (a.unit) |u| unit_settled = stopBuildUnit(arena, io, ctx.parent_env, icd, u) != .failed;
-			}
+			const cur = readActiveForStop(arena, io, icd);
+			const unit_settled = stopActiveUnit(arena, io, ctx.parent_env, icd, cur) != .failed;
 			var rec_fin: ?rollback.FinishResult = null;
 			if (inflightExists(io, icd)) _ = recoverInflight(arena, ctx, .{ .holds_config_lock = host.config_held, .ssh_identity = host.ssh_identity, .fin_out = &rec_fin });
 			if (host.config_held) {
@@ -5408,7 +5451,7 @@ fn runCancel(arena: Allocator, ctx: *const plugin.Ctx, args: cli.ApplyArgs, host
 					const fin = rollback.finishPending(arena, ctx, .{ .holds_apply_flock = true });
 					writeFinishWarnings(arena, io, fin);
 				}
-				if (unit_settled and cur != null and !(if (readActive(arena, io, icd)) |now| holderAlive(arena, io, now) else false)) clearActive(io, icd);
+				if (unit_settled and cur != .absent and !(if (readActive(arena, io, icd)) |now| holderAlive(arena, io, now) else false)) clearActive(io, icd);
 			}
 			result = if (signalled) .done else .none;
 		} else {
@@ -5473,44 +5516,110 @@ fn waitPidfd(io: Io, pidfd: i32, ms: i64) bool {
 
 pub const UnitStop = enum {
 	/// Nothing of this instance runs under the name (the unit is not loaded,
-	/// inactive or failed), or apply/active names another instance's unit.
+	/// or it failed; for an unreadable apply/active, no systemd runs here),
+	/// or apply/active names another instance's unit.
 	none,
-	/// The stop was queued.
+	/// The stop was queued, and the unit then ended (stop_settle_ms).
 	stopped,
-	/// systemctl could not tell, or could not stop it: the unit may still run.
+	/// systemctl could not tell, could not stop it, or it still ran
+	/// stop_settle_ms after its stop was queued: the unit may still run.
 	failed,
 };
 
-/// Stop this instance's build unit `unit` by its name, when systemd says it
-/// runs. Not by InvocationID: systemd-run --wait often reports none, and one
-/// apply runs several stages under the name. A by-name stop is only for a
-/// holder of the apply flock (no live apply then owns the name: every apply
-/// holds that flock from preflight until it exits) or for `cogbox delete`
-/// under the config lock on a stopped instance; a stopper with neither would
-/// need the run's own identity. The name check is the guard against a copied
-/// apply/active naming another instance's unit. `--no-ask-password`: a
-/// stopper without the right to stop a root apply's unit fails rather than
-/// asking on the caller's terminal. Bounded by two systemctl calls (10 s
-/// each, run through the terminate flag).
-fn stopBuildUnit(arena: Allocator, io: Io, env: *const std.process.Environ.Map, icd: []const u8, unit: []const u8) UnitStop {
-	const mine = buildUnitName(arena, icd) catch return .failed;
-	if (!std.mem.eql(u8, unit, mine)) return .none;
+/// A stopper's wait for a stopped unit to end (Bounds.stop_settle_ms; only
+/// the tests shorten it).
+pub var stop_settle_ms: i64 = Bounds.stop_settle_ms;
+
+/// sd_booted(3)'s probe: without it no systemd runs here, so no unit can
+/// (only the tests point it elsewhere).
+pub var systemd_dir: [:0]const u8 = "/run/systemd/system";
+
+/// What `systemctl show -p LoadState -p ActiveState <unit>` says (KEY=VALUE
+/// lines, in systemd's own order).
+const UnitState = struct {
+	/// `loaded`, `not-found`, ...; null when systemctl printed none.
+	load: ?[]const u8 = null,
+	active: []const u8,
+
+	/// Whether something of the unit may run, or will: a loaded unit that is
+	/// still inactive may have its start job queued (between
+	/// StartTransientUnit and PID 1 dispatching it, the window in which
+	/// systemd-run prints no InvocationID), which a stop cancels. A failed
+	/// unit runs nothing, and systemd starts no transient unit under a name
+	/// that is still loaded.
+	fn mayRun(s: UnitState) bool {
+		if (std.mem.eql(u8, s.active, "failed")) return false;
+		if (s.active.len == 0 or std.mem.eql(u8, s.active, "inactive")) {
+			const load = s.load orelse return true;
+			return std.mem.eql(u8, load, "loaded");
+		}
+		return true;
+	}
+
+	/// After this stopper's stop: nothing of it runs (unloaded, inactive or
+	/// failed; the stop replaced any queued start job).
+	fn ended(s: UnitState) bool {
+		return s.active.len == 0 or std.mem.eql(u8, s.active, "inactive") or std.mem.eql(u8, s.active, "failed");
+	}
+};
+
+/// One `systemctl show` of `unit` (run through the terminate flag, killed at
+/// `deadline_ms`); null when it failed or printed no ActiveState.
+fn unitState(arena: Allocator, io: Io, env: *const std.process.Environ.Map, unit: []const u8, deadline_ms: i64) ?UnitState {
 	const res = runChild(arena, io, .{
-		.argv = &.{ "systemctl", "show", "-p", "ActiveState", "--value", unit },
+		.argv = &.{ "systemctl", "show", "-p", "LoadState", "-p", "ActiveState", unit },
 		.env = env,
-		.deadline_ms = nowMs(io) + Bounds.systemctl_ms,
-		.out_cap = 256,
+		.deadline_ms = deadline_ms,
+		.out_cap = 1024,
 		.err_cap = 4096,
 		.ignore_terminate = true,
 	});
-	if (!res.exitedWith(0)) {
+	if (!res.exitedWith(0)) return null;
+	var load: ?[]const u8 = null;
+	var active: ?[]const u8 = null;
+	var it = std.mem.splitScalar(u8, res.stdout.data(), '\n');
+	while (it.next()) |raw| {
+		const line = std.mem.trim(u8, raw, " \t\r");
+		if (std.mem.startsWith(u8, line, "LoadState=")) load = line["LoadState=".len..];
+		if (std.mem.startsWith(u8, line, "ActiveState=")) active = line["ActiveState=".len..];
+	}
+	return .{ .load = load, .active = active orelse return null };
+}
+
+/// After a queued stop: poll the unit every child_poll_ms until it ended,
+/// at most stop_settle_ms (each show is cut at that bound too). A stopper
+/// that went on while it is still loaded would have the next apply's stage
+/// refused under the same name (failed/build). True once it ended.
+fn waitUnitEnded(arena: Allocator, io: Io, env: *const std.process.Environ.Map, unit: []const u8) bool {
+	const until = nowMs(io) + stop_settle_ms;
+	while (true) {
+		if (unitState(arena, io, env, unit, until)) |s| if (s.ended()) return true;
+		const left = until - nowMs(io);
+		if (left <= 0) return false;
+		Io.sleep(io, Io.Duration.fromMilliseconds(@min(left, Bounds.child_poll_ms)), .awake) catch {};
+	}
+}
+
+/// Stop this instance's build unit `unit` by its name, when systemd says it
+/// may run, and wait for it to end. Not by InvocationID: systemd-run --wait
+/// often reports none, and one apply runs several stages under the name. A
+/// by-name stop is only for a holder of the apply flock (no live apply then
+/// owns the name: every apply holds that flock from preflight until it
+/// exits) or for `cogbox delete` under the config lock on a stopped
+/// instance; a stopper with neither would need the run's own identity. The
+/// name check is the guard against a copied apply/active naming another
+/// instance's unit. `--no-ask-password`: a stopper without the right to stop
+/// a root apply's unit fails rather than asking on the caller's terminal.
+/// Bounded by two systemctl calls (10 s each) and the wait for the unit to
+/// end (10 s), all run through the terminate flag: 30 s.
+fn stopBuildUnit(arena: Allocator, io: Io, env: *const std.process.Environ.Map, icd: []const u8, unit: []const u8) UnitStop {
+	const mine = buildUnitName(arena, icd) catch return .failed;
+	if (!std.mem.eql(u8, unit, mine)) return .none;
+	const state = unitState(arena, io, env, unit, nowMs(io) + Bounds.systemctl_ms) orelse {
 		warnf(arena, io, "could not tell whether {s}, a build an earlier live apply started, still runs; apply/active keeps it", .{unit});
 		return .failed;
-	}
-	// With --collect an ended unit is unloaded (empty or `inactive`); a
-	// failed one runs nothing either.
-	const state = std.mem.trim(u8, res.stdout.data(), " \t\r\n");
-	if (state.len == 0 or std.mem.eql(u8, state, "inactive") or std.mem.eql(u8, state, "failed")) return .none;
+	};
+	if (!state.mayRun()) return .none;
 	const stop = runChild(arena, io, .{
 		.argv = &.{ "systemctl", "--no-ask-password", "stop", "--no-block", unit },
 		.env = env,
@@ -5519,11 +5628,34 @@ fn stopBuildUnit(arena: Allocator, io: Io, env: *const std.process.Environ.Map, 
 		.err_cap = 4096,
 		.ignore_terminate = true,
 	});
-	if (stop.exitedWith(0)) return .stopped;
+	if (stop.exitedWith(0)) {
+		if (waitUnitEnded(arena, io, env, unit)) return .stopped;
+		warnf(arena, io, "{s}, a build an earlier live apply left running, had not ended {d} s after its stop; apply/active keeps it", .{ unit, @divTrunc(stop_settle_ms, 1000) });
+		return .failed;
+	}
 	// It ended in between.
 	if (stop.exit != null and std.mem.indexOf(u8, stop.stderr.data(), " not loaded") != null) return .none;
 	warnf(arena, io, "could not stop {s}, a build an earlier live apply left running; apply/active keeps it", .{unit});
 	return .failed;
+}
+
+/// The by-name stop a stopper owes what apply/active says (stopBuildUnit):
+/// the unit a record names, `.none` without a record or a unit. A file that
+/// is there but cannot be read or parsed may be the only record of a unit
+/// that runs: this instance's own unit is stopped by its name (the name does
+/// not depend on the record), and `.none` (the file may go) only when that
+/// stop settled, or when systemd does not run here, so that no unit can.
+fn stopActiveUnit(arena: Allocator, io: Io, env: *const std.process.Environ.Map, icd: []const u8, rec: ActiveRead) UnitStop {
+	switch (rec) {
+		.absent => return .none,
+		.record => |a| return if (a.unit) |u| stopBuildUnit(arena, io, env, icd, u) else .none,
+		.unreadable => |err| {
+			const mine = buildUnitName(arena, icd) catch return .failed;
+			warnf(arena, io, "cannot read {s}/apply/active ({s}); stopping {s}, this instance's build unit, by its name", .{ icd, @errorName(err), mine });
+			if (std.c.access(systemd_dir, std.c.F_OK) != 0) return .none;
+			return stopBuildUnit(arena, io, env, icd, mine);
+		},
+	}
 }
 
 // --- --log ------------------------------------------------------------------------------------
@@ -6144,13 +6276,12 @@ pub fn stopStep(arena: Allocator, ctx: *const plugin.Ctx, apply_fd: std.posix.fd
 
 /// `cogbox delete`, under the config lock on a stopped instance, before it
 /// removes the instance dir: stop the build unit apply/active records, by its
-/// name (stopBuildUnit; a live apply's own watch then ends it `superseded`).
-/// `.none` without a record naming a unit. On `.failed` the unit may still
-/// run, and the caller must not remove its only record.
+/// name (stopActiveUnit; an unreadable record by this instance's own unit
+/// name; a live apply's own watch then ends it `superseded`). `.none`
+/// without a record naming a unit. On `.failed` the unit may still run, and
+/// the caller must not remove its only record.
 pub fn stopRecordedBuild(arena: Allocator, io: Io, env: *const std.process.Environ.Map, icd: []const u8) UnitStop {
-	const a = readActive(arena, io, icd) orelse return .none;
-	const unit = a.unit orelse return .none;
-	return stopBuildUnit(arena, io, env, icd, unit);
+	return stopActiveUnit(arena, io, env, icd, readActiveForStop(arena, io, icd));
 }
 
 // --- the launcher's preboot steps (spec section 6, "Internal verb") ----------------------
@@ -6198,15 +6329,22 @@ pub fn prebootApply(arena: Allocator, ctx: *const plugin.Ctx, running: ?bool, ap
 	if (pa.flock == .taken) {
 		// Read again under the flock: a holder signalled above may have
 		// rewritten it before it ended. The flock proves no live apply owns
-		// the unit's name, so it is stopped by that name. Once nothing of the
-		// dead holder's build runs (stopped, or not running), its record goes,
-		// so later passes repeat no systemctl call; a stop that failed keeps it
+		// the unit's name, so it is stopped by that name (an unreadable
+		// record, by this instance's own unit name). Once nothing of the dead
+		// holder's build runs (stopped, or not running), its record goes, so
+		// later passes repeat no systemctl call; a stop that failed keeps it
 		// for the next stopper.
-		if (readActive(arena, io, icd)) |a| if (a.unit != null and !holderAlive(arena, io, a)) {
-			const st = stopBuildUnit(arena, io, ctx.parent_env, icd, a.unit.?);
+		const cur = readActiveForStop(arena, io, icd);
+		const owed = switch (cur) {
+			.absent => false,
+			.record => |a| a.unit != null and !holderAlive(arena, io, a),
+			.unreadable => true,
+		};
+		if (owed) {
+			const st = stopActiveUnit(arena, io, ctx.parent_env, icd, cur);
 			pa.orphan_stopped = st == .stopped;
 			if (st != .failed) clearActive(io, icd);
-		};
+		}
 	}
 	if (inflightExists(io, icd)) {
 		if (stopped and pa.flock == .taken) {

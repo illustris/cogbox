@@ -3225,13 +3225,18 @@ const unit_inv = "0123456789abcdef0123456789abcdef";
 
 /// A fake `systemctl` on the fixture's PATH: it logs its argv to
 /// $FAKE_DIR/systemctl, takes its verb wherever it appears (after
-/// `--no-ask-password`) and the unit as its last argument. `show -p
-/// ActiveState` prints $FAKE_DIR/systemctl.state (`inactive` by default) and
-/// `show -p InvocationID` $FAKE_DIR/systemctl.inv; with $FAKE_DIR/systemctl.showrc
-/// `show` exits with that code instead. `stop` takes 0.6 s (more than the child
-/// loop's 250 ms slice, as a PID 1 the build itself loads does), logs
-/// `stop-done`, then exits with $FAKE_DIR/systemctl.rc (0 by default), or, with
-/// $FAKE_DIR/systemctl.notloaded, says the unit is not loaded (exit 5).
+/// `--no-ask-password`) and the unit as its last argument. `show` prints the
+/// unit's LoadState ($FAKE_DIR/systemctl.load; by default `not-found` for an
+/// inactive or empty state, else `loaded`) and ActiveState
+/// ($FAKE_DIR/systemctl.state, `inactive` by default); with
+/// $FAKE_DIR/systemctl.showrc it exits with that code instead. `stop` takes
+/// 0.6 s (more than the child loop's 250 ms slice, as a PID 1 the build
+/// itself loads does), logs `stop-done`, then exits with $FAKE_DIR/systemctl.rc
+/// (0 by default), or, with $FAKE_DIR/systemctl.notloaded, says the unit is
+/// not loaded (exit 5). A stopper's stop (`--no-ask-password`) it accepts
+/// ends the unit: the next $FAKE_DIR/systemctl.settle shows (0 by default)
+/// answer `deactivating`, the one after that unloaded, and later ones the
+/// state files again.
 fn fakeSystemctl(fx: *GuestFx) !void {
 	var base_env = try std.testing.environ.createMap(fx.a());
 	const sh = apply.findExe(fx.a(), &base_env, "sh") orelse return error.SkipZigTest;
@@ -3246,16 +3251,31 @@ fn fakeSystemctl(fx: *GuestFx) !void {
 		\\case $verb in
 		\\  show)
 		\\    if [ -e "$F/systemctl.showrc" ]; then exit "$(cat "$F/systemctl.showrc")"; fi
-		\\    case " $* " in
-		\\      *" -p ActiveState "*) cat "$F/systemctl.state" 2>/dev/null || echo inactive ;;
-		\\      *" -p InvocationID "*) cat "$F/systemctl.inv" 2>/dev/null ;;
-		\\    esac
+		\\    if [ -e "$F/systemctl.left" ]; then
+		\\      n=$(cat "$F/systemctl.left")
+		\\      if [ "$n" -gt 0 ]; then
+		\\        echo $((n - 1)) > "$F/systemctl.left"
+		\\        printf 'LoadState=loaded\nActiveState=deactivating\n'
+		\\      else
+		\\        rm -f "$F/systemctl.left"
+		\\        printf 'LoadState=not-found\nActiveState=inactive\n'
+		\\      fi
+		\\      exit 0
+		\\    fi
+		\\    st=$(cat "$F/systemctl.state" 2>/dev/null || echo inactive)
+		\\    if [ -e "$F/systemctl.load" ]; then ld=$(cat "$F/systemctl.load")
+		\\    else case $st in inactive|'') ld=not-found ;; *) ld=loaded ;; esac
+		\\    fi
+		\\    printf 'LoadState=%s\nActiveState=%s\n' "$ld" "$st"
 		\\    exit 0 ;;
 		\\  stop) sleep 0.6
 		\\    echo stop-done >> "$F/systemctl"
 		\\    if [ -e "$F/systemctl.notloaded" ]; then printf 'Failed to stop %s: Unit %s not loaded.\n' "$u" "$u" >&2; exit 5; fi
 		\\    rc=$(cat "$F/systemctl.rc" 2>/dev/null || echo 0)
 		\\    [ "$rc" = 0 ] || printf 'Failed to stop %s: Connection timed out\n' "$u" >&2
+		\\    case " $* " in
+		\\      *" --no-ask-password "*) [ "$rc" != 0 ] || cat "$F/systemctl.settle" > "$F/systemctl.left" 2>/dev/null || echo 0 > "$F/systemctl.left" ;;
+		\\    esac
 		\\    exit "$rc" ;;
 		\\esac
 		\\exit 1
@@ -3330,7 +3350,7 @@ fn activeDuring(fx: *GuestFx, n: u32) !apply.Active {
 
 const stage_inner: []const []const u8 = &.{ "nix", "eval", "--raw", "x" };
 
-test "preflight names the build unit with the containment, before anything records the run" {
+test "nameBuildUnit names the per-instance unit under unit containment only" {
 	var fx: GuestFx = undefined;
 	try fx.init("name-unit");
 	defer fx.deinit();
@@ -3340,9 +3360,9 @@ test "preflight names the build unit with the containment, before anything recor
 	r.cap = .none;
 	try apply.nameBuildUnit(&r);
 	try t.expect(r.unit == null);
-	// Unit containment: the per-instance name, set before preflight's strict
-	// write that names S, so apply/active names the unit before any
-	// systemd-run starts it.
+	// Unit containment: the per-instance name. (applyFlow calls this right
+	// after detectCap, so the strict write that names S records it; that
+	// order is not observable from here.)
 	r.cap = .unit;
 	try apply.nameBuildUnit(&r);
 	try t.expectEqualStrings(try apply.buildUnitName(fx.a(), fx.path("icd")), r.unit.?);
@@ -3410,12 +3430,15 @@ test "build stages: apply/active names the unit through every stage and only the
 	var during = try activeDuring(&fx, 1);
 	try t.expectEqualStrings(r.unit.?, during.unit.?);
 	try t.expect(during.invocation == null);
-	// A stage whose line carries one records it while the stage runs.
+	// A stage whose line carries one records it while the stage runs (the
+	// record on disk once the stage returned: nothing rewrites it after the
+	// hook's write, however long that write took).
 	try fx.write("fake/sdrun.inv", unit_inv);
 	_ = try apply.runStage(&r, "instantiate (reproduction)", stage_inner);
 	try t.expectEqualStrings(unit_inv, r.invocation.?);
-	during = try activeDuring(&fx, 2);
-	try t.expectEqualStrings(unit_inv, during.invocation.?);
+	const noted = apply.readActive(fx.a(), fx.io(), fx.path("icd")) orelse return error.TestUnexpectedResult;
+	try t.expectEqualStrings(unit_inv, noted.invocation.?);
+	try t.expectEqualStrings(r.unit.?, noted.unit.?);
 	// The next stage's line has none: the record never names the earlier
 	// stage's run while this one runs under the same name.
 	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/sdrun.inv"));
@@ -3489,11 +3512,11 @@ test "--cancel: a dead holder's build unit is stopped by its name, with no Invoc
 	try t.expectEqualStrings("none", c.get("result").?.string);
 	try t.expect(!c.get("signalled").?.bool);
 	const log = try fx.read("fake/systemctl");
-	try t.expect(std.mem.indexOf(u8, log, try std.fmt.allocPrint(fx.a(), "show -p ActiveState --value {s}\n", .{unit})) != null);
+	try t.expect(std.mem.indexOf(u8, log, try std.fmt.allocPrint(fx.a(), "show -p LoadState -p ActiveState {s}\n", .{unit})) != null);
 	try t.expectEqual(@as(usize, 1), countOf(log, stop_line));
 	try t.expect(fx.exists("icd/apply/active"));
 	try t.expect(std.mem.indexOf(u8, errText(&fx), "could not stop " ++ "cogbox-apply-build-") != null);
-	// The stop is accepted: apply/active goes.
+	// The stop is accepted and the unit ends: apply/active goes.
 	try fx.write("fake/systemctl.rc", "0\n");
 	_ = try cancelDead(&fx);
 	try t.expectEqual(@as(usize, 2), countOf(try fx.read("fake/systemctl"), stop_line));
@@ -3501,7 +3524,6 @@ test "--cancel: a dead holder's build unit is stopped by its name, with no Invoc
 	// The record names an earlier stage's InvocationID while a later stage
 	// runs under the name: still this apply's unit, so it is stopped.
 	try plantBuildActive(&fx, sn, unit_inv);
-	try fx.write("fake/systemctl.inv", "ffffffffffffffffffffffffffffffff\n");
 	_ = try cancelDead(&fx);
 	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), stop_line));
 	try t.expect(!fx.exists("icd/apply/active"));
@@ -3512,9 +3534,55 @@ test "--cancel: a dead holder's build unit is stopped by its name, with no Invoc
 	_ = try cancelDead(&fx);
 	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
 	try t.expect(!fx.exists("icd/apply/active"));
+	// Loaded but still inactive: its start job may still be queued (the
+	// window in which systemd-run prints no InvocationID), and it would then
+	// start with no record. It is stopped (which cancels that job) first.
+	try plantBuildActive(&fx, sn, null);
+	try fx.write("fake/systemctl.load", "loaded\n");
+	_ = try cancelDead(&fx);
+	try t.expectEqual(@as(usize, 4), countOf(try fx.read("fake/systemctl"), stop_line));
+	try t.expect(!fx.exists("icd/apply/active"));
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.load"));
+	// The stop is queued, but the unit is still stopping when the wait for
+	// it ends: the record stays for the next stopper (cogworx may start a
+	// new run right after its cancel, whose stage the name still loaded
+	// would refuse).
+	apply.stop_settle_ms = 600;
+	try plantBuildActive(&fx, sn, null);
+	try fx.write("fake/systemctl.state", "active\n");
+	try fx.write("fake/systemctl.settle", "1000000\n");
+	_ = try cancelDead(&fx);
+	apply.stop_settle_ms = apply.Bounds.stop_settle_ms;
+	try t.expectEqual(@as(usize, 5), countOf(try fx.read("fake/systemctl"), stop_line));
+	try t.expect(fx.exists("icd/apply/active"));
+	try t.expect(std.mem.indexOf(u8, errText(&fx), unit) != null and std.mem.indexOf(u8, errText(&fx), "had not ended") != null);
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.left"));
+	// It ends within the wait (two polls still see it stopping): stopped,
+	// and only then the record goes.
+	try fx.write("fake/systemctl.settle", "2\n");
+	const shows = countOf(try fx.read("fake/systemctl"), "show -p LoadState");
+	_ = try cancelDead(&fx);
+	try t.expectEqual(@as(usize, 6), countOf(try fx.read("fake/systemctl"), stop_line));
+	try t.expectEqual(shows + 4, countOf(try fx.read("fake/systemctl"), "show -p LoadState"));
+	try t.expect(!fx.exists("icd/apply/active"));
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.settle"));
+	// An apply/active it cannot parse may be the only record of a running
+	// unit: this instance's unit is stopped by its name, and the file stays
+	// until that stop is confirmed.
+	apply.systemd_dir = try fx.a().dupeZ(u8, fx.root);
+	defer apply.systemd_dir = "/run/systemd/system";
+	try fx.write("icd/apply/active", "{\"pid\": 1, \"unit\": \"cogbox-apply-bu\n");
+	try fx.write("fake/systemctl.rc", "1\n");
+	_ = try cancelDead(&fx);
+	try t.expectEqual(@as(usize, 7), countOf(try fx.read("fake/systemctl"), stop_line));
+	try t.expect(fx.exists("icd/apply/active"));
+	try t.expect(std.mem.indexOf(u8, errText(&fx), try std.fmt.allocPrint(fx.a(), "cannot read {s}/apply/active", .{fx.path("icd")})) != null);
+	try fx.write("fake/systemctl.rc", "0\n");
+	_ = try cancelDead(&fx);
+	try t.expectEqual(@as(usize, 8), countOf(try fx.read("fake/systemctl"), stop_line));
+	try t.expect(!fx.exists("icd/apply/active"));
 	// A copied apply/active naming another instance's unit: no systemctl
 	// call at all, and the record goes.
-	try fx.write("fake/systemctl.state", "active\n");
 	try apply.writeActive(fx.a(), fx.io(), fx.path("icd"), .{
 		.pid = 1,
 		.unit = "cogbox-apply-build-000000000000",
@@ -3629,22 +3697,22 @@ test "--cancel: a holder that outlives SIGTERM is SIGKILLed only with the config
 	try t.expect(!fx.exists("icd/apply/active"));
 }
 
-/// A build-phase holder that, on SIGTERM, renames icd/apply/active.next over
-/// icd/apply/active and exits: the record of a later stage's unit it wrote
-/// before it ended, its own stop of that unit having failed.
-fn spawnRewritingHolder(fx: *GuestFx) !Holder {
+/// A build-phase holder that, on SIGTERM, removes icd/apply/active and exits,
+/// as the verb's terminate path does once its own stop of the unit was
+/// accepted.
+fn spawnClearingHolder(fx: *GuestFx) !Holder {
 	const sh = apply.findExe(fx.a(), &fx.env, "sh") orelse return error.SkipZigTest;
-	const script = fx.path("holder-rewrite.sh");
-	try fx.write("holder-rewrite.sh",
+	const script = fx.path("holder-clear.sh");
+	try fx.write("holder-clear.sh",
 		\\LOG=$1
-		\\trap 'mv "$2" "$3"; echo term >> "$LOG"; exit 0' TERM
+		\\trap 'rm -f "$2"; echo term >> "$LOG"; exit 0' TERM
 		\\echo ready >> "$LOG"
 		\\while :; do sleep 0.05; done
 		\\
 	);
-	const log = fx.path("holder-rewrite.log");
+	const log = fx.path("holder-clear.log");
 	const child = try std.process.spawn(fx.io(), .{
-		.argv = &.{ sh, script, log, fx.path("icd/apply/active.next"), fx.path("icd/apply/active") },
+		.argv = &.{ sh, script, log, fx.path("icd/apply/active") },
 		.stdin = .ignore,
 		.stdout = .ignore,
 		.stderr = .ignore,
@@ -3661,36 +3729,27 @@ fn spawnRewritingHolder(fx: *GuestFx) !Holder {
 	return h;
 }
 
-test "--cancel: the build unit is stopped by the apply/active read under the flock, which the holder may have rewritten before it ended" {
+test "--cancel: apply/active is read again under the flock; a holder that cleared it as it ended (its own stop accepted) leaves nothing to stop" {
 	var fx: GuestFx = undefined;
 	try fx.init("cancel-reread");
 	defer fx.deinit();
 	try fakeSystemctl(&fx);
 	const sn = try fx.snaps();
-	const unit = try apply.buildUnitName(fx.a(), fx.path("icd"));
-	const inv2 = "fedcba9876543210fedcba9876543210";
-	// The holder's later stage (inv2) runs under the unit's name, and PID 1
-	// refuses to stop it.
+	// As the cancel first reads apply/active, the record names the holder's
+	// unit, which systemd says runs (and PID 1 would refuse to stop).
 	try fx.write("fake/systemctl.state", "active\n");
-	try fx.write("fake/systemctl.inv", inv2 ++ "\n");
 	try fx.write("fake/systemctl.rc", "1\n");
-	var h = try spawnRewritingHolder(&fx);
+	var h = try spawnClearingHolder(&fx);
 	defer h.stop(&fx);
-	// apply/active.next: the record the holder leaves as it ends; apply/active:
-	// the earlier stage's, as the cancel reads it before its signal.
-	for ([_][]const u8{ inv2, unit_inv }, 0..) |inv, i| {
-		try apply.writeActive(fx.a(), fx.io(), fx.path("icd"), .{
-			.pid = h.pid,
-			.starttime = apply.procStarttime(fx.a(), fx.io(), h.pid),
-			.unit = unit,
-			.invocation = inv,
-			.gen = gen,
-			.scratch_id = &sn.s,
-			.phase = .build,
-			.deadline = apply.bootSeconds(fx.io()) + 600,
-		}, null);
-		if (i == 0) try t.expect(std.c.rename(try fx.a().dupeZ(u8, fx.path("icd/apply/active")), try fx.a().dupeZ(u8, fx.path("icd/apply/active.next"))) == 0);
-	}
+	try apply.writeActive(fx.a(), fx.io(), fx.path("icd"), .{
+		.pid = h.pid,
+		.starttime = apply.procStarttime(fx.a(), fx.io(), h.pid),
+		.unit = try apply.buildUnitName(fx.a(), fx.path("icd")),
+		.gen = gen,
+		.scratch_id = &sn.s,
+		.phase = .build,
+		.deadline = apply.bootSeconds(fx.io()) + 600,
+	}, null);
 	// The holder's flock is free once it ends.
 	_ = std.c.flock(fx.apply_lock.handle, std.posix.LOCK.UN);
 	const mine = try lockFd(&fx);
@@ -3698,12 +3757,10 @@ test "--cancel: the build unit is stopped by the apply/active read under the flo
 	const c = try cancelOnce(&fx, null, true, mine.handle);
 	try t.expectEqualStrings("done", c.get("result").?.string);
 	try t.expectEqual(@as(usize, 1), h.count(&fx, "term"));
-	// The stop went to the stage that runs, and failed: apply/active, that
-	// unit's only record, stays for the next stopper.
-	const log = try fx.read("fake/systemctl");
-	try t.expectEqual(@as(usize, 1), countOf(log, "stop --no-block cogbox-apply-build-"));
-	const kept = apply.readActive(fx.a(), fx.io(), fx.path("icd")) orelse return error.TestUnexpectedResult;
-	try t.expectEqualStrings(inv2, kept.invocation.?);
+	// What the cancel read before its signal is stale: under the flock no
+	// record names a unit, so PID 1 is asked nothing.
+	try t.expect(!fx.exists("fake/systemctl"));
+	try t.expect(!fx.exists("icd/apply/active"));
 }
 
 test "preboot: an orphaned build unit is stopped by its name, whatever InvocationID its record carries; its record goes once nothing of it runs, so later passes make no systemctl call; a failed stop keeps it" {
@@ -3732,15 +3789,15 @@ test "preboot: an orphaned build unit is stopped by its name, whatever Invocatio
 	try t.expect(pa.orphan_stopped);
 	try t.expect(!fx.exists("icd/apply/active"));
 	_ = std.c.flock(mine.handle, std.posix.LOCK.UN);
-	// The next pass has nothing to ask PID 1.
+	// The next pass has nothing to ask PID 1 (the two passes asked once
+	// each, and the second once more as its stopped unit ended).
 	pa = apply.prebootApply(fx.a(), fx.ctx(), false, mine.handle);
 	try t.expect(!pa.orphan_stopped);
-	try t.expectEqual(@as(usize, 2), countOf(try fx.read("fake/systemctl"), "show -p ActiveState"));
+	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "show -p LoadState -p ActiveState "));
 	_ = std.c.flock(mine.handle, std.posix.LOCK.UN);
 	// An earlier stage's InvocationID in the record, a later stage running
 	// under the name: stopped all the same.
 	try plantBuildActive(&fx, sn, unit_inv);
-	try fx.write("fake/systemctl.inv", "ffffffffffffffffffffffffffffffff\n");
 	pa = apply.prebootApply(fx.a(), fx.ctx(), false, mine.handle);
 	try t.expect(pa.orphan_stopped);
 	try t.expect(!fx.exists("icd/apply/active"));
@@ -3764,6 +3821,56 @@ test "preboot: an orphaned build unit is stopped by its name, whatever Invocatio
 	try t.expect(fx.exists("icd/apply/active"));
 	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
 	try t.expect(std.mem.indexOf(u8, try fx.read("fake/systemctl"), "InvocationID") == null);
+	_ = std.c.flock(fx.apply_lock.handle, std.posix.LOCK.UN);
+	// The stop is queued, but the unit is still stopping when the wait for
+	// it ends: the record stays, and the next stopper tries again.
+	apply.stop_settle_ms = 600;
+	try fx.write("fake/systemctl.settle", "1000000\n");
+	pa = apply.prebootApply(fx.a(), fx.ctx(), false, mine.handle);
+	apply.stop_settle_ms = apply.Bounds.stop_settle_ms;
+	try t.expect(pa.flock == .taken and !pa.orphan_stopped);
+	try t.expect(fx.exists("icd/apply/active"));
+	try t.expectEqual(@as(usize, 4), countOf(try fx.read("fake/systemctl"), stop_line));
+	try t.expect(std.mem.indexOf(u8, errText(&fx), "had not ended") != null);
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.left"));
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.settle"));
+	_ = std.c.flock(mine.handle, std.posix.LOCK.UN);
+	// The launcher spells the icd in bash: with a trailing slash in
+	// XDG_CONFIG_HOME or HOME it carries a `//`. The same instance, the same
+	// unit name, so the orphan is stopped, never taken for another
+	// instance's unit and its record cleared while it runs.
+	const ctx2 = fx.ctx();
+	ctx2.plugins_flake_dir = try std.fmt.allocPrint(fx.a(), "{s}//icd/plugins-flake", .{fx.root});
+	try fx.write("fake/systemctl.rc", "1\n");
+	pa = apply.prebootApply(fx.a(), ctx2, false, mine.handle);
+	try t.expect(pa.flock == .taken and !pa.orphan_stopped);
+	try t.expect(fx.exists("icd/apply/active"));
+	try t.expectEqual(@as(usize, 5), countOf(try fx.read("fake/systemctl"), stop_line));
+	_ = std.c.flock(mine.handle, std.posix.LOCK.UN);
+	try fx.write("fake/systemctl.rc", "0\n");
+	pa = apply.prebootApply(fx.a(), ctx2, false, mine.handle);
+	try t.expect(pa.orphan_stopped);
+	try t.expect(!fx.exists("icd/apply/active"));
+	_ = std.c.flock(mine.handle, std.posix.LOCK.UN);
+	// An apply/active it cannot read: this instance's unit is stopped by its
+	// name, and the file stays until that stop is confirmed.
+	apply.systemd_dir = try fx.a().dupeZ(u8, fx.root);
+	defer apply.systemd_dir = "/run/systemd/system";
+	var big: std.ArrayList(u8) = .empty;
+	try big.appendNTimes(fx.a(), ' ', 70 << 10);
+	try fx.write("icd/apply/active", big.items);
+	try fx.write("fake/systemctl.rc", "1\n");
+	pa = apply.prebootApply(fx.a(), fx.ctx(), false, mine.handle);
+	try t.expect(pa.flock == .taken and !pa.orphan_stopped);
+	try t.expect(fx.exists("icd/apply/active"));
+	try t.expectEqual(@as(usize, 7), countOf(try fx.read("fake/systemctl"), stop_line));
+	try t.expect(std.mem.indexOf(u8, errText(&fx), "cannot read ") != null);
+	_ = std.c.flock(mine.handle, std.posix.LOCK.UN);
+	try fx.write("fake/systemctl.rc", "0\n");
+	pa = apply.prebootApply(fx.a(), fx.ctx(), false, mine.handle);
+	try t.expect(pa.orphan_stopped);
+	try t.expect(!fx.exists("icd/apply/active"));
+	try t.expectEqual(@as(usize, 8), countOf(try fx.read("fake/systemctl"), stop_line));
 }
 
 test "cogbox delete's step: the recorded build unit is stopped by its own name, whatever InvocationID it records; a unit that runs and cannot be stopped answers failed" {
@@ -3782,7 +3889,6 @@ test "cogbox delete's step: the recorded build unit is stopped by its own name, 
 	try plantBuildActive(&fx, sn, null);
 	try t.expectEqual(apply.UnitStop.stopped, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
 	try plantBuildActive(&fx, sn, unit_inv);
-	try fx.write("fake/systemctl.inv", "ffffffffffffffffffffffffffffffff\n");
 	try t.expectEqual(apply.UnitStop.stopped, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
 	try t.expectEqual(@as(usize, 2), countOf(try fx.read("fake/systemctl"), "--no-ask-password stop --no-block cogbox-apply-build-"));
 	// PID 1 refuses the stop, or cannot be asked: the unit may still run.
@@ -3793,6 +3899,36 @@ test "cogbox delete's step: the recorded build unit is stopped by its own name, 
 	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
 	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.showrc"));
 	try fx.write("fake/systemctl.rc", "0\n");
+	// The stop is queued, but the unit has not ended when the wait for it
+	// does: it may still run, so delete must keep its record.
+	apply.stop_settle_ms = 600;
+	try fx.write("fake/systemctl.settle", "1000000\n");
+	try t.expectEqual(apply.UnitStop.failed, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	apply.stop_settle_ms = apply.Bounds.stop_settle_ms;
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.left"));
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.settle"));
+	try t.expectEqual(@as(usize, 4), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
+	// An apply/active it cannot parse: this instance's own unit is stopped
+	// by its name (stopped, refused, or nothing runs under it).
+	apply.systemd_dir = try fx.a().dupeZ(u8, fx.root);
+	defer apply.systemd_dir = "/run/systemd/system";
+	try fx.write("icd/apply/active", "not json\n");
+	try t.expectEqual(apply.UnitStop.stopped, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try fx.write("fake/systemctl.rc", "1\n");
+	try t.expectEqual(apply.UnitStop.failed, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try fx.write("fake/systemctl.rc", "0\n");
+	try t.expectEqual(@as(usize, 6), countOf(try fx.read("fake/systemctl"), try std.fmt.allocPrint(fx.a(), "--no-ask-password stop --no-block {s}\n", .{try apply.buildUnitName(fx.a(), icd)})));
+	try fx.write("fake/systemctl.state", "inactive\n");
+	try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try fx.write("fake/systemctl.state", "active\n");
+	// No systemd here, so no unit can run: `.none` without asking, where
+	// systemctl would fail (never a delete refused for good).
+	apply.systemd_dir = try fx.a().dupeZ(u8, fx.path("no-systemd"));
+	try fx.write("fake/systemctl.showrc", "1\n");
+	const calls = countOf(try fx.read("fake/systemctl"), "\n");
+	try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try t.expectEqual(calls, countOf(try fx.read("fake/systemctl"), "\n"));
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.showrc"));
 	// Another instance's unit name (a copied apply/active): never stopped.
 	try apply.writeActive(fx.a(), fx.io(), icd, .{
 		.pid = 1,
@@ -3803,7 +3939,7 @@ test "cogbox delete's step: the recorded build unit is stopped by its own name, 
 		.deadline = 0,
 	}, null);
 	try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
-	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
+	try t.expectEqual(@as(usize, 6), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
 	// The step only reads: the instance dir it runs before deleting is not
 	// recreated once it is gone.
 	try std.Io.Dir.cwd().deleteTree(fx.io(), icd);
@@ -3819,20 +3955,39 @@ test "a build unit's stop by name: what systemd says decides whether it runs; on
 	const sn = try fx.snaps();
 	const icd = fx.path("icd");
 	try plantBuildActive(&fx, sn, null);
-	// Unloaded (--collect), inactive or failed: nothing runs, no stop.
+	// Unloaded (--collect: inactive, or ActiveState empty), or failed (loaded
+	// or not): nothing runs, no stop.
 	for ([_][]const u8{ "\n", "inactive\n", "failed\n" }) |state| {
 		try fx.write("fake/systemctl.state", state);
 		try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
 	}
+	try fx.write("fake/systemctl.load", "not-found\n");
+	try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
 	try t.expectEqual(@as(usize, 0), countOf(try fx.read("fake/systemctl"), " stop "));
-	// Starting, running, reloading, stopping: stopped.
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.load"));
+	// Starting, running, reloading, stopping: stopped. So is a loaded unit
+	// that is still inactive: its start job may be queued, and the stop
+	// cancels it.
 	for ([_][]const u8{ "activating\n", "active\n", "reloading\n", "deactivating\n" }) |state| {
 		try fx.write("fake/systemctl.state", state);
 		try t.expectEqual(apply.UnitStop.stopped, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
 	}
-	try t.expectEqual(@as(usize, 4), countOf(try fx.read("fake/systemctl"), "--no-ask-password stop --no-block cogbox-apply-build-"));
+	try fx.write("fake/systemctl.state", "inactive\n");
+	try fx.write("fake/systemctl.load", "loaded\n");
+	try t.expectEqual(apply.UnitStop.stopped, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.load"));
+	try t.expectEqual(@as(usize, 5), countOf(try fx.read("fake/systemctl"), "--no-ask-password stop --no-block cogbox-apply-build-"));
+	// A queued stop is waited for: `.stopped` only once the unit ended (two
+	// polls still see it stopping, the third sees it unloaded).
+	try fx.write("fake/systemctl.state", "active\n");
+	try fx.write("fake/systemctl.settle", "2\n");
+	const shows = countOf(try fx.read("fake/systemctl"), "show -p LoadState -p ActiveState ");
+	try t.expectEqual(apply.UnitStop.stopped, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try t.expectEqual(shows + 4, countOf(try fx.read("fake/systemctl"), "show -p LoadState -p ActiveState "));
+	try t.expect(!fx.exists("fake/systemctl.left"));
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.settle"));
 	// It ended between the two calls: nothing to stop.
 	try fx.write("fake/systemctl.notloaded", "");
 	try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
-	try t.expectEqual(@as(usize, 5), countOf(try fx.read("fake/systemctl"), "stop-done"));
+	try t.expectEqual(@as(usize, 7), countOf(try fx.read("fake/systemctl"), "stop-done"));
 }

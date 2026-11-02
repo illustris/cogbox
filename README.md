@@ -127,7 +127,7 @@ attach and detach (`Ctrl-]`) freely without stopping the VM.
 | `status` | Print whether an instance is running, plus ports/net mode |
 | `list` | List all instances. `--json` for machine-readable output |
 | `init` | Create config + host directories without launching |
-| `delete` | Delete an instance's config + persistent files (refuses if running; `-y` skips the prompt) |
+| `delete` | Delete an instance's config + persistent files (refuses if running, and with exit 75 while a live plugin apply's build for it runs and cannot be stopped; `-y` skips the prompt) |
 | `ssh` | Connect to a running instance via SSH. A trailing command of two or more words is an argv vector: each word is quoted, so `#`, spaces, quotes, `$`, backticks and newlines reach the remote command literally. A command passed as ONE argument stays a shell string the guest shell interprets |
 | `rules` | Manage CIDR (L4) allow/deny rules -- [docs](docs/network-filtering.md#l4-cidr-rules) |
 | `remap` | Manage TCP destination-remap rules -- [docs](docs/network-filtering.md#tcp-destination-remap) |

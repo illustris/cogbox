@@ -1805,6 +1805,8 @@ done(rc if rc >= 0 else 128 - rc)
     rc, out = machine.execute(la("cogbox plugin apply --json --name la 2>&1"))
     print(out)
     expect("failed", "busy")
+    # busy because its stop of the unit was refused (not a held lock).
+    check(f"could not stop {la_unit}" in out and "apply/active keeps it" in out, out)
     check(machine.succeed(f"cat {la_apply}/active") == before, "a non-root apply overwrote the record of a unit it could not stop")
     machine.succeed(f"systemctl is-active --quiet {la_unit}")
     # The cancel recovery, as cogworx runs it on GCE and PVE.

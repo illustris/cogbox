@@ -626,11 +626,20 @@ class Lifecycle(unittest.TestCase):
             "gen": "0123456789abcdef", "scratch_id": "00000000000000aa", "phase": "build",
             "deadline": 0}) + "\n")
         fake, log, rc = self.root / "fake-systemctl", self.root / "systemctl.log", self.root / "stop-rc"
+        gone = self.root / "unit-gone"
         fake.mkdir()
+        # The unit runs until a stop is accepted; the next show then finds
+        # it unloaded (--collect), which the stopper waits for.
         self.executable(fake / "systemctl", f"#!{self.bash}\n"
                         f"printf '%s\\n' \"$*\" >> {Q(str(log))}\n"
-                        f"case \" $* \" in *\" show \"*) echo active; exit 0 ;; esac\n"
-                        f"exit \"$(cat {Q(str(rc))})\"\n")
+                        f"case \" $* \" in *\" show \"*)\n"
+                        f"  if [ -e {Q(str(gone))} ]; then printf 'LoadState=not-found\\nActiveState=inactive\\n'\n"
+                        f"  else printf 'LoadState=loaded\\nActiveState=active\\n'; fi\n"
+                        f"  exit 0 ;;\n"
+                        f"esac\n"
+                        f"r=$(cat {Q(str(rc))})\n"
+                        f"[ \"$r\" != 0 ] || : > {Q(str(gone))}\n"
+                        f"exit \"$r\"\n")
         self.env["PATH"] = str(fake) + os.pathsep + self.env["PATH"]
         rc.write_text("4\n")
         refused = self.cli("delete", "-y", ok=False)
