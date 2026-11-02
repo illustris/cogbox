@@ -1006,6 +1006,27 @@ test "the build unit's name is per instance and stable" {
 	try t.expectEqual(@as(usize, "cogbox-apply-build-".len + 12), x.len);
 }
 
+test "the build unit's name: a canonical icd keeps the name it always had; the launcher's and the verb's spellings of one icd name one unit" {
+	var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+	defer arena_state.deinit();
+	const a = arena_state.allocator();
+	// sha256 of the icd string itself, as every earlier cogbox named it (a
+	// GCE or PVE host's icd included): no unit already running is renamed.
+	const canonical = "/home/u/.config/cogbox/instances/a";
+	try t.expectEqualStrings("cogbox-apply-build-033a921dbed2", try apply.buildUnitName(a, canonical));
+	try t.expectEqualStrings("cogbox-apply-build-7bedfedfb5e6", try apply.buildUnitName(a, "/root/.config/cogbox/instances/default"));
+	// XDG_CONFIG_HOME=/home/u/.config/ (or HOME=/home/u/) in the launcher's
+	// bash, a trailing slash, `.` components: the same instance, the same unit.
+	for ([_][]const u8{
+		"/home/u/.config//cogbox/instances/a",
+		"/home/u//.config/cogbox/instances/a",
+		"/home/u/.config/cogbox/instances/a/",
+		"//home/u/./.config/cogbox//instances/a//",
+	}) |spelling| try t.expectEqualStrings(try apply.buildUnitName(a, canonical), try apply.buildUnitName(a, spelling));
+	// `..` is not resolved: through a symlink it is another directory.
+	try t.expect(!std.mem.eql(u8, try apply.buildUnitName(a, canonical), try apply.buildUnitName(a, "/home/u/x/../.config/cogbox/instances/a")));
+}
+
 // --- containment ---------------------------------------------------------------------
 
 test "containment follows nix's own store selection" {
@@ -1672,17 +1693,28 @@ test "preflight: a user flake edited since the boot (nix hash path differs from 
 }
 
 /// A fake `systemctl` first on PATH (bootPluginX's bin): it logs its argv to
-/// systemctl.log; `show` prints $FAKE_UNIT_STATE (`inactive` when unset); a
-/// stop exits with $FAKE_STOP_RC (0 when unset).
+/// systemctl.log; `show` prints the unit's LoadState and ActiveState
+/// ($FAKE_UNIT_STATE: `inactive` and not loaded when unset, loaded
+/// otherwise); a stop exits with $FAKE_STOP_RC (0 when unset), and one it
+/// accepts ends the unit for the next `show`, unless $FAKE_STOP_STUCK is
+/// non-empty (it never ends).
 fn fakeSystemctl(inst: *Inst) !void {
 	const a = inst.s.a();
 	var base_env = try std.testing.environ.createMap(a);
 	const sh = apply.findExe(a, &base_env, "sh") orelse return error.SkipZigTest;
 	try inst.s.write("bin/systemctl", try std.mem.concat(a, u8, &.{ "#!", sh, "\n",
 		\\printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
+		\\gone=$FAKE_SYSTEMCTL_LOG.gone
 		\\case " $* " in
-		\\  *" show "*) echo "${FAKE_UNIT_STATE:-inactive}"; exit 0 ;;
-		\\  *" stop "*) exit "${FAKE_STOP_RC:-0}" ;;
+		\\  *" show "*)
+		\\    if [ -e "$gone" ]; then rm -f "$gone"; printf 'LoadState=not-found\nActiveState=inactive\n'; exit 0; fi
+		\\    st=${FAKE_UNIT_STATE:-inactive}
+		\\    case $st in inactive) ld=not-found ;; *) ld=loaded ;; esac
+		\\    printf 'LoadState=%s\nActiveState=%s\n' "$ld" "$st"
+		\\    exit 0 ;;
+		\\  *" stop "*) rc=${FAKE_STOP_RC:-0}
+		\\    if [ "$rc" = 0 ] && [ -z "${FAKE_STOP_STUCK-}" ]; then : > "$gone"; fi
+		\\    exit "$rc" ;;
 		\\esac
 		\\exit 1
 		\\
@@ -1736,6 +1768,83 @@ test "preflight: a build unit a dead apply left running is stopped by its name, 
 	_ = try inst.run(json_args, true);
 	try inst.expectOutcome("failed", "build");
 	try t.expectEqual(@as(usize, 4), std.mem.count(u8, try inst.s.read("systemctl.log"), " stop "));
+	// PID 1 takes the stop, but the unit is still stopping when the wait for
+	// it ends: going on would have this apply's own stage refused under the
+	// name the old unit still holds. The apply waits; the record stays.
+	apply.stop_settle_ms = 600;
+	defer apply.stop_settle_ms = apply.Bounds.stop_settle_ms;
+	try apply.writeActive(a, io, icd, .{ .pid = 1, .unit = unit, .scratch_id = "00000000000000aa", .phase = .build, .deadline = 0 }, null);
+	const before = try inst.s.read("icd/apply/active");
+	try inst.env.put("FAKE_UNIT_STATE", "deactivating");
+	try inst.env.put("FAKE_STOP_RC", "0");
+	try inst.env.put("FAKE_STOP_STUCK", "1");
+	const nix_calls = nixCalls(&inst).len;
+	_ = try inst.run(json_args, true);
+	try inst.expectOutcome("failed", "busy");
+	try t.expectEqualStrings(before, try inst.s.read("icd/apply/active"));
+	try t.expectEqual(nix_calls, nixCalls(&inst).len);
+	try t.expectEqual(@as(usize, 5), std.mem.count(u8, try inst.s.read("systemctl.log"), stop_line));
+	try t.expect(std.mem.indexOf(u8, inst.err.items, "had not ended") != null);
+}
+
+test "preflight: an apply/active it cannot read may be a running unit's only record; this instance's unit is stopped by its name before the record is replaced" {
+	var inst: Inst = undefined;
+	try inst.init("pf-unreadable", plugin_x_cfg);
+	defer inst.deinit();
+	try bootPluginX(&inst, "sha256-USER=");
+	try fakeSystemctl(&inst);
+	const a = inst.s.a();
+	const icd = inst.s.path("icd");
+	const unit = try apply.buildUnitName(a, icd);
+	const stop_line = try std.fmt.allocPrint(a, "--no-ask-password stop --no-block {s}\n", .{unit});
+	// systemd runs here (the build sandbox has no /run/systemd/system).
+	apply.systemd_dir = try a.dupeZ(u8, icd);
+	defer apply.systemd_dir = "/run/systemd/system";
+	// Malformed, or larger than the reader takes: either way it may be what
+	// a root apply SIGKILLed in its build left (a non-root reader gets
+	// EACCES the same way).
+	var big: std.ArrayList(u8) = .empty;
+	try big.appendNTimes(a, ' ', 70 << 10);
+	try big.appendSlice(a, "{}\n");
+	for ([_][]const u8{ "{\"pid\": 1, \"unit\": \"cogbox-apply-bu\n", big.items }, 0..) |bytes, i| {
+		try inst.s.write("icd/apply/active", bytes);
+		try inst.env.put("FAKE_UNIT_STATE", "active");
+		// The unit runs and PID 1 refuses the stop: the apply waits, the
+		// file stays byte for byte, nothing is hashed or built.
+		try inst.env.put("FAKE_STOP_RC", "1");
+		const nix_calls = nixCalls(&inst).len;
+		inst.err.clearRetainingCapacity();
+		_ = try inst.run(json_args, true);
+		try inst.expectOutcome("failed", "busy");
+		try t.expectEqualStrings(bytes, try inst.s.read("icd/apply/active"));
+		try t.expectEqual(nix_calls, nixCalls(&inst).len);
+		try t.expectEqual(2 * i + 1, std.mem.count(u8, try inst.s.read("systemctl.log"), stop_line));
+		try t.expect(std.mem.indexOf(u8, inst.err.items, try std.fmt.allocPrint(a, "cannot read {s}/apply/active", .{icd})) != null);
+		try t.expect(std.mem.indexOf(u8, inst.err.items, "apply/active keeps it") != null);
+		// PID 1 takes the stop and the unit ends: the apply goes on and
+		// writes its own record (this fixture ends at the build).
+		try inst.env.put("FAKE_STOP_RC", "0");
+		_ = try inst.run(json_args, true);
+		try inst.expectOutcome("failed", "build");
+		try t.expectEqual(2 * i + 2, std.mem.count(u8, try inst.s.read("systemctl.log"), stop_line));
+		try t.expect(!inst.s.exists("icd/apply/active"));
+	}
+	// Nothing of that name runs: never a wedge, the apply goes on.
+	try inst.s.write("icd/apply/active", "{\n");
+	try inst.env.put("FAKE_UNIT_STATE", "inactive");
+	try inst.env.put("FAKE_STOP_RC", "1");
+	_ = try inst.run(json_args, true);
+	try inst.expectOutcome("failed", "build");
+	try t.expectEqual(@as(usize, 4), std.mem.count(u8, try inst.s.read("systemctl.log"), " stop "));
+	// No systemd here at all, so no unit can run: the apply goes on without
+	// asking (systemctl would fail).
+	apply.systemd_dir = try a.dupeZ(u8, inst.s.path("no-systemd"));
+	try inst.s.write("icd/apply/active", "{\n");
+	try inst.env.put("FAKE_UNIT_STATE", "active");
+	const calls = std.mem.count(u8, try inst.s.read("systemctl.log"), "\n");
+	_ = try inst.run(json_args, true);
+	try inst.expectOutcome("failed", "build");
+	try t.expectEqual(calls, std.mem.count(u8, try inst.s.read("systemctl.log"), "\n"));
 }
 
 /// The audit.log lines of an Apply anyway (`"event":"force"`), parsed.

@@ -639,7 +639,7 @@ apply_instance_running() {
 # RENAMES trees into the trash, because the daemon pass must own a live QEMU
 # within `cogbox start`'s 60s; `start` runs its init pass before that window,
 # so the one O(files) delete happens there. Bounded from outside too (TERM at
-# 360s, KILL 5s later; its own legs add up to 330s: holder 40, unit stop 20,
+# 360s, KILL 5s later; its own legs add up to 340s: holder 40, unit stop 30,
 # rollback finish 240, trash 30): its budgets are checked between steps, so a
 # single wedged syscall would escape them. Its exit status is only a warning:
 # what decides the boot is the intent check after it.
