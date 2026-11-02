@@ -1718,6 +1718,115 @@ done(rc if rc >= 0 else 128 - rc)
     for name in ["guard", "lock", "user", "mount"]:
         plan_agrees(name)
 
+    # LA7b: an orphaned build unit on a host that stays up. A root apply
+    # (`cap: unit`; root without sudo, as GCE and PVE run it, with HOME and
+    # XDG_RUNTIME_DIR naming testuser's instance) runs each build stage in
+    # `cogbox-apply-build-<12 hex of sha256(icd)>`.
+    # A `systemd-run` shim first on its PATH forces what systemd 261 often does
+    # on its own (the `Running as unit:` line reaches the verb without its
+    # InvocationID) and runs a long, recognisable process in stage (a)'s unit
+    # instead of the evaluation; the real systemd-run starts the real unit. The
+    # verb is SIGKILLed, as cogworx's bound does before its cancel: its
+    # systemd-run client dies with it, and the unit runs on, recorded only by
+    # apply/active. A non-root apply cannot stop a root apply's unit, so it
+    # answers failed/busy and leaves the record as it was; the cancel, as
+    # root, stops the unit by its name and only then clears the record.
+    import hashlib
+    la_unit = "cogbox-apply-build-" + hashlib.sha256(la_icd.encode()).hexdigest()[:12]
+    la_sdrun_shim = (
+        "#!/run/current-system/sw/bin/bash\n"
+        "for a in \"$@\"; do case $a in *declaredRunner.drvPath*) orphan=1 ;; esac; done\n"
+        "if [ -n \"${orphan-}\" ]; then\n"
+        "  opts=()\n"
+        "  for a in \"$@\"; do [ \"$a\" = -- ] && break; opts+=(\"$a\"); done\n"
+        "  set -- \"${opts[@]}\" -- /tmp/la-shim/la-orphan-build\n"
+        "fi\n"
+        "exec 2> >(/run/current-system/sw/bin/sed -u 's/; invocation ID: [0-9a-f]\\{32\\}$//' >&2)\n"
+        "exec /run/current-system/sw/bin/systemd-run \"$@\""
+    )
+    machine.succeed("mkdir -p /tmp/la-shim")
+    machine.succeed("cat > /tmp/la-shim/systemd-run << 'SH_EOF'\n" + la_sdrun_shim + "\nSH_EOF")
+    # Not `exec -a NAME sleep`: coreutils is one multi-call binary that picks
+    # the program from argv[0]. The loop's own cmdline names the script.
+    machine.succeed(
+        "printf '#!/run/current-system/sw/bin/bash\\nwhile :; do /run/current-system/sw/bin/sleep 5; done\\n'"
+        " > /tmp/la-shim/la-orphan-build"
+    )
+    la_orphan = "pgrep -f '^/run/current-system/sw/bin/bash /tmp/la-shim/la-orphan-buil[d]'"
+    machine.succeed("chmod 0755 /tmp/la-shim/systemd-run /tmp/la-shim/la-orphan-build")
+    la_root = (
+        "env -u NIX_REMOTE -u SUDO_USER -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u COGBOX_DATA "
+        f"HOME=/home/testuser XDG_RUNTIME_DIR=/run/user/1000 PATH=/tmp/la-shim:$PATH {LA_ENV}"
+    )
+
+    def la7b_diag():
+        print(machine.execute(
+            "set -x; cat /tmp/la-orphan.out; "
+            f"cat {la_apply}/active; ls -la {la_apply}; "
+            "ps -eo pid,ppid,etimes,user,args --forest | grep -v ']$' | tail -n 80; "
+            f"systemctl status --no-pager {la_unit}; "
+            "systemctl list-units --all --no-pager --plain 'cogbox-apply-build*'; "
+            "cat /proc/locks; ls -lai /home/testuser/.config/cogbox/.locks; "
+            "journalctl --no-pager -n 80"
+        )[1])
+
+    def la7b_wait(cmd, timeout):
+        try:
+            machine.wait_until_succeeds(cmd, timeout=timeout)
+        except Exception:
+            la7b_diag()
+            raise
+
+    print(machine.succeed(f"{la_root} sh -c 'id -u; command -v systemd-run cogbox; echo $PATH'"))
+    machine.succeed(
+        "setsid -f sh -c "
+        + shlex.quote(f"{la_root} cogbox plugin apply --json --op 1 --name la > /tmp/la-orphan.out 2>&1")
+        + " < /dev/null > /dev/null 2>&1"
+    )
+    # The root apply reaches its build, or reports early.
+    la_reported = "grep -q '^{\"apply\"' /tmp/la-orphan.out"
+    la7b_wait(f"jq -e '.phase == \"build\"' {la_apply}/active || {la_reported}", 120)
+    # Then stage (a)'s unit runs the orphan.
+    la7b_wait(f"(systemctl is-active --quiet {la_unit} && {la_orphan}) || {la_reported}", 120)
+    if machine.execute(f"systemctl is-active --quiet {la_unit} && {la_orphan}")[0] != 0:
+        la7b_diag()
+        raise AssertionError("the root apply ended before its build unit ran the orphan")
+    act = json.loads(machine.succeed(f"cat {la_apply}/active"))
+    # The no-ID path was taken, and the record names the unit regardless.
+    check(act["unit"] == la_unit and act["phase"] == "build" and act["invocation"] is None, act)
+    machine.succeed(f"kill -KILL {act['pid']}")
+    machine.wait_until_fails(f"kill -0 {act['pid']}", timeout=30)
+    machine.wait_until_fails("pgrep -f 'systemd-run --unit=cogbox-apply-buil[d]'", timeout=30)
+    print(machine.succeed("cat /tmp/la-orphan.out"))
+    # The orphan: the verb and its systemd-run client are gone, the unit runs.
+    machine.succeed(f"systemctl is-active --quiet {la_unit}")
+    machine.succeed(la_orphan)
+    before = machine.succeed(f"cat {la_apply}/active")
+    rc, out = machine.execute(la("cogbox plugin apply --json --name la 2>&1"))
+    print(out)
+    expect("failed", "busy")
+    check(machine.succeed(f"cat {la_apply}/active") == before, "a non-root apply overwrote the record of a unit it could not stop")
+    machine.succeed(f"systemctl is-active --quiet {la_unit}")
+    # The cancel recovery, as cogworx runs it on GCE and PVE.
+    out = machine.succeed(f"{la_root} cogbox plugin apply --cancel --json --op 1 --name la")
+    print(out)
+    c = json.loads(out.strip().splitlines()[-1])["cancel"]
+    check(c["result"] == "none" and c["signalled"] is False, c)
+    machine.wait_until_fails(f"systemctl is-active --quiet {la_unit}", timeout=30)
+    machine.wait_until_fails(la_orphan, timeout=30)
+    machine.wait_until_succeeds(
+        f"test -z \"$(systemctl list-units --all --plain --no-legend '{la_unit}*')\"", timeout=30
+    )
+    machine.succeed(f"test ! -e {la_apply}/active")
+    machine.succeed("rm -rf /tmp/la-shim")
+    # Root without sudo chowns nothing back: its scratch snapshot and build
+    # log are root's. The instance is testuser's again for the legs below.
+    machine.succeed(f"chown -R testuser:users {la_icd}")
+    # Nothing stale blocks the next apply.
+    out = machine.succeed(la("cogbox plugin apply --json --name la"))
+    print(out)
+    expect("already_live")
+
     # LA8: rollback of a removal. la-guard's activation hangs once /etc/la-x is
     # gone, so `del la-x` is rejected: la-x is reinserted with its source, its
     # tagged deny comes back, and its allow (which the del removed) does not.

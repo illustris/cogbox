@@ -5,6 +5,7 @@ Unlike test_shutdown.py, no launcher functions or admission wiring are copied.
 The production substitution boundary supplies a hermetic runner and helper.
 """
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -606,6 +607,44 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(inflight.read_text(), before)
         self.assertFalse((self.icd() / "apply" / "rollback").exists())
         self.assertLess(took, 12)
+
+    def test_delete_stops_a_recorded_build_unit_by_name_and_keeps_everything_when_it_cannot(self):
+        # cogbox delete stops the build unit apply/active records, by its
+        # per-instance name, before it removes anything (the record here has
+        # no InvocationID, as systemd-run with --wait often prints none). A
+        # unit that runs and cannot be stopped (a non-root delete of a root
+        # apply's unit) keeps all three dirs and the record: exit 75.
+        self.cli("init", "--no-auto-keys", "--yes", "--network", "none")
+        icd = self.icd()
+        data = self.root / "data" / "instances" / "demo"
+        for d in (data, self.runtime):
+            d.mkdir(parents=True, exist_ok=True)
+        unit = "cogbox-apply-build-" + hashlib.sha256(str(icd).encode()).hexdigest()[:12]
+        (icd / "apply").mkdir(parents=True, exist_ok=True)
+        (icd / "apply" / "active").write_text(json.dumps({
+            "pid": 1, "starttime": None, "unit": unit, "invocation": None, "op": None,
+            "gen": "0123456789abcdef", "scratch_id": "00000000000000aa", "phase": "build",
+            "deadline": 0}) + "\n")
+        fake, log, rc = self.root / "fake-systemctl", self.root / "systemctl.log", self.root / "stop-rc"
+        fake.mkdir()
+        self.executable(fake / "systemctl", f"#!{self.bash}\n"
+                        f"printf '%s\\n' \"$*\" >> {Q(str(log))}\n"
+                        f"case \" $* \" in *\" show \"*) echo active; exit 0 ;; esac\n"
+                        f"exit \"$(cat {Q(str(rc))})\"\n")
+        self.env["PATH"] = str(fake) + os.pathsep + self.env["PATH"]
+        rc.write_text("4\n")
+        refused = self.cli("delete", "-y", ok=False)
+        self.assertEqual(refused.returncode, 75, refused.stdout + refused.stderr)
+        self.assertIn("could not be stopped", refused.stderr)
+        for d in (icd, data, self.runtime):
+            self.assertTrue(d.exists(), f"delete removed {d} while the build unit it records still runs")
+        self.assertTrue((icd / "apply" / "active").exists())
+        self.assertIn(f"--no-ask-password stop --no-block {unit}\n", log.read_text())
+        rc.write_text("0\n")
+        self.cli("delete", "-y")
+        for d in (icd, data, self.runtime):
+            self.assertFalse(d.exists(), f"delete left {d}")
+        self.assertEqual(log.read_text().count(f"stop --no-block {unit}\n"), 2)
 
     def test_plugin_change_behind_a_finishing_live_apply_exits_69_untouched(self):
         # The apply gate: a guest-phase apply (apply/active names a live

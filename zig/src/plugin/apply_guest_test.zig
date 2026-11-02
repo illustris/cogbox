@@ -3224,22 +3224,38 @@ test "inline apply: under the mutation's own locks, its report is captured and h
 const unit_inv = "0123456789abcdef0123456789abcdef";
 
 /// A fake `systemctl` on the fixture's PATH: it logs its argv to
-/// $FAKE_DIR/systemctl; `show` prints $FAKE_DIR/systemctl.inv; `stop` takes
-/// 0.6 s (more than the child loop's 250 ms slice, as a PID 1 the build itself
-/// loads does), then exits with $FAKE_DIR/systemctl.rc (0 by default) and logs
-/// `stop-done`.
+/// $FAKE_DIR/systemctl, takes its verb wherever it appears (after
+/// `--no-ask-password`) and the unit as its last argument. `show -p
+/// ActiveState` prints $FAKE_DIR/systemctl.state (`inactive` by default) and
+/// `show -p InvocationID` $FAKE_DIR/systemctl.inv; with $FAKE_DIR/systemctl.showrc
+/// `show` exits with that code instead. `stop` takes 0.6 s (more than the child
+/// loop's 250 ms slice, as a PID 1 the build itself loads does), logs
+/// `stop-done`, then exits with $FAKE_DIR/systemctl.rc (0 by default), or, with
+/// $FAKE_DIR/systemctl.notloaded, says the unit is not loaded (exit 5).
 fn fakeSystemctl(fx: *GuestFx) !void {
 	var base_env = try std.testing.environ.createMap(fx.a());
 	const sh = apply.findExe(fx.a(), &base_env, "sh") orelse return error.SkipZigTest;
 	try fx.write("bin/systemctl", try std.mem.concat(fx.a(), u8, &.{ "#!", sh, "\n",
 		\\F=$FAKE_DIR
 		\\printf '%s\n' "$*" >> "$F/systemctl"
-		\\case $1 in
-		\\  show) cat "$F/systemctl.inv" 2>/dev/null; exit 0 ;;
+		\\verb=
+		\\for a; do
+		\\  case $a in -*) ;; *) [ -n "$verb" ] || verb=$a ;; esac
+		\\  u=$a
+		\\done
+		\\case $verb in
+		\\  show)
+		\\    if [ -e "$F/systemctl.showrc" ]; then exit "$(cat "$F/systemctl.showrc")"; fi
+		\\    case " $* " in
+		\\      *" -p ActiveState "*) cat "$F/systemctl.state" 2>/dev/null || echo inactive ;;
+		\\      *" -p InvocationID "*) cat "$F/systemctl.inv" 2>/dev/null ;;
+		\\    esac
+		\\    exit 0 ;;
 		\\  stop) sleep 0.6
-		\\    rc=$(cat "$F/systemctl.rc" 2>/dev/null || echo 0)
-		\\    [ "$rc" = 0 ] || printf 'Failed to stop %s: Connection timed out\n' "$3" >&2
 		\\    echo stop-done >> "$F/systemctl"
+		\\    if [ -e "$F/systemctl.notloaded" ]; then printf 'Failed to stop %s: Unit %s not loaded.\n' "$u" "$u" >&2; exit 5; fi
+		\\    rc=$(cat "$F/systemctl.rc" 2>/dev/null || echo 0)
+		\\    [ "$rc" = 0 ] || printf 'Failed to stop %s: Connection timed out\n' "$u" >&2
 		\\    exit "$rc" ;;
 		\\esac
 		\\exit 1
@@ -3248,17 +3264,88 @@ fn fakeSystemctl(fx: *GuestFx) !void {
 	if (std.c.chmod(try fx.a().dupeZ(u8, fx.path("bin/systemctl")), 0o755) != 0) return error.SkipZigTest;
 }
 
+/// A fake `systemd-run` on the fixture's PATH: it logs its argv to
+/// $FAKE_DIR/systemd-run and prints its `Running as unit:` line, with `;
+/// invocation ID: <$FAKE_DIR/sdrun.inv>` only when that file exists (systemd
+/// 261 with --wait prints none when PID 1 had not run the start job yet). 0.3 s
+/// later (past the child loop's 250 ms slice, so the verb has read the line) it
+/// copies $FAKE_ICD/apply/active to $FAKE_DIR/active.during.<n> (its n-th
+/// call). It then prints `Finished with result: success` and exits 0, or, with
+/// $FAKE_DIR/sdrun.die, is SIGKILLed alone before that line, as a client killed
+/// on its own (or whose bus failed) leaves its unit running.
+fn fakeSystemdRun(fx: *GuestFx) !void {
+	var base_env = try std.testing.environ.createMap(fx.a());
+	const sh = apply.findExe(fx.a(), &base_env, "sh") orelse return error.SkipZigTest;
+	try fx.write("bin/systemd-run", try std.mem.concat(fx.a(), u8, &.{ "#!", sh, "\n",
+		\\F=$FAKE_DIR
+		\\printf '%s\n' "$*" >> "$F/systemd-run"
+		\\n=$(( $(cat "$F/sdrun.n" 2>/dev/null || echo 0) + 1 ))
+		\\echo "$n" > "$F/sdrun.n"
+		\\u=
+		\\for a; do case $a in --unit=*) u=${a#--unit=} ;; esac; done
+		\\if [ -e "$F/sdrun.inv" ]; then
+		\\  printf 'Running as unit: %s.service; invocation ID: %s\n' "$u" "$(cat "$F/sdrun.inv")" >&2
+		\\else
+		\\  printf 'Running as unit: %s.service\n' "$u" >&2
+		\\fi
+		\\sleep 0.3
+		\\cp "$FAKE_ICD/apply/active" "$F/active.during.$n" 2>/dev/null
+		\\if [ -e "$F/sdrun.die" ]; then kill -KILL $$; fi
+		\\echo 'Finished with result: success' >&2
+		\\exit 0
+		\\
+	}));
+	if (std.c.chmod(try fx.a().dupeZ(u8, fx.path("bin/systemd-run")), 0o755) != 0) return error.SkipZigTest;
+}
+
 /// apply/active as a build-phase holder leaves it: dead (pid 1, no
-/// starttime), naming this instance's build unit and its InvocationID.
-fn plantBuildActive(fx: *GuestFx, sn: Snaps) !void {
+/// starttime), naming this instance's build unit and `invocation` (null: the
+/// line systemd-run printed had none).
+fn plantBuildActive(fx: *GuestFx, sn: Snaps, invocation: ?[]const u8) !void {
 	try apply.writeActive(fx.a(), fx.io(), fx.path("icd"), .{
 		.pid = 1,
 		.unit = try apply.buildUnitName(fx.a(), fx.path("icd")),
-		.invocation = unit_inv,
+		.invocation = invocation,
 		.scratch_id = &sn.s,
 		.phase = .build,
 		.deadline = 0,
 	}, null);
+}
+
+/// The run in its build phase under unit containment, the build bound a
+/// minute away; preflight named the unit (nameBuildUnit).
+fn stageRun(fx: *GuestFx, sn: Snaps) !apply.Run {
+	var r = try fx.run(sn);
+	r.cap = .unit;
+	r.build_deadline_ms = nowMs(fx.io()) + 60_000;
+	try apply.nameBuildUnit(&r);
+	return r;
+}
+
+/// apply/active as the fake systemd-run saw it during its n-th call.
+fn activeDuring(fx: *GuestFx, n: u32) !apply.Active {
+	const bytes = try fx.read(try std.fmt.allocPrint(fx.a(), "fake/active.during.{d}", .{n}));
+	return std.json.parseFromSliceLeaky(apply.Active, fx.a(), bytes, .{ .ignore_unknown_fields = true });
+}
+
+const stage_inner: []const []const u8 = &.{ "nix", "eval", "--raw", "x" };
+
+test "preflight names the build unit with the containment, before anything records the run" {
+	var fx: GuestFx = undefined;
+	try fx.init("name-unit");
+	defer fx.deinit();
+	const sn = try fx.snaps();
+	var r = try fx.run(sn);
+	// A daemon client builds in the daemon: no unit.
+	r.cap = .none;
+	try apply.nameBuildUnit(&r);
+	try t.expect(r.unit == null);
+	// Unit containment: the per-instance name, set before preflight's strict
+	// write that names S, so apply/active names the unit before any
+	// systemd-run starts it.
+	r.cap = .unit;
+	try apply.nameBuildUnit(&r);
+	try t.expectEqualStrings(try apply.buildUnitName(fx.a(), fx.path("icd")), r.unit.?);
 }
 
 test "build-phase terminate: the unit's stop runs through the flag past the loop's slice; apply/active stays until a stop is confirmed" {
@@ -3274,7 +3361,7 @@ test "build-phase terminate: the unit's stop runs through the flag past the loop
 	r.invocation = unit_inv;
 	// A stage the group signal ended: systemd-run is gone, its unit runs on.
 	r.unit_live = true;
-	try plantBuildActive(&fx, sn);
+	try plantBuildActive(&fx, sn, unit_inv);
 	r.active_written = true;
 	apply.terminate.store(15, .release);
 
@@ -3300,50 +3387,147 @@ test "build-phase terminate: the unit's stop runs through the flag past the loop
 	try t.expect(!fx.exists("icd/apply/active"));
 
 	// No stage left a unit running: nothing is stopped, apply/active goes.
-	try plantBuildActive(&fx, sn);
+	try plantBuildActive(&fx, sn, unit_inv);
 	try t.expectEqual(@as(u8, 128 + 15), apply.terminateBuild(&r));
 	try t.expectEqual(@as(usize, 2), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
 	try t.expect(!fx.exists("icd/apply/active"));
 }
 
-test "--cancel: a dead holder's build unit is stopped on its InvocationID; apply/active stays until a stop is confirmed" {
+test "build stages: apply/active names the unit through every stage and only the running stage's InvocationID, none when systemd-run prints none" {
+	var fx: GuestFx = undefined;
+	try fx.init("stage-inv");
+	defer fx.deinit();
+	try fakeSystemdRun(&fx);
+	const sn = try fx.snaps();
+	var r = try stageRun(&fx, sn);
+	// Preflight's write that names S named the unit, and no InvocationID.
+	try plantBuildActive(&fx, sn, null);
+	r.active_written = true;
+	// Stage (a): systemd-run's line carried no ID (systemd 261's race). The
+	// record still names the unit, the stoppers' handle.
+	_ = try apply.runStage(&r, "instantiate", stage_inner);
+	try t.expect(r.invocation == null);
+	var during = try activeDuring(&fx, 1);
+	try t.expectEqualStrings(r.unit.?, during.unit.?);
+	try t.expect(during.invocation == null);
+	// A stage whose line carries one records it while the stage runs.
+	try fx.write("fake/sdrun.inv", unit_inv);
+	_ = try apply.runStage(&r, "instantiate (reproduction)", stage_inner);
+	try t.expectEqualStrings(unit_inv, r.invocation.?);
+	during = try activeDuring(&fx, 2);
+	try t.expectEqualStrings(unit_inv, during.invocation.?);
+	// The next stage's line has none: the record never names the earlier
+	// stage's run while this one runs under the same name.
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/sdrun.inv"));
+	_ = try apply.runStage(&r, "realise", stage_inner);
+	try t.expect(r.invocation == null);
+	during = try activeDuring(&fx, 3);
+	try t.expectEqualStrings(r.unit.?, during.unit.?);
+	try t.expect(during.invocation == null);
+	const kept = apply.readActive(fx.a(), fx.io(), fx.path("icd")) orelse return error.TestUnexpectedResult;
+	try t.expect(kept.invocation == null);
+	// Every stage ran under the one per-instance name and reported its unit's
+	// end: nothing is left running.
+	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemd-run"), try std.fmt.allocPrint(fx.a(), "--unit={s} ", .{r.unit.?})));
+	try t.expect(!r.unit_live);
+}
+
+test "build stage: systemd-run that died without its `Finished with result:` line left its unit running; it is stopped, and apply/active stays until a stop is confirmed" {
+	var fx: GuestFx = undefined;
+	try fx.init("stage-die");
+	defer fx.deinit();
+	try fakeSystemdRun(&fx);
+	try fakeSystemctl(&fx);
+	const sn = try fx.snaps();
+	var r = try stageRun(&fx, sn);
+	try plantBuildActive(&fx, sn, null);
+	r.active_written = true;
+	// The client is SIGKILLed alone: the loop did not stop it, and no flag is
+	// set, but its unit runs on. PID 1 takes the stop: nothing can run on.
+	try fx.write("fake/sdrun.die", "");
+	const st = try apply.runStage(&r, "instantiate", stage_inner);
+	try t.expect(st.exit.stopped == null and st.exit.unit_result == null);
+	const log = try fx.read("fake/systemctl");
+	try t.expectEqual(@as(usize, 1), countOf(log, try std.fmt.allocPrint(fx.a(), "stop --no-block {s}\n", .{r.unit.?})));
+	try t.expect(!r.unit_live);
+	// PID 1 refuses the stop: the unit may still run, and neither the
+	// terminate path nor the verb's own finish removes apply/active, the
+	// unit's only record.
+	try fx.write("fake/systemctl.rc", "1\n");
+	_ = try apply.runStage(&r, "instantiate", stage_inner);
+	try t.expect(r.unit_live);
+	try t.expectEqual(@as(u8, 128), apply.terminateBuild(&r));
+	try t.expect(fx.exists("icd/apply/active"));
+	r.stage_a_ok = false;
+	_ = apply.finish(&r, apply.Outcome.of(.failed, .build));
+	try t.expectEqualStrings("failed", (try fx.last()).get("result").?.string);
+	const kept = apply.readActive(fx.a(), fx.io(), fx.path("icd")) orelse return error.TestUnexpectedResult;
+	try t.expectEqualStrings(r.unit.?, kept.unit.?);
+	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "stop-done"));
+}
+
+/// `apply --cancel` (the config lock held) after a holder that is gone.
+fn cancelDead(fx: *GuestFx) !std.json.ObjectMap {
+	return cancelOnce(fx, null, true, fx.apply_lock.handle);
+}
+
+test "--cancel: a dead holder's build unit is stopped by its name, with no InvocationID or an earlier stage's; apply/active stays until a stop is confirmed" {
 	var fx: GuestFx = undefined;
 	try fx.init("cancel-unit");
 	defer fx.deinit();
 	try fakeSystemctl(&fx);
 	const sn = try fx.snaps();
-	try fx.write("fake/systemctl.inv", unit_inv ++ "\n");
-	try plantBuildActive(&fx, sn);
-	const host: apply.Host = .{
-		.config_fd = fx.cfg_lock.handle,
-		.config_held = true,
-		.apply_fd = fx.apply_lock.handle,
-		.sink = &fx.sink,
-		.sink_allocator = fx.a(),
-	};
+	const unit = try apply.buildUnitName(fx.a(), fx.path("icd"));
+	const stop_line = try std.fmt.allocPrint(fx.a(), "--no-ask-password stop --no-block {s}\n", .{unit});
+	// The holder was SIGKILLed (as cogworx's bound does before its cancel)
+	// while its unit ran; systemd-run had printed no InvocationID.
+	try plantBuildActive(&fx, sn, null);
+	try fx.write("fake/systemctl.state", "active\n");
 	// The stop fails: the record stays for the next stopper.
 	try fx.write("fake/systemctl.rc", "1\n");
-	try t.expect(std.c.flock(fx.cfg_lock.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) == 0);
-	try t.expectEqual(@as(u8, 0), apply.run(fx.ctx(), .{ .mode = .cancel, .json = true }, host));
-	var log = try fx.read("fake/systemctl");
-	try t.expect(std.mem.indexOf(u8, log, "show -p InvocationID --value cogbox-apply-build-") != null);
-	try t.expectEqual(@as(usize, 1), countOf(log, "stop-done"));
+	var c = try cancelDead(&fx);
+	try t.expectEqualStrings("none", c.get("result").?.string);
+	try t.expect(!c.get("signalled").?.bool);
+	const log = try fx.read("fake/systemctl");
+	try t.expect(std.mem.indexOf(u8, log, try std.fmt.allocPrint(fx.a(), "show -p ActiveState --value {s}\n", .{unit})) != null);
+	try t.expectEqual(@as(usize, 1), countOf(log, stop_line));
 	try t.expect(fx.exists("icd/apply/active"));
+	try t.expect(std.mem.indexOf(u8, errText(&fx), "could not stop " ++ "cogbox-apply-build-") != null);
 	// The stop is accepted: apply/active goes.
 	try fx.write("fake/systemctl.rc", "0\n");
-	try t.expect(std.c.flock(fx.cfg_lock.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) == 0);
-	try t.expectEqual(@as(u8, 0), apply.run(fx.ctx(), .{ .mode = .cancel, .json = true }, host));
-	log = try fx.read("fake/systemctl");
-	try t.expectEqual(@as(usize, 2), countOf(log, "stop-done"));
+	_ = try cancelDead(&fx);
+	try t.expectEqual(@as(usize, 2), countOf(try fx.read("fake/systemctl"), stop_line));
 	try t.expect(!fx.exists("icd/apply/active"));
-	// Another InvocationID now runs under the name: not this record's run, so
-	// nothing is stopped and the record goes.
-	try plantBuildActive(&fx, sn);
+	// The record names an earlier stage's InvocationID while a later stage
+	// runs under the name: still this apply's unit, so it is stopped.
+	try plantBuildActive(&fx, sn, unit_inv);
 	try fx.write("fake/systemctl.inv", "ffffffffffffffffffffffffffffffff\n");
-	try t.expect(std.c.flock(fx.cfg_lock.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) == 0);
-	try t.expectEqual(@as(u8, 0), apply.run(fx.ctx(), .{ .mode = .cancel, .json = true }, host));
-	try t.expectEqual(@as(usize, 2), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
+	_ = try cancelDead(&fx);
+	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), stop_line));
 	try t.expect(!fx.exists("icd/apply/active"));
+	// Nothing runs under the name (it ended; --collect unloaded it): no stop,
+	// and the record goes.
+	try plantBuildActive(&fx, sn, null);
+	try fx.write("fake/systemctl.state", "inactive\n");
+	_ = try cancelDead(&fx);
+	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
+	try t.expect(!fx.exists("icd/apply/active"));
+	// A copied apply/active naming another instance's unit: no systemctl
+	// call at all, and the record goes.
+	try fx.write("fake/systemctl.state", "active\n");
+	try apply.writeActive(fx.a(), fx.io(), fx.path("icd"), .{
+		.pid = 1,
+		.unit = "cogbox-apply-build-000000000000",
+		.scratch_id = &sn.s,
+		.phase = .build,
+		.deadline = 0,
+	}, null);
+	const calls = countOf(try fx.read("fake/systemctl"), "\n");
+	_ = try cancelDead(&fx);
+	try t.expectEqual(calls, countOf(try fx.read("fake/systemctl"), "\n"));
+	try t.expect(!fx.exists("icd/apply/active"));
+	// No stopper asks PID 1 for an InvocationID any more.
+	try t.expect(std.mem.indexOf(u8, try fx.read("fake/systemctl"), "InvocationID") == null);
 }
 
 // --- --cancel against a live holder, and cogbox delete's step ---------------------------
@@ -3487,6 +3671,7 @@ test "--cancel: the build unit is stopped by the apply/active read under the flo
 	const inv2 = "fedcba9876543210fedcba9876543210";
 	// The holder's later stage (inv2) runs under the unit's name, and PID 1
 	// refuses to stop it.
+	try fx.write("fake/systemctl.state", "active\n");
 	try fx.write("fake/systemctl.inv", inv2 ++ "\n");
 	try fx.write("fake/systemctl.rc", "1\n");
 	var h = try spawnRewritingHolder(&fx);
@@ -3521,14 +3706,16 @@ test "--cancel: the build unit is stopped by the apply/active read under the flo
 	try t.expectEqualStrings(inv2, kept.invocation.?);
 }
 
-test "preboot: an orphaned build unit's record goes once nothing of it runs, so later passes make no systemctl call; a failed stop keeps it" {
+test "preboot: an orphaned build unit is stopped by its name, whatever InvocationID its record carries; its record goes once nothing of it runs, so later passes make no systemctl call; a failed stop keeps it" {
 	var fx: GuestFx = undefined;
 	try fx.init("pb-orphan");
 	defer fx.deinit();
 	try fakeSystemctl(&fx);
 	const sn = try fx.snaps();
-	try fx.write("fake/systemctl.inv", unit_inv ++ "\n");
-	try plantBuildActive(&fx, sn);
+	const unit = try apply.buildUnitName(fx.a(), fx.path("icd"));
+	const stop_line = try std.fmt.allocPrint(fx.a(), "--no-ask-password stop --no-block {s}\n", .{unit});
+	try plantBuildActive(&fx, sn, null);
+	try fx.write("fake/systemctl.state", "active\n");
 	_ = std.c.flock(fx.apply_lock.handle, std.posix.LOCK.UN);
 	const mine = try lockFd(&fx);
 	defer mine.close(fx.io());
@@ -3536,6 +3723,7 @@ test "preboot: an orphaned build unit's record goes once nothing of it runs, so 
 	try fx.write("fake/systemctl.rc", "1\n");
 	var pa = apply.prebootApply(fx.a(), fx.ctx(), false, mine.handle);
 	try t.expect(pa.flock == .taken and !pa.orphan_stopped);
+	try t.expectEqual(@as(usize, 1), countOf(try fx.read("fake/systemctl"), stop_line));
 	try t.expect(fx.exists("icd/apply/active"));
 	_ = std.c.flock(mine.handle, std.posix.LOCK.UN);
 	// The stop is accepted: the record goes.
@@ -3547,38 +3735,66 @@ test "preboot: an orphaned build unit's record goes once nothing of it runs, so 
 	// The next pass has nothing to ask PID 1.
 	pa = apply.prebootApply(fx.a(), fx.ctx(), false, mine.handle);
 	try t.expect(!pa.orphan_stopped);
-	try t.expectEqual(@as(usize, 2), countOf(try fx.read("fake/systemctl"), "show -p InvocationID"));
+	try t.expectEqual(@as(usize, 2), countOf(try fx.read("fake/systemctl"), "show -p ActiveState"));
 	_ = std.c.flock(mine.handle, std.posix.LOCK.UN);
-	// Another run under the unit's name: nothing of the record's runs, so it
-	// goes without a stop.
-	try plantBuildActive(&fx, sn);
+	// An earlier stage's InvocationID in the record, a later stage running
+	// under the name: stopped all the same.
+	try plantBuildActive(&fx, sn, unit_inv);
 	try fx.write("fake/systemctl.inv", "ffffffffffffffffffffffffffffffff\n");
+	pa = apply.prebootApply(fx.a(), fx.ctx(), false, mine.handle);
+	try t.expect(pa.orphan_stopped);
+	try t.expect(!fx.exists("icd/apply/active"));
+	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), stop_line));
+	_ = std.c.flock(mine.handle, std.posix.LOCK.UN);
+	// Nothing runs under the name: the record goes without a stop.
+	try plantBuildActive(&fx, sn, null);
+	try fx.write("fake/systemctl.state", "inactive\n");
 	pa = apply.prebootApply(fx.a(), fx.ctx(), false, mine.handle);
 	try t.expect(!pa.orphan_stopped);
 	try t.expect(!fx.exists("icd/apply/active"));
-	try t.expectEqual(@as(usize, 2), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
+	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
+	_ = std.c.flock(mine.handle, std.posix.LOCK.UN);
+	// Someone else holds the apply flock (a live apply): nothing is stopped
+	// and the record stays.
+	try plantBuildActive(&fx, sn, null);
+	try fx.write("fake/systemctl.state", "active\n");
+	try t.expect(std.c.flock(fx.apply_lock.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) == 0);
+	pa = apply.prebootApply(fx.a(), fx.ctx(), false, mine.handle);
+	try t.expect(pa.flock == .busy and !pa.orphan_stopped);
+	try t.expect(fx.exists("icd/apply/active"));
+	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
+	try t.expect(std.mem.indexOf(u8, try fx.read("fake/systemctl"), "InvocationID") == null);
 }
 
-test "cogbox delete's step: the recorded build unit is stopped only on its own name and InvocationID" {
+test "cogbox delete's step: the recorded build unit is stopped by its own name, whatever InvocationID it records; a unit that runs and cannot be stopped answers failed" {
 	var fx: GuestFx = undefined;
 	try fx.init("delete-unit");
 	defer fx.deinit();
 	try fakeSystemctl(&fx);
 	const sn = try fx.snaps();
+	const icd = fx.path("icd");
 	// Nothing recorded: no systemctl call at all.
-	try t.expect(!apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, fx.path("icd")));
+	try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
 	try t.expect(!fx.exists("fake/systemctl"));
-	// The unit still runs the recorded invocation: stopped.
-	try plantBuildActive(&fx, sn);
-	try fx.write("fake/systemctl.inv", unit_inv ++ "\n");
-	try t.expect(apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, fx.path("icd")));
-	try t.expectEqual(@as(usize, 1), countOf(try fx.read("fake/systemctl"), "stop --no-block cogbox-apply-build-"));
-	// Another run under the name: left alone.
+	// The unit runs; the record has no InvocationID, or an earlier stage's:
+	// stopped either way.
+	try fx.write("fake/systemctl.state", "active\n");
+	try plantBuildActive(&fx, sn, null);
+	try t.expectEqual(apply.UnitStop.stopped, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try plantBuildActive(&fx, sn, unit_inv);
 	try fx.write("fake/systemctl.inv", "ffffffffffffffffffffffffffffffff\n");
-	try t.expect(!apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, fx.path("icd")));
-	try t.expectEqual(@as(usize, 1), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
+	try t.expectEqual(apply.UnitStop.stopped, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try t.expectEqual(@as(usize, 2), countOf(try fx.read("fake/systemctl"), "--no-ask-password stop --no-block cogbox-apply-build-"));
+	// PID 1 refuses the stop, or cannot be asked: the unit may still run.
+	try fx.write("fake/systemctl.rc", "1\n");
+	try t.expectEqual(apply.UnitStop.failed, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try fx.write("fake/systemctl.showrc", "1\n");
+	try t.expectEqual(apply.UnitStop.failed, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
+	try std.Io.Dir.cwd().deleteFile(fx.io(), fx.path("fake/systemctl.showrc"));
+	try fx.write("fake/systemctl.rc", "0\n");
 	// Another instance's unit name (a copied apply/active): never stopped.
-	try apply.writeActive(fx.a(), fx.io(), fx.path("icd"), .{
+	try apply.writeActive(fx.a(), fx.io(), icd, .{
 		.pid = 1,
 		.unit = "cogbox-apply-build-000000000000",
 		.invocation = unit_inv,
@@ -3586,12 +3802,37 @@ test "cogbox delete's step: the recorded build unit is stopped only on its own n
 		.phase = .build,
 		.deadline = 0,
 	}, null);
-	try fx.write("fake/systemctl.inv", unit_inv ++ "\n");
-	try t.expect(!apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, fx.path("icd")));
-	try t.expectEqual(@as(usize, 1), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
+	try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try t.expectEqual(@as(usize, 3), countOf(try fx.read("fake/systemctl"), "stop --no-block"));
 	// The step only reads: the instance dir it runs before deleting is not
 	// recreated once it is gone.
-	try std.Io.Dir.cwd().deleteTree(fx.io(), fx.path("icd"));
-	try t.expect(!apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, fx.path("icd")));
+	try std.Io.Dir.cwd().deleteTree(fx.io(), icd);
+	try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
 	try t.expect(!fx.exists("icd"));
+}
+
+test "a build unit's stop by name: what systemd says decides whether it runs; only a running one is stopped" {
+	var fx: GuestFx = undefined;
+	try fx.init("unit-stop");
+	defer fx.deinit();
+	try fakeSystemctl(&fx);
+	const sn = try fx.snaps();
+	const icd = fx.path("icd");
+	try plantBuildActive(&fx, sn, null);
+	// Unloaded (--collect), inactive or failed: nothing runs, no stop.
+	for ([_][]const u8{ "\n", "inactive\n", "failed\n" }) |state| {
+		try fx.write("fake/systemctl.state", state);
+		try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	}
+	try t.expectEqual(@as(usize, 0), countOf(try fx.read("fake/systemctl"), " stop "));
+	// Starting, running, reloading, stopping: stopped.
+	for ([_][]const u8{ "activating\n", "active\n", "reloading\n", "deactivating\n" }) |state| {
+		try fx.write("fake/systemctl.state", state);
+		try t.expectEqual(apply.UnitStop.stopped, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	}
+	try t.expectEqual(@as(usize, 4), countOf(try fx.read("fake/systemctl"), "--no-ask-password stop --no-block cogbox-apply-build-"));
+	// It ended between the two calls: nothing to stop.
+	try fx.write("fake/systemctl.notloaded", "");
+	try t.expectEqual(apply.UnitStop.none, apply.stopRecordedBuild(fx.a(), fx.io(), &fx.env, icd));
+	try t.expectEqual(@as(usize, 5), countOf(try fx.read("fake/systemctl"), "stop-done"));
 }

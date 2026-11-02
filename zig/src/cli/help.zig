@@ -216,7 +216,9 @@ pub const DELETE =
     \\plugins-flake/, authorized_keys, ...), its persistent data dir (disk
     \\overlays and guest state), and any leftover runtime dir (sockets, logs,
     \\pid). Refuses to delete a running instance -- stop it first with
-    \\'cogbox stop'.
+    \\'cogbox stop'. Stops a live plugin apply's build for the instance
+    \\first, and refuses (exit 75, nothing removed) while that build runs
+    \\and cannot be stopped (run the delete as root if the apply ran as root).
     \\
     \\Prompts for confirmation, listing the directories to be removed, unless
     \\-y/--yes is given (or stdin is not a terminal, as for the CLI's other
