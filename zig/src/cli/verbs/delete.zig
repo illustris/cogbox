@@ -96,12 +96,17 @@ pub fn run(
 	defer if (backup) |b| allocator.free(b.bytes);
 
 	// A live plugin apply building for this instance (the unit apply/active
-	// records, on an InvocationID match) is stopped before its inputs go; its
-	// own watch then ends it superseded, and nothing recreates the config dir.
+	// records, stopped by its name) is stopped before its inputs go; its own
+	// watch then ends it superseded, and nothing recreates the config dir. A
+	// unit that runs and cannot be stopped keeps everything: removing the dir
+	// would remove the unit's only record, and a recreated instance reuses
+	// its name.
 	{
 		var arena_state = std.heap.ArenaAllocator.init(allocator);
 		defer arena_state.deinit();
-		_ = plugin_module.apply.stopRecordedBuild(arena_state.allocator(), io, env, cfg_dir);
+		if (plugin_module.apply.stopRecordedBuild(arena_state.allocator(), io, env, cfg_dir) == .failed) {
+			util.die(allocator, io, "delete", exit_codes.tempfail, "a live plugin apply's build for instance '{s}' is still running and could not be stopped; try again (as root if the apply ran as root)", .{label});
+		}
 	}
 
 	// Keep the config discoverable until persistent and runtime cleanup both

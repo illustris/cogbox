@@ -1671,6 +1671,73 @@ test "preflight: a user flake edited since the boot (nix hash path differs from 
 	try t.expectEqualStrings("no_nixpkgs_source", (try inst.report()).get("detail").?.array.items[0].string);
 }
 
+/// A fake `systemctl` first on PATH (bootPluginX's bin): it logs its argv to
+/// systemctl.log; `show` prints $FAKE_UNIT_STATE (`inactive` when unset); a
+/// stop exits with $FAKE_STOP_RC (0 when unset).
+fn fakeSystemctl(inst: *Inst) !void {
+	const a = inst.s.a();
+	var base_env = try std.testing.environ.createMap(a);
+	const sh = apply.findExe(a, &base_env, "sh") orelse return error.SkipZigTest;
+	try inst.s.write("bin/systemctl", try std.mem.concat(a, u8, &.{ "#!", sh, "\n",
+		\\printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
+		\\case " $* " in
+		\\  *" show "*) echo "${FAKE_UNIT_STATE:-inactive}"; exit 0 ;;
+		\\  *" stop "*) exit "${FAKE_STOP_RC:-0}" ;;
+		\\esac
+		\\exit 1
+		\\
+	}));
+	if (std.c.chmod(try a.dupeZ(u8, inst.s.path("bin/systemctl")), 0o755) != 0) return error.SkipZigTest;
+	try inst.env.put("FAKE_SYSTEMCTL_LOG", inst.s.path("systemctl.log"));
+}
+
+test "preflight: a build unit a dead apply left running is stopped by its name, with or without an InvocationID; one it cannot stop keeps apply/active and the apply answers failed/busy" {
+	var inst: Inst = undefined;
+	try inst.init("pf-orphan", plugin_x_cfg);
+	defer inst.deinit();
+	try bootPluginX(&inst, "sha256-USER=");
+	try fakeSystemctl(&inst);
+	const a = inst.s.a();
+	const io = inst.s.io();
+	const icd = inst.s.path("icd");
+	const unit = try apply.buildUnitName(a, icd);
+	const stop_line = try std.fmt.allocPrint(a, "--no-ask-password stop --no-block {s}\n", .{unit});
+	// An apply SIGKILLed in its build left its unit running; the line
+	// systemd-run printed had no InvocationID (systemd 261), or the record
+	// still names an earlier stage's.
+	for ([_]?[]const u8{ null, "0123456789abcdef0123456789abcdef" }) |inv| {
+		try apply.writeActive(a, io, icd, .{ .pid = 1, .unit = unit, .invocation = inv, .scratch_id = "00000000000000aa", .phase = .build, .deadline = 0 }, null);
+		const before = try inst.s.read("icd/apply/active");
+		const stops = std.mem.count(u8, inst.s.read("systemctl.log") catch "", stop_line);
+		const nix_calls = nixCalls(&inst).len;
+		try inst.env.put("FAKE_UNIT_STATE", "active");
+		// PID 1 refuses the stop (a non-root apply cannot stop a root
+		// apply's unit): the apply waits, and the record stays byte for
+		// byte, the unit's only record; nothing is hashed or built.
+		try inst.env.put("FAKE_STOP_RC", "1");
+		_ = try inst.run(json_args, true);
+		try inst.expectOutcome("failed", "busy");
+		try t.expectEqualStrings(before, try inst.s.read("icd/apply/active"));
+		try t.expectEqual(nix_calls, nixCalls(&inst).len);
+		try t.expectEqual(stops + 1, std.mem.count(u8, try inst.s.read("systemctl.log"), stop_line));
+		// PID 1 takes the stop: the apply goes on (this fixture ends at the
+		// build, which has no nixpkgs source).
+		try inst.env.put("FAKE_STOP_RC", "0");
+		_ = try inst.run(json_args, true);
+		try inst.expectOutcome("failed", "build");
+		try t.expectEqualStrings("no_nixpkgs_source", (try inst.report()).get("detail").?.array.items[0].string);
+		try t.expectEqual(stops + 2, std.mem.count(u8, try inst.s.read("systemctl.log"), stop_line));
+		try t.expect(!inst.s.exists("icd/apply/active"));
+	}
+	// The unit no longer runs: no stop, and the apply goes on.
+	try apply.writeActive(a, io, icd, .{ .pid = 1, .unit = unit, .scratch_id = "00000000000000aa", .phase = .build, .deadline = 0 }, null);
+	try inst.env.put("FAKE_UNIT_STATE", "inactive");
+	try inst.env.put("FAKE_STOP_RC", "1");
+	_ = try inst.run(json_args, true);
+	try inst.expectOutcome("failed", "build");
+	try t.expectEqual(@as(usize, 4), std.mem.count(u8, try inst.s.read("systemctl.log"), " stop "));
+}
+
 /// The audit.log lines of an Apply anyway (`"event":"force"`), parsed.
 fn forceAudit(inst: *Inst) ![]const std.json.ObjectMap {
 	const data = inst.s.read("icd/apply/audit.log") catch return &.{};

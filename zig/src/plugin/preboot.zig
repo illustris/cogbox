@@ -10,8 +10,8 @@
 // In one call, in this order (spec section 6, "Internal verb"):
 //   1. on a stopped instance, signal the live apply holder apply/active names
 //      through a pidfd (SIGTERM, at most 30 s, then SIGKILL, at most 10 s);
-//   2. with the apply flock free (LOCK_NB), stop an orphaned build unit whose
-//      InvocationID still matches;
+//   2. with the apply flock free (LOCK_NB), stop by its name the build unit a
+//      dead apply's apply/active still names;
 //   3. on a stopped instance with the apply flock free, resolve inflight.json
 //      (`unknown`, unless an intent or a record exists, which is rolled back);
 //      otherwise leave it for a recoverer that can still read the guest (an
