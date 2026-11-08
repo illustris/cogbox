@@ -22,7 +22,8 @@
 // so the `ech` flag is surfaced for the caller to act on per tier (the worker
 // allows ECH on the terminate tier, where mitmproxy enforces Host==SNI on the
 // decrypted request, and refuses it on the splice tier, which trusts the
-// cleartext SNI for routing).
+// cleartext SNI for routing, unless the opt-in ECH-capability probe
+// (echprobe.zig) finds the server it would splice to not ECH-capable).
 //
 // All length fields are bounds-checked against a hostile guest; every
 // out-of-range access yields .deny rather than a panic.
@@ -44,7 +45,8 @@ pub const PeekResult = union(enum) {
 const rec_handshake: u8 = 0x16;
 const hs_client_hello: u8 = 0x01;
 const ext_server_name: u16 = 0x0000;
-const ext_ech: u16 = 0xfe0d; // encrypted_client_hello (draft-ietf-tls-esni)
+const ext_ech: u16 = 0xfe0d; // encrypted_client_hello (RFC 9849)
+const ext_alpn: u16 = 0x0010; // application_layer_protocol_negotiation (RFC 7301)
 const sni_host_name: u8 = 0x00;
 const max_handshake: usize = 16 * 1024; // sane ClientHello cap
 
@@ -83,10 +85,25 @@ const Cursor = struct {
 /// Extract the SNI host_name from a (possibly partial) TLS stream prefix.
 /// On `.sni`, the returned slice lives in `out_sni`.
 pub fn extractSni(buf: []const u8, out_sni: []u8) PeekResult {
-	// Reassemble the ClientHello handshake message, which MAY be fragmented
-	// across multiple TLS handshake records. We copy record payloads into a
-	// contiguous scratch so the rest of the parse can index linearly.
 	var scratch: [max_handshake]u8 = undefined;
+	return switch (reassemble(buf, &scratch)) {
+		.body => |body| parseClientHello(body, out_sni),
+		.need_more => .need_more,
+		.deny => .deny,
+	};
+}
+
+const Reassembled = union(enum) {
+	body: []const u8, // the ClientHello body (after its 4-byte header), in scratch
+	need_more,
+	deny,
+};
+
+/// Reassemble the ClientHello handshake message, which MAY be fragmented
+/// across multiple TLS handshake records. We copy record payloads into a
+/// contiguous scratch so the rest of the parse can index linearly. Shared by
+/// extractSni and echShape so both read exactly the same bytes.
+fn reassemble(buf: []const u8, scratch: *[max_handshake]u8) Reassembled {
 	var filled: usize = 0;
 	var off: usize = 0;
 
@@ -116,7 +133,7 @@ pub fn extractSni(buf: []const u8, out_sni: []u8) PeekResult {
 				(@as(usize, scratch[2]) << 8) | scratch[3];
 			const need = 4 + hlen;
 			if (need > scratch.len) return .deny;
-			if (filled >= need) return parseClientHello(scratch[4..need], out_sni);
+			if (filled >= need) return .{ .body = scratch[4..need] };
 			// otherwise keep consuming records (loop re-checks buf bounds)
 		}
 	}
@@ -147,7 +164,8 @@ fn parseClientHello(body: []const u8, out_sni: []u8) PeekResult {
 		// Note ECH but keep parsing: the cleartext SNI is still extracted and
 		// the caller decides what to do with an ECH-bearing hello per tier
 		// (the inner name could be a denied sibling, so the splice path refuses
-		// it; terminate is safe because mitmproxy re-checks Host==SNI).
+		// it unless the opt-in probe clears the server; terminate is safe
+		// because mitmproxy re-checks Host==SNI).
 		if (etype == ext_ech) ech = true;
 		if (etype == ext_server_name and found == null) {
 			found = parseServerName(edata) catch return .deny;
@@ -157,7 +175,8 @@ fn parseClientHello(body: []const u8, out_sni: []u8) PeekResult {
 	// No cleartext host_name. With ECH present the client may be naming any
 	// vhost on the IP in its encrypted inner hello -- including an L7-denied
 	// sibling -- and the L4-only splice could not see that deny, so it stays
-	// .deny (the passthrough tier refuses ECH for the same reason). Without ECH
+	// .deny (the splice tier gates ECH on the cleartext name for the same
+	// reason, and here there is none). Without ECH
 	// the hello is well-formed and nameless: the worker L4-gates it.
 	const name = found orelse return if (ech) .deny else .no_sni;
 	if (name.len == 0 or name.len > out_sni.len) return .deny; // empty HostName violates RFC 6066 (malformed); oversize is unsupported
@@ -179,6 +198,132 @@ fn parseServerName(data: []const u8) error{Malformed}!?[]const u8 {
 		if (ntype == sni_host_name) return name;
 	}
 	return null;
+}
+
+// --- ECH shape (for the l7proxy's ECH-capability probe, echprobe.zig) ---
+
+// Caps on what the probe will mirror from a guest's hello. An X25519 enc is 32
+// bytes and a hybrid X25519-ML-KEM-768 one 1120, so 1216 covers what browsers
+// send; the payload is the padded inner hello plus its AEAD tag. Anything
+// larger is `.unsupported`, which the caller refuses without probing.
+pub const max_ech_enc: usize = 1216;
+pub const max_ech_payload: usize = 4096;
+pub const max_alpn: usize = 512;
+
+/// The outer ECH extension of a guest's ClientHello, plus its ALPN extension,
+/// as the probe re-emits them. Every field is a COPY: the reassembly scratch is
+/// local to echShape. `alpn` holds the whole ALPN extension_data, its u16 list
+/// length included, ready to re-emit; `alpn_len` is 0 when the hello has none.
+/// The payload itself is never copied -- the probe sends random bytes of the
+/// same length, so nothing the guest encrypted ever leaves the host.
+pub const EchShape = struct {
+	kdf_id: u16,
+	aead_id: u16,
+	config_id: u8,
+	enc: [max_ech_enc]u8,
+	enc_len: u16,
+	payload_len: u16,
+	alpn: [max_alpn]u8,
+	alpn_len: u16,
+};
+
+pub const EchShapeResult = enum { ok, malformed, unsupported };
+
+/// Read the shape of the ECH extension (and the ALPN extension) out of a fully
+/// buffered ClientHello. `.malformed` covers a hello that does not reassemble,
+/// no ECH extension or two, an inner (type 1) or unknown ECH type, a zero-length
+/// payload, trailing bytes in the ECH extension, two ALPN extensions or a bad
+/// ALPN list; `.unsupported` an enc, payload or ALPN past the caps above. The
+/// caller refuses both without probing: neither is a hello the probe can mirror.
+pub fn echShape(buf: []const u8, out: *EchShape) EchShapeResult {
+	var scratch: [max_handshake]u8 = undefined;
+	const body = switch (reassemble(buf, &scratch)) {
+		.body => |b| b,
+		.need_more, .deny => return .malformed,
+	};
+	var c = Cursor{ .b = body };
+	if (!c.skip(2 + 32)) return .malformed; // client_version + random
+	const sid_len = c.readU8() orelse return .malformed;
+	if (!c.skip(sid_len)) return .malformed; // session_id
+	const cs_len = c.readU16() orelse return .malformed;
+	if (!c.skip(cs_len)) return .malformed; // cipher_suites
+	const cm_len = c.readU8() orelse return .malformed;
+	if (!c.skip(cm_len)) return .malformed; // compression_methods
+	const ext_total = c.readU16() orelse return .malformed;
+	const ext_bytes = c.take(ext_total) orelse return .malformed;
+
+	var seen_ech = false;
+	var seen_alpn = false;
+	var unsupported = false;
+	var ec = Cursor{ .b = ext_bytes };
+	// Same extension walk (and trailing-byte leniency) as parseClientHello.
+	while (ec.remaining() >= 4) {
+		const etype = ec.readU16().?;
+		const elen = ec.readU16().?;
+		const edata = ec.take(elen) orelse return .malformed;
+		if (etype == ext_ech) {
+			if (seen_ech) return .malformed;
+			seen_ech = true;
+			switch (parseEchOuter(edata, out)) {
+				.ok => {},
+				.malformed => return .malformed,
+				.unsupported => unsupported = true,
+			}
+		} else if (etype == ext_alpn) {
+			if (seen_alpn) return .malformed;
+			seen_alpn = true;
+			if (!alpnListValid(edata)) return .malformed;
+			if (edata.len > max_alpn) {
+				unsupported = true;
+			} else {
+				@memcpy(out.alpn[0..edata.len], edata);
+				out.alpn_len = @intCast(edata.len);
+			}
+		}
+	}
+	if (!seen_ech) return .malformed;
+	if (unsupported) return .unsupported;
+	if (!seen_alpn) out.alpn_len = 0;
+	return .ok;
+}
+
+/// RFC 9849 section 5: ECHClientHello { ECHClientHelloType type; select (type)
+/// { case outer: HpkeSymmetricCipherSuite cipher_suite; uint8 config_id;
+/// opaque enc<0..2^16-1>; opaque payload<1..2^16-1>; case inner: Empty; } }.
+fn parseEchOuter(data: []const u8, out: *EchShape) EchShapeResult {
+	var c = Cursor{ .b = data };
+	const ech_type = c.readU8() orelse return .malformed;
+	if (ech_type != 0) return .malformed; // 1 = inner: never on the wire in an outer hello
+	const kdf_id = c.readU16() orelse return .malformed;
+	const aead_id = c.readU16() orelse return .malformed;
+	const config_id = c.readU8() orelse return .malformed;
+	const enc_len = c.readU16() orelse return .malformed;
+	const enc = c.take(enc_len) orelse return .malformed;
+	const payload_len = c.readU16() orelse return .malformed;
+	if (payload_len == 0) return .malformed;
+	if (!c.skip(payload_len)) return .malformed;
+	if (c.remaining() != 0) return .malformed;
+	if (enc_len > max_ech_enc or payload_len > max_ech_payload) return .unsupported;
+	out.kdf_id = kdf_id;
+	out.aead_id = aead_id;
+	out.config_id = config_id;
+	@memcpy(out.enc[0..enc_len], enc);
+	out.enc_len = enc_len;
+	out.payload_len = payload_len;
+	return .ok;
+}
+
+/// RFC 7301: ProtocolNameList protocol_name_list<2..2^16-1>, each
+/// ProtocolName<1..2^8-1>. The list must fill the extension exactly.
+fn alpnListValid(data: []const u8) bool {
+	var c = Cursor{ .b = data };
+	const list_len = c.readU16() orelse return false;
+	if (list_len == 0 or list_len != c.remaining()) return false;
+	while (c.remaining() > 0) {
+		const n = c.readU8().?;
+		if (n == 0 or !c.skip(n)) return false;
+	}
+	return true;
 }
 
 // --- Tests ---

@@ -21,6 +21,11 @@ const std = @import("std");
 const filter = @import("filter");
 const tls = @import("tls.zig");
 const http = @import("http.zig");
+const clock = @import("clock.zig");
+/// The ECH-capability probe's protocol half and result cache. Public so the CLI
+/// (`cogbox __ech-probe`) and the tests reach its types; the socket half
+/// (echProbeAddr, echGate) lives below with the rest of the connect plumbing.
+pub const echprobe = @import("echprobe.zig");
 
 const c = @cImport({
 	@cDefine("_GNU_SOURCE", "1");
@@ -33,23 +38,15 @@ const c = @cImport({
 	@cInclude("netinet/in.h");
 	@cInclude("netdb.h");
 	@cInclude("sys/time.h");
-	@cInclude("time.h"); // clock_gettime / struct timespec for the peek deadline
 	@cInclude("poll.h");
 	@cInclude("unistd.h");
 	@cInclude("errno.h");
 	@cInclude("string.h");
 });
 
-// CLOCK_MONOTONIC uses different ABI values on Linux and Darwin.
-const CLOCK_MONOTONIC: c_int = if (@import("platform").darwin) 6 else 1;
-
-/// Monotonic milliseconds, used only to bound the fast-path classification peek.
-/// Monotonic (not wall-clock) so a clock step can't lengthen or shorten it.
-pub fn monotonicMs() i64 {
-	var ts: c.struct_timespec = std.mem.zeroes(c.struct_timespec);
-	_ = c.clock_gettime(CLOCK_MONOTONIC, &ts);
-	return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), std.time.ns_per_ms);
-}
+/// Monotonic milliseconds (clock.zig), re-exported so the peek-deadline callers
+/// and their tests keep reaching it here.
+pub const monotonicMs = clock.monotonicMs;
 
 // open(2) -- declared directly to dodge fcntl.h's FORTIFY macros (same
 // reasoning as the netfilter shim).
@@ -167,7 +164,15 @@ fn unlockRules() void {
 var reload_pending = std.atomic.Value(bool).init(false);
 var conn_count = std.atomic.Value(usize).init(0);
 
-pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: AcceptMode, listen_addr: u32, funnel: bool, peek_ms: i32) !void {
+// The ECH gate's process-wide inputs, set once in run() before any accept
+// loop starts (workers only read them): the Io the probe draws its entropy
+// from, and whether the probe may run at all. Off unless the operator set
+// COGBOX_L7_ECH_PROBE=1 (the CLI reads it): off, every ECH hello on the splice
+// tier is refused, as before the probe existed.
+var ech_io: std.Io = undefined;
+var ech_probe_enabled: bool = false;
+
+pub fn run(_: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, l7_base: u16, mode: AcceptMode, listen_addr: u32, funnel: bool, peek_ms: i32, ech_probe: bool) !void {
 	if (runtime_dir.len >= runtime_dir_buf.len) return error.PathTooLong;
 	@memcpy(runtime_dir_buf[0..runtime_dir.len], runtime_dir);
 	runtime_dir_len = runtime_dir.len;
@@ -176,6 +181,9 @@ pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: Ac
 	listen_addr_host = listen_addr;
 	funnel_all = funnel;
 	peek_fast_ms = clampPeekMs(peek_ms);
+	ech_io = io;
+	ech_probe_enabled = ech_probe;
+	const ech_state: []const u8 = if (ech_probe) "on" else "off";
 	installSignals();
 	loadRules();
 
@@ -196,7 +204,7 @@ pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: Ac
 			const http_fd = try listenFront(ports.http);
 
 			const la: [4]u8 = @bitCast(std.mem.nativeToBig(u32, listen_addr_host));
-			logLine("l7proxy: listening on {d}.{d}.{d}.{d}:{d} (tls) :{d} (http); terminate backend 127.0.0.1:{d}; funnel_all={}", .{ la[0], la[1], la[2], la[3], ports.tls, ports.http, ports.mitm, funnel_all });
+			logLine("l7proxy: listening on {d}.{d}.{d}.{d}:{d} (tls) :{d} (http); terminate backend 127.0.0.1:{d}; funnel_all={} ech_probe={s}", .{ la[0], la[1], la[2], la[3], ports.tls, ports.http, ports.mitm, funnel_all, ech_state });
 
 			const th = try std.Thread.spawn(.{}, acceptLoop, .{http_fd});
 			th.detach();
@@ -213,7 +221,7 @@ pub fn run(_: std.mem.Allocator, runtime_dir: []const u8, l7_base: u16, mode: Ac
 			const r_fd = try listenFront(ports.tls);
 
 			const la: [4]u8 = @bitCast(std.mem.nativeToBig(u32, listen_addr_host));
-			logLine("l7proxy: REDIRECT listener on {d}.{d}.{d}.{d}:{d}; terminate backend 127.0.0.1:{d}", .{ la[0], la[1], la[2], la[3], ports.tls, ports.mitm });
+			logLine("l7proxy: REDIRECT listener on {d}.{d}.{d}.{d}:{d}; terminate backend 127.0.0.1:{d} ech_probe={s}", .{ la[0], la[1], la[2], la[3], ports.tls, ports.mitm, ech_state });
 
 			acceptLoop(r_fd);
 		},
@@ -603,18 +611,6 @@ fn worker(client_fd: c_int) void {
 	const needs_inject = inject_hosts.contains(host);
 	unlockRules();
 
-	// ECH policy: an ECH extension means the cleartext SNI we keyed on may be a
-	// decoy for an encrypted inner name. On the splice path we route purely on
-	// that SNI, so a real ECH could front a denied sibling -- refuse. On the
-	// terminate path mitmproxy is the TLS endpoint and its addon re-checks
-	// Host==SNI on the decrypted request, so ECH (GREASE or real) can't smuggle
-	// a different host past it; let it through (this is what unblocks Chrome,
-	// whose default GREASE ECH would otherwise be denied here).
-	if (is_tls and ech and !needs_term) {
-		logReject(orig, host, "ech-on-splice");
-		return;
-	}
-
 	// Route to the terminate backend (mitmproxy + the enforcement/injection
 	// addon) when:
 	//   - TLS  and the host needs MITM termination (the existing tier choice), OR
@@ -639,18 +635,70 @@ fn worker(client_fd: c_int) void {
 		return;
 	}
 
+	// ECH policy. Every TLS flow left here is spliced on its cleartext SNI. An
+	// ECH extension means that SNI is the OUTER name and may be a decoy: on a
+	// client-facing server that decrypts ECH for many names (a CDN), a real ECH
+	// hello can name an allowed outer host while its encrypted inner hello
+	// names a denied one, and the splice would carry it there unseen. So an
+	// ECH hello is spliced only when the ECH-capability probe (echGate) shows
+	// that the very address we connected to, asked with this outer SNI, does
+	// not take ECH: RFC 9849 section 7.1 says "If the server is configured
+	// with any ECHConfigs, it MUST include the encrypted_client_hello extension
+	// in its EncryptedExtensions with the retry_configs field", so a GREASE
+	// probe answered by a decrypted EncryptedExtensions without it is evidence
+	// that this server instance, right now, holds no ECHConfigs it advertises.
+	// Evidence, not proof: a server whose keys are not sent as retry configs
+	// (Go SendAsRetry=false, OpenSSL keys loaded no-retry, a split-mode
+	// frontend) or a load-balanced frontend whose probe and connection land on
+	// different machines can still decrypt real ECH -- the residual
+	// docs/network-filtering.md states, and the reason the probe runs only
+	// when the operator opted in (COGBOX_L7_ECH_PROBE=1).
+	// Everything else (capable, any probe error, a hello the probe cannot
+	// mirror, the probe off) is refused, logged reason=ech-on-splice
+	// with the outcome and a hint naming the fix. The terminate tier never gets
+	// here: mitmproxy is the TLS endpoint and its addon re-checks Host==SNI on
+	// the decrypted request, so ECH (GREASE or real) cannot smuggle a different
+	// host past it. The gate sits after the l7-deny check (a denied host is
+	// refused for that, never probed) and before any dial for a hello the
+	// probe would refuse anyway.
+	const ech_splice = is_tls and ech;
+	var shape: tls.EchShape = undefined;
+	if (ech_splice) {
+		const refused: ?echprobe.Result = switch (tls.echShape(buf[0..buffered], &shape)) {
+			.malformed => .{ .outcome = .unknown, .detail = .ech_malformed },
+			.unsupported => .{ .outcome = .unknown, .detail = .ech_unsupported },
+			.ok => if (ech_probe_enabled) null else .{ .outcome = .unknown, .detail = .disabled },
+		};
+		if (refused) |r| {
+			logEchReject(orig, host, null, r);
+			return;
+		}
+	}
+
 	// L7 allow SUPERSEDES the L4 CIDR deny-list for the re-resolved IP (still
 	// gated by the non-overridable hard floor). A no_match host falls back to
 	// the instance L4 policy. Either way the hard floor always applies.
 	const supersede_l4 = verdict == .allow;
-	const up_fd = dialUpstream(host, orig.port, supersede_l4) orelse {
+	const up = dialUpstream(host, orig.port, supersede_l4) orelse {
 		logReject(orig, host, "no-vetted-upstream");
 		return;
 	};
-	defer _ = c.close(up_fd);
+	defer _ = c.close(up.fd);
 
-	if (!writeAll(up_fd, buf[0..buffered])) return;
-	relay(client_fd, up_fd);
+	// The probe goes to exactly the address the splice is connected to, on the
+	// same port, with the guest's outer SNI bytes: no new reach, and nothing
+	// learned for one address vouches for another.
+	if (ech_splice) {
+		const g = echGate(ech_io, up.ip, orig.port, host, &shape);
+		if (g.probed) logEchProbe(host, up.ip, orig.port, g);
+		if (!echprobe.allowsSplice(g.result)) {
+			logEchReject(orig, host, up.ip, g.result);
+			return;
+		}
+	}
+
+	if (!writeAll(up.fd, buf[0..buffered])) return;
+	relay(client_fd, up.fd);
 }
 
 // --- terminate-tier handoff to the mitmproxy backend ---
@@ -946,11 +994,15 @@ pub fn peekClassify(
 
 // --- upstream dial with SSRF + CIDR re-check ---
 
+/// A connected upstream: the fd and the vetted address it is connected to (the
+/// ECH gate probes exactly that address).
+const Upstream = struct { fd: c_int, ip: filter.IpAddr };
+
 /// Dial the re-resolved upstream. `supersede_l4` is true when an explicit L7
 /// `allow` matched the vhost -- then the only gate is the non-overridable hard
 /// floor (the name allow overrides the L4 IP deny-list). When false (the vhost
 /// matched no L7 rule), the resolved IP must also pass the instance L4 policy.
-fn dialUpstream(host: []const u8, port: u16, supersede_l4: bool) ?c_int {
+fn dialUpstream(host: []const u8, port: u16, supersede_l4: bool) ?Upstream {
 	var name_z: [256]u8 = undefined;
 	if (host.len >= name_z.len) return null;
 	@memcpy(name_z[0..host.len], host);
@@ -995,12 +1047,13 @@ fn dialUpstream(host: []const u8, port: u16, supersede_l4: bool) ?c_int {
 		}
 
 		// Vet-then-pin: connect to exactly the sockaddr we just vetted.
-		if (connectVetted(ai, port)) |fd| return fd;
+		if (connectVetted(ai, port, ip)) |up| return up;
 	}
 	return null;
 }
 
-fn connectVetted(ai: *c.struct_addrinfo, port: u16) ?c_int {
+/// Connect to `ai` (whose address is `ip`, already vetted) on `port`.
+fn connectVetted(ai: *c.struct_addrinfo, port: u16, ip: filter.IpAddr) ?Upstream {
 	var storage: c.struct_sockaddr_storage = std.mem.zeroes(c.struct_sockaddr_storage);
 	const alen = ai.ai_addrlen;
 	if (alen == 0 or alen > @sizeOf(c.struct_sockaddr_storage)) return null;
@@ -1023,7 +1076,7 @@ fn connectVetted(ai: *c.struct_addrinfo, port: u16) ?c_int {
 		_ = c.close(fd);
 		return null;
 	}
-	return fd;
+	return .{ .fd = fd, .ip = ip };
 }
 
 // --- raw-L4 splice arm (redirect or socks5+funnel-all) ---
@@ -1086,35 +1139,163 @@ fn rawL4Splice(client_fd: c_int, orig: Orig, buffered: []const u8, deny_reason: 
 /// arm, on an orig dst that already cleared rawL4Allowed. originalDst only ever
 /// yields IPv4, but the v6 branch is kept for completeness.
 fn connectRaw(addr: filter.IpAddr, port: u16) ?c_int {
+	var storage: c.struct_sockaddr_storage = undefined;
+	const alen = sockaddrFor(addr, port, &storage);
+	const fd = c.socket(familyOf(addr), c.SOCK_STREAM, 0);
+	if (fd < 0) return null;
+	setTimeouts(fd);
+	if (c_connect(fd, @ptrCast(&storage), alen) != 0) {
+		_ = c.close(fd);
+		return null;
+	}
+	return fd;
+}
+
+fn familyOf(addr: filter.IpAddr) c_int {
+	return switch (addr) {
+		.ipv4 => c.AF_INET,
+		.ipv6 => c.AF_INET6,
+	};
+}
+
+/// The sockaddr for a literal IP:port, zeroed first; returns its length.
+fn sockaddrFor(addr: filter.IpAddr, port: u16, storage: *c.struct_sockaddr_storage) c.socklen_t {
+	storage.* = std.mem.zeroes(c.struct_sockaddr_storage);
 	switch (addr) {
 		.ipv4 => |b| {
-			var sa: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
+			const sa: *c.struct_sockaddr_in = @ptrCast(@alignCast(storage));
 			sa.sin_family = c.AF_INET;
 			sa.sin_port = std.mem.nativeToBig(u16, port);
 			sa.sin_addr.s_addr = @bitCast(b);
-			const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-			if (fd < 0) return null;
-			setTimeouts(fd);
-			if (c_connect(fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0) {
-				_ = c.close(fd);
-				return null;
-			}
-			return fd;
+			return @sizeOf(c.struct_sockaddr_in);
 		},
 		.ipv6 => |b| {
-			var sa: c.struct_sockaddr_in6 = std.mem.zeroes(c.struct_sockaddr_in6);
+			const sa: *c.struct_sockaddr_in6 = @ptrCast(@alignCast(storage));
 			sa.sin6_family = c.AF_INET6;
 			sa.sin6_port = std.mem.nativeToBig(u16, port);
 			@memcpy(@as([*]u8, @ptrCast(&sa.sin6_addr))[0..16], &b);
-			const fd = c.socket(c.AF_INET6, c.SOCK_STREAM, 0);
-			if (fd < 0) return null;
-			setTimeouts(fd);
-			if (c_connect(fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in6)) != 0) {
-				_ = c.close(fd);
-				return null;
-			}
-			return fd;
+			return @sizeOf(c.struct_sockaddr_in6);
 		},
+	}
+}
+
+// --- ECH-capability probe: the socket half (echprobe.zig has the protocol) ---
+
+const o_nonblock: c_int = @bitCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+
+/// Connect `fd` to `sa` before `deadline_at_ms` (monotonic): non-blocking
+/// connect + poll(POLLOUT) + SO_ERROR, the shape that bounds a dial on both
+/// Linux and Darwin (a blocking connect is not bounded by SO_SNDTIMEO on
+/// Darwin; see socks5/main.zig connectPolled). Back to blocking afterwards,
+/// with SO_RCVTIMEO/SO_SNDTIMEO set to what is left of the deadline as a
+/// backstop under probeFd's own polls.
+fn connectBounded(fd: c_int, sa: *const c.struct_sockaddr_storage, alen: c.socklen_t, deadline_at_ms: i64) bool {
+	const flags = std.c.fcntl(fd, std.c.F.GETFL);
+	if (flags < 0) return false;
+	if (std.c.fcntl(fd, std.c.F.SETFL, flags | o_nonblock) != 0) return false;
+	if (c_connect(fd, @ptrCast(sa), alen) != 0) {
+		const e = std.c._errno().*;
+		// EINTR leaves a non-blocking connect running in the background, so it
+		// is waited for exactly like EINPROGRESS.
+		if (e != c.EINPROGRESS and e != c.EINTR) return false;
+		while (true) {
+			const now = monotonicMs();
+			if (now >= deadline_at_ms) return false;
+			var pfd = [_]c.struct_pollfd{.{ .fd = fd, .events = c.POLLOUT, .revents = 0 }};
+			const pr = c.poll(&pfd, 1, @intCast(@min(deadline_at_ms - now, std.math.maxInt(c_int))));
+			if (pr < 0) {
+				if (std.c._errno().* == c.EINTR) continue;
+				return false;
+			}
+			if (pr == 0) return false;
+			break;
+		}
+		var so_error: c_int = 0;
+		var olen: c.socklen_t = @sizeOf(c_int);
+		if (c_getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, @ptrCast(&so_error), &olen) != 0 or so_error != 0) return false;
+	}
+	if (std.c.fcntl(fd, std.c.F.SETFL, flags) != 0) return false;
+	const now = monotonicMs();
+	if (now >= deadline_at_ms) return false;
+	const left = deadline_at_ms - now;
+	var tv: c.struct_timeval = .{ .tv_sec = @intCast(@divTrunc(left, 1000)), .tv_usec = @intCast(@mod(left, 1000) * 1000) };
+	if (c.setsockopt(fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval)) != 0) return false;
+	if (c.setsockopt(fd, c.SOL_SOCKET, c.SO_SNDTIMEO, &tv, @sizeOf(c.struct_timeval)) != 0) return false;
+	return true;
+}
+
+/// Probe one literal ip:port with `sni` and the guest-derived `shape`: a
+/// bounded connect, then echprobe.probeFd, all inside `deadline_at_ms`. Callers
+/// pass exactly the address a splice dialled (vet-then-pin: no resolution
+/// here). Any socket or connect failure, or the deadline, is
+/// unknown/connect_failed. The probe fd is always closed.
+pub fn echProbeAddr(ip: filter.IpAddr, port: u16, sni: []const u8, shape: *const tls.EchShape, entropy: []const u8, deadline_at_ms: i64) echprobe.Result {
+	const failed: echprobe.Result = .{ .outcome = .unknown, .detail = .connect_failed };
+	var storage: c.struct_sockaddr_storage = undefined;
+	const alen = sockaddrFor(ip, port, &storage);
+	const fd = c.socket(familyOf(ip), c.SOCK_STREAM, 0);
+	if (fd < 0) return failed;
+	defer _ = c.close(fd);
+	if (!connectBounded(fd, &storage, alen, deadline_at_ms)) return failed;
+	return echprobe.probeFd(fd, sni, shape, entropy, deadline_at_ms);
+}
+
+/// One ECH gate decision. `probed` is true only when this call ran a probe
+/// (not a cache hit, a wait on another connection's probe, or a refusal before
+/// any probe); `ms` is the time the call took.
+pub const GateResult = struct { result: echprobe.Result, probed: bool, ms: i64 };
+
+// The proxy-wide probe cache (echGate). Static: no allocator on this path.
+var ech_cache: echprobe.Cache = .{};
+
+/// The ECH gate against the proxy-wide cache. Does not log: the worker logs
+/// the decision (and one line per real probe).
+pub fn echGate(io: std.Io, ip: filter.IpAddr, port: u16, sni: []const u8, shape: *const tls.EchShape) GateResult {
+	return echGateWith(&ech_cache, io, ip, port, sni, shape);
+}
+
+/// The ECH gate against `cache`: a cached result, or a wait on another
+/// connection's probe of the same key (single-flight) or for a free in-flight
+/// slot (max_inflight), both bounded by wait_budget_ms, or a fresh probe with
+/// fresh entropy. Never cached: busy, pending_timeout, entropy (see
+/// echprobe.cacheTtlMs). Pass the result to echprobe.allowsSplice; nothing
+/// else decides.
+pub fn echGateWith(cache: *echprobe.Cache, io: std.Io, ip: filter.IpAddr, port: u16, sni: []const u8, shape: *const tls.EchShape) GateResult {
+	const start = monotonicMs();
+	// A shape tls.echShape would not have produced, or an SNI no key can hold,
+	// is refused before it can claim a slot.
+	const unsupported: GateResult = .{ .result = .{ .outcome = .unknown, .detail = .ech_unsupported }, .probed = false, .ms = 0 };
+	if (shape.payload_len == 0 or echprobe.entropyLen(shape) > echprobe.max_entropy_len) return unsupported;
+	const key = echprobe.Key.init(ip, port, sni, shape) orelse return unsupported;
+	while (true) {
+		const now = monotonicMs();
+		const claim = cache.lookupOrClaim(&key, now);
+		switch (claim) {
+			.hit => |r| return .{ .result = r, .probed = false, .ms = now - start },
+			// Wait rather than refuse at once: a page load opens many new
+			// spliced connections inside one probe RTT, and a burst over the
+			// cap should queue. The cap still bounds the probes running.
+			.pending, .busy => {
+				if (now - start >= echprobe.wait_budget_ms) {
+					const d: echprobe.Detail = if (claim == .busy) .busy else .pending_timeout;
+					return .{ .result = .{ .outcome = .unknown, .detail = d }, .probed = false, .ms = now - start };
+				}
+				_ = c.poll(null, 0, 10);
+			},
+			.claimed => |cl| {
+				var entropy_buf: [echprobe.max_entropy_len]u8 = undefined;
+				const entropy = entropy_buf[0..echprobe.entropyLen(shape)];
+				io.randomSecure(entropy) catch {
+					const r: echprobe.Result = .{ .outcome = .unknown, .detail = .entropy };
+					cache.complete(cl, &key, r, monotonicMs());
+					return .{ .result = r, .probed = false, .ms = monotonicMs() - start };
+				};
+				const r = echProbeAddr(ip, port, sni, shape, entropy, monotonicMs() + echprobe.probe_deadline_ms);
+				const end = monotonicMs();
+				cache.complete(cl, &key, r, end);
+				return .{ .result = r, .probed = true, .ms = end - start };
+			},
+		}
 	}
 }
 
@@ -1203,6 +1384,45 @@ fn logReject(orig: Orig, host: []const u8, reason: []const u8) void {
 	var ipbuf: [46]u8 = undefined;
 	const ips = formatIp(orig.addr, &ipbuf);
 	std.debug.print("l7proxy: reject host={s} orig={s}:{d} reason={s}\n", .{ host, ips, orig.port, reason });
+}
+
+/// The fixed tail of every ech-on-splice line. The client only ever sees a
+/// closed connection (Chromium: ERR_CONNECTION_CLOSED), so the log has to name
+/// ECH and both fixes. Logged in double quotes, so it holds none.
+pub const ech_reject_hint = "client sent an Encrypted ClientHello (ECH, GREASE included) to a host spliced on its cleartext SNI; turn ECH off in the client (Chromium policy EncryptedClientHelloEnabled=false, Playwright channel chromium) or have the host terminated (listed under allowed hosts, not passthrough)";
+comptime {
+	std.debug.assert(std.mem.indexOfScalar(u8, ech_reject_hint, '"') == null);
+}
+
+/// The splice-tier ECH refusal: `reason=ech-on-splice` (the token tests and
+/// operators grep for) plus the gate's outcome and detail, the address the
+/// gate probed (`upstream=-` when the hello was refused before any dial) and
+/// ech_reject_hint, quoted so a key=value reader sees where it ends.
+fn logEchReject(orig: Orig, host: []const u8, upstream: ?filter.IpAddr, r: echprobe.Result) void {
+	var ipbuf: [46]u8 = undefined;
+	const ips = formatIp(orig.addr, &ipbuf);
+	var upbuf: [64]u8 = undefined;
+	const ups = if (upstream) |ip| formatIpPort(ip, orig.port, &upbuf) else "-";
+	var alertbuf: [16]u8 = undefined;
+	std.debug.print("l7proxy: reject host={s} orig={s}:{d} reason=ech-on-splice ech={s} detail={s}{s} upstream={s} hint=\"{s}\"\n", .{ host, ips, orig.port, echprobe.outcomeName(r.outcome), echprobe.detailName(r.detail), alertField(r, &alertbuf), ups, ech_reject_hint });
+}
+
+/// One line per probe the gate actually ran (not per cache hit or wait).
+fn logEchProbe(sni: []const u8, ip: filter.IpAddr, port: u16, g: GateResult) void {
+	var upbuf: [64]u8 = undefined;
+	var alertbuf: [16]u8 = undefined;
+	std.debug.print("l7proxy: ech-probe host={s} upstream={s} result={s} detail={s}{s} ms={d}\n", .{ sni, formatIpPort(ip, port, &upbuf), echprobe.outcomeName(g.result.outcome), echprobe.detailName(g.result.detail), alertField(g.result, &alertbuf), g.ms });
+}
+
+/// ` alert=<n>` for an alert outcome, else empty.
+fn alertField(r: echprobe.Result, buf: []u8) []const u8 {
+	if (r.detail != .alert) return "";
+	return std.fmt.bufPrint(buf, " alert={d}", .{r.alert}) catch "";
+}
+
+fn formatIpPort(addr: filter.IpAddr, port: u16, buf: []u8) []const u8 {
+	var ipbuf: [46]u8 = undefined;
+	return std.fmt.bufPrint(buf, "{s}:{d}", .{ formatIp(addr, &ipbuf), port }) catch "?";
 }
 
 fn formatIp(addr: filter.IpAddr, buf: []u8) []const u8 {

@@ -47,9 +47,11 @@ const KNOWN_VERBS = [_][]const u8{
 	// providers), "__plugin-apply-preboot" (the launcher's per-pass live-apply
 	// housekeeping), "__unitplan" (the live apply's host unit plan for two
 	// toplevels, as text; checks.cogbox-vm phase LA compares it with a guest's
-	// dry-activate).
+	// dry-activate), "__ech-probe" (the l7proxy's ECH-capability probe against
+	// one ip:port + SNI, for operators and checks.l7-ech-probe-interop).
 	"__launch", "__l7proxy", "__render-rules", "enforce", "__divertshim",
 	"__claude-stub", "__authproxy", "__plugin-apply-preboot", "__unitplan",
+	"__ech-probe",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -123,6 +125,12 @@ pub fn main(init: std.process.Init) !void {
 		return;
 	}
 
+	// `__ech-probe <ip> <port> <sni> [alpn[,alpn...]]`: one GREASE-ECH probe of
+	// a literal address, exactly as the l7proxy runs it (no cache). It needs no
+	// instance and touches no config or state, so it runs before path
+	// resolution, like __unitplan.
+	if (std.mem.eql(u8, verb, "__ech-probe")) return echProbe(allocator, io, rest);
+
 	// Resolve XDG paths and check for legacy migration before dispatch.
 	var p = paths.resolve(allocator, io, env) catch |err| {
 		util.die(allocator, io, null, exit_codes.software, "failed to resolve paths: {s}", .{@errorName(err)});
@@ -195,7 +203,18 @@ pub fn main(init: std.process.Init) !void {
 			(std.fmt.parseInt(i32, v, 10) catch 300)
 		else
 			300;
-		return l7proxy_module.run(allocator, rest[0], base, accept_mode, listen_addr, funnel_all, peek_ms);
+		// COGBOX_L7_ECH_PROBE=1|on|true turns on the splice tier's
+		// ECH-capability probe. It is off by default, because a not-capable
+		// answer is evidence, not proof, that the server cannot decrypt ECH
+		// (docs/network-filtering.md, "Residual risk"). Off, every well-formed
+		// ECH hello to a host the proxy splices rather than terminates is
+		// refused before any dial (logged ech-on-splice ech=unknown
+		// detail=disabled); a malformed or oversized ECH extension is logged
+		// detail=ech-malformed or ech-unsupported, on or off. The startup line
+		// prints which (ech_probe=on|off). The probe draws its entropy from `io`
+		// (init.io), which run() keeps for the workers.
+		const ech_probe = echProbeSetting(env.get("COGBOX_L7_ECH_PROBE"));
+		return l7proxy_module.run(allocator, io, rest[0], base, accept_mode, listen_addr, funnel_all, peek_ms, ech_probe);
 	}
 	if (std.mem.eql(u8, verb, "__authproxy")) {
 		if (rest.len < 1) util.die(allocator, io, null, exit_codes.usage, "__authproxy requires a runtime dir [l7-base-port]", .{});
@@ -250,6 +269,59 @@ pub fn main(init: std.process.Init) !void {
 	if (std.mem.eql(u8, verb, "start")) return start_verb.run(allocator, io, env, &p, rest);
 
 	util.die(allocator, io, null, exit_codes.usage, "unknown verb '{s}'", .{verb});
+}
+
+/// COGBOX_L7_ECH_PROBE for __l7proxy. Fails closed: true only for 1, on or
+/// true (any case). Unset, empty, 0, off and false are off, and so is any other
+/// value -- with a warning, so a typo cannot pass for a setting.
+fn echProbeSetting(v: ?[]const u8) bool {
+	const s = v orelse return false;
+	for ([_][]const u8{ "1", "on", "true" }) |w| {
+		if (std.ascii.eqlIgnoreCase(s, w)) return true;
+	}
+	for ([_][]const u8{ "", "0", "off", "false" }) |w| {
+		if (std.ascii.eqlIgnoreCase(s, w)) return false;
+	}
+	std.debug.print("l7proxy: COGBOX_L7_ECH_PROBE='{s}' is not 1, on, true, 0, off or false; the ECH probe stays off\n", .{s});
+	return false;
+}
+
+/// `cogbox __ech-probe <ip> <port> <sni> [alpn[,alpn...]]`: send one GREASE
+/// ECH ClientHello (l7proxy echprobe.greaseShape) to the literal ip:port with
+/// that outer SNI, read through EncryptedExtensions, and print one line:
+/// `result=<outcome> detail=<detail>[ alert=<n>] ms=<elapsed>`. Exit 0 whenever
+/// a probe ran, whatever it found; 64 on a bad argument.
+fn echProbe(allocator: std.mem.Allocator, io: std.Io, rest: []const []const u8) !void {
+	const probe = l7proxy_module.echprobe;
+	const verb = "__ech-probe";
+	if (rest.len < 3 or rest.len > 4) util.die(allocator, io, verb, exit_codes.usage, "usage: cogbox __ech-probe <ip> <port> <sni> [alpn[,alpn...]]", .{});
+	const ip: filter_mod.IpAddr = if (filter_mod.parseIpv4(rest[0])) |b|
+		.{ .ipv4 = b }
+	else if (filter_mod.parseIpv6(rest[0])) |b|
+		.{ .ipv6 = b }
+	else
+		util.die(allocator, io, verb, exit_codes.usage, "'{s}' is not an IPv4 or IPv6 address", .{rest[0]});
+	const port = std.fmt.parseInt(u16, rest[1], 10) catch 0;
+	if (port == 0) util.die(allocator, io, verb, exit_codes.usage, "'{s}' is not a port (1-65535)", .{rest[1]});
+	const sni = rest[2];
+	if (sni.len > 255 or !filter_mod.isValidHostName(sni)) util.die(allocator, io, verb, exit_codes.usage, "'{s}' is not a valid host name", .{sni});
+
+	var random: [33]u8 = undefined;
+	io.randomSecure(&random) catch util.die(allocator, io, verb, exit_codes.software, "no secure entropy", .{});
+	const shape = probe.greaseShape(&random, if (rest.len == 4) rest[3] else "") orelse
+		util.die(allocator, io, verb, exit_codes.usage, "'{s}' is not a comma-separated ALPN list (names of 1-255 bytes)", .{rest[3]});
+	var entropy_buf: [probe.max_entropy_len]u8 = undefined;
+	const entropy = entropy_buf[0..probe.entropyLen(&shape)];
+	io.randomSecure(entropy) catch util.die(allocator, io, verb, exit_codes.software, "no secure entropy", .{});
+
+	const start = l7proxy_module.monotonicMs();
+	const r = l7proxy_module.echProbeAddr(ip, port, sni, &shape, entropy, start + probe.probe_deadline_ms);
+	const ms = l7proxy_module.monotonicMs() - start;
+	if (r.detail == .alert) {
+		try util.say(allocator, io, "result={s} detail={s} alert={d} ms={d}", .{ probe.outcomeName(r.outcome), probe.detailName(r.detail), r.alert, ms });
+	} else {
+		try util.say(allocator, io, "result={s} detail={s} ms={d}", .{ probe.outcomeName(r.outcome), probe.detailName(r.detail), ms });
+	}
 }
 
 fn isKnownVerb(s: []const u8) bool {

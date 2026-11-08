@@ -610,6 +610,12 @@
 			hasNixMcp = builtins.hasAttr system (nix-mcp.packages or {});
 		in [
 			./runtime/module.nix
+			# Browser defaults with ECH (and GREASE ECH) off, for every target: the
+			# host side refuses an ECH hello to any host it splices (unless the
+			# operator turned on its ECH-capability probe and the server answers
+			# not capable), so a guest browser without them fails on every such
+			# HTTPS host. checks.guest-browser-ech-off asserts the files.
+			./modules/guest-browser-ech-off.nix
 			# Declare the cogbox.* plugin-contribution option tree (the "brain"
 			# contract). Every plugin module fills in its slice; the base module
 			# below reads the merged config.cogbox and materializes it into each
@@ -5877,6 +5883,15 @@
 			# `packages.gce-image` builds this one. Memoized -- the other gce-image-*
 			# checks force this same toplevel.
 			gceResolverDefaultHostEvals = (builtins.tryEval gceToplevel.drvPath).success;
+			# The Go fixture behind checks.l7-ech-probe-interop (the probe verb
+			# against real TLS stacks) and checks.l7-ech-gate (the real l7proxy
+			# worker): tests/ech-probe-interop.
+			echProbeFixture = pkgs.buildGoModule {
+				pname = "cogbox-ech-probe-interop";
+				version = "0.1.0";
+				src = ./tests/ech-probe-interop;
+				vendorHash = null;
+			};
 		in lib.optionalAttrs ((mkHarnesses system pkgs) ? "hermes-agent") {
 			# Exercise the same helper used by the container state unit. There is no
 			# container boot harness in this repository, so retain one invocation check.
@@ -6631,6 +6646,61 @@
 				touch $out
 			'';
 
+			# The l7proxy's ECH-capability probe (zig/src/l7proxy/echprobe.zig),
+			# driven through `cogbox __ech-probe` against real Go crypto/tls
+			# servers: with ECH keys sent as retry configs (capable), without
+			# keys, with ALPN, the SendAsRetry=false residual (not-capable), keys
+			# chosen by ALPN (capable under h2, not under acme-tls/1), TLS 1.2, a
+			# group the probe does not offer, and silent and closing raw
+			# listeners; and against an OpenSSL s_server. The Zig unit tests share
+			# the key schedule with their fake server, so only a real TLS stack
+			# proves the handshake and the reading of retry_configs. Loopback
+			# only; no network.
+			l7-ech-probe-interop = pkgs.runCommand "cogbox-l7-ech-probe-interop" {
+				nativeBuildInputs = [ pkgs.openssl ];
+			} ''
+				export HOME=$TMPDIR
+				${echProbeFixture}/bin/ech-probe-interop ${self.packages.${system}.cogbox-tools}/bin/cogbox
+				touch $out
+			'';
+
+			# The splice-tier ECH gate through the real l7proxy worker: `cogbox
+			# __l7proxy` (from cogbox-tools), fed ECH hellos over its SOCKS5 front
+			# door by the same fixture's worker mode (tests/ech-probe-interop/
+			# worker.go) and checked on its log and on what each origin received.
+			# With COGBOX_L7_ECH_PROBE=1: GREASE to a server without ECH keys is
+			# spliced and then cached; a real ECH hello whose outer name is
+			# allowed but whose inner name is denied (the decoy-SNI hole) is
+			# probed capable and refused, also from the cache; the probe follows
+			# the address the proxy re-resolved and dialled, not the guest's
+			# SOCKS destination (a real ECH hello CONNECTed to the server without
+			# ECH keys, outer name resolving to the ECH one, is refused and
+			# reaches neither); a TLS 1.2 server is unknown and refused; an
+			# l7-denied name, a malformed extension and an L4-denied address are
+			# refused before any probe; and the cache keys on ALPN, so
+			# not-capable learned under acme-tls/1 never serves an h2 hello. Then
+			# the default (probe off) refuses every ECH hello before any dial,
+			# and an unrecognised switch value stays off with a warning. The unit
+			# tests have no worker-level harness and `__ech-probe` bypasses the
+			# worker, so only this proves the wiring. Runs in a private user +
+			# network + mount namespace (`unshare -rnm`): the origins sit on
+			# documentation addresses on lo, and the fixture binds its own
+			# /etc/hosts. So the builder must allow unprivileged user namespaces
+			# (not user.max_user_namespaces=0, not AppArmor's
+			# restrict_unprivileged_userns); on one that does not, the check
+			# fails saying so instead of passing without running.
+			l7-ech-gate = pkgs.runCommand "cogbox-l7-ech-gate" {
+				nativeBuildInputs = [ pkgs.util-linux pkgs.iproute2 ];
+			} ''
+				export HOME=$TMPDIR
+				if ! unshare -rnm true; then
+					echo "l7-ech-gate: this builder cannot create an unprivileged user + network + mount namespace (unshare -rnm); run the check on a builder that allows them" >&2
+					exit 1
+				fi
+				unshare -rnm ${echProbeFixture}/bin/ech-probe-interop worker ${self.packages.${system}.cogbox-tools}/bin/cogbox
+				touch $out
+			'';
+
 			# Reply-via-uplink policy routing (modules/guest-reply-route.nix) is
 			# VM-only: the container never imports it, so its closure is unchanged.
 			# Every VM profile must carry the networkd half on the uplink's generic
@@ -6685,6 +6755,50 @@
 						bad "${ruleset} names an interface; the uplink's name differs between profiles, match its link group"
 					fi
 				''}
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# Browser defaults with ECH off (modules/guest-browser-ech-off.nix) in
+			# every guest flavour. The host side refuses GREASE ECH to any host it
+			# splices rather than terminates (l7proxy `ech-on-splice`; its opt-in
+			# ECH-capability probe only rescues servers without ECH), so a guest
+			# browser without these files fails with a bare ERR_CONNECTION_CLOSED
+			# on every such HTTPS host while curl to it works. Paths and contents
+			# are literal needles, deliberately not imported from the module, so a
+			# renamed, dropped or edited file fails here. Forces only the small
+			# etc text files, never a toplevel.
+			guest-browser-ech-off = let
+				cfg = c: self.nixosConfigurations.${c}.config;
+				configs = [ (configName system) "${configName system}-hosted" "${configName system}-container" ];
+				policies = [
+					{ path = "chromium/policies/managed/cogbox-ech.json"; who = "nixpkgs chromium"; }
+					{ path = "opt/chrome/policies/managed/cogbox-ech.json"; who = "Google Chrome (Playwright channel 'chrome')"; }
+					{ path = "opt/chrome_for_testing/policies/managed/cogbox-ech.json"; who = "Chrome for Testing (Playwright channel 'chromium')"; }
+				];
+				ffPath = "firefox/defaults/pref/cogbox-ech.js";
+				ffLines = [
+					''pref("security.tls.ech.grease_probability", 0);''
+					''pref("network.dns.echconfig.enabled", false);''
+					''pref("network.dns.http3_echconfig.enabled", false);''
+				];
+				has = c: p: let etc = (cfg c).environment.etc; in etc ? ${p} && etc.${p}.enable;
+				src = c: p: (cfg c).environment.etc.${p}.source;
+				missing = c: p: who: ''
+					bad ${lib.escapeShellArg "${c} has no /etc/${p}; ${who} sends GREASE ECH and fails on every spliced HTTPS host"}
+				'';
+			in pkgs.runCommand "cogbox-guest-browser-ech-off" {
+				nativeBuildInputs = [ pkgs.jq pkgs.gnugrep ];
+			} ''
+				fails=0
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+				${lib.concatMapStrings (c: lib.concatMapStrings ({ path, who }: if !(has c path) then missing c path who else ''
+					jq -e '. == {"EncryptedClientHelloEnabled": false}' ${src c path} >/dev/null \
+						|| bad ${lib.escapeShellArg "${c}: /etc/${path} is not exactly {\"EncryptedClientHelloEnabled\": false}; ${who} keeps sending GREASE ECH"}
+				'') policies + (if !(has c ffPath) then missing c ffPath "Firefox" else lib.concatMapStrings (l: ''
+					grep -qxF ${lib.escapeShellArg l} ${src c ffPath} \
+						|| bad ${lib.escapeShellArg "${c}: /etc/${ffPath} lacks the line ${l} (Firefox keeps sending GREASE ECH)"}
+				'') ffLines)) configs}
 				[ "$fails" -eq 0 ] || exit 1
 				touch $out
 			'';
