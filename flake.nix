@@ -5228,7 +5228,11 @@
 					);
 					src = lib.cleanSource ./zig;
 				};
-				nativeBuildInputs = [ pkgs.zig ];
+				# Zig 0.16, not nixpkgs' default zig (0.17): this tree does not
+				# compile on 0.17 yet (0.17 drops --global-cache-dir and @cImport and
+				# rejects its `**` array-repeat expressions). Port it before nixpkgs
+				# drops zig_0_16. zig-tests and the darwin builds use the same version.
+				nativeBuildInputs = [ pkgs.zig_0_16 ];
 				dontConfigure = true;
 				dontInstall = true;
 				buildPhase = ''
@@ -6709,7 +6713,7 @@
 					);
 					src = lib.cleanSource ./zig;
 				};
-				nativeBuildInputs = [ pkgs.zig ];
+				nativeBuildInputs = [ pkgs.zig_0_16 ];
 				dontConfigure = true;
 				dontInstall = true;
 				buildPhase = ''
