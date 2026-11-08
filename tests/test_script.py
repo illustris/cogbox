@@ -54,22 +54,33 @@ machine.wait_for_open_port(9000)
 
 # Node-side helper for the L7 ECH regression tests (Phases K/L). Crafts a TLS
 # ClientHello carrying a cleartext SNI plus, optionally, an ECH extension
-# (0xfe0d) -- the GREASE ECH that Chrome/Chromium send on every handshake --
-# and pushes it through the proxy's SOCKS5 front door exactly like the guest
-# shim does. Usage: ech-hello.py <proxy_port> <dest_ip> <sni> <ech:0|1>.
-# Prints "socks-ok" once the proxy accepts the SOCKS connection. We don't
-# complete a real TLS handshake; the assertions read the proxy's decision off
-# its log. (curl/openssl never send ECH, so this is the only way to exercise
-# the ECH path in the VM.)
+# (0xfe0d) and pushes it through the proxy's SOCKS5 front door exactly like
+# the guest shim does. Usage:
+#   ech-hello.py <proxy_port> <dest_ip> <sni> <ech:0|1|grease>
+# 0 sends no ECH; 1 a malformed 1-byte stub ECH extension (refused without a
+# probe, detail=ech-malformed); grease a well-formed RFC 9849 GREASE outer
+# extension -- what Chrome/Chromium send on every TLS 1.3 handshake -- which
+# the splice tier refuses too unless its opt-in ECH-capability probe is on and
+# finds the upstream not capable. Prints "socks-ok" once the proxy
+# accepts the SOCKS connection. We don't complete a real TLS handshake; the
+# assertions read the proxy's decision off its log. (curl/openssl never send
+# ECH, so this is the only way to exercise the ECH path in the VM.)
 ech_hello_script = r'''
-import socket, struct, sys
-port = int(sys.argv[1]); dst = sys.argv[2]; sni = sys.argv[3].encode(); ech = sys.argv[4] == "1"
+import os, socket, struct, sys
+port = int(sys.argv[1]); dst = sys.argv[2]; sni = sys.argv[3].encode(); ech = sys.argv[4]
+assert ech in ("0", "1", "grease"), "ech must be 0, 1 or grease"
 def u16(x): return struct.pack(">H", x)
 sni_entry = b"\x00" + u16(len(sni)) + sni          # name_type host_name + name
 sni_list = u16(len(sni_entry)) + sni_entry
 exts = u16(0x0000) + u16(len(sni_list)) + sni_list  # server_name extension
-if ech:
+if ech == "1":
     exts += u16(0xfe0d) + u16(1) + b"\x00"          # stub ECH extension
+elif ech == "grease":
+    # ECHClientHello outer: type 0, HKDF-SHA256 / AES-128-GCM, a random
+    # config_id, a 32-byte enc and a 160-byte payload, all random.
+    outer = (b"\x00" + u16(0x0001) + u16(0x0001) + os.urandom(1)
+             + u16(32) + os.urandom(32) + u16(160) + os.urandom(160))
+    exts += u16(0xfe0d) + u16(len(outer)) + outer
 body = (b"\x03\x03" + b"\x00" * 32 + b"\x00"         # version + random + empty session_id
         + b"\x00\x02\x13\x01" + b"\x01\x00"          # one cipher suite + null compression
         + u16(len(exts)) + exts)
@@ -2773,10 +2784,13 @@ serve(80, handle_http)
     rc, out = gcurl("--resolve vhost-b.test:443:203.0.113.5 https://vhost-b.test/")
     assert rc != 0, f"vhost-b should be blocked again after del, rc={rc}"
 
-    # ECH on the passthrough/splice tier is REFUSED: routing trusts the
-    # cleartext SNI, so a real ECH could front a denied sibling. vhost-a is
-    # still allowed (passthrough), but an ECH-bearing hello for it must be
-    # dropped with the dedicated reason.
+    # ECH on the passthrough/splice tier: routing trusts the cleartext SNI, so
+    # a real ECH could front a denied sibling, and every ECH hello is refused.
+    # (The proxy's opt-in ECH-capability probe, COGBOX_L7_ECH_PROBE=1, would
+    # let one through to an upstream it finds not capable; it is off here, as
+    # by default, and checks.l7-ech-gate covers it turned on.) A malformed ECH
+    # extension (the 1-byte stub) is refused with the dedicated reason BEFORE
+    # any dial.
     wlog = "/run/user/1000/cogbox-work/cogbox.log"
     before = int(machine.succeed(f"wc -l < {wlog}").strip())
     out = machine.succeed(f"python3 /tmp/ech-hello.py {work_tls} 203.0.113.5 vhost-a.test 1")
@@ -2786,6 +2800,25 @@ serve(80, handle_http)
     )
     new = machine.succeed(f"tail -n +{before + 1} {wlog}")
     assert "host=vhost-a.test" in new, new
+    assert "detail=ech-malformed" in new, new
+    assert "upstream=-" in new, new
+    assert "hint=" in new and "EncryptedClientHelloEnabled=false" in new, new
+    assert "ech-probe host=vhost-a.test" not in new, f"stub ECH was probed: {new!r}"
+    # A well-formed GREASE ECH hello (what Chromium sends) is refused as well,
+    # through the launcher's default: the probe is off, so the refusal comes
+    # before any dial or probe, whatever the origin would have answered.
+    before = int(machine.succeed(f"wc -l < {wlog}").strip())
+    out = machine.succeed(f"python3 /tmp/ech-hello.py {work_tls} 203.0.113.5 vhost-a.test grease")
+    assert "socks-ok" in out, out
+    machine.wait_until_succeeds(
+        f"tail -n +{before + 1} {wlog} | grep ech-on-splice | grep -q detail=disabled", timeout=10
+    )
+    new = machine.succeed(f"tail -n +{before + 1} {wlog}")
+    assert "host=vhost-a.test" in new, new
+    assert "ech=unknown detail=disabled upstream=-" in new, new
+    assert "ech-probe" not in new, f"GREASE ECH was probed with the probe off: {new!r}"
+    full = machine.succeed(f"cat {wlog}")
+    assert "ech_probe=off" in full and "ech_probe=on" not in full, "the launcher's proxy should start with the ECH probe off"
     # A non-ECH hello for the same vhost is NOT refused for ECH (it proceeds to
     # the splice) -- proves the refusal keys on ECH, not on the host.
     before = int(machine.succeed(f"wc -l < {wlog}").strip())
@@ -2890,6 +2923,7 @@ with subtest("Phase L: L7 terminate tier (CA injection + Host/path enforcement)"
     # enter the terminate handoff -- NOT reject it as unclassifiable (the bug
     # this fix addresses) nor as ech-on-splice (that's the passthrough tier).
     # This is what unblocks Chrome's default GREASE ECH against a terminate vhost.
+    # The terminate tier never runs the ECH-capability probe either.
     wlog = "/run/user/1000/cogbox-work/cogbox.log"
     before = int(machine.succeed(f"wc -l < {wlog}").strip())
     out = machine.succeed(f"python3 /tmp/ech-hello.py {work_tls} 203.0.113.5 vhost-a.test 1")
@@ -2898,6 +2932,7 @@ with subtest("Phase L: L7 terminate tier (CA injection + Host/path enforcement)"
     new = machine.succeed(f"tail -n +{before + 1} {wlog}")
     assert "unclassifiable-or-no-sni" not in new, f"ECH hello wrongly rejected at SNI peek: {new!r}"
     assert "ech-on-splice" not in new, f"terminate vhost wrongly refused ECH: {new!r}"
+    assert "ech-probe" not in new, f"terminate vhost was ECH-probed: {new!r}"
 
     stop_instance("cc-work", name="work")
 

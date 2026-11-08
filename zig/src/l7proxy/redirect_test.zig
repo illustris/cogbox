@@ -9,7 +9,8 @@
 //     metadata address;
 //   - the classify-vs-raw-L4 boundary: 80/443 still classify (TLS/HTTP, ->
 //     terminate, not raw-L4); an unclassifiable flow on :443 is GATED, not
-//     auto-allowed; an ECH ClientHello is still refused on the splice tier.
+//     auto-allowed; an ECH ClientHello on the splice tier reaches the ECH
+//     gate, which refuses it unless the probe finds the server not capable.
 //
 // The redirect path takes NO CAP_NET_ADMIN: it binds a normal listener and
 // reads only SO_ORIGINAL_DST (no IP_TRANSPARENT, no getsockname, no fwmark).
@@ -20,6 +21,7 @@ const std = @import("std");
 const t = std.testing;
 const filter = @import("filter");
 const main = @import("main.zig");
+const tls = @import("tls.zig");
 
 // Own cImport so the tests can construct libc-ABI sockaddrs to feed the
 // kernel-sockaddr parser. The pointers cross into main as type-erased anyopaque,
@@ -168,7 +170,24 @@ test "rawL4Allowed: an instance with no hard-deny line is unchanged" {
 
 // Minimal single-record TLS ClientHello builder -- mirrors tls.zig's test
 // fixture so the classify path is exercised on real bytes over a real socket.
+// `with_ech` adds the 1-byte stub ECH extension (the malformed shape the VM
+// Phase K helper sends).
 fn buildHello(buf: []u8, server_name: []const u8, with_ech: bool) []u8 {
+	return buildHelloEch(buf, server_name, if (with_ech) .stub else .none);
+}
+
+const EchKind = enum { none, stub, grease };
+
+// The GREASE variant's fields, which the echShape assertions read back.
+const grease_config_id: u8 = 0x2a;
+const grease_enc_len: usize = 32;
+const grease_payload_len: usize = 160;
+
+/// buildHello with a choice of ECH extension: none, the 1-byte stub, or a
+/// well-formed RFC 9849 section 6.2 GREASE outer extension (type 0, HKDF-SHA256
+/// / AES-128-GCM, a config_id, a 32-byte enc, a 160-byte payload) -- what
+/// Chromium sends.
+fn buildHelloEch(buf: []u8, server_name: []const u8, ech_kind: EchKind) []u8 {
 	var hs: [1024]u8 = undefined;
 	var n: usize = 0;
 	hs[n] = 0x03;
@@ -209,15 +228,45 @@ fn buildHello(buf: []u8, server_name: []const u8, with_ech: bool) []u8 {
 		@memcpy(hs[n .. n + server_name.len], server_name);
 		n += server_name.len;
 	}
-	if (with_ech) {
-		hs[n] = 0xfe;
-		hs[n + 1] = 0x0d;
-		n += 2; // ext type ECH
-		hs[n] = 0x00;
-		hs[n + 1] = 0x01;
-		n += 2; // ext data len 1
-		hs[n] = 0x00;
-		n += 1;
+	switch (ech_kind) {
+		.none => {},
+		.stub => {
+			hs[n] = 0xfe;
+			hs[n + 1] = 0x0d;
+			n += 2; // ext type ECH
+			hs[n] = 0x00;
+			hs[n + 1] = 0x01;
+			n += 2; // ext data len 1
+			hs[n] = 0x00;
+			n += 1;
+		},
+		.grease => {
+			const ext_len = 1 + 2 + 2 + 1 + 2 + grease_enc_len + 2 + grease_payload_len;
+			hs[n] = 0xfe;
+			hs[n + 1] = 0x0d;
+			hs[n + 2] = @intCast(ext_len >> 8);
+			hs[n + 3] = @intCast(ext_len & 0xff);
+			n += 4; // ext type ECH + ext data len
+			hs[n] = 0x00;
+			n += 1; // ECHClientHelloType outer
+			hs[n] = 0x00;
+			hs[n + 1] = 0x01;
+			hs[n + 2] = 0x00;
+			hs[n + 3] = 0x01;
+			n += 4; // kdf HKDF-SHA256, aead AES-128-GCM
+			hs[n] = grease_config_id;
+			n += 1;
+			hs[n] = 0x00;
+			hs[n + 1] = @intCast(grease_enc_len);
+			n += 2;
+			@memset(hs[n .. n + grease_enc_len], 0x5a);
+			n += grease_enc_len; // enc
+			hs[n] = 0x00;
+			hs[n + 1] = @intCast(grease_payload_len);
+			n += 2;
+			@memset(hs[n .. n + grease_payload_len], 0xa5);
+			n += grease_payload_len; // payload
+		},
 	}
 	const ext_total = n - ext_start;
 	hs[ext_len_pos] = @intCast((ext_total >> 8) & 0xff);
@@ -434,25 +483,86 @@ test "classify: malformed TLS is still .deny (never .no_sni)" {
 	try t.expect(cl3 == .deny);
 }
 
-test "classify: an ECH ClientHello is still refused on the splice tier" {
+// The splice-tier ECH gate. The worker refuses an ECH-bearing hello unless
+// tls.echShape reads it as .ok, the probe is on, and echprobe.allowsSplice
+// holds for the probe of the address the splice connected to. As with the
+// no-SNI arm there is no worker-level socket harness here, so the gate is
+// proven piecewise: classification + shape here, the probe and the cache in
+// echprobe_test.zig, and the wired worker (the real `cogbox __l7proxy`) in
+// checks.l7-ech-gate (every outcome, the default-off switch, the ALPN cache
+// key) and the VM test's Phase K (the default, through the launcher).
+
+test "ech gate: the 1-byte stub ECH hello is .tls with ech set, and its shape is malformed" {
 	var raw: [1200]u8 = undefined;
-	const hello = buildHello(&raw, "app.example.com", true); // GREASE/real ECH present
+	const hello = buildHelloEch(&raw, "app.example.com", .stub);
 	var oh: [256]u8 = undefined;
 	var op: [2048]u8 = undefined;
 	var os: [256]u8 = undefined;
 	const cl = classifyBytes(hello, &oh, &op, &os);
 	try t.expect(cl == .tls);
 	try t.expect(cl.tls.ech); // ECH flagged for the worker
+	// .malformed: the worker refuses it (detail=ech-malformed) before any dial
+	// or probe.
+	var shape: tls.EchShape = undefined;
+	try t.expectEqual(tls.EchShapeResult.malformed, tls.echShape(hello, &shape));
+}
 
-	// On the splice (passthrough) tier the worker refuses an ECH-bearing hello:
-	// the production condition is `is_tls and ech and !needs_term`. A passthrough
-	// host's needsTerminate is false, so the refusal holds.
-	var rs: filter.L7RuleSet = .{};
-	filter.parseL7Rules("mode passthrough\nallow app.example.com", &rs);
-	const needs_term = rs.needsTerminate("app.example.com");
-	try t.expect(!needs_term);
-	const is_tls = true;
-	try t.expect(is_tls and cl.tls.ech and !needs_term);
+test "ech gate: a well-formed GREASE ECH hello is .tls with ech set, and its shape is ok" {
+	var raw: [1200]u8 = undefined;
+	const hello = buildHelloEch(&raw, "app.example.com", .grease);
+	var oh: [256]u8 = undefined;
+	var op: [2048]u8 = undefined;
+	var os: [256]u8 = undefined;
+	const cl = classifyBytes(hello, &oh, &op, &os);
+	try t.expect(cl == .tls);
+	try t.expectEqualStrings("app.example.com", cl.tls.name);
+	try t.expect(cl.tls.ech);
+	// .ok: the worker dials, then probes with this shape.
+	var shape: tls.EchShape = undefined;
+	try t.expectEqual(tls.EchShapeResult.ok, tls.echShape(hello, &shape));
+	try t.expectEqual(@as(u16, 0x0001), shape.kdf_id);
+	try t.expectEqual(@as(u16, 0x0001), shape.aead_id);
+	try t.expectEqual(grease_config_id, shape.config_id);
+	try t.expectEqual(@as(u16, grease_enc_len), shape.enc_len);
+	try t.expectEqual(@as(u16, grease_payload_len), shape.payload_len);
+	try t.expectEqual(@as(u16, 0), shape.alpn_len);
+	// The no-ECH hello still reads as no ECH at all.
+	const plain = buildHelloEch(&raw, "app.example.com", .none);
+	try t.expectEqual(tls.EchShapeResult.malformed, tls.echShape(plain, &shape));
+}
+
+test "ech gate: passthrough and unlisted hosts reach the splice-tier gate" {
+	// A host the worker terminates never reaches the gate (mitmproxy is the
+	// endpoint). needsTerminate is false for a passthrough host AND for an
+	// unlisted one under the default terminate mode -- no_match is never
+	// terminated -- so both are gated.
+	var pt: filter.L7RuleSet = .{};
+	filter.parseL7Rules("mode passthrough\nallow app.example.com", &pt);
+	try t.expect(!pt.needsTerminate("app.example.com"));
+	var term: filter.L7RuleSet = .{};
+	filter.parseL7Rules("allow app.example.com", &term);
+	try t.expect(term.mode_terminate);
+	try t.expect(term.needsTerminate("app.example.com")); // terminated: not gated
+	try t.expect(!term.needsTerminate("unlisted.example.com"));
+}
+
+test "ech gate: only not_capable lets an ECH hello through" {
+	const probe = main.echprobe;
+	for (std.enums.values(probe.Detail)) |d| {
+		try t.expect(!probe.allowsSplice(.{ .outcome = .capable, .detail = d }));
+		try t.expect(!probe.allowsSplice(.{ .outcome = .unknown, .detail = d }));
+	}
+	// The refusals the worker makes before any probe are unknown, so they
+	// refuse too.
+	for ([_]probe.Detail{ .ech_malformed, .ech_unsupported, .disabled }) |d|
+		try t.expect(!probe.allowsSplice(.{ .outcome = .unknown, .detail = d }));
+	try t.expect(probe.allowsSplice(.{ .outcome = .not_capable, .detail = .ee_without_ech }));
+	// The hint on every ech-on-splice line names ECH and both fixes.
+	try t.expect(std.mem.indexOf(u8, main.ech_reject_hint, "Encrypted ClientHello (ECH") != null);
+	try t.expect(std.mem.indexOf(u8, main.ech_reject_hint, "EncryptedClientHelloEnabled=false") != null);
+	try t.expect(std.mem.indexOf(u8, main.ech_reject_hint, "have the host terminated (listed under allowed hosts, not passthrough)") != null);
+	// It is logged in double quotes, so it must hold none.
+	try t.expect(std.mem.indexOfScalar(u8, main.ech_reject_hint, '"') == null);
 }
 
 test "peek: COGBOX_L7_PEEK_MS override is clamped both directions" {
