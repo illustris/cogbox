@@ -138,7 +138,6 @@ in
 				fileSystems."/".autoResize = true;
 			};
 			boot.loader.grub.enable = true;
-			boot.initrd.systemd.enable = true;
 			# TEST ONLY: GRUB's messages on the serial console, before the
 			# shipped guard text (which is otherwise exactly the file).
 			boot.loader.grub.extraConfig = lib.mkBefore ''
