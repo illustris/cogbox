@@ -611,10 +611,11 @@
 		in [
 			./runtime/module.nix
 			# Browser defaults with ECH (and GREASE ECH) off, for every target: the
-			# host side refuses an ECH hello to any host it splices (unless the
-			# operator turned on its ECH-capability probe and the server answers
-			# not capable), so a guest browser without them fails on every such
-			# HTTPS host. checks.guest-browser-ech-off asserts the files.
+			# host side refuses an ECH hello to any host it splices unless its
+			# ECH-capability probe (on unless the operator turned it off) finds
+			# the server not capable, so a guest browser without them fails on
+			# every such HTTPS host whose server takes ECH (or on every one, with
+			# the probe off). checks.guest-browser-ech-off asserts the files.
 			./modules/guest-browser-ech-off.nix
 			# Declare the cogbox.* plugin-contribution option tree (the "brain"
 			# contract). Every plugin module fills in its slice; the base module
@@ -6668,27 +6669,28 @@
 			# __l7proxy` (from cogbox-tools), fed ECH hellos over its SOCKS5 front
 			# door by the same fixture's worker mode (tests/ech-probe-interop/
 			# worker.go) and checked on its log and on what each origin received.
-			# With COGBOX_L7_ECH_PROBE=1: GREASE to a server without ECH keys is
-			# spliced and then cached; a real ECH hello whose outer name is
-			# allowed but whose inner name is denied (the decoy-SNI hole) is
-			# probed capable and refused, also from the cache; the probe follows
-			# the address the proxy re-resolved and dialled, not the guest's
-			# SOCKS destination (a real ECH hello CONNECTed to the server without
-			# ECH keys, outer name resolving to the ECH one, is refused and
-			# reaches neither); a TLS 1.2 server is unknown and refused; an
-			# l7-denied name, a malformed extension and an L4-denied address are
-			# refused before any probe; and the cache keys on ALPN, so
-			# not-capable learned under acme-tls/1 never serves an h2 hello. Then
-			# the default (probe off) refuses every ECH hello before any dial,
-			# and an unrecognised switch value stays off with a warning. The unit
-			# tests have no worker-level harness and `__ech-probe` bypasses the
-			# worker, so only this proves the wiring. Runs in a private user +
-			# network + mount namespace (`unshare -rnm`): the origins sit on
-			# documentation addresses on lo, and the fixture binds its own
-			# /etc/hosts. So the builder must allow unprivileged user namespaces
-			# (not user.max_user_namespaces=0, not AppArmor's
-			# restrict_unprivileged_userns); on one that does not, the check
-			# fails saying so instead of passing without running.
+			# With the probe on (the default: unset, empty, or an on spelling):
+			# GREASE to a server without ECH keys is spliced and then cached; a
+			# real ECH hello whose outer name is allowed but whose inner name is
+			# denied (the decoy-SNI hole) is probed capable and refused, also from
+			# the cache; the probe follows the address the proxy re-resolved and
+			# dialled, not the guest's SOCKS destination (a real ECH hello
+			# CONNECTed to the server without ECH keys, outer name resolving to
+			# the ECH one, is refused and reaches neither); a TLS 1.2 server is
+			# unknown and refused; an l7-denied name, a malformed extension and an
+			# L4-denied address are refused before any probe; and the cache keys
+			# on ALPN, so not-capable learned under acme-tls/1 never serves an h2
+			# hello. Then the kill switch (0, off, false in any case) refuses
+			# every ECH hello before any dial, empty and the on spellings stay on,
+			# and an unrecognised value ('yes', 'enable') is off with a warning.
+			# The unit tests have no worker-level harness and `__ech-probe`
+			# bypasses the worker, so only this proves the wiring. Runs in a
+			# private user + network + mount namespace (`unshare -rnm`): the
+			# origins sit on documentation addresses on lo, and the fixture binds
+			# its own /etc/hosts. So the builder must allow unprivileged user
+			# namespaces (not user.max_user_namespaces=0, not AppArmor's
+			# restrict_unprivileged_userns); on one that does not, the check fails
+			# saying so instead of passing without running.
 			l7-ech-gate = pkgs.runCommand "cogbox-l7-ech-gate" {
 				nativeBuildInputs = [ pkgs.util-linux pkgs.iproute2 ];
 			} ''
@@ -6761,13 +6763,13 @@
 
 			# Browser defaults with ECH off (modules/guest-browser-ech-off.nix) in
 			# every guest flavour. The host side refuses GREASE ECH to any host it
-			# splices rather than terminates (l7proxy `ech-on-splice`; its opt-in
-			# ECH-capability probe only rescues servers without ECH), so a guest
-			# browser without these files fails with a bare ERR_CONNECTION_CLOSED
-			# on every such HTTPS host while curl to it works. Paths and contents
-			# are literal needles, deliberately not imported from the module, so a
-			# renamed, dropped or edited file fails here. Forces only the small
-			# etc text files, never a toplevel.
+			# splices rather than terminates (l7proxy `ech-on-splice`; its
+			# ECH-capability probe, on by default, only rescues servers without
+			# ECH), so a guest browser without these files fails with a bare
+			# ERR_CONNECTION_CLOSED on every such HTTPS host while curl to it
+			# works. Paths and contents are literal needles, deliberately not
+			# imported from the module, so a renamed, dropped or edited file
+			# fails here. Forces only the small etc text files, never a toplevel.
 			guest-browser-ech-off = let
 				cfg = c: self.nixosConfigurations.${c}.config;
 				configs = [ (configName system) "${configName system}-hosted" "${configName system}-container" ];
@@ -6785,7 +6787,7 @@
 				has = c: p: let etc = (cfg c).environment.etc; in etc ? ${p} && etc.${p}.enable;
 				src = c: p: (cfg c).environment.etc.${p}.source;
 				missing = c: p: who: ''
-					bad ${lib.escapeShellArg "${c} has no /etc/${p}; ${who} sends GREASE ECH and fails on every spliced HTTPS host"}
+					bad ${lib.escapeShellArg "${c} has no /etc/${p}; ${who} sends GREASE ECH and fails on every spliced HTTPS host whose server takes ECH (every one with the probe off)"}
 				'';
 			in pkgs.runCommand "cogbox-guest-browser-ech-off" {
 				nativeBuildInputs = [ pkgs.jq pkgs.gnugrep ];

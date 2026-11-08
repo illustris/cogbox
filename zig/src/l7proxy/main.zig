@@ -166,9 +166,10 @@ var conn_count = std.atomic.Value(usize).init(0);
 
 // The ECH gate's process-wide inputs, set once in run() before any accept
 // loop starts (workers only read them): the Io the probe draws its entropy
-// from, and whether the probe may run at all. Off unless the operator set
-// COGBOX_L7_ECH_PROBE=1 (the CLI reads it): off, every ECH hello on the splice
-// tier is refused, as before the probe existed.
+// from, and whether the probe may run at all. On unless the operator set the
+// kill switch COGBOX_L7_ECH_PROBE=0 (the CLI reads it; a value it does not
+// know is off too): off, every ECH hello on the splice tier is refused, as
+// before the probe existed. The initial false only matters before run().
 var ech_io: std.Io = undefined;
 var ech_probe_enabled: bool = false;
 
@@ -651,8 +652,8 @@ fn worker(client_fd: c_int) void {
 	// (Go SendAsRetry=false, OpenSSL keys loaded no-retry, a split-mode
 	// frontend) or a load-balanced frontend whose probe and connection land on
 	// different machines can still decrypt real ECH -- the residual
-	// docs/network-filtering.md states, and the reason the probe runs only
-	// when the operator opted in (COGBOX_L7_ECH_PROBE=1).
+	// docs/network-filtering.md states, accepted on 2026-11-08 when the probe
+	// went on by default (the operator's kill switch: COGBOX_L7_ECH_PROBE=0).
 	// Everything else (capable, any probe error, a hello the probe cannot
 	// mirror, the probe off) is refused, logged reason=ech-on-splice
 	// with the outcome and a hint naming the fix. The terminate tier never gets

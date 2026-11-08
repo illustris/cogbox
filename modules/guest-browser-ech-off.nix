@@ -5,14 +5,14 @@
 # Why: the host-side l7proxy refuses a ClientHello that carries an ECH
 # extension for every host it splices rather than terminates (unlisted hosts,
 # --passthrough, `l7 mode passthrough`, the harness API hosts; logged
-# `ech-on-splice`). Its ECH-capability probe, which lets ECH through to a
-# server that does not take it (servers behind Cloudflare always do), is off
-# unless the operator sets COGBOX_L7_ECH_PROBE=1. The splice routes on
-# the cleartext outer SNI, and a real ECH hello can name an allowed outer host
-# while the encrypted inner one is denied. Chromium-family browsers and Firefox
-# send a GREASE ECH extension on every TLS 1.3 handshake, so without these
-# files a guest browser fails with a bare ERR_CONNECTION_CLOSED on every
-# refused HTTPS host that curl reaches.
+# `ech-on-splice`). Its ECH-capability probe lets ECH through only to a
+# server that does not take it (servers behind Cloudflare always do); it is on
+# unless the operator sets the kill switch COGBOX_L7_ECH_PROBE=0. The splice
+# routes on the cleartext outer SNI, and a real ECH hello can name an allowed
+# outer host while the encrypted inner one is denied. Chromium-family browsers
+# and Firefox send a GREASE ECH extension on every TLS 1.3 handshake, so
+# without these files a guest browser fails with a bare ERR_CONNECTION_CLOSED
+# on every refused HTTPS host that curl reaches.
 #
 # Who reads what (the policy directory is compiled into each build):
 # - /etc/chromium/policies/managed: nixpkgs chromium.
@@ -32,8 +32,10 @@
 #
 # Not covered: chrome-headless-shell, Playwright's DEFAULT headless browser,
 # has no policy loader and always sends GREASE ECH; nothing in the guest can
-# reach it. Launch Playwright with channel 'chromium' (or 'chrome') instead,
-# or list the host under allowed hosts so it is terminated.
+# reach it. The host's ECH probe (on by default) lets it through to spliced
+# servers without ECH; for the rest, launch Playwright with channel 'chromium'
+# (or 'chrome') instead, or list the host under allowed hosts so it is
+# terminated.
 #
 # Precedence: Chromium merges every file in managed/ and the lexicographically
 # LAST file wins a key conflict. cogbox-ech.json sorts before default.json and

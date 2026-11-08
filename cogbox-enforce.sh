@@ -162,12 +162,14 @@ start_l7mitm() {
 # classification peek for raw-L4-allowed flows, so a silent server-speaks-first
 # client (SSH/SMTP/...) doesn't stall on the general I/O timeout before its flow
 # falls through to the raw-L4 splice. Left unset here to use the built-in default.
-# COGBOX_L7_ECH_PROBE=1 turns on the ECH-capability probe, which lets an
-# ECH-bearing ClientHello to a spliced (not terminated) host through when the
-# server answers it as not ECH-capable (evidence, not proof: see
-# docs/network-filtering.md). Unset, every such hello is refused as
+# The ECH-capability probe, which lets an ECH-bearing ClientHello to a spliced
+# (not terminated) host through when the server answers it as not ECH-capable
+# (evidence, not proof: see docs/network-filtering.md), is ON by default.
+# COGBOX_L7_ECH_PROBE=0 (or off, false) is its kill switch, and any value the
+# proxy does not know turns it off too: then every such hello is refused as
 # ech-on-splice. Left unset here, like the peek tuning: the proxy sees it only
-# if the pod's environment carries it.
+# if the pod's environment carries it, and no control-plane setting puts it
+# there today.
 start_l7proxy() {
 	@cogbox@ __l7proxy "$RUNTIME" "$BASE" &
 	L7PROXY_PID=$!

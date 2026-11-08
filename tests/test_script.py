@@ -13,15 +13,17 @@ def probe(name, ip):
     return as_user(f"cogbox ssh {name_arg}{shlex.quote(remote)}")
 
 
-def boot_and_wait(unit, args, ssh_port):
+def boot_and_wait(unit, args, ssh_port, env=""):
     # `cogbox start --no-ssh` daemonizes the VM (passt + QEMU) itself and
     # returns once QEMU has come up, WITHOUT opening an interactive SSH session
     # (which would block this command forever). The auto-ssh default is covered
     # separately in Phase J. The daemon is setsid'd into its own session, so it
     # survives this command and is torn down later by `cogbox stop`. The `unit`
-    # arg is kept for call-site compatibility but is now unused.
+    # arg is kept for call-site compatibility but is now unused. `env` is a
+    # VAR=value prefix for the start command (the launcher and the proxies it
+    # spawns inherit it), e.g. Phase M's ECH-probe kill switch.
     _ = unit
-    machine.succeed(as_user(f"cogbox start --no-ssh {args}".strip()))
+    machine.succeed(as_user(f"{env} cogbox start --no-ssh {args}".strip()))
     machine.wait_until_succeeds(
         as_user(f"ssh {SSH_OPTS} -p {ssh_port} root@127.0.0.1 true"),
         timeout=600,
@@ -60,11 +62,12 @@ machine.wait_for_open_port(9000)
 # 0 sends no ECH; 1 a malformed 1-byte stub ECH extension (refused without a
 # probe, detail=ech-malformed); grease a well-formed RFC 9849 GREASE outer
 # extension -- what Chrome/Chromium send on every TLS 1.3 handshake -- which
-# the splice tier refuses too unless its opt-in ECH-capability probe is on and
-# finds the upstream not capable. Prints "socks-ok" once the proxy
-# accepts the SOCKS connection. We don't complete a real TLS handshake; the
-# assertions read the proxy's decision off its log. (curl/openssl never send
-# ECH, so this is the only way to exercise the ECH path in the VM.)
+# the splice tier refuses too unless its ECH-capability probe (on by default;
+# COGBOX_L7_ECH_PROBE=0 is the kill switch) finds the upstream not capable.
+# Prints "socks-ok" once the proxy accepts the SOCKS connection. We don't
+# complete a real TLS handshake; the assertions read the proxy's decision off
+# its log (and the origin's TLS log). (curl/openssl never send ECH, so this is
+# the only way to exercise the ECH path in the VM.)
 ech_hello_script = r'''
 import os, socket, struct, sys
 port = int(sys.argv[1]); dst = sys.argv[2]; sni = sys.argv[3].encode(); ech = sys.argv[4]
@@ -2614,16 +2617,23 @@ with subtest("Phase K: L7 vhost filtering (passthrough tier)"):
     # Origin: HTTPS on :443 + HTTP on :80, both bound to 203.0.113.5. Each
     # request's Host is appended to a hit log; the proxy only ever connects
     # here for an ALLOWED vhost, so the log is the ground truth for which
-    # vhosts actually reached a backend.
+    # vhosts actually reached a backend. Every :443 connection also appends
+    # one line to a TLS log BEFORE the handshake, once its first byte arrives
+    # ("tls data"), or it closes ("tls eof"), fails ("tls error") or stays
+    # silent ("tls timeout") first: a ClientHello the origin cannot complete
+    # (the ECH legs' crafted hellos) never reaches the hit log, but it does
+    # reach this one.
     origin_script = r'''
 import socket, ssl, threading
 ORIGIN = "203.0.113.5"
 HITLOG = "/tmp/origin-hits.log"
+TLSLOG = "/tmp/origin-tls.log"
 open(HITLOG, "w").close()
+open(TLSLOG, "w").close()
 lock = threading.Lock()
-def loghit(s):
+def loghit(s, path=HITLOG):
     with lock:
-        with open(HITLOG, "a") as f:
+        with open(path, "a") as f:
             f.write(s + "\n")
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain("/tmp/origin.pem")
@@ -2644,6 +2654,15 @@ def respond(conn, scheme):
     conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
                  % (len(body), body))
 def handle_tls(raw):
+    try:
+        raw.settimeout(10)
+        first = "data" if raw.recv(1, socket.MSG_PEEK) else "eof"
+    except socket.timeout:
+        first = "timeout"
+    except OSError:
+        first = "error"
+    raw.settimeout(None)
+    loghit("tls " + first, TLSLOG)
     try:
         c = ctx.wrap_socket(raw, server_side=True)
     except Exception:
@@ -2785,12 +2804,13 @@ serve(80, handle_http)
     assert rc != 0, f"vhost-b should be blocked again after del, rc={rc}"
 
     # ECH on the passthrough/splice tier: routing trusts the cleartext SNI, so
-    # a real ECH could front a denied sibling, and every ECH hello is refused.
-    # (The proxy's opt-in ECH-capability probe, COGBOX_L7_ECH_PROBE=1, would
-    # let one through to an upstream it finds not capable; it is off here, as
-    # by default, and checks.l7-ech-gate covers it turned on.) A malformed ECH
-    # extension (the 1-byte stub) is refused with the dedicated reason BEFORE
-    # any dial.
+    # a real ECH could front a denied sibling, and an ECH hello is refused
+    # unless the proxy's ECH-capability probe -- on here, as by default --
+    # finds the upstream it dialled not capable. (checks.l7-ech-gate covers
+    # every outcome and every spelling of the COGBOX_L7_ECH_PROBE kill switch;
+    # Phase M boots with the switch set, through the launcher.) A malformed
+    # ECH extension (the 1-byte stub) is refused with the dedicated reason
+    # BEFORE any dial or probe, probe on or off.
     wlog = "/run/user/1000/cogbox-work/cogbox.log"
     before = int(machine.succeed(f"wc -l < {wlog}").strip())
     out = machine.succeed(f"python3 /tmp/ech-hello.py {work_tls} 203.0.113.5 vhost-a.test 1")
@@ -2804,21 +2824,37 @@ serve(80, handle_http)
     assert "upstream=-" in new, new
     assert "hint=" in new and "EncryptedClientHelloEnabled=false" in new, new
     assert "ech-probe host=vhost-a.test" not in new, f"stub ECH was probed: {new!r}"
-    # A well-formed GREASE ECH hello (what Chromium sends) is refused as well,
-    # through the launcher's default: the probe is off, so the refusal comes
-    # before any dial or probe, whatever the origin would have answered.
+    # A well-formed GREASE ECH hello (what Chromium and chrome-headless-shell
+    # send) through the launcher's default, which leaves the probe on: the
+    # proxy dials the origin, probes that address with the hello's outer SNI,
+    # and splices. This origin (python3's ssl over OpenSSL, no ECH keys)
+    # answers EncryptedExtensions without ECH: not-capable.
     before = int(machine.succeed(f"wc -l < {wlog}").strip())
+    tls_before = int(machine.succeed("wc -l < /tmp/origin-tls.log").strip())
     out = machine.succeed(f"python3 /tmp/ech-hello.py {work_tls} 203.0.113.5 vhost-a.test grease")
     assert "socks-ok" in out, out
     machine.wait_until_succeeds(
-        f"tail -n +{before + 1} {wlog} | grep ech-on-splice | grep -q detail=disabled", timeout=10
+        f"tail -n +{before + 1} {wlog} | grep -q "
+        "'ech-probe host=vhost-a.test upstream=203.0.113.5:443 result=not-capable detail=ee-without-ech'",
+        timeout=10,
     )
+    # The splice, positively: two connections reached the origin and both
+    # carried a hello -- the probe's, and the guest's own, which the proxy
+    # writes to the connection it dialled before probing only once the probe
+    # allows it. A not-capable answer followed by a dropped flow would leave
+    # that first connection "tls eof".
+    machine.wait_until_succeeds(
+        f"test $(tail -n +{tls_before + 1} /tmp/origin-tls.log | grep -c '^tls data$') -eq 2",
+        timeout=10,
+    )
+    machine.succeed("sleep 1")
     new = machine.succeed(f"tail -n +{before + 1} {wlog}")
-    assert "host=vhost-a.test" in new, new
-    assert "ech=unknown detail=disabled upstream=-" in new, new
-    assert "ech-probe" not in new, f"GREASE ECH was probed with the probe off: {new!r}"
+    assert "ech-on-splice" not in new, f"GREASE ECH to an origin without ECH keys was refused with the probe on: {new!r}"
+    tls_new = machine.succeed(f"tail -n +{tls_before + 1} /tmp/origin-tls.log").splitlines()
+    assert tls_new == ["tls data", "tls data"], f"the probe plus one spliced hello should reach the origin: {tls_new!r}"
     full = machine.succeed(f"cat {wlog}")
-    assert "ech_probe=off" in full and "ech_probe=on" not in full, "the launcher's proxy should start with the ECH probe off"
+    assert "ech_probe=on" in full and "ech_probe=off" not in full, "the launcher's proxy should start with the ECH probe on (the default)"
+    assert "COGBOX_L7_ECH_PROBE=" not in full, f"the launcher's proxy warned about a probe setting nothing set: {full!r}"
     # A non-ECH hello for the same vhost is NOT refused for ECH (it proceeds to
     # the splice) -- proves the refusal keys on ECH, not on the host.
     before = int(machine.succeed(f"wc -l < {wlog}").strip())
@@ -2941,6 +2977,10 @@ with subtest("Phase M: terminate-by-default + --passthrough + --insecure-upstrea
     # three behaviors: (A) a bare allow is MITM'd -> 502 (upstream verify fails);
     # (B) --passthrough opts back out -> end-to-end TLS, curl -k reaches it (200);
     # (C) --insecure-upstream stays terminate but skips upstream verify -> 200.
+    # This boot also sets the l7proxy's ECH-probe kill switch
+    # (COGBOX_L7_ECH_PROBE=0) on `cogbox start`, which the launcher passes down
+    # to the proxy: B's splice then refuses a GREASE ECH hello before any dial
+    # or probe. The terminate tier never probes, so A and C are unaffected.
     machine.succeed("systemctl reset-failed l7-origin 2>/dev/null || true")
     machine.succeed("systemd-run --unit=l7-origin --collect python3 /tmp/l7-origin.py")
     machine.wait_until_succeeds("grep -q 'listen 443' /tmp/origin-hits.log", timeout=10)
@@ -2962,7 +3002,7 @@ with subtest("Phase M: terminate-by-default + --passthrough + --insecure-upstrea
     #    bare allow is then MITM'd, so the self-signed upstream is rejected
     #    (verify on) -> 502 over a TRUSTED client TLS leg.
     machine.succeed(as_user("printf '' | cogbox l7 set --name work"))
-    boot_and_wait("cc-work", "--name work", ssh_port=2223)
+    boot_and_wait("cc-work", "--name work", ssh_port=2223, env="COGBOX_L7_ECH_PROBE=0")
     # No launch flags here: neither Phase D's work grant nor Phase E's
     # edited-runner grant may survive into this fresh work VM.
     machine.succeed(as_user(
@@ -2996,6 +3036,29 @@ with subtest("Phase M: terminate-by-default + --passthrough + --insecure-upstrea
         as_user("cogbox ssh --name work " + shlex.quote(pt_probe + " | grep -q 200")),
         timeout=20,
     )
+    # The kill switch reached the proxy: it started with the probe off (no
+    # warning: 0 is a known value), and a GREASE ECH hello to this spliced host
+    # is refused before any dial or probe -- nothing reaches the origin, which
+    # the same hello through Phase K's default (probe on) reached twice.
+    wlog = f"{rt}/cogbox.log"
+    full = machine.succeed(f"cat {wlog}")
+    assert "ech_probe=off" in full and "ech_probe=on" not in full, \
+        f"COGBOX_L7_ECH_PROBE=0 on cogbox start did not turn the proxy's ECH probe off: {full!r}"
+    assert "l7proxy: COGBOX_L7_ECH_PROBE=" not in full, f"the proxy warned about COGBOX_L7_ECH_PROBE=0: {full!r}"
+    before = int(machine.succeed(f"wc -l < {wlog}").strip())
+    tls_before = int(machine.succeed("wc -l < /tmp/origin-tls.log").strip())
+    out = machine.succeed(f"python3 /tmp/ech-hello.py {work_tls} 203.0.113.5 vhost-a.test grease")
+    assert "socks-ok" in out, out
+    machine.wait_until_succeeds(
+        f"tail -n +{before + 1} {wlog} | grep ech-on-splice | grep -q detail=disabled", timeout=10
+    )
+    machine.succeed("sleep 1")
+    new = machine.succeed(f"tail -n +{before + 1} {wlog}")
+    assert "host=vhost-a.test" in new, new
+    assert "ech=unknown detail=disabled upstream=-" in new, new
+    assert "ech-probe" not in new, f"GREASE ECH was probed with the kill switch set: {new!r}"
+    tls_new = machine.succeed(f"tail -n +{tls_before + 1} /tmp/origin-tls.log").splitlines()
+    assert tls_new == [], f"a GREASE ECH hello reached the origin with the kill switch set: {tls_new!r}"
 
     # C) --insecure-upstream: still terminate, but skip upstream verify -> 200
     #    over the trusted bundle (no -k), reaching the origin.

@@ -22,8 +22,9 @@
 // so the `ech` flag is surfaced for the caller to act on per tier (the worker
 // allows ECH on the terminate tier, where mitmproxy enforces Host==SNI on the
 // decrypted request, and refuses it on the splice tier, which trusts the
-// cleartext SNI for routing, unless the opt-in ECH-capability probe
-// (echprobe.zig) finds the server it would splice to not ECH-capable).
+// cleartext SNI for routing, unless the ECH-capability probe (echprobe.zig,
+// on unless the operator turned it off) finds the server it would splice to
+// not ECH-capable).
 //
 // All length fields are bounds-checked against a hostile guest; every
 // out-of-range access yields .deny rather than a panic.
@@ -164,7 +165,7 @@ fn parseClientHello(body: []const u8, out_sni: []u8) PeekResult {
 		// Note ECH but keep parsing: the cleartext SNI is still extracted and
 		// the caller decides what to do with an ECH-bearing hello per tier
 		// (the inner name could be a denied sibling, so the splice path refuses
-		// it unless the opt-in probe clears the server; terminate is safe
+		// it unless the ECH probe clears the server; terminate is safe
 		// because mitmproxy re-checks Host==SNI).
 		if (etype == ext_ech) ech = true;
 		if (etype == ext_server_name and found == null) {

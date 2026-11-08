@@ -9,8 +9,8 @@
 // on documentation addresses. It asserts on the proxy's log lines and on what
 // each origin received, so a gate that splices after a capable or unknown
 // probe, probes the guest's SOCKS destination instead of the address it
-// re-resolved and dialled, ignores the default-off switch, or serves a cached
-// answer learned under another ALPN fails here.
+// re-resolved and dialled, ignores its kill switch (or is off by default), or
+// serves a cached answer learned under another ALPN fails here.
 //
 // It needs a private user, network and mount namespace (checks.l7-ech-gate
 // runs it under `unshare -rnm`): it puts the addresses below on lo and binds
@@ -469,13 +469,14 @@ func runWorker(cogbox string) error {
 		return "reject host=" + host + " orig=" + ip + ":443 reason=ech-on-splice ech=" + outcome + " detail=" + detail + " upstream=" + upstream + " hint=\""
 	}
 
-	// --- probe on: every outcome through the worker ---
-	p, err := startGateProxy(cogbox, tmp, "on", "COGBOX_L7_ECH_PROBE=1")
+	// --- the default (COGBOX_L7_ECH_PROBE unset): probe on, every outcome
+	// through the worker ---
+	p, err := startGateProxy(cogbox, tmp, "on")
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(p.all(), "ech_probe=on") {
-		g.failf("on: startup line lacks ech_probe=on: %q", p.all())
+	if log := p.all(); !strings.Contains(log, "ech_probe=on") || strings.Contains(log, "COGBOX_L7_ECH_PROBE=") {
+		g.failf("on: the default startup line lacks ech_probe=on, or warns: %q", log)
 	}
 
 	// A GREASE hello to a server without ECH keys: probed not-capable, then
@@ -572,7 +573,7 @@ func runWorker(cogbox string) error {
 	// hello under h2 to the same address and name, with the same ECH suite
 	// and enc length, must get a probe of its own (capable) and be refused,
 	// not that cached answer.
-	p, err = startGateProxy(cogbox, tmp, "alpn", "COGBOX_L7_ECH_PROBE=1")
+	p, err = startGateProxy(cogbox, tmp, "alpn")
 	if err != nil {
 		return err
 	}
@@ -590,35 +591,43 @@ func runWorker(cogbox string) error {
 	g.noECH("real-ech-after-acme", &ech, e, ok)
 	p.stop()
 
-	// --- the default: probe off ---
-	p, err = startGateProxy(cogbox, tmp, "default")
+	// --- the kill switch: probe off ---
+	p, err = startGateProxy(cogbox, tmp, "kill", "COGBOX_L7_ECH_PROBE=0")
 	if err != nil {
 		return err
 	}
 	if !strings.Contains(p.all(), "ech_probe=off") {
-		g.failf("default: startup line lacks ech_probe=off: %q", p.all())
+		g.failf("kill: startup line lacks ech_probe=off: %q", p.all())
 	}
 	p.begin()
 	h = plain.hellos.Load()
-	send("default-grease", ipPlain, plainName, "grease")
-	g.need("default-grease", p, reject(plainName, ipPlain, "unknown", "disabled", "-"))
-	g.absent("default-grease", p, "ech-probe")
-	g.hellos("default-grease", &plain, h, 0)
+	send("kill-grease", ipPlain, plainName, "grease")
+	g.need("kill-grease", p, reject(plainName, ipPlain, "unknown", "disabled", "-"))
+	g.absent("kill-grease", p, "ech-probe")
+	g.hellos("kill-grease", &plain, h, 0)
 	p.begin()
 	h, e = ech.hellos.Load(), ech.echOK.Load()
 	ok = realECH(ipECH, denied, "h2", configList, pool)
-	g.need("default-real-ech", p, reject(publicName, ipECH, "unknown", "disabled", "-"))
-	g.hellos("default-real-ech", &ech, h, 0)
-	g.noECH("default-real-ech", &ech, e, ok)
+	g.need("kill-real-ech", p, reject(publicName, ipECH, "unknown", "disabled", "-"))
+	g.hellos("kill-real-ech", &ech, h, 0)
+	g.noECH("kill-real-ech", &ech, e, ok)
 	p.stop()
 
-	// --- the switch fails closed: an unrecognised value is off, and says so;
-	// the on spellings are case-insensitive ---
+	// --- every spelling of the switch, in any case: empty and the on
+	// spellings leave the probe on, the off spellings turn it off, and a value
+	// that is neither (a mistyped kill switch) is off too and says so ---
 	for _, v := range []struct {
 		val, state string
 		warn       bool
-	}{{"yes", "off", true}, {"0", "off", false}, {"TRUE", "on", false}, {"On", "on", false}} {
+	}{
+		{"", "on", false}, {"1", "on", false}, {"on", "on", false}, {"true", "on", false}, {"TRUE", "on", false}, {"On", "on", false},
+		{"0", "off", false}, {"off", "off", false}, {"false", "off", false}, {"OFF", "off", false}, {"False", "off", false},
+		{"yes", "off", true}, {"enable", "off", true},
+	} {
 		name := "switch-" + v.val
+		if v.val == "" {
+			name = "switch-empty"
+		}
 		p, err = startGateProxy(cogbox, tmp, name, "COGBOX_L7_ECH_PROBE="+v.val)
 		if err != nil {
 			return err
@@ -630,10 +639,19 @@ func runWorker(cogbox string) error {
 		if warned := strings.Contains(log, "COGBOX_L7_ECH_PROBE='"+v.val+"'"); warned != v.warn {
 			g.failf("%s: warning logged=%v, want %v: %q", name, warned, v.warn, log)
 		}
-		if v.state == "off" {
-			p.begin()
-			send(name, ipPlain, plainName, "grease")
+		// Each proxy starts with an empty cache, so on means a probe and a
+		// splice, off a refusal before any dial.
+		p.begin()
+		h = plain.hellos.Load()
+		send(name, ipPlain, plainName, "grease")
+		if v.state == "on" {
+			g.need(name, p, probeLine(plainName, ipPlain, "not-capable"))
+			g.absent(name, p, "reject")
+			g.hellos(name, &plain, h, 2)
+		} else {
 			g.need(name, p, reject(plainName, ipPlain, "unknown", "disabled", "-"))
+			g.absent(name, p, "ech-probe")
+			g.hellos(name, &plain, h, 0)
 		}
 		p.stop()
 	}
