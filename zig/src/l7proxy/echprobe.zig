@@ -25,8 +25,9 @@
 //     NO_RETRY keys, a split-mode frontend) still decrypts real ECH and looks
 //     the same. That residual is documented in docs/network-filtering.md and
 //     checks.l7-ech-probe-interop pins it (Go SendAsRetry=false reads as
-//     not-capable). It is why the probe is OFF unless the operator sets
-//     COGBOX_L7_ECH_PROBE=1 (read by the CLI, enforced by the worker's ECH
+//     not-capable). The probe is ON by default all the same (that residual
+//     was accepted on 2026-11-08), and COGBOX_L7_ECH_PROBE=0 is the
+//     operator's kill switch (read by the CLI, enforced by the worker's ECH
 //     gate in main.zig): off, every ECH hello on the splice tier is refused.
 //   - anything else      -> `unknown`: refuse.
 // allowsSplice is the single predicate that may let an ECH hello through.

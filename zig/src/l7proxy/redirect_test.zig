@@ -489,8 +489,10 @@ test "classify: malformed TLS is still .deny (never .no_sni)" {
 // no-SNI arm there is no worker-level socket harness here, so the gate is
 // proven piecewise: classification + shape here, the probe and the cache in
 // echprobe_test.zig, and the wired worker (the real `cogbox __l7proxy`) in
-// checks.l7-ech-gate (every outcome, the default-off switch, the ALPN cache
-// key) and the VM test's Phase K (the default, through the launcher).
+// checks.l7-ech-gate (every outcome, the default-on probe and every spelling
+// of its COGBOX_L7_ECH_PROBE kill switch, the ALPN cache key) and the VM
+// test's Phase K (the default-on probe through the launcher: not-capable,
+// then spliced) and Phase M (the kill switch through the launcher).
 
 test "ech gate: the 1-byte stub ECH hello is .tls with ech set, and its shape is malformed" {
 	var raw: [1200]u8 = undefined;

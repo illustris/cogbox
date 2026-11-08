@@ -203,16 +203,19 @@ pub fn main(init: std.process.Init) !void {
 			(std.fmt.parseInt(i32, v, 10) catch 300)
 		else
 			300;
-		// COGBOX_L7_ECH_PROBE=1|on|true turns on the splice tier's
-		// ECH-capability probe. It is off by default, because a not-capable
-		// answer is evidence, not proof, that the server cannot decrypt ECH
-		// (docs/network-filtering.md, "Residual risk"). Off, every well-formed
-		// ECH hello to a host the proxy splices rather than terminates is
-		// refused before any dial (logged ech-on-splice ech=unknown
-		// detail=disabled); a malformed or oversized ECH extension is logged
-		// detail=ech-malformed or ech-unsupported, on or off. The startup line
-		// prints which (ech_probe=on|off). The probe draws its entropy from `io`
-		// (init.io), which run() keeps for the workers.
+		// COGBOX_L7_ECH_PROBE is the kill switch of the splice tier's
+		// ECH-capability probe, which is ON by default (decided 2026-11-08):
+		// a not-capable answer is evidence, not proof, that the server cannot
+		// decrypt ECH (docs/network-filtering.md, "Residual risk"), and that
+		// residual is accepted so clients that cannot turn ECH off (Playwright's
+		// chrome-headless-shell) reach servers without ECH. 0|off|false turns
+		// it off, and so does a value echProbeSetting does not know. Off, every
+		// well-formed ECH hello to a host the proxy splices rather than
+		// terminates is refused before any dial (logged ech-on-splice
+		// ech=unknown detail=disabled); a malformed or oversized ECH extension
+		// is logged detail=ech-malformed or ech-unsupported, on or off. The
+		// startup line prints which (ech_probe=on|off). The probe draws its
+		// entropy from `io` (init.io), which run() keeps for the workers.
 		const ech_probe = echProbeSetting(env.get("COGBOX_L7_ECH_PROBE"));
 		return l7proxy_module.run(allocator, io, rest[0], base, accept_mode, listen_addr, funnel_all, peek_ms, ech_probe);
 	}
@@ -271,18 +274,19 @@ pub fn main(init: std.process.Init) !void {
 	util.die(allocator, io, null, exit_codes.usage, "unknown verb '{s}'", .{verb});
 }
 
-/// COGBOX_L7_ECH_PROBE for __l7proxy. Fails closed: true only for 1, on or
-/// true (any case). Unset, empty, 0, off and false are off, and so is any other
-/// value -- with a warning, so a typo cannot pass for a setting.
+/// COGBOX_L7_ECH_PROBE for __l7proxy, the probe's kill switch. Unset, empty,
+/// 1, on and true (any case) are on; 0, off and false (any case) are off. Any
+/// other value is off too, with a warning: a mistyped kill switch fails closed
+/// (every ECH hello on the splice tier refused) and cannot pass for a setting.
 fn echProbeSetting(v: ?[]const u8) bool {
-	const s = v orelse return false;
-	for ([_][]const u8{ "1", "on", "true" }) |w| {
+	const s = v orelse return true;
+	for ([_][]const u8{ "", "1", "on", "true" }) |w| {
 		if (std.ascii.eqlIgnoreCase(s, w)) return true;
 	}
-	for ([_][]const u8{ "", "0", "off", "false" }) |w| {
+	for ([_][]const u8{ "0", "off", "false" }) |w| {
 		if (std.ascii.eqlIgnoreCase(s, w)) return false;
 	}
-	std.debug.print("l7proxy: COGBOX_L7_ECH_PROBE='{s}' is not 1, on, true, 0, off or false; the ECH probe stays off\n", .{s});
+	std.debug.print("l7proxy: COGBOX_L7_ECH_PROBE='{s}' is not 1, on, true, 0, off or false; the ECH probe is off\n", .{s});
 	return false;
 }
 
