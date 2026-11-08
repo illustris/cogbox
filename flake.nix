@@ -2454,19 +2454,73 @@
 					fi
 				'';
 
-				# Pre-accept Claude Code workspace trust for ~/work (both /root/work
-				# and the /var/lib/cogbox/work it resolves to, since Node's cwd
-				# resolves the symlink) and reconcile stale pre-migration project
-				# keys. Replaces the per-plugin cogbox-claude-trust units. Also seeds
-				# bypassPermissionsModeAccepted -- see the block above claudeStubScript,
-				# which carries the full rationale for both backends.
+				# Pre-accept Claude Code workspace trust and external CLAUDE.md imports
+				# for ~/work, and reconcile stale pre-migration project keys. Replaces
+				# the per-plugin cogbox-claude-trust units.
+				#
+				# Claude Code keys ~/.claude.json .projects by the RESOLVED cwd (its
+				# canonical git root, else the realpath) and reads a project's flags
+				# from that one key, with no ancestor walk. So the seed covers
+				# /var/lib/cogbox/work, /root/work and whatever `readlink -f
+				# /root/work` resolves to. On the VM those are the literal path; on
+				# the container /var/lib/cogbox is itself a symlink into the state
+				# PVC (${cogboxData}), so the key Claude Code actually reads is the
+				# PVC path, and only the realpath seed reaches it.
+				#
+				# The external-includes pair answers "Allow external CLAUDE.md file
+				# imports?": plugin rules ($WORK/.claude/rules/*) link through
+				# .cogbox/brain into /nix/store, outside the cwd, so every plugin boot
+				# would park the harness on that dialog. Either key true suppresses
+				# the dialog, but only hasClaudeMdExternalIncludesApproved loads the
+				# external files; hasClaudeMdExternalIncludesWarningShown mirrors what
+				# the dialog's own Yes writes. A No (or Esc) writes Approved=false with
+				# WarningShown=true and so silently drops every plugin rule for good.
+				# The seed is therefore FORCED (=) at every boot: it repairs a
+				# decline, at the cost of re-approving a user's explicit No -- ~/work
+				# is the base-owned tree whose external imports are the brain's own
+				# plugin rules. Both keys, like the trust flag, live under
+				# .projects[...] only; top-level they are never read.
+				#
+				# One top-level key rides along on both backends:
+				# fullscreenUpsellSeenCount, raised to 3. claude-code 2.1.293 asks
+				# "Try the new fullscreen renderer?" at REPL start until that count
+				# (its own impression counter) reaches 3; accepting restarts the
+				# harness into the alternate-screen renderer or saves it as the
+				# user's renderer, a screen the control plane's harness reader was
+				# not built against, so the workspace agent relays it rather than
+				# accept it, and a delegated launch would park on it. The same count
+				# is also 2.1.293's fresh-install signal: with GrowthBook off (a
+				# Bedrock/Vertex provider, or telemetry off) and no `tui` in the
+				# user's settings, an install whose firstStartVersion is set and
+				# whose count is below 3 defaults to the fullscreen renderer. So on
+				# those guests raising the count also ends that fresh-install
+				# fullscreen default and keeps the classic renderer the control
+				# plane reads; only with GrowthBook on (first-party) is it a pure
+				# nudge suppressor. It is load-bearing, not cosmetic. `tui` in the
+				# user's settings and the tengu_* GrowthBook gates still choose the
+				# renderer. Never lowered.
+				#
+				# No other first-run dialog is seeded here (the upsell count above
+				# is a REPL-start nudge, not a first-run dialog): MCP project servers
+				# are auto-approved under the harness's bypass mode, and the terms,
+				# trial, API-key and managed-settings dialogs are account, credential
+				# or server state rather than per-work-dir answers. The VM branch also
+				# seeds hasCompletedOnboarding/bypassPermissionsModeAccepted -- see the
+				# block above claudeStubScript, which carries the full rationale for
+				# both backends.
 				brainTrustScript = pkgs.writeShellScript "cogbox-brain-trust" ''
 					set -eu
 					f=/root/.claude.json
 					[ -s "$f" ] || echo '{}' > "$f"
-					${pkgs.jq}/bin/jq '
-						.projects["/var/lib/cogbox/work"].hasTrustDialogAccepted = true
-						| .projects["/root/work"].hasTrustDialogAccepted = true
+					real=$(readlink -f /root/work 2>/dev/null || true)
+					${pkgs.jq}/bin/jq --arg real "$real" '
+						def seed($k): .projects[$k].hasTrustDialogAccepted = true
+							| .projects[$k].hasClaudeMdExternalIncludesApproved = true
+							| .projects[$k].hasClaudeMdExternalIncludesWarningShown = true;
+						seed("/var/lib/cogbox/work")
+						| seed("/root/work")
+						| (if ($real | startswith("/")) then seed($real) else . end)
+						| (if ((.fullscreenUpsellSeenCount | type) == "number" and .fullscreenUpsellSeenCount >= 3) then . else .fullscreenUpsellSeenCount = 3 end)
 						| del(.projects["/var/lib/cogbox"])
 						| del(.projects["/var/lib/cogbox/home"])${lib.optionalString isVm ''
 
@@ -2548,7 +2602,8 @@
 					# runs nor seed-reset away the user's config -- on any parse/shape
 					# failure the file is left untouched (claude-code's own
 					# corrupt-config handling deals with real rot). brain-trust later
-					# enriches the same file (workspace trust).
+					# enriches the same file (workspace trust and the external CLAUDE.md
+					# import approval).
 					#
 					# bypassPermissionsModeAccepted rides along for the same reason, and is
 					# forced the same way. It records that the harness's first-run consent
@@ -3588,7 +3643,7 @@
 						};
 					};
 					cogbox-brain-trust = {
-						description = "Pre-accept Claude Code workspace trust for ~/work";
+						description = "Pre-accept Claude Code workspace trust and external imports for ~/work";
 						wantedBy = [ "multi-user.target" ];
 						before = [ "multi-user.target" "sshd.service" ];
 						after = [ stateUnit "cogbox-brain-materialize.service" ]
@@ -5669,10 +5724,12 @@
 			stage2Overlays = cfg: lib.attrNames (lib.filterAttrs
 				(_: f: (f.overlay.lowerdir or null) != null && !(lib.elem "x-initrd.mount" f.options))
 				cfg.fileSystems);
-			# The two realized harness-config reconcile scripts, one per backend, for
-			# harness-firstrun-flags below. Forcing the two small scripts rather than
-			# a toplevel keeps that check cheap.
+			# The realized harness-config reconcile scripts for harness-firstrun-flags
+			# below: the container's claude-stub and the brain-trust oneshot of each
+			# backend. Forcing the small scripts rather than a toplevel keeps that
+			# check cheap.
 			containerHarnessConfScript = self.nixosConfigurations."${configName system}-container".config.systemd.services.cogbox-claude-stub.serviceConfig.ExecStart;
+			containerTrustScript = self.nixosConfigurations."${configName system}-container".config.systemd.services.cogbox-brain-trust.serviceConfig.ExecStart;
 			vmHarnessConfScript = self.nixosConfigurations.${configName system}.config.systemd.services.cogbox-brain-trust.serviceConfig.ExecStart;
 			# Every cogbox GUEST config that renders a resolved.conf, paired with
 			# its name, for guest-dns-no-public-fallback below. Forcing the small
@@ -6020,10 +6077,14 @@
 			# prompt instead of reaching the REPL. No unit or VM test in this repo
 			# reaches that: it needs an interactive terminal, and `claude -p` passes
 			# either way. Assert the realized scripts by grep: cheap,
-			# and it fails on the drift rather than on the symptom.
+			# and it fails on the drift rather than on the symptom. The per-project
+			# half -- workspace trust and the external CLAUDE.md import approval --
+			# is brain-trust's on BOTH backends, so that script is asserted for the
+			# VM and the container alike.
 			harness-firstrun-flags = pkgs.runCommand "cogbox-harness-firstrun-flags" { } ''
 				fails=0
 				container=${containerHarnessConfScript}
+				containerTrust=${containerTrustScript}
 				vm=${vmHarnessConfScript}
 
 				for flag in hasCompletedOnboarding bypassPermissionsModeAccepted; do
@@ -6053,6 +6114,44 @@
 					echo "FAIL: bypassPermissionsModeAccepted written under .projects[...]; the global getter would never see it" >&2
 					fails=$((fails + 1))
 				fi
+
+				# brain-trust, both backends: trust plus the external CLAUDE.md import
+				# approval (plugin rules resolve into /nix/store, outside the cwd),
+				# forced under every key ~/work can resolve to. Claude Code reads a
+				# project's flags only from .projects[<resolved cwd>], and on the
+				# container that is the state-PVC path behind the /var/lib/cogbox
+				# symlink, which only the readlink -f seed reaches.
+				for s in "$vm" "$containerTrust"; do
+					for pat in \
+						".projects[\$k].hasTrustDialogAccepted = true" \
+						".projects[\$k].hasClaudeMdExternalIncludesApproved = true" \
+						".projects[\$k].hasClaudeMdExternalIncludesWarningShown = true" \
+						'seed("/var/lib/cogbox/work")' \
+						'seed("/root/work")' \
+						"seed(\$real)" \
+						'readlink -f /root/work'; do
+						if ! grep -qF -- "$pat" "$s"; then
+							echo "FAIL: brain-trust $s does not carry: $pat" >&2
+							fails=$((fails + 1))
+						fi
+					done
+					# The includes keys are per-project state: a top-level write is
+					# never read, and the dialog still fires.
+					if grep -qE '(^|[^]A-Za-z0-9_])\.hasClaudeMdExternalIncludes' "$s"; then
+						echo "FAIL: brain-trust $s writes a hasClaudeMdExternalIncludes key outside .projects[...]; it is never read" >&2
+						fails=$((fails + 1))
+					fi
+					# The fullscreen renderer upsell's seen count, top-level (global
+					# config), raised to the 3 at which 2.1.293 stops asking.
+					if ! grep -qF -- '.fullscreenUpsellSeenCount = 3' "$s"; then
+						echo "FAIL: brain-trust $s does not raise fullscreenUpsellSeenCount to 3" >&2
+						fails=$((fails + 1))
+					fi
+					if grep -qF -- '.projects[$k].fullscreenUpsellSeenCount' "$s"; then
+						echo "FAIL: brain-trust $s writes fullscreenUpsellSeenCount under .projects[...]; it is read top-level" >&2
+						fails=$((fails + 1))
+					fi
+				done
 
 				test "$fails" = 0
 				touch $out
