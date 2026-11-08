@@ -14,14 +14,7 @@ The observed loss of recent unsynced edits, absent guest shutdown journal, and
 successful explicitly synced control are consistent with that mechanism; they
 do not establish immunity to every storage or external-host failure.
 
-The pinned microvm dependency already provides `bin/microvm-shutdown`. Its QEMU
-implementation sends one Ctrl-Alt-Delete event through the private QMP socket and
-waits for that socket to stop accepting connections. The runner uses `-no-reboot`
-and `reboot=t`, so an orderly guest reboot exits QEMU rather than booting another
-guest. Reuse the helper belonging to the launcher's actual `RUNNER_DIR`; do not
-substitute an SSH command, add a guest agent, or depend on generic ACPI defaults.
-The helper has no deadline, emits raw QMP replies, and returns success when its
-socket is absent. Those are caller-side obligations, not completion proof.
+The pinned microvm dependency already provides `bin/microvm-shutdown`. Its QEMU implementation sends one QMP `system_powerdown` (the ACPI power button) through the private QMP socket and waits for that socket to stop accepting connections. The guest powers off on it (systemd-logind's default power-key action, which cogbox does not change), and a guest poweroff ends QEMU. The runner uses `-no-reboot` and `reboot=t`, so an orderly guest reboot also exits QEMU rather than booting another guest. Reuse the helper belonging to the launcher's actual `RUNNER_DIR`; do not substitute an SSH command or add a guest agent. The helper has no deadline, emits raw QMP replies, and returns success when its socket is absent. Those are caller-side obligations, not completion proof.
 
 The runner also keeps `panic=-1`: Linux immediately reboots after a panic. With
 `-no-reboot`, an unclean panic and an orderly reboot can both end QEMU with exit
@@ -67,7 +60,7 @@ Normal TERM/INT requests one orderly attempt:
    hints. Preserve the run/result and diagnostic logs, including unexpected
    zero/nonzero guest exits. Do not change persistent guest/user data.
 
-Repeated normal stop signals must not issue repeated Ctrl-Alt-Delete events or
+Repeated normal stop signals must not issue repeated power-button requests or
 reenter cleanup. A force request during an orderly attempt must cancel/reap the
 owned helper and enter the same child-first fallback, never exit halfway through
 the cleanup guard or kill only the launcher.

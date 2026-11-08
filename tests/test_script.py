@@ -36,7 +36,11 @@ def stop_instance(unit, name=None):
     # stop-reliability path that the background-by-default model depends on.
     _ = unit
     name_arg = f"--name {name}" if name else ""
-    machine.succeed(as_user(f"cogbox stop {name_arg}".strip()))
+    out = machine.succeed(as_user(f"cogbox stop {name_arg}".strip()))
+    # microvm-shutdown asks the guest to power off (QMP system_powerdown);
+    # a guest that ignored it would stop only through the forced fallback
+    # after the 45s drain window.
+    assert "forced termination" not in out, out
     runtime = "/run/user/1000/cogbox" + (("-" + name) if name else "")
     machine.wait_until_fails(f"test -e {runtime}/pid", timeout=30)
 

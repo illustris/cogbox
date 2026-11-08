@@ -20,15 +20,15 @@
 			url = "github:illustris/flake";
 			flake = false;
 		};
-		# Held at fdfc182 in flake.lock (update with `nix flake update` naming
-		# every OTHER input). microvm.nix 45c1f41 dropped its minimized QEMU
-		# (nixosTestRunner), whose force-uid0 9p patch cogbox relies on: without
-		# it a non-root host's 9p shares surface the host uid in the guest, so
-		# root's git refuses ~/work repos as "dubious ownership", and the runner
-		# QEMU gains a ~590 MiB GUI/audio closure. It also switched
-		# microvm-shutdown from Ctrl-Alt-Delete to system_powerdown, which
-		# docs/graceful-guest-shutdown.md describes. Take that bump as its own
-		# change: pin a minimized microvm.qemu.package and update the doc.
+		# Updated with the other inputs. microvm.nix no longer minimizes its
+		# runner QEMU (nixosTestRunner), so the guest's microvm block pins
+		# microvm.qemu.package to that build itself. Its force-uid0 9p patch is
+		# load-bearing: without it a non-root host's 9p shares surface the host
+		# uid in the guest, so root's git refuses ~/work repos as "dubious
+		# ownership", and the runner QEMU gains a ~590 MiB GUI/audio closure.
+		# checks.runner-qemu-9p-uid0 guards the pin. microvm-shutdown asks the
+		# guest to power off with QMP system_powerdown (the ACPI power button);
+		# see docs/graceful-guest-shutdown.md.
 		microvm = {
 			url = "github:microvm-nix/microvm.nix";
 			inputs.nixpkgs.follows = "nixpkgs";
@@ -405,6 +405,14 @@
 					'';
 					microvm = {
 						hypervisor = "qemu";
+						# microvm.nix no longer minimizes its runner QEMU. Pin the
+						# nixosTestRunner build of the package it would pick (same condition
+						# as its qemu.package default): its force-uid0 9p patch makes the 9p
+						# shares root-owned in the guest, and it leaves out the GUI/audio
+						# closure. Guarded by checks.runner-qemu-9p-uid0.
+						qemu.package = (if config.microvm.cpu == null && config.microvm.vmHostPackages.stdenv.hostPlatform.isLinux
+							then config.microvm.vmHostPackages.qemu_kvm
+							else config.microvm.vmHostPackages.qemu).override { nixosTestRunner = true; };
 						inherit vcpu mem;
 						socket = "${name}.socket";
 						interfaces = [{
@@ -7039,6 +7047,17 @@
 				HOME=$TMPDIR qemu-x86_64 -cpu SandyBridge-v1 $tools/bin/cogbox help > /dev/null
 				touch $out
 			'';
+			# microvm.nix no longer minimizes its runner QEMU, so the guest's
+			# microvm block pins the nixosTestRunner build itself. Losing that pin
+			# builds and boots fine but drops the force-uid0 9p patch (host uid on
+			# ~/work, git "dubious ownership"): assert both runners still carry it.
+			runner-qemu-9p-uid0 = let
+				hasPatch = c: lib.any (p: lib.hasSuffix "force-uid0-on-9p.patch" (toString p))
+					(c.config.microvm.qemu.package.patches or [ ]);
+			in assert lib.assertMsg
+				(lib.all hasPatch [ self.nixosConfigurations.cogbox-x86_64 self.nixosConfigurations.cogbox-x86_64-hosted ])
+				"the cogbox runner QEMU must be nixpkgs' nixosTestRunner build (force-uid0-on-9p.patch)";
+			pkgs.runCommand "cogbox-runner-qemu-9p-uid0" { } "touch $out";
 			# On the container backend the guest half
 			# (plugin commands/skills/agents + cogbox.packages) is
 			# delivered by the cogbox-brain-materialize oneshot rebuilding the brain
