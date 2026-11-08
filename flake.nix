@@ -6277,26 +6277,26 @@
 					esac
 				}
 
-				test '${releaseHarnesses.claude-code.version}' = '2.1.293'
-				test '${releaseHarnesses.opencode.version}' = '1.18.35'
-				test '${releaseHarnesses.codex.version}' = '0.161.0'
-				test '${releaseHarnesses.hermes-agent.version}' = '2026.9.24'
-				test '${releaseHarnesses.omp.version}' = '18.8.4'
-				test '${releaseHarnesses.pi.version}' = '1.1.0'
-				test '${releaseHarnesses.dsh.version}' = '0.2.0-rc.2'
+				test '${releaseHarnesses.claude-code.version}' = '2.1.319'
+				test '${releaseHarnesses.opencode.version}' = '1.19.5'
+				test '${releaseHarnesses.codex.version}' = '0.167.0'
+				test '${releaseHarnesses.hermes-agent.version}' = '0.23.0'
+				test '${releaseHarnesses.omp.version}' = '18.18.1'
+				test '${releaseHarnesses.pi.version}' = '1.5.0'
+				test '${releaseHarnesses.dsh.version}' = '0.2.2-rc.1'
 
-				assert_version '2.1.293' ${releaseHarnesses.claude-code}/bin/claude --version
-				assert_version '1.18.35' ${releaseHarnesses.opencode}/bin/opencode --version
-				assert_version '0.161.0' ${releaseHarnesses.codex}/bin/codex --version
-				assert_version '18.8.4' ${releaseHarnesses.omp}/bin/omp --version
-				assert_version '1.1.0' ${releaseHarnesses.pi}/bin/pi --version
-				assert_version '0.2.0-rc.2' ${releaseHarnesses.dsh}/bin/dsh --version
+				assert_version '2.1.319' ${releaseHarnesses.claude-code}/bin/claude --version
+				assert_version '1.19.5' ${releaseHarnesses.opencode}/bin/opencode --version
+				assert_version '0.167.0' ${releaseHarnesses.codex}/bin/codex --version
+				assert_version '18.18.1' ${releaseHarnesses.omp}/bin/omp --version
+				assert_version '1.5.0' ${releaseHarnesses.pi}/bin/pi --version
+				assert_version '0.2.2-rc.1' ${releaseHarnesses.dsh}/bin/dsh --version
 
 				if ! hermes_output=$(${releaseHarnesses.hermes-agent}/bin/hermes --version 2>&1); then
 					printf 'version command failed: hermes --version\n%s\n' "$hermes_output" >&2
 					exit 1
 				fi
-				for expected in 'v0.21.5' '(2026.9.24)'; do
+				for expected in 'v0.23.0' '(2026.9.24)'; do
 					case "$hermes_output" in
 					*"$expected"*) ;;
 					*)
