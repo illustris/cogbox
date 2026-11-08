@@ -55,7 +55,6 @@ in
 		nix.settings.substituters = lib.mkForce [ ];
 		environment.etc."runtime-test/indirect/flake.nix".source = ./fixtures/runtime-env/indirect/flake.nix;
 
-		boot.initrd.systemd.enable = true;
 		virtualisation = {
 			cores = 2;
 			memorySize = 2048;
