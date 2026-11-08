@@ -256,6 +256,8 @@ L4/L7 composition table, [host-side credential
 injection](docs/network-filtering.md#host-side-credential-injection), the
 threat model, and the enforcement internals.
 
+A LAN host in 192.168.0.0/16 that the guest reaches through its gateway rather than on-link (on macOS, every LAN) can be captured by the guest's Docker networks, which come from that range; see [guest Docker address pools](docs/internals.md#guest-docker-address-pools) to move them.
+
 ## Configuration
 
 All settings are in `~/.config/cogbox/` (or `$XDG_CONFIG_HOME/cogbox/`),
@@ -360,7 +362,7 @@ variables -- see [Internals](docs/internals.md#host-side-path-overrides).
 | HTTP | 127.0.0.1:8080 -> 8080 (guest 8080 is reserved for the `app-relay` plugin) |
 | Mosh UDP | off. `COGBOX_MOSH_UDP_FORWARD=lo-hi` adds a `passt -u` forward for that guest range, composed with the bind prefix exactly like the two TCP forwards; the GCE host sets `60000-60031` from `mosh-udp-range.nix`. The guest carries only `mosh-server`, and a session needs the cogworx gateway's UDP relay -- see [network filtering](docs/network-filtering.md#the-mosh-reply-socket-exemption) |
 | Network | rules (private/bogon denied, public allowed) |
-| Docker | enabled. Replies to TCP connections and to UDP exchanges with uplink-bound sockets that arrive on the guest uplink leave through the uplink, so a Docker network (or another guest route) overlapping a client's address does not capture them; residuals in [internals](docs/internals.md#guest-reply-routing) |
+| Docker | enabled. docker0 and networks created without an explicit subnet get a /24 from 192.168.0.0/16, not Docker's stock 172.17-172.31 pools, and a plugin or the instance flake can override that ([internals](docs/internals.md#guest-docker-address-pools)). Replies to TCP connections and to UDP exchanges with uplink-bound sockets that arrive on the guest uplink leave through the uplink, so a Docker network (or another guest route) overlapping a client's address does not capture them; residuals in [internals](docs/internals.md#guest-reply-routing) |
 | Storage profile | `workstation` (see below) |
 
 ### Storage profiles
