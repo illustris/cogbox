@@ -5,7 +5,7 @@ in {
   zig-tests = pkgs.stdenv.mkDerivation {
     name = "cogbox-zig-tests";
     src = lib.cleanSource ../zig;
-    nativeBuildInputs = [ pkgs.zig ];
+    nativeBuildInputs = [ pkgs.zig_0_16 ];
     dontConfigure = true;
     dontInstall = true;
     buildPhase = ''

@@ -11,7 +11,7 @@ let
     pname = "cogbox-tools";
     version = "0.1.0";
     src = lib.cleanSource ../zig;
-    nativeBuildInputs = [ pkgs.zig ];
+    nativeBuildInputs = [ pkgs.zig_0_16 ];
     dontConfigure = true;
     dontInstall = true;
     buildPhase = ''
