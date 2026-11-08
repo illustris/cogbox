@@ -350,11 +350,17 @@
 		# directory is harmless). The warning is for interactive shells only, and
 		# fires when a generation is selected but its bin no longer resolves: the
 		# boot restore is still running, has failed, or was skipped by the kill switch.
+		# /etc/profile is read by other POSIX login shells (dash, say), not only
+		# bash, so this text must stay POSIX sh (no [[ ]]).
 		runtimeLoginShellInit = lib.concatStrings [
 			"\nexport PATH=\"/root/work/.cogbox/runtime/current/bin:$PATH\""
-			"\nif [[ $- == *i* ]] && [ -L /root/work/.cogbox/runtime/current ] && [ ! -d /root/work/.cogbox/runtime/current/bin/ ]; then"
-			"\n\techo \"cogbox: the selected runtime tools are not active (boot restore pending, failed or disabled); run 'cogbox-env status' and 'systemctl status cogbox-runtime-restore'\" >&2"
-			"\nfi"
+			"\ncase $- in"
+			"\n*i*)"
+			"\n\tif [ -L /root/work/.cogbox/runtime/current ] && [ ! -d /root/work/.cogbox/runtime/current/bin/ ]; then"
+			"\n\t\techo \"cogbox: the selected runtime tools are not active (boot restore pending, failed or disabled); run 'cogbox-env status' and 'systemctl status cogbox-runtime-restore'\" >&2"
+			"\n\tfi"
+			"\n\t;;"
+			"\nesac"
 		];
 
 		mkMicrovm = system: name: {
@@ -4592,9 +4598,75 @@
 					# error -- so cogbox-guest-pool-boot-bounded asserts each of these
 					# still carries an ExecStart alongside the bound.
 					"rw-${utils.escapeSystemdPath p.guest}"
-					{ serviceConfig.TimeoutStartSec = 120; }) overlayPaths))) ];
+					{ serviceConfig.TimeoutStartSec = 120; }) overlayPaths))) (lib.optionalAttrs isVm {
+					# Hold dockerd until the uplink has its DHCP lease, for the address
+					# pool below. dockerd skips a pool subnet that overlaps an on-link
+					# route or a nameserver only if that route exists when the network
+					# is created, and it creates docker0 at startup. Nothing else orders
+					# it after the lease: the upstream unit's network-online.target is
+					# reached at once, because the guest does not run wait-online. If
+					# dockerd won that race on a 192.168.0.0/24 uplink (a common home
+					# LAN that passt copies into the guest), docker0 would take
+					# 192.168.0.1/24, usually the gateway, and the guest would lose its
+					# default route and `cogbox ssh` for that boot. Bounded (10 s) and
+					# fail open, since no lease must not mean no docker. A merged
+					# ExecStartPre rather than wait-online, which would hold every
+					# network-online.target consumer too. checks.guest-docker-pools runs
+					# it with, without and with a late default route. Only while docker
+					# is enabled: a plugin that turns it off (podman's dockerCompat must)
+					# would otherwise keep a stray docker.service holding just this
+					# ExecStartPre, which systemd refuses (no ExecStart) and a live apply
+					# would then try to start -- the stray-merged-unit hazard of the rw-*
+					# bounds above, so the check also asserts docker-off renders none.
+					docker = lib.mkIf config.virtualisation.docker.enable { serviceConfig.ExecStartPre = [ "-${pkgs.writeShellScript "cogbox-docker-wait-uplink" ''
+						i=0
+						while [ "$i" -lt 100 ]; do
+							if [ -n "$(${pkgs.iproute2}/bin/ip -4 route show default 2>/dev/null)" ]; then
+								[ "$i" -eq 0 ] || echo "cogbox: the uplink's IPv4 default route appeared after $((i / 10)).$((i % 10))s; starting dockerd"
+								exit 0
+							fi
+							${pkgs.coreutils}/bin/sleep 0.1
+							i=$((i + 1))
+						done
+						echo "cogbox: no IPv4 default route after 10s; starting dockerd anyway, so docker0 can take a subnet the uplink later gets. Once the uplink is up, 'systemctl restart docker' picks docker0 again" >&2
+						exit 0
+					''}" ]; };
+				}) ];
 
 				virtualisation.docker.enable = lib.mkIf isVm true;
+				# Networks Docker picks a subnet for (docker0, and every network or compose
+				# network created without an explicit subnet) come from 192.168.0.0/16 in
+				# /24s instead of Docker's stock 172.17-172.31 pools, which overlap private
+				# ranges a control plane or site network commonly uses. passt keeps a
+				# remote peer's real source address, so a bridge on the peer's range
+				# captures what the guest sends it (guest reply routing rescues only
+				# inbound TCP and uplink-bound UDP). Docker skips a pool subnet that
+				# overlaps an on-link route or a nameserver if that route or nameserver
+				# exists when the network is created, so the uplink's own subnet is not
+				# picked once the uplink has its lease (docker.service waits for it, see
+				# cogbox-docker-wait-uplink above). lib.mkDefault: a plain definition in
+				# a plugin or the instance flake replaces the whole list, and
+				# lib.mkForce [ ] restores Docker's stock pools. dockerd refuses to
+				# start with both --default-address-pool and this key (its conflict
+				# test is the key's presence, so even an empty list counts), so the
+				# base steps aside when extraOptions already passes the flag, the
+				# usual workaround for these very overlaps: such a composition keeps
+				# its own pools and its docker, as before. Existing networks keep their
+				# subnet. checks.guest-docker-pools pins it.
+				virtualisation.docker.daemon.settings.default-address-pools = lib.mkIf (isVm
+					&& !(lib.hasInfix "--default-address-pool" config.virtualisation.docker.extraOptions)) (lib.mkDefault [
+					{ base = "192.168.0.0/16"; size = 24; }
+				]);
+				# Only a composition that defines the key itself as well as the flag
+				# gets here (the base steps aside for the flag alone). A warning, not
+				# an assertion: a failed compose would cost the whole box over docker
+				# alone, and the message names the fix. Even lib.mkForce [ ] does not
+				# clear the conflict.
+				warnings = lib.optional (isVm
+					&& config.virtualisation.docker.enable
+					&& lib.hasInfix "--default-address-pool" config.virtualisation.docker.extraOptions
+					&& config.virtualisation.docker.daemon.settings ? default-address-pools)
+					"cogbox: virtualisation.docker.extraOptions passes --default-address-pool, but a module also defines virtualisation.docker.daemon.settings.default-address-pools (the guest's own default steps aside for the flag), and dockerd refuses to start with both (even when the list is empty). Keep one: move the pools from the flag into daemon.settings.default-address-pools, or drop that definition.";
 
 				# Cap the journal now that it can outlive a reboot. journald's
 				# SystemMaxUse defaults to 10% of the containing filesystem and
@@ -6300,6 +6372,7 @@
 					assert !(lib.hasInfix profile disabled.programs.bash.loginShellInit);
 					assert lib.hasInfix profile enabled.programs.bash.loginShellInit;
 					assert lib.hasInfix warning enabled.programs.bash.loginShellInit;
+					assert !(lib.hasInfix "[[" enabled.programs.bash.loginShellInit);
 					assert !(hasPackage disabled);
 					assert hasPackage enabled;
 					assert lib.hasInfix profile (launcher enabled);
@@ -6321,6 +6394,7 @@
 					assert hasPackage config;
 					assert lib.hasInfix profile config.programs.bash.loginShellInit;
 					assert lib.hasInfix warning config.programs.bash.loginShellInit;
+					assert !(lib.hasInfix "[[" config.programs.bash.loginShellInit);
 					assert lib.hasInfix profile (launcher config);
 					assert (skillsOf config).cogbox-runtime == ./skills/cogbox-runtime;
 					assert config.fileSystems ? ${work};
@@ -6407,7 +6481,7 @@
 				assert !(hasPackage pluginOff);
 				assert !(lib.hasInfix profile pluginOff.programs.bash.loginShellInit);
 				pkgs.runCommand "cogbox-runtime-environment-tests" {
-					nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
+					nativeBuildInputs = [ pkgs.bash pkgs.dash pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
 				} ''
 					fails=0
 					fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
@@ -6459,18 +6533,24 @@
 					mkdir -p "$scratch/.cogbox/runtime/selections/t"
 					sed "s|/root/work|$scratch|g" ${pkgs.writeText "hosted-login.sh" hosted.programs.bash.loginShellInit} > login.sh
 					bash -n login.sh || fail "the hosted loginShellInit is not valid bash"
-					warns() { HOME=$TMPDIR bash --norc --noprofile -i -c '. ./login.sh' 2>&1 >/dev/null </dev/null | grep -c 'cogbox-env status' || true; }
-					quiet() { HOME=$TMPDIR bash --norc --noprofile -c '. ./login.sh' 2>&1 >/dev/null </dev/null | grep -c 'cogbox-env status' || true; }
-					[ "$(warns)" = 0 ] || fail "login warns with nothing selected"
-					ln -s selections/t "$scratch/.cogbox/runtime/current"
-					ln -s /nonexistent/bin "$scratch/.cogbox/runtime/selections/t/bin"
-					[ "$(warns)" = 1 ] || fail "login does not warn exactly once when the selected bin is gone"
-					[ "$(quiet)" = 0 ] || fail "a non-interactive login shell warns"
-					rm "$scratch/.cogbox/runtime/selections/t/bin"
-					mkdir "$scratch/.cogbox/runtime/selections/t/bin"
-					[ "$(warns)" = 0 ] || fail "login warns although the selected bin resolves"
-					HOME=$TMPDIR bash --norc --noprofile -c '. ./login.sh; echo "$PATH"' | grep -q "^$scratch/.cogbox/runtime/current/bin:" \
-						|| fail "the runtime profile is not first on the login PATH"
+					dash -n login.sh || fail "the hosted loginShellInit is not valid POSIX sh"
+					# /etc/profile is read by any POSIX login shell, so run it under dash
+					# too: a bashism there prints an error line instead of the warning.
+					for sh in "bash --norc --noprofile" dash; do
+						warns() { HOME=$TMPDIR $sh -i -c '. ./login.sh' 2>&1 >/dev/null </dev/null | grep -c 'cogbox-env status' || true; }
+						quiet() { HOME=$TMPDIR $sh -c '. ./login.sh' 2>&1 >/dev/null </dev/null || true; }
+						rm -rf "$scratch/.cogbox/runtime/current" "$scratch/.cogbox/runtime/selections/t/bin"
+						[ "$(warns)" = 0 ] || fail "$sh: login warns with nothing selected"
+						ln -s selections/t "$scratch/.cogbox/runtime/current"
+						ln -s /nonexistent/bin "$scratch/.cogbox/runtime/selections/t/bin"
+						[ "$(warns)" = 1 ] || fail "$sh: login does not warn exactly once when the selected bin is gone"
+						[ -z "$(quiet)" ] || fail "$sh: a non-interactive login shell prints on stderr: $(quiet)"
+						rm "$scratch/.cogbox/runtime/selections/t/bin"
+						mkdir "$scratch/.cogbox/runtime/selections/t/bin"
+						[ "$(warns)" = 0 ] || fail "$sh: login warns although the selected bin resolves"
+						HOME=$TMPDIR $sh -c '. ./login.sh; echo "$PATH"' | grep -q "^$scratch/.cogbox/runtime/current/bin:" \
+							|| fail "$sh: the runtime profile is not first on the login PATH"
+					done
 
 					[ "$fails" -eq 0 ] || exit 1
 
@@ -6757,6 +6837,140 @@
 						bad "${ruleset} names an interface; the uplink's name differs between profiles, match its link group"
 					fi
 				''}
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
+			# Guest Docker address pools: every VM profile renders a daemon.json
+			# whose default-address-pools is the 192.168.0.0/16 pool and never
+			# reaches into 10.0.0.0/8 or 172.16.0.0/12 (Docker's stock pools sit in
+			# 172.17-172.31, and a bridge on a remote peer's range captures what the
+			# guest sends that peer), and a plain definition replaces it. The
+			# container cannot run Docker and must not enable it. The pool is a
+			# literal needle, deliberately not imported from the module, so an
+			# edited value fails here; tests/check_guest_docker_pools.py holds the
+			# overlap test. Reads the realized docker.service and the daemon.json it
+			# passes, because builtins.match drops the string context that would
+			# build the file. The same unit must hold dockerd for the uplink's
+			# default route (cogbox-docker-wait-uplink): the wait runs, from the
+			# unit's own ExecStartPre path, in a private network namespace with no
+			# default route (it must give up after its bound and still exit 0),
+			# with one (silent and at once) and with one added a second late (it
+			# must start dockerd before the bound). A composition that passes
+			# --default-address-pool in extraOptions must get no key and no warning
+			# (dockerd refuses the two together), one that also defines the key
+			# must be warned, and one that turns docker off must render no
+			# docker.service at all (no stray ExecStartPre-only unit).
+			guest-docker-pools = let
+				cfg = c: self.nixosConfigurations.${c}.config;
+				vms = [ (configName system) "${configName system}-hosted" ]
+					++ lib.optional (system == "aarch64-linux") "cogbox-aarch64-darwin";
+				ct = "${configName system}-container";
+				want = ''[{"base":"192.168.0.0/16","size":24}]'';
+				override = [ { base = "198.51.100.0/24"; size = 28; } ];
+				extended = m: (self.nixosConfigurations.${configName system}.extendModules {
+					modules = [ m ];
+				}).config;
+				overridden = (extended {
+					virtualisation.docker.daemon.settings.default-address-pools = override;
+				}).virtualisation.docker.daemon.settings.default-address-pools;
+				flagWarned = c: lib.any (lib.hasInfix "--default-address-pool") c.warnings;
+				flag = "--default-address-pool base=198.18.0.0/16,size=24";
+				flagged = extended { virtualisation.docker.extraOptions = flag; };
+				flaggedKeyed = extended {
+					virtualisation.docker.extraOptions = flag;
+					virtualisation.docker.daemon.settings.default-address-pools = override;
+				};
+				dockerOff = extended { virtualisation.docker.enable = lib.mkForce false; };
+				on = c: (cfg c).virtualisation.docker.enable;
+				unitOf = c: "${c.systemd.units."docker.service".unit}/docker.service";
+				unitFile = c: unitOf (cfg c);
+			in pkgs.runCommand "cogbox-guest-docker-pools" {
+				nativeBuildInputs = [ pkgs.coreutils pkgs.gnugrep pkgs.iproute2 pkgs.python3Minimal pkgs.util-linux ];
+			} ''
+				fails=0
+				bad() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+				${lib.optionalString (on ct) ''
+					bad "${ct} enables docker, which the container cannot run (the agent container has no CAP_NET_ADMIN) and which the docs say it lacks"
+				''}
+				${lib.optionalString (overridden != override) ''
+					bad ${lib.escapeShellArg "a plain default-address-pools definition does not replace the base pools: got ${builtins.toJSON overridden}"}
+				''}
+				${lib.optionalString (flagWarned (cfg (configName system))) ''
+					bad "${configName system} warns about --default-address-pool although nothing passes it"
+				''}
+				${lib.optionalString (flagged.virtualisation.docker.daemon.settings ? default-address-pools) ''
+					bad ${lib.escapeShellArg "a composition passing --default-address-pool in docker.extraOptions still gets default-address-pools (${builtins.toJSON flagged.virtualisation.docker.daemon.settings.default-address-pools}), so its dockerd refuses to start"}
+				''}
+				${lib.optionalString (flagWarned flagged) ''
+					bad "a composition passing only --default-address-pool in docker.extraOptions is warned, although the guest's pools step aside for it"
+				''}
+				${lib.optionalString (!(flagWarned flaggedKeyed)) ''
+					bad "a composition passing --default-address-pool in docker.extraOptions and defining default-address-pools gets no warning"
+				''}
+				${lib.optionalString (dockerOff.systemd.units ? "docker.service") ''
+					bad "a composition turning docker off still renders a docker.service (a stray unit with no ExecStart, which systemd refuses)"
+				''}
+				# The flag-only composition, realized: dockerd gets the flag and a
+				# daemon.json without the key, the only shape it starts with.
+				grep -qF -- ${lib.escapeShellArg flag} ${unitOf flagged} \
+					|| bad "the flag-only composition's docker.service does not pass its --default-address-pool"
+				conf=$(grep -o -- '--config-file=[^ ;]*' ${unitOf flagged} | head -n 1 || true)
+				conf=''${conf#--config-file=}
+				if [ -n "$conf" ] && grep -qF default-address-pools "$conf"; then
+					bad "the flag-only composition's daemon.json $conf sets default-address-pools alongside the flag: $(cat "$conf")"
+				fi
+				: > waits
+				${lib.concatMapStrings (c: if !(on c) then ''
+					bad "${c} does not enable docker, so this check would prove nothing for it"
+				'' else ''
+					conf=$(grep -o -- '--config-file=[^ ;]*' ${unitFile c} | head -n 1 || true)
+					conf=''${conf#--config-file=}
+					if [ -z "$conf" ]; then
+						bad "${c}: docker.service passes no --config-file, so no daemon.json sets the pools"
+					else
+						python3 ${./tests/check_guest_docker_pools.py} "$conf" ${lib.escapeShellArg want} ${c} || fails=$((fails + 1))
+					fi
+					if grep -qF -- --default-address-pool ${unitFile c}; then
+						bad "${c}: docker.service passes --default-address-pool, which dockerd refuses alongside the daemon.json key"
+					fi
+					wait=$(grep -o '^ExecStartPre=-/nix/store/[^ ]*-cogbox-docker-wait-uplink$' ${unitFile c} | head -n 1 || true)
+					if [ -z "$wait" ]; then
+						bad "${c}: docker.service does not wait for the uplink's default route (no fail-open ExecStartPre=-...cogbox-docker-wait-uplink), so docker0 can take the uplink's subnet before the lease"
+					else
+						echo "''${wait#ExecStartPre=-}" >> waits
+					fi
+				'') vms}
+
+				if ! unshare -rn true; then
+					bad "this builder cannot create an unprivileged user + network namespace (unshare -rn); run the check on a builder that allows them"
+				fi
+				for w in $(sort -u waits); do
+					# No default route ever: give up after the bound, say so, start dockerd.
+					start=$(date +%s)
+					if ! unshare -rn "$w" > none.out 2> none.err; then
+						bad "$w exits non-zero with no default route; dockerd would not start"
+					fi
+					took=$(( $(date +%s) - start ))
+					[ "$took" -ge 9 ] || bad "$w gave up after ''${took}s with no default route, not its 10s bound"
+					grep -q 'no IPv4 default route after 10s' none.err || bad "$w does not report the timeout on stderr: $(cat none.err)"
+					# A default route already there: silent, and at once.
+					start=$(date +%s)
+					unshare -rn sh -c 'ip link set lo up && ip route add default dev lo && exec "$1"' sh "$w" > now.out 2> now.err \
+						|| bad "$w exits non-zero with a default route present"
+					took=$(( $(date +%s) - start ))
+					[ "$took" -le 2 ] || bad "$w took ''${took}s with a default route already present"
+					[ ! -s now.out ] && [ ! -s now.err ] || bad "$w prints with a default route already present: $(cat now.out now.err)"
+					# The lease arrives a second late: dockerd starts then, well inside the bound.
+					start=$(date +%s)
+					unshare -rn sh -c 'ip link set lo up || exit 1; (sleep 1; ip route add default dev lo) & exec "$1"' sh "$w" > late.out 2> late.err \
+						|| bad "$w exits non-zero when the default route arrives late"
+					took=$(( $(date +%s) - start ))
+					[ "$took" -lt 6 ] || bad "$w took ''${took}s although the default route arrived after 1s"
+					grep -q "default route appeared after" late.out || bad "$w does not log the wait for a late default route: $(cat late.out late.err)"
+					[ ! -s late.err ] || bad "$w prints on stderr for a late default route: $(cat late.err)"
+				done
+				[ -s waits ] || bad "no VM guest carries the uplink wait, so nothing above ran it"
 				[ "$fails" -eq 0 ] || exit 1
 				touch $out
 			'';

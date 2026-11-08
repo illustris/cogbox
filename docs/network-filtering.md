@@ -83,6 +83,8 @@ cogbox rules list
 cogbox rules add allow 192.168.1.50/32 --at 8
 ```
 
+The guest's Docker networks come from 192.168.0.0/16, and Docker skips only the subnets the guest has on-link, so a LAN host in that range the guest reaches through its gateway (on macOS, every LAN: the uplink is slirp's 10.0.2.0/24) can be captured by a Docker network instead. Move the pool when that applies: see [guest Docker address pools](internals.md#guest-docker-address-pools).
+
 **Block a specific public address** -- insert the deny ahead of the trailing `allow 0.0.0.0/0`. Easiest is `--at 1` so it runs before all existing rules:
 
 ```sh
