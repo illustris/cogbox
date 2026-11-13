@@ -687,7 +687,7 @@ code or install a login key.
 | `cogworx-self-addrs` | floor unit (rule 2) and supervisor (`--bind-addr`/`--self-addr`). Absent or empty falls back to the metadata server's own `instance/network-interfaces/*/ip`, because every insert body stamps this key empty (no address exists yet) and only a later Start refreshes it; an empty set from BOTH sources FAILS the boot in both |
 | `cogworx-maintenance`, `cogworx-resolver` | supervisor short-circuit; read by key PRESENCE, never value |
 | `cogworx-resolver-deadline` | resolver self-destruct timer |
-| `cogworx-ssh-ca-pub`, `cogworx-ssh-principal` | supervisor: the gateway user CA staged for the guest, and the control certificate principal sshd accepts |
+| `cogworx-ssh-ca-pub`, `cogworx-ssh-principal` | supervisor: the gateway user CA staged for the guest, and the control certificate principal sshd accepts. Written as root into the guest's data share (`.config/ssh-ca.pub`, `.config/ssh-principals/root`) through a temp file and `mv -T`, so a symlink or FIFO the guest left at either name is replaced, never followed or opened; a `.config` or `.config/ssh-principals` that is a symlink or not a directory stages neither, with a journal warning, rather than writing through it |
 
 Guest attributes published back, each stamped `<nonce> <payload>`:
 `cogworx/vm-host-key` (every boot class, before any sandbox start),

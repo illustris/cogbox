@@ -8083,6 +8083,42 @@
 				touch $out
 			'';
 
+			# The sftp subsystem in the realised sshd_config of the GUEST, on the VM
+			# target in both storage profiles and on the container target. sftp
+			# rides it, as does scp (sftp protocol by default since OpenSSH 9.0),
+			# and so does a gateway certificate forced to internal-sftp: sshd looks
+			# the requested subsystem up in its config before the forced command
+			# replaces it, so without the line every such session is refused. This
+			# flake sets none of it; the line is the NixOS default
+			# (services.openssh.allowSFTP), which a nixpkgs bump or a stray
+			# allowSFTP = false would remove with nothing else noticing.
+			# environment.etc's source rather than a toplevel's /etc: the entry is
+			# mode "symlink", so it is the same file, for the cost hostedFstab
+			# names above.
+			cogbox-guest-sshd-sftp = let
+				guests = lib.genAttrs [ (configName system) "${configName system}-hosted" "${configName system}-container" ]
+					(n: self.nixosConfigurations.${n}.config.environment.etc."ssh/sshd_config".source);
+			in pkgs.runCommand "cogbox-guest-sshd-sftp" { } ''
+				fails=0
+				${lib.concatStrings (lib.mapAttrsToList (n: conf: ''
+					# The first global Subsystem sftp: sshd keywords are case-insensitive,
+					# subsystem names are not, and a Match block's lines apply only to
+					# the connections it matches.
+					cmd=$(awk 'tolower($1) == "match" { exit } tolower($1) == "subsystem" && $2 == "sftp" { print $3; exit }' ${conf})
+					if [ -z "$cmd" ]; then
+						echo "FAIL: ${n}: the realised sshd_config has no global Subsystem sftp line; sftp, scp and an internal-sftp certificate would all be refused" >&2
+						fails=$((fails + 1))
+					elif [ "$cmd" != internal-sftp ] && [ ! -x "$cmd" ]; then
+						echo "FAIL: ${n}: Subsystem sftp runs $cmd, which is not an executable" >&2
+						fails=$((fails + 1))
+					else
+						echo "ok - ${n}: Subsystem sftp $cmd"
+					fi
+				'') guests)}
+				[ "$fails" -eq 0 ] || exit 1
+				touch $out
+			'';
+
 			# Floor-before-sandbox and scrub-independence are both load-bearing
 			# orderings. Both are the kind of thing a later "tidy the
 			# dependency graph" commit breaks without any test noticing.

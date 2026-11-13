@@ -714,13 +714,54 @@ fi
 # Public-key material and an instance id only; no secret. The guest's
 # cogbox-vm-sshd-prep seeds empty fail-closed files when these are absent, so a
 # deployment without the SSH gateway is not broken by their absence.
+#
+# Written as root into the guest's 9p data share, where every name below the
+# instance data dir is the GUEST's: with security_model=none (see
+# read_boot_stamp) a symlink, FIFO or device node it made there is a real one on
+# this host. So nothing here opens or creates through such a name. A directory
+# on the way that is a symlink, or not a directory, refuses the pair, which
+# leaves the guest's sshd without this CA: fail closed. Each file is a temp file
+# mktemp creates in its directory, renamed over the name with `mv -T`, as the
+# launcher publishes .app-launch: the rename replaces whatever sits there -- a
+# symlink, a FIFO, a device node -- without following or opening it, and a
+# directory there fails the rename instead of receiving the file. Checked, then
+# used: sound because only a running guest changes the share and none runs
+# here, the previous run's having died with the unit's cgroup. One that outlived
+# that kill could race the checks, and leg (e) refuses its boot right after.
+#
+# share_dir <path>: <path>, whose parent is a real directory, as a real
+# directory -- made when absent, never through a symlink -- or fail.
+share_dir() {
+	[ -e "$1" ] || [ -L "$1" ] || mkdir -- "$1"
+	[ -d "$1" ] && [ ! -L "$1" ]
+}
+# share_put <dir> <name> <line>: <dir>/<name> replaced by <line>, mode 0644.
+share_put() {
+	local tmp
+	tmp=$(mktemp "$1/.$2.XXXXXX") || return 1
+	if printf '%s\n' "$3" > "$tmp" && chmod 0644 "$tmp" && mv -fT -- "$tmp" "$1/$2"; then
+		return 0
+	fi
+	rm -f -- "$tmp"
+	return 1
+}
 SSH_CA_PUB="$(md_get cogworx-ssh-ca-pub)"
 SSH_PRINCIPAL="$(md_get cogworx-ssh-principal)"
 if [ -n "$SSH_CA_PUB" ] && [ -n "$SSH_PRINCIPAL" ]; then
 	_sd="$COGBOX_DATA/instances/$INSTANCE"
-	mkdir -p "$_sd/.config/ssh-principals" "$_sd/ssh"
-	printf '%s\n' "$SSH_CA_PUB" > "$_sd/.config/ssh-ca.pub"
-	printf '%s\n' "$SSH_PRINCIPAL" > "$_sd/.config/ssh-principals/root"
+	# The share's root is this host's (cogbox init made it, and a guest cannot
+	# replace its own mount); only the names below it are the guest's.
+	mkdir -p -- "$_sd"
+	share_dir "$_sd/ssh" \
+		|| note "warning: $_sd/ssh is a symlink or not a directory; left as the guest made it"
+	if share_dir "$_sd/.config" && share_dir "$_sd/.config/ssh-principals"; then
+		share_put "$_sd/.config" ssh-ca.pub "$SSH_CA_PUB" \
+			|| note "warning: could not stage the gateway SSH CA at $_sd/.config/ssh-ca.pub"
+		share_put "$_sd/.config/ssh-principals" root "$SSH_PRINCIPAL" \
+			|| note "warning: could not stage the gateway SSH principal at $_sd/.config/ssh-principals/root"
+	else
+		note "warning: $_sd/.config or its ssh-principals is a symlink or not a directory; the gateway SSH CA and principal were not staged"
+	fi
 fi
 
 # The mitmproxy terminate tier runs under COGBOX_PROXY_RUNAS, so its persistent

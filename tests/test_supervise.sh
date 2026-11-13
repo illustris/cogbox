@@ -103,6 +103,15 @@
 #     plane classifies by (a classified summary, the generic literal, cleared
 #     by a later successful init) is unchanged -- except that a
 #     cogbox-stamped WARNING no longer stands in for an unstamped failure.
+#   - leg (c) stages the gateway CA and principal with the bytes, names and
+#     mode the old redirects wrote, and never through a name the guest made on
+#     its 9p data share, where a symlink or FIFO is a real one on the host: a
+#     symlink at either file (to a host file, a dangling path or a host
+#     directory) or a FIFO there is replaced, never followed or opened; a
+#     symlink at .config or .config/ssh-principals refuses the pair and one at
+#     ssh/ is left alone; a directory at a file's name fails that file's rename
+#     and takes its temp file with it. Nothing appears below any target, and no
+#     refusal costs the boot.
 #
 # Usage: test_supervise.sh <path-to-supervise.sh>
 # Needs: bash, coreutils, gawk, gnugrep. NOT curl/cogbox/GCE -- both are stubs.
@@ -2203,6 +2212,138 @@ if [ "$p" = 3 ] && grep -qxF 'PUT instance/guest-attributes/cogworx/ready n0nce-
 	ok "with a host boot id that is not a UUID readiness still waits for the stamp (poll $p), with no proof"
 else
 	bad "bad host boot id: readiness at poll $p, expected 3; $(grep 'cogworx/ready' "$md/events" | tr '\n' '|'); proof events: $(proof_events "$md")"
+fi
+
+# --- 13. leg (c) never writes through a name the guest made -----------------
+#
+# The instance data dir is the guest's 9p data share (security_model=none), so
+# every name below its root is the guest's, and a symlink there is a real one
+# on the host. Leg (c) runs as root and used to write the gateway CA and
+# principal with `mkdir -p` and two shell redirects, which follow such a link
+# to any host path. Each case plants one shape in the share before the boot,
+# as a guest of an earlier run would have left it, with an `outside` tree next
+# to the state disk standing in for the host paths it aims at. No guest key:
+# the start stub would make ssh/ itself, and ssh/ is one of the names on trial.
+GW_CA="ssh-ed25519 AAAAgatewayca gateway-ca"
+GW_ATTRS=("cogworx-ssh-ca-pub=$GW_CA" "cogworx-ssh-principal=acme-demo")
+share() { printf '%s' "$ROOT/$1/state/data/cogbox/instances/demo"; }
+# holds <path> <line>: <path> reads exactly <line> and one newline.
+holds() { [ "$(cat -- "$1" 2>/dev/null; printf x)" = "$2"$'\n'x ]; }
+# staged <path> <line>: ...and is a regular file, not a link, mode 0644.
+staged() { [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %a "$1")" = 644 ] && holds "$1" "$2"; }
+gw_boot() { SEED_GUEST_KEY="" run_boot "$1" "${BASE_ATTRS[@]}" "${GW_ATTRS[@]}"; }
+gw_started() { [ "$(evcount "$ROOT/$1/md" 'cogbox start')" = 1 ]; }
+
+# 13a. A fresh share: what the redirects used to write, at the same names and
+# mode, with ssh/ made, no temp file left beside either file, and a boot that
+# goes on to start the sandbox.
+rc=$(gw_boot gwfresh)
+sd=$(share gwfresh)
+if staged "$sd/.config/ssh-ca.pub" "$GW_CA" && staged "$sd/.config/ssh-principals/root" acme-demo \
+	&& [ "$(ls -A "$sd/.config" | tr '\n' ' ')" = "ssh-ca.pub ssh-principals " ] \
+	&& [ "$(ls -A "$sd/.config/ssh-principals")" = root ] \
+	&& [ -d "$sd/ssh" ] && [ ! -L "$sd/ssh" ] && gw_started gwfresh; then
+	ok "leg (c) stages the gateway CA and principal (exact bytes, 0644, no temp file left) and the boot goes on"
+else
+	bad "leg (c) on a fresh share: $(ls -lAR "$sd" 2>&1 | tr '\n' '|') starts=$(evcount "$ROOT/gwfresh/md" 'cogbox start')"
+fi
+
+# 13b. A symlink at either FILE: one to an existing host file, which the
+# redirect truncated and overwrote, and one dangling, which it created. Both
+# targets are untouched, and both names hold the staged file instead.
+sd=$(share gwfile); out="$ROOT/gwfile/outside"
+mkdir -p "$sd/.config/ssh-principals" "$out"
+printf 'host-file-sentinel\n' > "$out/victim"
+ln -s "$out/victim" "$sd/.config/ssh-ca.pub"
+ln -s "$out/created-by-root" "$sd/.config/ssh-principals/root"
+rc=$(gw_boot gwfile)
+if holds "$out/victim" host-file-sentinel && [ "$(ls -A "$out")" = victim ] \
+	&& staged "$sd/.config/ssh-ca.pub" "$GW_CA" && staged "$sd/.config/ssh-principals/root" acme-demo \
+	&& gw_started gwfile; then
+	ok "leg (c) replaces a symlink at either file (existing or dangling target) and never writes through it"
+else
+	bad "leg (c) and a symlink at a file: outside: $(ls -lA "$out" | tr '\n' '|') victim: $(cat "$out/victim"); share: $(ls -lAR "$sd/.config" | tr '\n' '|')"
+fi
+
+# 13c. A FIFO at the CA file, which the redirect blocked on with no reader
+# until the unit was killed, and a symlink to a host DIRECTORY at the
+# principal file, which a rename without -T moves the file INTO. Neither is
+# opened or followed: the boot finishes and both names hold the staged file.
+sd=$(share gwfifo); out="$ROOT/gwfifo/outside"
+mkdir -p "$sd/.config/ssh-principals" "$out/dir"
+mkfifo "$sd/.config/ssh-ca.pub"
+ln -s "$out/dir" "$sd/.config/ssh-principals/root"
+rc=$(gw_boot gwfifo)
+if [ "$rc" != 124 ] && [ -z "$(ls -A "$out/dir")" ] \
+	&& staged "$sd/.config/ssh-ca.pub" "$GW_CA" && staged "$sd/.config/ssh-principals/root" acme-demo \
+	&& gw_started gwfifo; then
+	ok "leg (c) replaces a FIFO and a link to a host directory at the files, opening and following neither"
+else
+	bad "leg (c) and a FIFO or directory link at a file: rc=$rc; outside dir: $(ls -lA "$out/dir" | tr '\n' '|'); share: $(ls -lAR "$sd/.config" | tr '\n' '|')"
+fi
+
+# 13d. A symlink at .config itself, to a host directory, where the redirects
+# created ssh-ca.pub and ssh-principals/root. The pair is refused instead:
+# nothing appears in the target, the guest's link stays as it made it, the
+# journal says so, and the boot is not the worse for it (ssh/ is still made
+# and the sandbox still starts).
+sd=$(share gwcfg); out="$ROOT/gwcfg/outside"
+mkdir -p "$sd" "$out/dir"
+ln -s "$out/dir" "$sd/.config"
+rc=$(gw_boot gwcfg)
+if [ -z "$(ls -A "$out/dir")" ] && [ -L "$sd/.config" ] \
+	&& grep -q 'gateway SSH CA and principal were not staged' "$ROOT/gwcfg/out.log" \
+	&& [ -d "$sd/ssh" ] && [ ! -L "$sd/ssh" ] && gw_started gwcfg; then
+	ok "leg (c) refuses a symlinked .config, writes nothing below its target, and still boots"
+else
+	bad "leg (c) and a symlink at .config: outside dir: $(ls -lAR "$out/dir" | tr '\n' '|'); journal: $(grep 'not staged' "$ROOT/gwcfg/out.log"); starts=$(evcount "$ROOT/gwcfg/md" 'cogbox start')"
+fi
+
+# 13e. The same at .config/ssh-principals: the principal is not written below
+# the target, and the CA beside it is not staged either, the pair being all or
+# nothing.
+sd=$(share gwprn); out="$ROOT/gwprn/outside"
+mkdir -p "$sd/.config" "$out/dir"
+ln -s "$out/dir" "$sd/.config/ssh-principals"
+rc=$(gw_boot gwprn)
+if [ -z "$(ls -A "$out/dir")" ] && [ ! -e "$sd/.config/ssh-ca.pub" ] && [ ! -L "$sd/.config/ssh-ca.pub" ] \
+	&& grep -q 'gateway SSH CA and principal were not staged' "$ROOT/gwprn/out.log" \
+	&& gw_started gwprn; then
+	ok "leg (c) refuses a symlinked .config/ssh-principals, the CA with it, and still boots"
+else
+	bad "leg (c) and a symlink at .config/ssh-principals: outside dir: $(ls -lAR "$out/dir" | tr '\n' '|'); share: $(ls -lAR "$sd/.config" | tr '\n' '|'); starts=$(evcount "$ROOT/gwprn/md" 'cogbox start')"
+fi
+
+# 13f. A symlink at ssh/, to a host directory: nothing is made below it and it
+# is left as the guest made it, while the pair, which does not live there, is
+# still staged.
+sd=$(share gwssh); out="$ROOT/gwssh/outside"
+mkdir -p "$sd" "$out/dir"
+ln -s "$out/dir" "$sd/ssh"
+rc=$(gw_boot gwssh)
+if [ -z "$(ls -A "$out/dir")" ] && [ -L "$sd/ssh" ] \
+	&& grep -qF "$sd/ssh is a symlink or not a directory" "$ROOT/gwssh/out.log" \
+	&& staged "$sd/.config/ssh-ca.pub" "$GW_CA" && staged "$sd/.config/ssh-principals/root" acme-demo \
+	&& gw_started gwssh; then
+	ok "leg (c) leaves a symlinked ssh/ alone and still stages the pair"
+else
+	bad "leg (c) and a symlink at ssh/: outside dir: $(ls -lAR "$out/dir" | tr '\n' '|'); share: $(ls -lAR "$sd" | tr '\n' '|')"
+fi
+
+# 13g. A real DIRECTORY at the CA file's name, which a rename without -T moves
+# the file INTO. The rename fails instead: the directory stays empty, the temp
+# file does not outlive it, the journal says so, and the principal beside it
+# is still staged.
+sd=$(share gwdir)
+mkdir -p "$sd/.config/ssh-ca.pub" "$sd/.config/ssh-principals"
+rc=$(gw_boot gwdir)
+if [ -d "$sd/.config/ssh-ca.pub" ] && [ -z "$(ls -A "$sd/.config/ssh-ca.pub")" ] \
+	&& [ "$(ls -A "$sd/.config" | tr '\n' ' ')" = "ssh-ca.pub ssh-principals " ] \
+	&& grep -qF "could not stage the gateway SSH CA at $sd/.config/ssh-ca.pub" "$ROOT/gwdir/out.log" \
+	&& staged "$sd/.config/ssh-principals/root" acme-demo && gw_started gwdir; then
+	ok "leg (c) fails the rename over a directory at the CA file, leaves no temp file, says so, and still stages the principal"
+else
+	bad "leg (c) and a directory at the CA file: share: $(ls -lAR "$sd/.config" | tr '\n' '|'); journal: $(grep 'gateway SSH' "$ROOT/gwdir/out.log"); starts=$(evcount "$ROOT/gwdir/md" 'cogbox start')"
 fi
 
 if [ -s "$ROOT/wedged" ]; then
