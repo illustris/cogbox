@@ -447,15 +447,24 @@ NIX_EOF"""))
         "cogbox ssh 'test -f /var/lib/cogbox/work/.omp/skills/cogbox-plugins/SKILL.md'"
     ))
     # Hermes's skills land inside its home overlay upper. With both codex
-    # and pi disabled, their shared .agents/skills tree is omitted. A
-    # plugin-less brain has no rules, so no AGENTS.md digest is linked.
+    # and pi disabled, their shared .agents/skills tree is omitted. The base
+    # bakes the cogbox-git rule, so even a plugin-less brain links the
+    # AGENTS.md digest, and the git host helper it names is on PATH.
     machine.succeed(as_user(
         "cogbox ssh 'test ! -e /var/lib/cogbox/work/.agents/skills/cogbox-plugins/SKILL.md'"
     ))
     machine.succeed(as_user(
         "cogbox ssh 'test -f /root/.hermes/skills/cogbox-plugins/SKILL.md'"
     ))
-    machine.succeed(as_user("cogbox ssh 'test ! -e /root/work/AGENTS.md'"))
+    machine.succeed(as_user(
+        "cogbox ssh 'test \"$(readlink /root/work/AGENTS.md)\" = .cogbox/brain/AGENTS.md'"
+    ))
+    machine.succeed(as_user(
+        "cogbox ssh 'grep -qxF \"<!-- cogbox rule: cogbox-git -->\" /root/work/AGENTS.md'"
+    ))
+    machine.succeed(as_user(
+        "cogbox ssh 'test -f /root/work/.cogbox/brain/skills/cogbox-git/SKILL.md && command -v cogbox-git-hosts'"
+    ))
     # Claude workspace trust is pre-accepted for the new workdir.
     machine.succeed(as_user(
         "cogbox ssh 'grep -q /var/lib/cogbox/work /root/.claude.json'"

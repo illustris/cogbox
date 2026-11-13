@@ -79,6 +79,10 @@ pub const Args = struct {
 	config_path: []const u8,
 	runtime_path: []const u8,
 	cmd: Cmd,
+	// Not an argv flag; set by main.dispatch. The instance data directory the
+	// git-host summary (main.git_hosts_file) is published into; null publishes
+	// nothing.
+	data_dir: ?[]const u8 = null,
 };
 
 pub const ParseError = error{

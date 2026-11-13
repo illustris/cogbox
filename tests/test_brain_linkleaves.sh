@@ -137,9 +137,20 @@ for p in work/.claude/skills/demo-es work/.claude/commands/demo-rca.md \
 	work/.opencode/commands/demo-rca.md work/.omp/rules/demo-readonly.md root/.hermes/skills/demo-overview; do
 	gone "$R/$p" || bad "stale $p survived ($(readlink "$R/$p"))"
 done
-for p in work/.claude/settings.json work/.mcp.json work/.omp/mcp.json work/AGENTS.md; do
+for p in work/.claude/settings.json work/.mcp.json work/.omp/mcp.json; do
 	gone "$R/$p" && ok "stale $p removed" || bad "stale $p survived ($(readlink "$R/$p"))"
 done
+# The base brain bakes a rule (cogbox-git), so its AGENTS.md digest exists and
+# the link through the stable brain path now reads the base digest -- without
+# the removed plugin's rule.
+if [ "$(readlink "$R/work/AGENTS.md")" = .cogbox/brain/AGENTS.md ] \
+	&& [ "$(readlink -f "$R/work/AGENTS.md")" = "$(readlink -f "$base/AGENTS.md")" ] \
+	&& grep -qxF '<!-- cogbox rule: cogbox-git -->' "$R/work/AGENTS.md" \
+	&& ! grep -q demo-readonly "$R/work/AGENTS.md"; then
+	ok "AGENTS.md now reads the base brain's digest (cogbox-git, no plugin rule)"
+else
+	bad "AGENTS.md after boot 2: $(readlink "$R/work/AGENTS.md" 2>/dev/null || echo absent)"
+fi
 [ "$(readlink "$R/work/.claude/skills/cogbox-plugins")" = "$base/claude/skills/cogbox-plugins" ] \
 	&& ok "the base brain's own skills are linked" \
 	|| bad "cogbox-plugins reads $(readlink "$R/work/.claude/skills/cogbox-plugins" 2>/dev/null || echo absent)"
@@ -188,6 +199,19 @@ if [ "$rc" = 0 ] && [ -f "$R2/work/.mcp.json" ] && [ ! -L "$R2/work/.mcp.json" ]
 	ok "a user's regular .mcp.json survives"
 else
 	bad "user .mcp.json was touched (rc=$rc, $(ls -la "$R2/work/.mcp.json" 2>&1))"
+fi
+# ...and neither is a user's own regular AGENTS.md (it hides the digest the
+# base brain now always has).
+R4="$W/r4"
+mkscript "$R4"
+mkdir -p "$R4/work"
+echo 'user rules' > "$R4/work/AGENTS.md"
+materialize "$R4" "$base" user-agents
+if [ "$rc" = 0 ] && [ -f "$R4/work/AGENTS.md" ] && [ ! -L "$R4/work/AGENTS.md" ] \
+	&& [ "$(cat "$R4/work/AGENTS.md")" = 'user rules' ]; then
+	ok "a user's regular AGENTS.md survives"
+else
+	bad "user AGENTS.md was touched (rc=$rc, $(ls -la "$R4/work/AGENTS.md" 2>&1))"
 fi
 
 # --- a stale link the prune cannot remove never fails the unit ---

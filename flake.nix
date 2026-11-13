@@ -2000,7 +2000,8 @@
 				codexConfig = tomlFmt.generate "config.toml" codexConfigAttrs;
 				ompMcpJson = jsonFmt.generate "mcp.json" { mcpServers = ompMcp; };
 
-				# --- the cogbox-authored capability index (the only always-on text) ---
+				# --- the cogbox-authored capability index (always-on, beside the rules:
+				#     the base itself bakes one, cogbox-git, modules/sandbox-skills.nix) ---
 				# Descriptions are read from the ORIGINAL discovered path, never from a
 				# qualified copy: the copy is a derivation, and readFile-ing one would
 				# turn this eval into import-from-derivation -- which the offline
@@ -2173,6 +2174,14 @@
 					set -e
 					mkdir -p $out/rules
 					${linkInto "$out/rules" ".md" rules}
+					# Harness-neutral skills tree, built for every brain: a harness
+					# that loads no skills natively (dsh, and anything else that reads
+					# only AGENTS.md) reads a skill by path as
+					# ~/work/.cogbox/brain/skills/<name>/SKILL.md -- the baked
+					# cogbox-git rule names that path.
+					mkdir -p $out/skills
+					${linkInto "$out/skills" "" skills}
+					ln -s ${indexSkill} $out/skills/cogbox-plugins
 				'' + lib.optionalString (harnesses ? "claude-code") ''
 					mkdir -p $out/claude/skills $out/claude/agents $out/claude/commands
 					${linkInto "$out/claude/skills" "" skills}
@@ -2219,9 +2228,10 @@
 					ln -s ${indexSkill} $out/hermes/skills/cogbox-plugins
 				'' + lib.optionalString (rules != {}) ''
 					# Harness-neutral rules digest: pi and hermes auto-inject an
-					# AGENTS.md found in the cwd, and codex reads it natively -- none
-					# of them has a native per-file rules dir like claude-code's
-					# .claude/rules. Concatenate the merged rules into one AGENTS.md,
+					# AGENTS.md found in the cwd, and codex and dsh read it natively --
+					# none of them has a native per-file rules dir like claude-code's
+					# .claude/rules. Every brain has one now: the base bakes the
+					# cogbox-git rule (modules/sandbox-skills.nix). Concatenate the merged rules into one AGENTS.md,
 					# linked into ~/work only-if-absent by the materialize oneshot.
 					# Path-scoped rules (paths: frontmatter) become always-on here,
 					# same trade-off as opencode's instructions glob; the frontmatter
@@ -2464,7 +2474,8 @@
 					linkleaves "$brain/hermes/skills" /root/.hermes/skills
 
 					# Harness-neutral AGENTS.md (pi + hermes inject it from the cwd,
-					# codex reads it natively): linked THROUGH the stable brain path
+					# codex and dsh read it natively; every brain has one, since the
+					# base bakes a rule): linked THROUGH the stable brain path
 					# so it tracks brain rebuilds, and only-if-absent so a user's own
 					# AGENTS.md is never clobbered. A dangling link that is ours
 					# (rules removed by a plugin change) is dropped, not left broken.
@@ -6598,14 +6609,48 @@
 					assert native.system.build.cogboxBrainUnits.skills.cogbox-network == ./skills/cogbox-network;
 					assert native.system.build.cogboxBrainUnits.skills.cogbox-remote-access == ./skills/cogbox-remote-access;
 					assert native.system.build.cogboxBrainUnits.skills.cogbox-vault == ./skills/cogbox-vault;
+					# The first baked rule, and the git host helper it names, on the
+					# system PATH with the summary path of this target.
+					assert native.system.build.cogboxBrainUnits.rules.cogbox-git == ./rules/cogbox-git.md;
+					assert lib.hasInfix "summary_layout=${if native.boot.isContainer then "container" else "vm"}\n" (gitHosts native).text;
+					assert lib.hasInfix (builtins.readFile ./cogbox-git-hosts.sh) (gitHosts native).text;
 					true;
+				gitHosts = config: lib.findFirst (p: p.name == "cogbox-git-hosts")
+					(throw "cogbox-git-hosts is not in environment.systemPackages") config.environment.systemPackages;
+				vm = (builtins.head configs).config;
+				container = (builtins.elemAt configs 1).config;
+			# The brain is target-independent (the container prebuild and boot
+			# rebuild rely on it), so the per-target helper must never reach it.
 			in assert lib.all checkConfig configs;
+				assert vm.system.build.cogboxBrain.drvPath == container.system.build.cogboxBrain.drvPath;
 				pkgs.runCommand "cogbox-native-app-module" {
-					nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.coreutils ];
+					nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.coreutils pkgs.curl pkgs.gnugrep ];
 				} ''
 					python3 ${./tests/test_guest_environment.py} \
-						${pkgs.writeText "vm-environment.sh" (builtins.head configs).config.systemd.services.cogbox-environment.script} \
-						${pkgs.writeText "container-environment.sh" (builtins.elemAt configs 1).config.systemd.services.cogbox-environment.script} -v
+						${pkgs.writeText "vm-environment.sh" vm.systemd.services.cogbox-environment.script} \
+						${pkgs.writeText "container-environment.sh" container.systemd.services.cogbox-environment.script} -v
+
+					# The git host helper, skill and rule.
+					test -x ${gitHosts vm}/bin/cogbox-git-hosts
+					test -x ${gitHosts container}/bin/cogbox-git-hosts
+					grep -q cogbox-git-hosts ${./skills/cogbox-git/SKILL.md}
+					grep -q cogbox-git-hosts ${./rules/cogbox-git.md}
+					# The list holds grant hosts only: both say an injected secret's
+					# host is not in it (the helper's own lines are pinned by
+					# test_git_hosts_helper.py below).
+					grep -qF 'reached through an injected secret instead of a grant is not listed' ${./skills/cogbox-git/SKILL.md}
+					grep -qF 'reached through an injected secret instead of a grant is not listed' ${./rules/cogbox-git.md}
+					test "$(grep -c . ${./rules/cogbox-git.md})" = 3
+					brain=${vm.system.build.cogboxBrain}
+					grep -qxF '<!-- cogbox rule: cogbox-git -->' $brain/AGENTS.md
+					grep -q cogbox-git-hosts $brain/AGENTS.md
+					if grep -qx -- --- $brain/AGENTS.md; then echo 'AGENTS.md kept a frontmatter delimiter' >&2; exit 1; fi
+					test -f $brain/rules/cogbox-git.md
+					test -f $brain/skills/cogbox-git/SKILL.md
+					test -f $brain/skills/cogbox-plugins/SKILL.md
+					export HOME=$TMPDIR
+					python3 ${./tests/test_git_hosts_helper.py} ${./cogbox-git-hosts.sh} \
+						${self.packages.${system}.cogbox-tools}/bin/cogbox -v
 					touch $out
 				'';
 			launch-flag-tests = pkgs.runCommand "cogbox-launch-flag-tests" {

@@ -422,6 +422,8 @@ The proxy and its mitmproxy terminate backend bind **per-instance** loopback por
 | `cogbox l7 set [-n NAME]` | Replace all rules from stdin (one `allow\|deny HOST` per line) |
 | `cogbox l7 mode passthrough\|terminate [-n NAME]` | Set the instance default tier (terminate if unset) |
 
+Every subcommand that writes config.json (all of the above except `list`) also republishes `git-hosts.json` at the root of the instance data directory: the git hosts the sandbox reaches through git grants (never a host reached only through an injected secret), for the guest's `cogbox-git-hosts` helper. The write is best-effort and silent and never changes a verb's output or exit status; see [host discovery](authproxy.md#host-discovery-git-hostsjson-and-cogbox-git-hosts).
+
 ```sh
 cogbox l7 add allow api.example.com                       # terminate (default)
 cogbox l7 add allow pinned.example.com --passthrough      # SNI-only (cert pinned)

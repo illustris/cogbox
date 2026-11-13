@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -47,9 +48,9 @@ class Contract(unittest.TestCase):
         self.addCleanup(cleanup)
         return child
 
-    def cli(self, *args, ok=True):
+    def cli(self, *args, ok=True, input=None):
         result = subprocess.run([str(CLI), *args], env=self.env, capture_output=True,
-                                text=True, timeout=12)
+                                text=True, timeout=12, input=input)
         if ok:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
@@ -282,6 +283,126 @@ while True:
         self.assertFalse(self.config.parent.exists())
         self.assertTrue(guard_path.exists())
 
+
+    # --- git-hosts.json: the guest-readable git host list the l7 verbs publish ---
+
+    FUNNEL = "allow git.example.com --path /\n"
+    BANNED = ("project_id", "projects", "secret", "grants", "git_user")
+
+    def git_hosts(self):
+        return self.root / "data/cogbox/instances/demo/git-hosts.json"
+
+    def replace_funnel(self, ok=True):
+        return self.cli("l7", "replace", "--plugin", "git-grants", "--from-stdin", "-n", "demo",
+                        input=self.FUNNEL, ok=ok)
+
+    def assert_no_tmp(self):
+        self.assertEqual(list(self.git_hosts().parent.glob(".git-hosts.json.*.tmp")), [])
+
+    def test_l7_verbs_publish_git_hosts(self):
+        self.init()
+        summary = self.git_hosts()
+        self.assertTrue(summary.parent.is_dir())
+        self.replace_funnel()
+        self.assertEqual(json.loads(summary.read_text()),
+                         {"version": 1, "hosts": [{"host": "git.example.com", "discovery": False}]})
+        st = summary.lstat()
+        self.assertTrue(stat.S_ISREG(st.st_mode))
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o644)
+
+        # No instance runtime dir exists in this harness: policy takes its
+        # not-running early return and must still publish.
+        doc = {"version": 2, "providers": [{
+            "provider": "GitLab", "plugin": "gitlab", "hosts": ["git.example.com"],
+            "secret": "git-gitlab", "git_user": "oauth2", "scheme": "https",
+            "grants": [{"id": "gg-1", "scope": "namespace", "repo": "grp", "projects": ["11"],
+                        "caps": ["git-read"]},
+                       {"id": "gg-2", "scope": "project", "repo": "grp/proj", "project_id": "1234",
+                        "caps": ["git-read"]}]}]}
+        result = self.cli("l7", "policy", "--from-stdin", "-n", "demo", input=json.dumps(doc))
+        self.assertIn("Instance is not running", result.stdout)
+        raw = summary.read_text()
+        self.assertEqual(json.loads(raw), {"version": 1, "hosts": [
+            {"host": "git.example.com", "scheme": "https", "discovery": True}]})
+        for banned in self.BANNED:
+            self.assertNotIn(banned, raw)
+
+        self.cli("l7", "clear", "--plugin", "git-grants", "-n", "demo")
+        self.assertEqual(json.loads(summary.read_text()), {"version": 1, "hosts": []})
+        self.cli("l7", "mode", "terminate", "-n", "demo")
+        self.assertEqual(json.loads(summary.read_text()), {"version": 1, "hosts": []})
+        self.assert_no_tmp()
+
+    def test_git_hosts_publish_never_changes_the_verb(self):
+        self.init()
+        self.replace_funnel()
+        control = self.replace_funnel()
+        control = (control.returncode, control.stdout, control.stderr)
+        summary = self.git_hosts()
+        data = summary.parent
+
+        def same():
+            r = self.replace_funnel()
+            self.assertEqual((r.returncode, r.stdout, r.stderr), control)
+            self.assert_no_tmp()
+
+        # (a) a symlink to a file: the target is untouched, the name is replaced.
+        victim = self.root / "victim"
+        victim.write_text("victim")
+        summary.unlink()
+        summary.symlink_to(victim)
+        same()
+        self.assertEqual(victim.read_text(), "victim")
+        self.assertTrue(stat.S_ISREG(summary.lstat().st_mode))
+
+        # (b) a symlink to a directory: nothing lands inside it.
+        target = self.root / "target-dir"
+        target.mkdir()
+        summary.unlink()
+        summary.symlink_to(target)
+        same()
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertTrue(stat.S_ISREG(summary.lstat().st_mode))
+
+        # (c) a directory at the name: it stays an empty directory.
+        summary.unlink()
+        summary.mkdir()
+        same()
+        self.assertTrue(summary.is_dir() and not summary.is_symlink())
+        self.assertEqual(list(summary.iterdir()), [])
+        summary.rmdir()
+
+        # (d) an unwritable data dir: nothing changes.
+        if os.geteuid() != 0:
+            self.replace_funnel()
+            before = summary.read_bytes()
+            data.chmod(0o555)
+            try:
+                same()
+                self.assertEqual(summary.read_bytes(), before)
+            finally:
+                data.chmod(0o755)
+
+        # (e) the data dir is gone: it is not recreated.
+        moved = self.root / "moved-data"
+        data.rename(moved)
+        r = self.replace_funnel()
+        self.assertEqual((r.returncode, r.stdout, r.stderr), control)
+        self.assertFalse(data.exists())
+
+    def test_refused_policy_publishes_nothing(self):
+        self.init()
+        summary = self.git_hosts()
+        for prime in (False, True):
+            if prime:
+                self.replace_funnel()
+            before = summary.read_bytes() if summary.exists() else None
+            r = self.cli("l7", "policy", "--from-stdin", "-n", "demo",
+                         input='{"version":3,"providers":[]}', ok=False)
+            self.assertEqual(r.returncode, 65)
+            self.assertEqual(r.stderr,
+                             "cogbox l7: error: unknown policy document version (expected 1 or 2)\n")
+            self.assertEqual(summary.read_bytes() if summary.exists() else None, before)
 
 if __name__ == "__main__":
     unittest.main()

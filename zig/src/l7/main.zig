@@ -8,6 +8,7 @@ const std = @import("std");
 pub const cli = @import("cli.zig");
 pub const rule = @import("rule.zig");
 
+const filter = @import("filter");
 const rules_module = @import("rules_module");
 const config = rules_module.config;
 const reload = rules_module.reload;
@@ -18,6 +19,7 @@ pub fn dispatch(
 	env: *std.process.Environ.Map,
 	config_path: []const u8,
 	runtime_path: []const u8,
+	data_dir: []const u8,
 	rest: []const []const u8,
 ) !void {
 	var argv = try allocator.alloc([]const u8, 4 + rest.len);
@@ -28,10 +30,11 @@ pub fn dispatch(
 	argv[3] = runtime_path;
 	for (rest, 0..) |a, i| argv[4 + i] = a;
 
-	const args = cli.parse(argv) catch |err| {
+	var args = cli.parse(argv) catch |err| {
 		try writeStderr(io, try std.fmt.allocPrint(allocator, "cogbox l7: error: {s}\n", .{@errorName(err)}));
 		std.process.exit(64);
 	};
+	args.data_dir = data_dir;
 
 	var loaded = config.load(allocator, io, args.config_path) catch |err| switch (err) {
 		error.FileNotFound => return die(allocator, io, "no config found at {s}", .{args.config_path}, 66),
@@ -189,7 +192,7 @@ fn cmdAdd(
 		else => return err,
 	};
 
-	try config.save(allocator, io, args.config_path, loaded.root().*);
+	try saveAndPublish(allocator, io, args, loaded);
 	const action_str = switch (a.action) {
 		.allow => "allow",
 		.deny => "deny",
@@ -265,7 +268,7 @@ fn cmdDel(
 		return die(allocator, io, "index {d} out of range (1..{d})", .{ d.index, rules_arr.items.len }, 65);
 	};
 
-	try config.save(allocator, io, args.config_path, loaded.root().*);
+	try saveAndPublish(allocator, io, args, loaded);
 	try announce(allocator, io, "Deleted l7 rule {d}.", .{d.index});
 	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
 }
@@ -279,7 +282,7 @@ fn cmdClear(
 	loaded: *config.Loaded,
 ) !void {
 	const removed = rule.deleteByPlugin(rules_arr, c.plugin);
-	try config.save(allocator, io, args.config_path, loaded.root().*);
+	try saveAndPublish(allocator, io, args, loaded);
 	try announce(allocator, io, "Cleared {d} l7 rule(s) tagged '{s}'.", .{ removed, c.plugin });
 	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
 }
@@ -370,7 +373,7 @@ fn cmdReplace(
 		65,
 	);
 
-	try config.save(allocator, io, args.config_path, loaded.root().*);
+	try saveAndPublish(allocator, io, args, loaded);
 	try announce(allocator, io, "Replaced {d} l7 rule(s) tagged '{s}' with {d}.", .{ removed, r.plugin, parsed.items.len });
 	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
 }
@@ -499,7 +502,7 @@ fn cmdPolicy(
 	};
 	try l7.object.put(arena, try arena.dupe(u8, "authpolicy"), doc);
 
-	try config.save(allocator, io, args.config_path, loaded.root().*);
+	try saveAndPublish(allocator, io, args, loaded);
 	try announce(allocator, io, "Auth-proxy policy replaced ({d} provider(s)).", .{providerCount(doc)});
 
 	// No live runtime dir => the instance isn't running; the boot render picks
@@ -553,7 +556,7 @@ fn cmdSet(
 	}
 
 	try rule.replaceAll(loaded.treeAllocator(), rules_arr, pairs.items);
-	try config.save(allocator, io, args.config_path, loaded.root().*);
+	try saveAndPublish(allocator, io, args, loaded);
 	try announce(allocator, io, "L7 rules replaced.", .{});
 	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
 }
@@ -569,9 +572,146 @@ fn cmdMode(
 	const arena = loaded.treeAllocator();
 	const mode_str = if (m.terminate) "terminate" else "passthrough";
 	try l7.object.put(arena, try arena.dupe(u8, "mode"), .{ .string = try arena.dupe(u8, mode_str) });
-	try config.save(allocator, io, args.config_path, loaded.root().*);
+	try saveAndPublish(allocator, io, args, loaded);
 	try announce(allocator, io, "L7 mode set to {s}.", .{mode_str});
 	try rules_module.maybeReload(allocator, io, args.runtime_path, loaded);
+}
+
+/// The guest-readable list of git hosts this sandbox reaches through git
+/// grants, published at the ROOT of the instance data directory: the VM
+/// guest sees it as /var/lib/cogbox/git-hosts.json (the 9p data share), the
+/// container guest as /var/lib/cogbox-state/data/cogbox/instances/<name>/
+/// git-hosts.json. The guest helper cogbox-git-hosts reads it by this name.
+/// Grant hosts only: a host reached through an injected secret (.l7.inject.specs,
+/// or an operator bind seeded from the secret store at render) is never read
+/// here, so never listed -- the helper, the baked rule and the skill say so.
+pub const git_hosts_file = "git-hosts.json";
+
+/// Render the git host summary for `network`: `{"version":1,"hosts":[...]}`,
+/// each host `{"host":H,"scheme":S,"discovery":B}` with `scheme` only when
+/// known. Hosts and scheme ONLY: never grants, project ids, secrets or the git
+/// user (grants stay behind the auth proxy's /_cogbox/grants). Pure; any
+/// malformed piece contributes nothing and is never an error.
+///
+/// Document hosts first: a known-version policy document entry with a string
+/// `plugin` and scheme http/https lists a host only when it is a valid host
+/// name AND an L7 rule names it -- the pure mirror of gate 3 of
+/// renderAuthProxyConf, so a document's extra hosts[] (only Hosts[0] is
+/// funnelled) and a document whose funnel has not landed claim nothing. Then
+/// legacy hosts: the allow host of every rule tagged reload.git_grants_tag, no
+/// scheme (nothing the verb receives carries one), discovery false. Deduped by
+/// exact host; the document entry wins (the funnel rule is itself tagged).
+pub fn renderGitHosts(allocator: std.mem.Allocator, network: std.json.Value, out: *std.ArrayList(u8)) !void {
+	var arena_state = std.heap.ArenaAllocator.init(allocator);
+	defer arena_state.deinit();
+	const arena = arena_state.allocator();
+
+	var hosts = std.json.Array.init(arena);
+	const rules = reload.l7Rules(network);
+
+	if (reload.authPolicyProviders(network)) |providers| {
+		for (providers.items) |p| {
+			if (p != .object) continue;
+			const plugin = reload.strField(p.object, "plugin") orelse continue;
+			const scheme = reload.strField(p.object, "scheme") orelse continue;
+			if (!std.mem.eql(u8, scheme, "http") and !std.mem.eql(u8, scheme, "https")) continue;
+			const hv = p.object.get("hosts") orelse continue;
+			if (hv != .array) continue;
+			for (hv.array.items) |h| {
+				if (h != .string) continue;
+				if (!filter.isValidHostName(h.string)) continue;
+				if (!reload.hostNamedInRules(rules, h.string)) continue;
+				if (gitHostListed(hosts, h.string)) continue;
+				var el: std.json.ObjectMap = .empty;
+				try el.put(arena, "host", .{ .string = h.string });
+				try el.put(arena, "scheme", .{ .string = scheme });
+				// Only the gitlab auth proxy plugin owns the local
+				// /_cogbox/grants route (authproxy/plugins/gitlab.zig); a host
+				// of any other plugin would answer no_route.
+				try el.put(arena, "discovery", .{ .bool = std.mem.eql(u8, plugin, "gitlab") });
+				try hosts.append(.{ .object = el });
+			}
+		}
+	}
+
+	if (rules) |r| {
+		for (r.items) |item| {
+			if (item != .object) continue;
+			const tag = reload.strField(item.object, "plugin") orelse continue;
+			if (!std.mem.eql(u8, tag, reload.git_grants_tag)) continue;
+			const h = reload.strField(item.object, "allow") orelse continue;
+			if (!filter.isValidHostName(h)) continue;
+			if (gitHostListed(hosts, h)) continue;
+			var el: std.json.ObjectMap = .empty;
+			try el.put(arena, "host", .{ .string = h });
+			try el.put(arena, "discovery", .{ .bool = false });
+			try hosts.append(.{ .object = el });
+		}
+	}
+
+	var root: std.json.ObjectMap = .empty;
+	try root.put(arena, "version", .{ .integer = 1 });
+	try root.put(arena, "hosts", .{ .array = hosts });
+	try config.writeJqTab(allocator, out, .{ .object = root });
+}
+
+fn gitHostListed(hosts: std.json.Array, host: []const u8) bool {
+	for (hosts.items) |el| {
+		if (std.mem.eql(u8, el.object.get("host").?.string, host)) return true;
+	}
+	return false;
+}
+
+/// Save config.json, then republish the git host summary. The ONLY way a verb
+/// in this file saves (a source guard in tests.zig counts the call sites), so
+/// every mutating verb republishes, before its announce (a closed stdout cannot
+/// skip it) and, in cmdPolicy, before the not-running early return.
+fn saveAndPublish(allocator: std.mem.Allocator, io: std.Io, args: cli.Args, loaded: *config.Loaded) !void {
+	try config.save(allocator, io, args.config_path, loaded.root().*);
+	publishGitHosts(allocator, io, args.data_dir, (loaded.network() catch return).*);
+}
+
+/// Best-effort publish of renderGitHosts into `data_dir`. Returns void, so it
+/// cannot fail the verb: every error is swallowed and nothing is printed --
+/// cogworx classifies these verbs' stdout/stderr byte-exactly.
+fn publishGitHosts(allocator: std.mem.Allocator, io: std.Io, data_dir: ?[]const u8, network: std.json.Value) void {
+	const dir_path = data_dir orelse return;
+	if (dir_path.len == 0) return;
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(allocator);
+	renderGitHosts(allocator, network, &out) catch return;
+	writeGitHosts(io, dir_path, out.items) catch {};
+}
+
+/// Write `bytes` to `<dir_path>/git_hosts_file` atomically. The data directory
+/// is guest-writable on VM vehicles (9p), so: never create the directory, write
+/// only bare leaves at its root, create the temp with O_EXCL (refuses anything
+/// already at the name, a planted symlink included), force 0644 whatever the
+/// umask (the guest must read it), and rename over the final name -- rename(2)
+/// replaces a file or a symlink without following it and fails on a directory.
+/// Mirrors config.save. Not reload.writeRuntimeFile: that opens the existing
+/// destination following links and creates non-exclusively.
+fn writeGitHosts(io: std.Io, dir_path: []const u8, bytes: []const u8) !void {
+	var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+	defer dir.close(io);
+
+	var nonce: [16]u8 = undefined;
+	io.random(&nonce);
+	var name_buf: [64]u8 = undefined;
+	const tmp = std.fmt.bufPrint(&name_buf, "." ++ git_hosts_file ++ ".{x}.tmp", .{nonce}) catch unreachable;
+
+	defer dir.deleteFile(io, tmp) catch {};
+	{
+		const f = try dir.createFile(io, tmp, .{ .exclusive = true, .permissions = .fromMode(0o644) });
+		defer f.close(io);
+		try f.setPermissions(io, .fromMode(0o644));
+		var write_buf: [1024]u8 = undefined;
+		var writer = f.writer(io, &write_buf);
+		try writer.interface.writeAll(bytes);
+		try writer.flush();
+		try f.sync(io);
+	}
+	try dir.rename(tmp, dir, git_hosts_file, io);
 }
 
 fn writeStdout(io: std.Io, bytes: []const u8) !void {
@@ -696,4 +836,285 @@ test "l7 add --plugin stamps the tag and approved: true; replace's stampPlugin a
 	try t.expect(item.object.get("approved") == null);
 
 	try t.expectError(error.IndexOutOfRange, insertAddRule(tree, rules_arr, .{ .action = .allow, .host = "x.example.com", .pos = 7 }));
+}
+
+// --- git host summary (renderGitHosts / publishGitHosts) ---
+
+const gh_empty = "{\n\t\"version\": 1,\n\t\"hosts\": []\n}\n";
+const gh_doc_https =
+	"{\n\t\"version\": 1,\n\t\"hosts\": [\n\t\t{\n\t\t\t\"host\": \"git.example.com\",\n\t\t\t\"scheme\": \"https\",\n\t\t\t\"discovery\": true\n\t\t}\n\t]\n}\n"
+;
+const gh_legacy_only =
+	"{\n\t\"version\": 1,\n\t\"hosts\": [\n\t\t{\n\t\t\t\"host\": \"git.example.com\",\n\t\t\t\"discovery\": false\n\t\t}\n\t]\n}\n"
+;
+
+// A v1 policy document (the validatePolicyDoc fixture) carrying every field
+// the summary must never repeat: secret, git_user, grants, project_id.
+const gh_v1_doc =
+	\\{"version":1,"providers":[{
+	\\  "provider":"GitLab","plugin":"gitlab","hosts":["git.example.com"],
+	\\  "secret":"git-gitlab","git_user":"oauth2","scheme":"https",
+	\\  "grants":[{"id":"gg-1","scope":"project","repo":"grp/proj",
+	\\             "project_id":"1234","caps":["git-read","issues"]}]}]}
+;
+const gh_funnel = "{\"allow\":\"git.example.com\",\"path\":\"/\",\"plugin\":\"git-grants\"}";
+
+fn ghRender(src: []const u8) ![]u8 {
+	var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, src, .{});
+	defer parsed.deinit();
+	var out: std.ArrayList(u8) = .empty;
+	errdefer out.deinit(t.allocator);
+	try renderGitHosts(t.allocator, parsed.value, &out);
+	return out.toOwnedSlice(t.allocator);
+}
+
+/// The leak sweep every golden passes: no forbidden substring, exactly the
+/// `version`/`hosts` top level, host objects keyed only by host/scheme/discovery.
+fn ghCheckShape(out: []const u8) !void {
+	for ([_][]const u8{ "project_id", "projects", "secret", "grants", "git_user" }) |banned| {
+		try t.expect(std.mem.indexOf(u8, out, banned) == null);
+	}
+	var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, out, .{});
+	defer parsed.deinit();
+	const root = parsed.value.object;
+	try t.expectEqual(@as(usize, 2), root.count());
+	try t.expectEqual(@as(i64, 1), root.get("version").?.integer);
+	for (root.get("hosts").?.array.items) |h| {
+		var it = h.object.iterator();
+		while (it.next()) |kv| {
+			const k = kv.key_ptr.*;
+			try t.expect(std.mem.eql(u8, k, "host") or std.mem.eql(u8, k, "scheme") or std.mem.eql(u8, k, "discovery"));
+		}
+	}
+}
+
+fn ghExpect(expected: []const u8, src: []const u8) !void {
+	const out = try ghRender(src);
+	defer t.allocator.free(out);
+	try t.expectEqualStrings(expected, out);
+	try ghCheckShape(out);
+}
+
+test "renderGitHosts: v1 document plus its funnel rule lists the host with scheme and discovery" {
+	// The input carries all five banned substrings, so ghCheckShape is not vacuous.
+	const src = "{\"l7\":{\"rules\":[" ++ gh_funnel ++ "],\"authpolicy\":" ++ gh_v1_doc ++ "}}";
+	try t.expect(std.mem.indexOf(u8, src, "git_user") != null);
+	try ghExpect(gh_doc_https, src);
+}
+
+test "renderGitHosts: v2 document with namespace and project grants lists only host and scheme" {
+	const src = "{\"l7\":{\"rules\":[" ++ gh_funnel ++ "],\"authpolicy\":" ++
+		\\{"version":2,"providers":[{
+		\\  "provider":"GitLab","plugin":"gitlab","hosts":["git.example.com"],
+		\\  "secret":"git-gitlab","git_user":"oauth2","scheme":"https",
+		\\  "grants":[{"id":"gg-1","scope":"namespace","repo":"grp","projects":["11","12"],"caps":["git-read"]},
+		\\            {"id":"gg-2","scope":"project","repo":"grp/proj","project_id":"1234",
+		\\             "caps":["git-read","git-write"],"push":{"deny_delete":true}}]}]}
+	++ "}}";
+	try t.expect(std.mem.indexOf(u8, src, "projects") != null);
+	try ghExpect(gh_doc_https, src);
+}
+
+test "renderGitHosts: legacy-only tagged allow rules give one host without scheme" {
+	try ghExpect(gh_legacy_only,
+		\\{"l7":{"rules":[
+		\\  {"allow":"git.example.com","path":"/grp/proj.git/info/refs","plugin":"git-grants"},
+		\\  {"allow":"git.example.com","path":"/grp/proj.git/git-upload-pack","methods":["POST"],"plugin":"git-grants"},
+		\\  {"deny":"git.example.com","path":"/grp/other","plugin":"git-grants"},
+		\\  {"deny":"deny.example.com","plugin":"git-grants"},
+		\\  {"allow":"*.example.com","plugin":"git-grants"},
+		\\  {"allow":"api.example.com","plugin":"obs-plugin"},
+		\\  {"allow":"app.example.com"}
+		\\]}}
+	);
+}
+
+test "renderGitHosts: mixed -- document host first, then a different legacy host" {
+	// The legacy rule comes FIRST in rule order; the document host still leads.
+	const src = "{\"l7\":{\"rules\":[{\"allow\":\"legacy.example.com\",\"plugin\":\"git-grants\"}," ++ gh_funnel ++
+		"],\"authpolicy\":" ++ gh_v1_doc ++ "}}";
+	try ghExpect(
+		"{\n\t\"version\": 1,\n\t\"hosts\": [\n\t\t{\n\t\t\t\"host\": \"git.example.com\",\n\t\t\t\"scheme\": \"https\",\n\t\t\t\"discovery\": true\n\t\t},\n\t\t{\n\t\t\t\"host\": \"legacy.example.com\",\n\t\t\t\"discovery\": false\n\t\t}\n\t]\n}\n"
+	, src);
+}
+
+test "renderGitHosts: empty document and no tagged rule give the empty list" {
+	try ghExpect(gh_empty, "{\"l7\":{\"rules\":[{\"allow\":\"api.example.com\"}],\"authpolicy\":{\"version\":1,\"providers\":[]}}}");
+	try ghExpect(gh_empty, "{\"rules\":[]}");
+	try ghExpect(gh_empty, "{}");
+}
+
+test "renderGitHosts: malformed pieces contribute nothing and never fail" {
+	// Every case carries an UNTAGGED rule naming the host, so only the document
+	// could list it (gate 3 holds; nothing is legacy).
+	const rule_for = "{\"allow\":\"git.example.com\"}";
+	const docs = [_][]const u8{
+		"\"not an object\"",
+		"{\"version\":3,\"providers\":[{\"plugin\":\"gitlab\",\"scheme\":\"https\",\"hosts\":[\"git.example.com\"]}]}",
+		"{\"version\":\"1\",\"providers\":[{\"plugin\":\"gitlab\",\"scheme\":\"https\",\"hosts\":[\"git.example.com\"]}]}",
+		"{\"version\":1,\"providers\":{}}",
+		"{\"version\":1,\"providers\":[\"gitlab\",7,null]}",
+		"{\"version\":1,\"providers\":[{\"plugin\":\"gitlab\",\"scheme\":\"https\",\"hosts\":\"git.example.com\"}]}",
+		"{\"version\":1,\"providers\":[{\"plugin\":\"gitlab\",\"scheme\":\"https\",\"hosts\":[7,null,{}]}]}",
+		"{\"version\":1,\"providers\":[{\"plugin\":\"gitlab\",\"hosts\":[\"git.example.com\"]}]}",
+		"{\"version\":1,\"providers\":[{\"plugin\":\"gitlab\",\"scheme\":\"ftp\",\"hosts\":[\"git.example.com\"]}]}",
+		"{\"version\":1,\"providers\":[{\"plugin\":\"gitlab\",\"scheme\":1,\"hosts\":[\"git.example.com\"]}]}",
+		"{\"version\":1,\"providers\":[{\"scheme\":\"https\",\"hosts\":[\"git.example.com\"]}]}",
+	};
+	for (docs) |doc| {
+		const src = try std.fmt.allocPrint(t.allocator, "{{\"l7\":{{\"rules\":[{s}],\"authpolicy\":{s}}}}}", .{ rule_for, doc });
+		defer t.allocator.free(src);
+		try ghExpect(gh_empty, src);
+	}
+	// Hosts that are not host names never reach the output, even when a rule
+	// names them byte for byte.
+	try ghExpect(gh_empty,
+		\\{"l7":{"rules":[{"allow":"x/../y"},{"allow":"a b"},{"allow":"git.example.com:8443"}],
+		\\ "authpolicy":{"version":1,"providers":[{"plugin":"gitlab","scheme":"https",
+		\\   "hosts":["x/../y","a b","git.example.com:8443"]}]}}}
+	);
+	// ...nor as legacy hosts.
+	try ghExpect(gh_empty,
+		\\{"l7":{"rules":[{"allow":"x/../y","plugin":"git-grants"},{"allow":"a b","plugin":"git-grants"},
+		\\ {"allow":"git.example.com:8443","plugin":"git-grants"},{"allow":7,"plugin":"git-grants"},
+		\\ {"allow":"git.example.com","plugin":7},"string rule",5]}}
+	);
+	// An unknown document version is dead text, but its funnel rule still makes
+	// the host a legacy one.
+	try ghExpect(gh_legacy_only, "{\"l7\":{\"rules\":[" ++ gh_funnel ++
+		"],\"authpolicy\":{\"version\":3,\"providers\":[{\"plugin\":\"gitlab\",\"scheme\":\"https\",\"hosts\":[\"git.example.com\"]}]}}}");
+	// rules / l7 of the wrong type.
+	try ghExpect(gh_empty, "{\"l7\":{\"rules\":{}}}");
+	try ghExpect(gh_empty, "{\"l7\":[]}");
+}
+
+test "renderGitHosts: a document host no rule names is not listed" {
+	const src = "{\"l7\":{\"rules\":[" ++ gh_funnel ++ "],\"authpolicy\":" ++
+		\\{"version":1,"providers":[{"plugin":"gitlab","scheme":"https","hosts":["git.example.com","mirror.example.com"]}]}
+	++ "}}";
+	try ghExpect(gh_doc_https, src);
+}
+
+test "renderGitHosts: a plugin other than gitlab keeps its scheme but has no discovery" {
+	try ghExpect(
+		"{\n\t\"version\": 1,\n\t\"hosts\": [\n\t\t{\n\t\t\t\"host\": \"git.example.com\",\n\t\t\t\"scheme\": \"http\",\n\t\t\t\"discovery\": false\n\t\t}\n\t]\n}\n"
+	, "{\"l7\":{\"rules\":[" ++ gh_funnel ++ "],\"authpolicy\":" ++
+		\\{"version":1,"providers":[{"plugin":"obs-plugin","scheme":"http","hosts":["git.example.com"]}]}
+	++ "}}");
+}
+
+test "renderGitHosts: a host reached through an injected secret is never listed" {
+	// Inject specs (a plugin's, or an operator --inject bind as the render seeds
+	// it) and the untagged rule an owner adds for that host are not grants. The
+	// guest helper, the baked rule and the skill tell the agent such a host is
+	// not listed; listing it, or claiming the list covers it, would break that.
+	const specs =
+		\\"inject":{"specs":[
+		\\  {"host":"git.other.example.com","style":"basic","secret":"api-token"},
+		\\  {"host":"api.example.com","style":"bearer","secret":"api-token","plugin":"obs-plugin"}]}
+	;
+	try ghExpect(gh_empty, "{\"l7\":{\"rules\":[{\"allow\":\"git.other.example.com\"}," ++
+		"{\"allow\":\"api.example.com\",\"plugin\":\"obs-plugin\"}]," ++ specs ++ "}}");
+	// Beside a grant host, only the grant host is listed.
+	try ghExpect(gh_doc_https, "{\"l7\":{\"rules\":[{\"allow\":\"git.other.example.com\"}," ++ gh_funnel ++
+		"],\"authpolicy\":" ++ gh_v1_doc ++ "," ++ specs ++ "}}");
+}
+
+test "renderGitHosts: a network that is not an object gives the empty list" {
+	try ghExpect(gh_empty, "\"full\"");
+	try ghExpect(gh_empty, "null");
+	try ghExpect(gh_empty, "[]");
+}
+
+/// A scratch directory under cwd for the publish tests; the caller owns teardown.
+fn ghScratch(io: std.Io, buf: []u8) ![]const u8 {
+	var rnd: [8]u8 = undefined;
+	io.random(&rnd);
+	const dir = try std.fmt.bufPrint(buf, "zig-githosts-test-{x}", .{rnd});
+	try std.Io.Dir.cwd().createDirPath(io, dir);
+	return dir;
+}
+
+/// No `*.tmp` leaf is left at the root of `dir`.
+fn ghNoTmp(io: std.Io, dir: []const u8) !void {
+	var d = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+	defer d.close(io);
+	var it = d.iterate();
+	while (try it.next(io)) |e| {
+		try t.expect(!std.mem.endsWith(u8, e.name, ".tmp"));
+	}
+}
+
+test "publishGitHosts: writes a 0644 regular file, replaces a planted symlink, never creates the dir" {
+	var threaded: std.Io.Threaded = .init(t.allocator, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, "{\"l7\":{\"rules\":[" ++ gh_funnel ++ "]}}", .{});
+	defer parsed.deinit();
+
+	var name_buf: [64]u8 = undefined;
+	const root = try ghScratch(io, &name_buf);
+	defer cwd.deleteTree(io, root) catch {};
+	const data = try std.fmt.allocPrint(t.allocator, "{s}/data", .{root});
+	defer t.allocator.free(data);
+	try cwd.createDirPath(io, data);
+	const file = try std.fmt.allocPrint(t.allocator, "{s}/" ++ git_hosts_file, .{data});
+	defer t.allocator.free(file);
+
+	// (a) Fresh: the exact bytes, a regular file, mode 0644.
+	publishGitHosts(t.allocator, io, data, parsed.value);
+	{
+		const got = try cwd.readFileAlloc(io, file, t.allocator, .limited(4096));
+		defer t.allocator.free(got);
+		try t.expectEqualStrings(gh_legacy_only, got);
+		const st = try cwd.statFile(io, file, .{ .follow_symlinks = false });
+		try t.expectEqual(std.Io.File.Kind.file, st.kind);
+		try t.expectEqual(@as(std.posix.mode_t, 0o644), st.permissions.toMode() & 0o777);
+	}
+	try ghNoTmp(io, data);
+
+	// (b) A planted symlink to a file: the target keeps its bytes, the name
+	// becomes a regular file holding the summary.
+	const victim = try std.fmt.allocPrint(t.allocator, "{s}/victim", .{root});
+	defer t.allocator.free(victim);
+	try cwd.writeFile(io, .{ .sub_path = victim, .data = "victim" });
+	try cwd.deleteFile(io, file);
+	// Relative to the link's own directory.
+	try cwd.symLink(io, "../victim", file, .{});
+	publishGitHosts(t.allocator, io, data, parsed.value);
+	{
+		const v = try cwd.readFileAlloc(io, victim, t.allocator, .limited(64));
+		defer t.allocator.free(v);
+		try t.expectEqualStrings("victim", v);
+		const st = try cwd.statFile(io, file, .{ .follow_symlinks = false });
+		try t.expectEqual(std.Io.File.Kind.file, st.kind);
+	}
+	try ghNoTmp(io, data);
+
+	// (c) A directory at the name: the rename fails silently, nothing lands
+	// inside it, no temp is left.
+	try cwd.deleteFile(io, file);
+	try cwd.createDirPath(io, file);
+	publishGitHosts(t.allocator, io, data, parsed.value);
+	{
+		const st = try cwd.statFile(io, file, .{ .follow_symlinks = false });
+		try t.expectEqual(std.Io.File.Kind.directory, st.kind);
+		var d = try cwd.openDir(io, file, .{ .iterate = true });
+		defer d.close(io);
+		var it = d.iterate();
+		try t.expect((try it.next(io)) == null);
+	}
+	try ghNoTmp(io, data);
+
+	// (d) A missing data dir: returns, creates nothing.
+	const missing = try std.fmt.allocPrint(t.allocator, "{s}/missing", .{root});
+	defer t.allocator.free(missing);
+	publishGitHosts(t.allocator, io, missing, parsed.value);
+	try t.expectError(error.FileNotFound, cwd.statFile(io, missing, .{ .follow_symlinks = false }));
+
+	// (e) No data dir at all (null / empty): nothing to do.
+	publishGitHosts(t.allocator, io, null, parsed.value);
+	publishGitHosts(t.allocator, io, "", parsed.value);
 }

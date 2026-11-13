@@ -44,6 +44,7 @@ Data (VM state, overlays) is stored per-instance under `~/.local/share/cogbox/in
     default/
       harness-overlay.img      # shared ext4 overlay for all harnesses
       .config/active-harnesses # newline-separated list of active harnesses
+      git-hosts.json           # git hosts the guest reaches through git grants (written by `cogbox l7`; docs/authproxy.md)
     work/
       harness-overlay.img
 ```

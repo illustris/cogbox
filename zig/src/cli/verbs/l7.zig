@@ -65,6 +65,11 @@ pub fn run(
 	defer allocator.free(cfg_path);
 	const inst_runtime = try paths.instanceRuntime(allocator, p, name);
 	defer allocator.free(inst_runtime);
+	// Where the mutating subcommands publish the guest-readable git host list
+	// (l7 main.git_hosts_file): the root of the instance data directory, which
+	// is the VM guest's /var/lib/cogbox.
+	const inst_data = try paths.instanceDataDir(allocator, p, name);
+	defer allocator.free(inst_data);
 
 	const cwd = std.Io.Dir.cwd();
 	cwd.access(io, cfg_path, .{}) catch {
@@ -74,5 +79,5 @@ pub fn run(
 	// env is threaded through for `l7 policy`, whose render path (renderFiles)
 	// resolves the secret-store dirs from it -- mirroring secret_verb.run. All
 	// other l7 subcommands ignore it.
-	try l7_module.dispatch(allocator, io, env, cfg_path, inst_runtime, rest.items);
+	try l7_module.dispatch(allocator, io, env, cfg_path, inst_runtime, inst_data, rest.items);
 }

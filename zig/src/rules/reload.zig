@@ -58,7 +58,8 @@ fn injectSpecs(network: std.json.Value) ?std.json.Array {
 	return specs.array;
 }
 
-fn strField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+// Pub: also read by l7/main.zig renderGitHosts (the guest's git host list).
+pub fn strField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 	const v = obj.get(key) orelse return null;
 	if (v != .string) return null;
 	return v.string;
@@ -88,7 +89,8 @@ fn injectPort(obj: std.json.ObjectMap) ?u16 {
 
 /// `.network.l7.rules` array (by value; shares the items pointer), or null when
 /// absent / not an array. Shared by the seedGitInjectSpecs fail-closed gate.
-fn l7Rules(network: std.json.Value) ?std.json.Array {
+/// Pub: also read by l7/main.zig renderGitHosts (the guest's git host list).
+pub fn l7Rules(network: std.json.Value) ?std.json.Array {
 	if (network != .object) return null;
 	const l7 = network.object.getPtr("l7") orelse return null;
 	if (l7.* != .object) return null;
@@ -251,7 +253,8 @@ fn warnUnrenderableL7(io: std.Io, network: std.json.Value) void {
 	}
 }
 
-fn hostNamedInRules(rules: ?std.json.Array, host: []const u8) bool {
+// Pub: l7/main.zig renderGitHosts mirrors gate 3 of renderAuthProxyConf with it.
+pub fn hostNamedInRules(rules: ?std.json.Array, host: []const u8) bool {
 	const r = rules orelse return false;
 	for (r.items) |item| {
 		if (item != .object) continue;
@@ -1211,7 +1214,8 @@ fn grantsCarryPush(grants_v: std.json.Value) bool {
 /// renderer): v2 adds fine caps and per-grant push rules, which ride into the
 /// conf inside the grants[] this render copies VERBATIM -- the vocabulary is
 /// the auth proxy plugin's to gate, not this render's.
-fn authPolicyProviders(network: std.json.Value) ?std.json.Array {
+/// Pub: also read by l7/main.zig renderGitHosts (the guest's git host list).
+pub fn authPolicyProviders(network: std.json.Value) ?std.json.Array {
 	if (network != .object) return null;
 	const l7 = network.object.getPtr("l7") orelse return null;
 	if (l7.* != .object) return null;
