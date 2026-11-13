@@ -156,11 +156,13 @@
 					# command parses with yargs `.strict()` and would
 					# reject it. `OPENCODE_PERMISSION` is the universal
 					# bypass: opencode JSON.parses it and merges it into
-					# `config.permission`. opencode 1.16.2 requires the
-					# object form keyed by category; a bare `"allow"` string
-					# is rejected -- the schema indexes it char by char
-					# (got "a" from "allow"[0]). Set every category to `allow`
-					# so opencode never prompts (`bash` also takes a {pattern:
+					# `config.permission`. Use the object form keyed by
+					# category: on opencode 1.16.2 (and 1.18.3) a bare
+					# `"allow"` string was rejected -- the schema indexed it
+					# char by char (got "a" from "allow"[0]). 1.19.5's schema
+					# takes a bare action again, but not re-tested through this
+					# env merge. Set every category to `allow` so
+					# opencode never prompts (`bash` also takes a {pattern:
 					# action} map; plain `"allow"` covers all patterns).
 					flags = [];
 					env = {
@@ -2503,14 +2505,16 @@
 				# .projects[...] only; top-level they are never read.
 				#
 				# One top-level key rides along on both backends:
-				# fullscreenUpsellSeenCount, raised to 3. claude-code 2.1.293 asks
+				# fullscreenUpsellSeenCount, raised to 3. claude-code asks
 				# "Try the new fullscreen renderer?" at REPL start until that count
-				# (its own impression counter) reaches 3; accepting restarts the
+				# (its own impression counter) reaches 3 (observed on 2.1.293; the
+				# threshold and the fresh-install check below read the same in the
+				# 2.1.323 bundle); accepting restarts the
 				# harness into the alternate-screen renderer or saves it as the
 				# user's renderer, a screen the control plane's harness reader was
 				# not built against, so the workspace agent relays it rather than
 				# accept it, and a delegated launch would park on it. The same count
-				# is also 2.1.293's fresh-install signal: with GrowthBook off (a
+				# is also its fresh-install signal: with GrowthBook off (a
 				# Bedrock/Vertex provider, or telemetry off) and no `tui` in the
 				# user's settings, an install whose firstStartVersion is set and
 				# whose count is below 3 defaults to the fullscreen renderer. So on
@@ -6242,7 +6246,8 @@
 						fails=$((fails + 1))
 					fi
 					# The fullscreen renderer upsell's seen count, top-level (global
-					# config), raised to the 3 at which 2.1.293 stops asking.
+					# config), raised to the 3 at which claude-code stops asking
+					# (2.1.293; unchanged in 2.1.323).
 					if ! grep -qF -- '.fullscreenUpsellSeenCount = 3' "$s"; then
 						echo "FAIL: brain-trust $s does not raise fullscreenUpsellSeenCount to 3" >&2
 						fails=$((fails + 1))
@@ -6277,20 +6282,20 @@
 					esac
 				}
 
-				test '${releaseHarnesses.claude-code.version}' = '2.1.319'
+				test '${releaseHarnesses.claude-code.version}' = '2.1.323'
 				test '${releaseHarnesses.opencode.version}' = '1.19.5'
-				test '${releaseHarnesses.codex.version}' = '0.167.0'
+				test '${releaseHarnesses.codex.version}' = '0.167.2'
 				test '${releaseHarnesses.hermes-agent.version}' = '0.23.0'
-				test '${releaseHarnesses.omp.version}' = '18.18.1'
-				test '${releaseHarnesses.pi.version}' = '1.5.0'
-				test '${releaseHarnesses.dsh.version}' = '0.2.2-rc.1'
+				test '${releaseHarnesses.omp.version}' = '18.19.0'
+				test '${releaseHarnesses.pi.version}' = '1.5.2'
+				test '${releaseHarnesses.dsh.version}' = '0.2.2-rc.2'
 
-				assert_version '2.1.319' ${releaseHarnesses.claude-code}/bin/claude --version
+				assert_version '2.1.323' ${releaseHarnesses.claude-code}/bin/claude --version
 				assert_version '1.19.5' ${releaseHarnesses.opencode}/bin/opencode --version
-				assert_version '0.167.0' ${releaseHarnesses.codex}/bin/codex --version
-				assert_version '18.18.1' ${releaseHarnesses.omp}/bin/omp --version
-				assert_version '1.5.0' ${releaseHarnesses.pi}/bin/pi --version
-				assert_version '0.2.2-rc.1' ${releaseHarnesses.dsh}/bin/dsh --version
+				assert_version '0.167.2' ${releaseHarnesses.codex}/bin/codex --version
+				assert_version '18.19.0' ${releaseHarnesses.omp}/bin/omp --version
+				assert_version '1.5.2' ${releaseHarnesses.pi}/bin/pi --version
+				assert_version '0.2.2-rc.2' ${releaseHarnesses.dsh}/bin/dsh --version
 
 				if ! hermes_output=$(${releaseHarnesses.hermes-agent}/bin/hermes --version 2>&1); then
 					printf 'version command failed: hermes --version\n%s\n' "$hermes_output" >&2
