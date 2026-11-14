@@ -16,6 +16,13 @@ import subprocess
 import tempfile
 import time
 import unittest
+import zlib
+
+
+def sealed(body):
+    # The trailer the renderer ends every netfilter-rules with
+    # (filter.ruleFileTrailer); the shim ignores a file without it.
+    return body + "# cogbox-rules-end crc32=%08x\n" % (zlib.crc32(body.encode()) & 0xffffffff)
 
 
 class DarwinTests(unittest.TestCase):
@@ -52,7 +59,7 @@ class DarwinTests(unittest.TestCase):
             udp = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
             udp.bind((host, port))
             rules = self.root / "rules"
-            rules.write_text("allow 0.0.0.0/0\n")
+            rules.write_text(sealed("allow 0.0.0.0/0\n"))
             env = dict(os.environ, NETFILTER_RULES=str(rules),
                        DYLD_INSERT_LIBRARIES=os.environ["COGBOX_NETFILTER"])
             p = self.spawn([os.environ["COGBOX_NET_PROBE"], host, str(port)], env=env,
@@ -64,12 +71,12 @@ class DarwinTests(unittest.TestCase):
             for mode in "tuc":
                 self.assertEqual(probe(mode), "allowed", mode)
             # Truncate in place: the shim intentionally holds this inode.
-            rules.write_text("deny 0.0.0.0/0\n")
+            rules.write_text(sealed("deny 0.0.0.0/0\n"))
             p.send_signal(signal.SIGUSR1)
             time.sleep(0.05)
             for mode in "tuc":
                 self.assertEqual(probe(mode), "denied", mode)
-            rules.write_text("allow 0.0.0.0/0\n")
+            rules.write_text(sealed("allow 0.0.0.0/0\n"))
             p.send_signal(signal.SIGUSR1)
             time.sleep(0.05)
             self.assertEqual(probe("u"), "allowed")
@@ -111,7 +118,7 @@ class DarwinTests(unittest.TestCase):
         args = [os.environ["COGBOX_SLIRP"], "--socket", str(path), "-4"]
         if filtered:
             rules = self.root / "rules"
-            rules.write_text("deny 0.0.0.0/0\n")
+            rules.write_text(sealed("deny 0.0.0.0/0\n"))
             env.update(NETFILTER_RULES=str(rules),
                        DYLD_INSERT_LIBRARIES=os.environ["COGBOX_NETFILTER"])
             args.append("--filtered")

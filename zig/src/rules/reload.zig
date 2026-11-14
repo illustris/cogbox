@@ -315,7 +315,9 @@ pub fn injectUnionCount(network: std.json.Value) usize {
 /// Render `.network` to wire-format rule lines for the LD_PRELOAD shim. Pure
 /// -- no I/O. Ordering on disk: host-topology directives (`no-implicit-dns`,
 /// `hard-deny`), L7 fail-closed denies, user CIDR rules, user remaps, then the
-/// auto-injected L7 funnel remaps.
+/// auto-injected L7 funnel remaps. This is the BODY only: writeRuntimeRules
+/// seals it with the trailer both readers require (renderRuleFile) and refuses
+/// a file over the shared budget or the remap table.
 ///
 /// The host-topology directives are written by whoever provisions the instance
 /// (`cogbox init --no-implicit-dns --self-addr --dns-host`), not by a user rule
@@ -1423,10 +1425,91 @@ fn resolveSecret(
 	return try secret_store.lookup(arena, io, global_dir, name);
 }
 
+/// What a sealed `netfilter-rules` render measures against the two limits its
+/// readers impose. `bytes` is the whole file, trailer included; `remap_lines` is
+/// every line that parseRules would dispatch to its remap table.
+pub const RuleFileFit = struct {
+	bytes: usize,
+	remap_lines: usize,
+	/// L7 was active for the render (l7Active), so its funnel remaps are the
+	/// LAST remap lines and the first a full table drops. Only the refusal
+	/// wording reads it (remapTailNote); fits/grewFrom do not.
+	l7: bool = false,
+
+	/// Both readers would take this file whole and keep every remap in it.
+	pub fn fits(self: RuleFileFit) bool {
+		return self.bytes <= filter.rule_file_budget and self.remap_lines <= filter.max_remap_rules;
+	}
+
+	/// Larger than `before` in either measure.
+	pub fn grewFrom(self: RuleFileFit, before: RuleFileFit) bool {
+		return self.bytes > before.bytes or self.remap_lines > before.remap_lines;
+	}
+};
+
+pub const RuleFileError = error{ RuleFileOverBudget, RemapTableFull };
+
+/// renderRules into the EMPTY `out`, sealed with filter.ruleFileTrailer: the
+/// exact bytes writeRuntimeRules publishes. It measures and does not refuse;
+/// see ruleFileFitError for that.
+///
+/// The remap count mirrors parseRules' dispatch (a trimmed line starting with
+/// `remap `) rather than its success: a line the parser would then reject is
+/// counted too, which can only over-count.
+pub fn renderRuleFile(allocator: std.mem.Allocator, network: std.json.Value, l7_base: u16, out: *std.ArrayList(u8)) !RuleFileFit {
+	std.debug.assert(out.items.len == 0);
+	try renderRules(allocator, network, l7_base, out);
+	var remap_lines: usize = 0;
+	var lines = std.mem.splitScalar(u8, out.items, '\n');
+	while (lines.next()) |line| {
+		if (std.mem.startsWith(u8, std.mem.trim(u8, line, " \t\r"), "remap ")) remap_lines += 1;
+	}
+	try out.appendSlice(allocator, &filter.ruleFileTrailer(out.items));
+	return .{ .bytes = out.items.len, .remap_lines = remap_lines, .l7 = l7Active(network) };
+}
+
+/// What a RemapTableFull render would lose, for both refusals (the render
+/// warning here and rules/main.zig ruleFileRefusalMessage): with L7 on, the
+/// funnel remaps rendered after the user's; with L7 off there is no funnel and
+/// the loss is the user's own remaps past the limit.
+pub fn remapTailNote(fit: RuleFileFit) []const u8 {
+	return if (fit.l7)
+		"the L7 funnel remaps are rendered last and would be dropped first"
+	else
+		"L7 is off, so the remaps past the limit that would be dropped are user remaps";
+}
+
+/// The refusal a render that does not fit gets, the budget first.
+///
+/// Over the budget, neither reader would install the file (it is not one
+/// complete render to them). Past filter.max_remap_rules remap lines, parseRules
+/// drops the tail in silence, and the tail is the L7 funnel remaps, rendered
+/// after the user's own -- the same loss as a byte cut, from a file that would
+/// otherwise install. That second check applies with L7 off too: a dropped user
+/// remap is a lost diversion as well. CIDR lines past filter.max_rules are NOT
+/// refused: dropping the tail of a first-match list whose default is deny only
+/// ever narrows. `hard-deny` lines are not counted (provisioner-written, one or
+/// two in practice).
+pub fn ruleFileFitError(fit: RuleFileFit) RuleFileError!void {
+	if (fit.bytes > filter.rule_file_budget) return error.RuleFileOverBudget;
+	if (fit.remap_lines > filter.max_remap_rules) return error.RemapTableFull;
+}
+
+/// Render, seal and publish `<runtime>/netfilter-rules`, or refuse: a render
+/// that does not fit (ruleFileFitError) leaves the file on disk exactly as it
+/// was and fails, so writeWireFiles publishes none of the six files and the
+/// readers keep the rules they have.
 pub fn writeRuntimeRules(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, network: std.json.Value, l7_base: u16) !void {
 	var out: std.ArrayList(u8) = .empty;
 	defer out.deinit(allocator);
-	try renderRules(allocator, network, l7_base, &out);
+	const fit = try renderRuleFile(allocator, network, l7_base, &out);
+	ruleFileFitError(fit) catch |err| {
+		switch (err) {
+			error.RuleFileOverBudget => warnRender(io, "netfilter-rules not written: {d} bytes is over the {d}-byte budget both of its readers take whole; they keep the rules they have", .{ fit.bytes, filter.rule_file_budget }),
+			error.RemapTableFull => warnRender(io, "netfilter-rules not written: {d} remap lines is over the {d} the filter keeps ({s}); they keep the rules they have", .{ fit.remap_lines, filter.max_remap_rules, remapTailNote(fit) }),
+		}
+		return err;
+	};
 	// In-place, NOT atomic: passt's shim holds an fd on this path (see
 	// writeRuntimeFileInPlace).
 	try writeRuntimeFileInPlace(allocator, io, runtime_dir, "netfilter-rules", out.items);
@@ -1857,26 +1940,24 @@ fn writeRuntimeFile(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []con
 /// leave the shim reading the unlinked old inode forever, so a rule NARROWING
 /// would silently never reach the guest. So this one stays truncate-in-place.
 ///
-/// This file has a SECOND reader for which the tear IS reachable: the L7 proxy
-/// re-opens `netfilter-rules` BY PATH in loadRules (l7proxy/main.zig), driven by a
-/// `reload_pending` flag its SIGHUP handler sets, and it can consume a flag an
-/// EARLIER render raised while a later, overlapping render is inside the
-/// truncate-then-writeAll window below. passt's shim is the reason the inode has
-/// to stay put, so the cheap fix (tmp + rename) is not available here -- so that
-/// reader carries the fix instead: l7proxy's `readPolledInto` re-stats after the
-/// read, keeps the previously installed CIDR set when the key moved (or when the
-/// read came back empty and the last one had content), and re-raises its own
-/// reload flag so the next accept-loop iteration retries on settled bytes. Render
-/// SERIALISATION is no longer what bounds the window.
+/// Which means BOTH of its readers can catch it mid-write. The shim's reload is
+/// deferred (its SIGUSR1 handler only raises a flag; the next intercepted call
+/// does the read), and the L7 proxy's re-open by path is driven the same way by
+/// SIGHUP, so either can consume a flag an EARLIER render raised while a later,
+/// overlapping render is inside the truncate-then-writeAll window below; two
+/// overlapping renders can also leave the shorter one's bytes over the longer
+/// one's tail. The cheap fix (tmp + rename) is not available here, so the FILE
+/// carries it instead: writeRuntimeRules seals every render with a CRC-32
+/// trailer, and both readers install a read only through filter.ruleFileBody,
+/// keeping the set they have otherwise. A reader landing in the window costs a
+/// retry (the render that was writing signals again when it is done), never a
+/// partial install.
 ///
-/// For the shim itself the window is not reachable in the same way: it re-reads
-/// only when the render signals it, which happens after the write returns, and it
-/// never caches a parse keyed on mtime.
-///
-/// `pub` only so l7proxy's reload_test.zig can hammer THIS writer -- the torn
-/// read it defends against is a property of the two halves together, and a test
-/// that re-created the write here would stop testing the moment this one
-/// changed. Production callers go through writeRuntimeRules.
+/// `pub` only so l7proxy's reload_test.zig can hammer THIS writer under both
+/// readers' real read paths -- the torn read they defend against is a property
+/// of the two halves together, and a test that re-created the write here would
+/// stop testing the moment this one changed. Production callers go through
+/// writeRuntimeRules.
 pub fn writeRuntimeFileInPlace(allocator: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, name: []const u8, bytes: []const u8) !void {
 	const path = try std.fs.path.join(allocator, &.{ runtime_dir, name });
 	defer allocator.free(path);
@@ -4597,4 +4678,269 @@ test "writeWireFiles: the publish order is pinned -- funnel first, confs next, l
 	try std.testing.expectEqualStrings("netfilter-rules", wire_write_order[0]);
 	try std.testing.expectEqualStrings("l7-inject-conf.json", wire_write_order[1]);
 	try std.testing.expectEqualStrings("l7-rules", wire_write_order[wire_write_order.len - 1]);
+}
+
+// --- netfilter-rules: sealed, and refused past what its readers keep --------
+
+/// A `.network` for the rule-file fit tests: L7 on (one allow rule) and a
+/// leading `allow 0.0.0.0/0`, so a funnel lost from the file would be direct
+/// :443 egress. Then `n_rules` more CIDR rules -- short IPv4, or with `v6` the
+/// longest line `rules add` takes in natural form (an IPv6 /128 with a proto, 54
+/// bytes) -- every one through the verb's own validation, and `n_remaps` user
+/// remaps on 192.0.2.x:8000+i, none of which matches the funnel probe.
+fn fitNetwork(arena: std.mem.Allocator, n_rules: usize, v6: bool, n_remaps: usize) !std.json.Value {
+	var rules = std.json.Array.init(arena);
+	_ = try rule.append(arena, &rules, .allow, "0.0.0.0/0");
+	for (0..n_rules) |i| {
+		var cidr: [64]u8 = undefined;
+		const spec = if (v6)
+			try std.fmt.bufPrint(&cidr, "tcp 2001:0db8:0000:0000:0000:0000:{x:0>4}:{x:0>4}/128", .{ i / 256, i % 256 })
+		else
+			try std.fmt.bufPrint(&cidr, "198.51.100.{d}/32", .{i % 256});
+		_ = try rule.append(arena, &rules, .allow, spec);
+	}
+	var remaps = std.json.Array.init(arena);
+	for (0..n_remaps) |i| {
+		var from: [64]u8 = undefined;
+		var to: [64]u8 = undefined;
+		var obj: std.json.ObjectMap = .empty;
+		try obj.put(arena, "from", .{ .string = try arena.dupe(u8, try std.fmt.bufPrint(&from, "tcp 192.0.2.{d}/32:{d}", .{ i, 8000 + i })) });
+		try obj.put(arena, "to", .{ .string = try arena.dupe(u8, try std.fmt.bufPrint(&to, "tcp 127.0.0.1:{d}", .{9000 + i})) });
+		try remaps.append(.{ .object = obj });
+	}
+	var net: std.json.ObjectMap = .empty;
+	try net.put(arena, "rules", .{ .array = rules });
+	try net.put(arena, "remap", .{ .array = remaps });
+	try net.put(arena, "l7", try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"rules\":[{\"allow\":\"a.example.com\"}]}", .{}));
+	return .{ .object = net };
+}
+
+const fit_probe: filter.IpAddr = .{ .ipv4 = .{ 203, 0, 113, 9 } };
+
+test "renderRuleFile: the sealed file is renderRules plus the trailer" {
+	const gpa = std.testing.allocator;
+	const src =
+		\\{"rules":[{"deny":"169.254.0.0/16"},{"allow":"0.0.0.0/0"}],
+		\\ "remap":[{"from":"tcp 192.0.2.0/24:25","to":"tcp 127.0.0.1:12525"}],
+		\\ "l7":{"mode":"terminate","rules":[{"allow":"api.example.com"}]}}
+	;
+	var parsed = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});
+	defer parsed.deinit();
+
+	var want: std.ArrayList(u8) = .empty;
+	defer want.deinit(gpa);
+	try renderRules(gpa, parsed.value, filter.l7_default_base, &want);
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	const fit = try renderRuleFile(gpa, parsed.value, filter.l7_default_base, &out);
+
+	// The body both readers get back is renderRules' bytes, exactly; the trailer
+	// is the last line and the only addition.
+	try std.testing.expectEqualStrings(want.items, filter.ruleFileBody(out.items) orelse return error.TestUnexpectedResult);
+	try std.testing.expect(std.mem.endsWith(u8, out.items, &filter.ruleFileTrailer(want.items)));
+	try std.testing.expectEqual(want.items.len + filter.rule_file_trailer_len, fit.bytes);
+	// One user remap plus the two funnels, as the parser counts them.
+	try std.testing.expectEqual(@as(usize, 3), fit.remap_lines);
+	try std.testing.expectEqual(filter.parseRules(want.items).remap_len, fit.remap_lines);
+	try std.testing.expect(fit.fits());
+
+	// A config with nothing to render seals to the trailer alone -- not an empty
+	// file, which neither reader takes for a render.
+	var none = try std.json.parseFromSlice(std.json.Value, gpa, "{\"rules\":[]}", .{});
+	defer none.deinit();
+	var empty_out: std.ArrayList(u8) = .empty;
+	defer empty_out.deinit(gpa);
+	const empty_fit = try renderRuleFile(gpa, none.value, filter.l7_default_base, &empty_out);
+	try std.testing.expectEqualStrings(&filter.ruleFileTrailer(""), empty_out.items);
+	try std.testing.expectEqual(@as(usize, filter.rule_file_trailer_len), empty_fit.bytes);
+	try std.testing.expectEqualStrings("", filter.ruleFileBody(empty_out.items) orelse return error.TestUnexpectedResult);
+}
+
+test "every render that fits carries both funnel remaps once parsed; every one that does not is refused" {
+	// The property the whole budget exists for, walked over a grid that crosses
+	// both limits: whatever a reader installs from a render with L7 on still
+	// diverts :443 and :80 to this instance's proxy, and a render that would not
+	// keep them is refused instead of written.
+	const gpa = std.testing.allocator;
+	var arena_state = std.heap.ArenaAllocator.init(gpa);
+	defer arena_state.deinit();
+	const ports = filter.l7PortsForBase(filter.l7_default_base);
+
+	var fitted: usize = 0;
+	var over_budget: usize = 0;
+	var remap_full: usize = 0;
+	for ([_]usize{ 0, 1, 100, 252, 256, 300, 700 }) |n_rules| {
+		for ([_]bool{ false, true }) |v6| {
+			for ([_]usize{ 0, 1, 61, 62, 63, 64 }) |n_remaps| {
+				_ = arena_state.reset(.retain_capacity);
+				const net = try fitNetwork(arena_state.allocator(), n_rules, v6, n_remaps);
+				var out: std.ArrayList(u8) = .empty;
+				defer out.deinit(gpa);
+				const fit = try renderRuleFile(gpa, net, filter.l7_default_base, &out);
+
+				if (fit.fits()) {
+					fitted += 1;
+					const rs = filter.parseRules(filter.ruleFileBody(out.items) orelse return error.TestUnexpectedResult);
+					try std.testing.expectEqual(ports.tls, (rs.evaluateRemap(.tcp, fit_probe, 443) orelse return error.TestUnexpectedResult).port);
+					try std.testing.expectEqual(ports.http, (rs.evaluateRemap(.tcp, fit_probe, 80) orelse return error.TestUnexpectedResult).port);
+					// The count the refusal judges by is the count the parser keeps.
+					try std.testing.expectEqual(fit.remap_lines, rs.remap_len);
+				} else if (ruleFileFitError(fit)) |_| {
+					return error.TestUnexpectedResult;
+				} else |err| switch (err) {
+					error.RuleFileOverBudget => over_budget += 1,
+					error.RemapTableFull => remap_full += 1,
+				}
+
+				// Where each limit falls: 700 IPv6 lines are over the budget whatever
+				// else; otherwise 62 user remaps still fit beside the two funnels and
+				// 63 do not; and everything else on the grid fits, 300 CIDR rules
+				// (past the 256 the parser keeps) included.
+				if (v6 and n_rules == 700) {
+					try std.testing.expectError(error.RuleFileOverBudget, ruleFileFitError(fit));
+				} else if (n_remaps > filter.max_remap_rules - 2) {
+					try std.testing.expectError(error.RemapTableFull, ruleFileFitError(fit));
+				} else {
+					try std.testing.expect(fit.fits());
+				}
+			}
+		}
+	}
+	try std.testing.expect(fitted > 0);
+	try std.testing.expect(over_budget > 0);
+	try std.testing.expect(remap_full > 0);
+}
+
+test "the largest config the filter's tables hold, in natural form, seals to 19075 bytes" {
+	// The figure filter.rule_file_budget's comment rests on: 256 CIDR rules, 64
+	// remaps and 16 hard-deny lines, each the longest its parser takes without
+	// whitespace padding, plus an IPv6 dns-host and no-implicit-dns. L7 off: its
+	// prologue and funnel lines are shorter than the user lines they would take
+	// table slots from. Far under the budget, so what reaches it is padding or
+	// more rules than the filter keeps.
+	const gpa = std.testing.allocator;
+	var arena_state = std.heap.ArenaAllocator.init(gpa);
+	defer arena_state.deinit();
+	const arena = arena_state.allocator();
+
+	var rules = std.json.Array.init(arena);
+	for (0..filter.max_rules) |i| {
+		var cidr: [64]u8 = undefined;
+		_ = try rule.append(arena, &rules, .allow, try std.fmt.bufPrint(&cidr, "tcp 2001:0db8:0000:0000:0000:0000:{x:0>4}:{x:0>4}/128", .{ i / 256, i % 256 }));
+	}
+	var remaps = std.json.Array.init(arena);
+	for (0..filter.max_remap_rules) |i| {
+		var from: [64]u8 = undefined;
+		var to: [64]u8 = undefined;
+		var obj: std.json.ObjectMap = .empty;
+		try obj.put(arena, "from", .{ .string = try arena.dupe(u8, try std.fmt.bufPrint(&from, "tcp 255.255.255.255/32:{d}", .{65535 - i})) });
+		try obj.put(arena, "to", .{ .string = try arena.dupe(u8, try std.fmt.bufPrint(&to, "tcp 255.255.255.255/32:{d}", .{65535 - i})) });
+		try remaps.append(.{ .object = obj });
+	}
+	var self_addrs = std.json.Array.init(arena);
+	for (0..filter.max_hard_rules) |i| {
+		var addr: [64]u8 = undefined;
+		try self_addrs.append(.{ .string = try arena.dupe(u8, try std.fmt.bufPrint(&addr, "2001:0db8:0000:0000:0000:0000:0000:{x:0>4}/128", .{i})) });
+	}
+	var net: std.json.ObjectMap = .empty;
+	try net.put(arena, "implicitDns", .{ .bool = false });
+	try net.put(arena, "dnsHost", .{ .string = "2001:0db8:0000:0000:0000:0000:0000:0035" });
+	try net.put(arena, "selfAddrs", .{ .array = self_addrs });
+	try net.put(arena, "rules", .{ .array = rules });
+	try net.put(arena, "remap", .{ .array = remaps });
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	const fit = try renderRuleFile(gpa, .{ .object = net }, filter.l7_default_base, &out);
+
+	// Every line is one the parser takes, and every table is exactly full.
+	const rs = filter.parseRules(filter.ruleFileBody(out.items) orelse return error.TestUnexpectedResult);
+	try std.testing.expectEqual(@as(usize, filter.max_rules), rs.len);
+	try std.testing.expectEqual(@as(usize, filter.max_remap_rules), rs.remap_len);
+	try std.testing.expectEqual(@as(usize, filter.max_hard_rules), rs.hard_len);
+	try std.testing.expect(rs.dns_host != null);
+	try std.testing.expect(!rs.implicit_dns_allow);
+
+	try std.testing.expectEqual(@as(usize, 19075), fit.bytes);
+	try std.testing.expect(fit.bytes < 19 * 1024);
+	try std.testing.expect(fit.fits());
+}
+
+test "no strict prefix of a real L7 render is accepted" {
+	// filter.zig walks every cut of a small sealed file; this walks every cut of
+	// a real near-budget render with L7 on, where the lines a cut drops first are
+	// the funnel remaps.
+	const gpa = std.testing.allocator;
+	var arena_state = std.heap.ArenaAllocator.init(gpa);
+	defer arena_state.deinit();
+
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(gpa);
+	// 62 user remaps (the most that fit beside the funnels) and as many IPv6
+	// lines as still fit: the largest file the grid above can produce.
+	var n: usize = 600;
+	const fit = while (n > 0) : (n -= 1) {
+		_ = arena_state.reset(.retain_capacity);
+		out.clearRetainingCapacity();
+		const f = try renderRuleFile(gpa, try fitNetwork(arena_state.allocator(), n, true, filter.max_remap_rules - 2), filter.l7_default_base, &out);
+		if (f.fits()) break f;
+	} else return error.TestUnexpectedResult;
+	// Within one IPv6 line of the budget.
+	try std.testing.expect(fit.bytes + 54 > filter.rule_file_budget);
+
+	try std.testing.expect(filter.ruleFileBody(out.items) != null);
+	for (0..out.items.len) |k| try std.testing.expect(filter.ruleFileBody(out.items[0..k]) == null);
+}
+
+fn readNetfilterRules(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+	const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+	defer f.close(io);
+	var rbuf: [4096]u8 = undefined;
+	var rd = f.reader(io, &rbuf);
+	return rd.interface.allocRemaining(gpa, .limited(1 << 20));
+}
+
+test "writeRuntimeRules: an over-budget or remap-full render is refused and the previous file is left byte-identical on the same inode" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const rt_dir = try tmpStoreDir(gpa, io);
+	defer gpa.free(rt_dir);
+	defer cwd.deleteTree(io, rt_dir) catch {};
+	const nf_path = try std.fs.path.join(gpa, &.{ rt_dir, "netfilter-rules" });
+	defer gpa.free(nf_path);
+
+	var arena_state = std.heap.ArenaAllocator.init(gpa);
+	defer arena_state.deinit();
+	const arena = arena_state.allocator();
+
+	try writeRuntimeRules(gpa, io, rt_dir, try fitNetwork(arena, 10, false, 1), filter.l7_default_base);
+	const before = try readNetfilterRules(gpa, io, nf_path);
+	defer gpa.free(before);
+	try std.testing.expect(filter.ruleFileBody(before) != null);
+	const ino = try inodeOf(nf_path);
+
+	// Over the budget: nothing written, not even the truncate. Both readers keep
+	// the set they installed from `before`, and the shim's held fd still points
+	// at it.
+	try std.testing.expectError(error.RuleFileOverBudget, writeRuntimeRules(gpa, io, rt_dir, try fitNetwork(arena, 700, true, 0), filter.l7_default_base));
+	{
+		const now = try readNetfilterRules(gpa, io, nf_path);
+		defer gpa.free(now);
+		try std.testing.expectEqualSlices(u8, before, now);
+		try std.testing.expectEqual(ino, try inodeOf(nf_path));
+	}
+
+	// Past the remap table with L7 on: 63 user remaps would push the second
+	// funnel remap out of what the filter keeps. Refused the same way.
+	try std.testing.expectError(error.RemapTableFull, writeRuntimeRules(gpa, io, rt_dir, try fitNetwork(arena, 0, false, filter.max_remap_rules - 1), filter.l7_default_base));
+	{
+		const now = try readNetfilterRules(gpa, io, nf_path);
+		defer gpa.free(now);
+		try std.testing.expectEqualSlices(u8, before, now);
+		try std.testing.expectEqual(ino, try inodeOf(nf_path));
+	}
 }

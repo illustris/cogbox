@@ -76,7 +76,8 @@ $XDG_RUNTIME_DIR/cogbox[-<name>]/
                          # state for a given harness)
   console.sock           # guest serial console (Unix socket)
   monitor.sock           # QEMU HMP monitor (Unix socket)
-  netfilter-rules        # rendered L4 + remap runtime rules
+  netfilter-rules        # rendered L4 + remap runtime rules; ends in a CRC-32
+                         # trailer line, at most 32 KiB (readers take it whole or not at all)
   l7-rules               # rendered L7 runtime rules
   console.log            # captured guest serial output
   cogbox.log             # daemon stdout/stderr (passt, QEMU warnings); kept on a failed start for post-mortem
@@ -287,7 +288,7 @@ The L7 CA-trust env (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, …, all pointing a
 
 ## Network enforcement
 
-In `rules` network mode, the wrapper loads a Zig shared library (`libnetfilter.so`) into passt via `LD_PRELOAD`. The library intercepts outbound socket calls (`connect`, `sendto`, `sendmsg`, `sendmmsg`) and checks destination addresses against the configured CIDR rules; denied connections receive `ENETUNREACH`. It initializes via `.init_array` (before `main()`) so all file I/O for rule loading completes before passt activates its seccomp-bpf sandbox. Rules hot-reload via `SIGUSR1`; the L7 proxy reloads via `SIGHUP`. The filter's default deny has exactly one exemption, armed only when the launcher is handed `COGBOX_MOSH_UDP_FORWARD`: passt's per-flow reply socket for an inbound datagram on that forwarded UDP range, recognised by its bound local address (see [the mosh reply-socket exemption](network-filtering.md#the-mosh-reply-socket-exemption)). Details, including the remap/SOCKS5 layer and the L7 proxy architecture, are in [network filtering](network-filtering.md).
+In `rules` network mode, the wrapper loads a Zig shared library (`libnetfilter.so`) into passt via `LD_PRELOAD`. The library intercepts outbound socket calls (`connect`, `sendto`, `sendmsg`, `sendmmsg`) and checks destination addresses against the configured CIDR rules; denied connections receive `ENETUNREACH`. It initializes via `.init_array` (before `main()`) so all file I/O for rule loading completes before passt activates its seccomp-bpf sandbox. Rules hot-reload via `SIGUSR1`; the L7 proxy reloads via `SIGHUP`. A rules file is installed only whole -- within its 32 KiB budget and ending in a trailer whose CRC-32 matches -- and any other read keeps the previous rule set; before the first complete file the filter denies everything, DNS included. The filter's default deny has exactly one exemption, armed only when the launcher is handed `COGBOX_MOSH_UDP_FORWARD`: passt's per-flow reply socket for an inbound datagram on that forwarded UDP range, recognised by its bound local address (see [the mosh reply-socket exemption](network-filtering.md#the-mosh-reply-socket-exemption)). Details, including the remap/SOCKS5 layer and the L7 proxy architecture, are in [network filtering](network-filtering.md).
 
 The `cogbox rules`/`remap`/`l7`/`plugin` verbs all edit `config.json`, regenerate the runtime rules files, and signal the running processes, so policy changes take effect without restarting the VM. The CLI shares the on-disk rule format parser with the LD_PRELOAD filter, so the formats stay in sync.
 

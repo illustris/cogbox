@@ -27,13 +27,11 @@ extern "c" fn __h_errno_location() *c_int;
 extern "c" fn inet_pton(af: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
 
 // POSIX I/O -- declared directly to avoid glibc macro issues with fcntl.h.
-// `open`, `read`, `lseek` are only used during init for the rules file; we
-// don't intercept them. `close` is intercepted (see real_close below).
+// `open` is only used during init, to open the rules file; we don't intercept
+// it. The reloads' lseek+read come from filter.readHeldRuleFile (std.c), and
+// neither is intercepted either. `close` is (see real_close below).
 const O_RDONLY: c_int = 0;
-const SEEK_SET: c_int = 0;
 extern "c" fn @"open"(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
-extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern "c" fn lseek(fd: c_int, offset: c_long, whence: c_int) c_long;
 
 // getsockname is not intercepted; the shim calls it itself (see
 // isForwardReplySocket) and passt's seccomp profile already carries it
@@ -52,7 +50,10 @@ const Mmsg = if (darwin) extern struct { msg_hdr: c.struct_msghdr, msg_len: c_ui
 
 // --- State ---
 
-var ruleset: filter.RuleSet = .{};
+// Deny-all, port 53 included, until loadRules installs a complete rules file:
+// with no fd, or before the first read that passes filter.ruleFileBody,
+// nothing has said what this guest may reach.
+var ruleset: filter.RuleSet = filter.RuleSet.fail_closed;
 var initialized: bool = false;
 var reload_pending = std.atomic.Value(bool).init(false);
 
@@ -260,21 +261,26 @@ fn init() void {
 	initialized = true;
 }
 
-/// Re-read rules from the pre-opened fd. Seccomp-safe: uses only lseek+read.
+/// Re-read rules from the pre-opened fd. Seccomp-safe: uses only lseek+read
+/// (filter.readHeldRuleFile).
+///
+/// Installs a read only when it is ONE complete render: within the shared
+/// budget and ending in a trailer whose CRC matches (filter.ruleFileBody). Any
+/// other read -- empty, cut anywhere, two overlapping renders mixed, over the
+/// budget, no trailer -- keeps the set already installed (`fail_closed` before
+/// the first). The reload is deferred to the next intercepted call, so it can
+/// land while a later render is still writing; that render signals again when
+/// it finishes. The shim has no log channel, so a refusal is silent here; the
+/// L7 proxy, reading the same file, logs it.
+///
+/// The buffer stays on the stack, not in a static: the darwin host may call in
+/// from more than one thread.
 fn loadRules() void {
 	if (rules_fd < 0) return;
 
-	if (lseek(rules_fd, 0, SEEK_SET) < 0) return;
-
-	var buf: [8192]u8 = undefined;
-	var total: usize = 0;
-	while (total < buf.len) {
-		const n = read(rules_fd, @ptrCast(&buf[total]), buf.len - total);
-		if (n <= 0) break;
-		total += @intCast(n);
-	}
-	if (total == 0) return;
-	ruleset = filter.parseRules(buf[0..total]);
+	var buf: [filter.rule_file_read_len]u8 = undefined;
+	const body = filter.readHeldRuleFile(rules_fd, &buf) orelse return;
+	ruleset = filter.parseRules(body);
 }
 
 fn handleSigusr1(_: std.posix.SIG) callconv(.c) void {

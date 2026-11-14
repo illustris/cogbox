@@ -46,6 +46,30 @@ pub const max_dns_pattern_len: u8 = 253; // RFC 1035 FQDN length cap
 // A VM has one or two of its own addresses, so this is deliberately small.
 pub const max_hard_rules = 16;
 
+// The largest `netfilter-rules` file, trailer included, that the renderer
+// writes (rules/reload.zig writeRuntimeRules) and that either reader installs
+// (the passt shim and the L7 proxy, both through ruleFileBody). ONE number for
+// all three, so no reader can ever take a prefix of what the renderer wrote.
+//
+// The arithmetic: the longest lines the verbs accept in natural form are an
+// IPv6 /128 CIDR with a proto (`allow tcp <39 chars>/128`, 54 bytes with the
+// newline) and an IPv4 remap with ports on both sides and a `/32` on its
+// target (67). 256 of the first, 64 of the second, 16 `hard-deny` lines (54),
+// an IPv6 `dns-host` (49), `no-implicit-dns` (16) and the trailer (34) come to
+// 19075 bytes, under 19 KiB -- so every config whose lines fit the parser's
+// tables in natural form fits (rules/reload.zig pins the figure). Only
+// whitespace-padded lines (`rules add` takes up to 128 bytes a line) or
+// configs past the table caps can reach it.
+pub const rule_file_budget: usize = 32 * 1024;
+// Both readers' buffer: one byte MORE than the budget, so a read that fills it
+// proves the file is over the budget instead of looking like a whole file.
+pub const rule_file_read_len: usize = rule_file_budget + 1;
+// The final line every rendered `netfilter-rules` carries: this prefix, the
+// CRC-32 (ISO-HDLC, zlib's crc32) of every byte before the line as 8 lowercase
+// hex digits, and a newline. A `#` line, so a parser that predates it skips it.
+pub const rule_file_trailer_prefix = "# cogbox-rules-end crc32=";
+pub const rule_file_trailer_len = rule_file_trailer_prefix.len + 8 + 1;
+
 pub const DnsPatternKind = enum { exact, left_wildcard, any };
 
 pub const DnsPattern = struct {
@@ -121,6 +145,14 @@ pub const RuleSet = struct {
 	// and it is not a loopback pass (127.0.0.1:<l7base+2>, the mitmproxy SOCKS5
 	// hop, stays denied like the rest of loopback). One address, port 53.
 	dns_host: ?IpAddr = null,
+
+	/// What a reader of `netfilter-rules` enforces before it has installed any
+	/// complete file (no file, or none that passed ruleFileBody yet): deny-all.
+	/// Unlike `RuleSet{}`, which is what an EMPTY render parses to, it denies
+	/// port 53 too -- with no file, nothing has said whether this host may let
+	/// DNS out to any address, and on a host that renders `no-implicit-dns` the
+	/// answer is no.
+	pub const fail_closed: RuleSet = .{ .implicit_dns_allow = false };
 
 	/// Evaluate a destination (proto, addr, port) against the CIDR rules.
 	/// Callers that don't know the protocol may pass `.any`; rules with an
@@ -789,7 +821,9 @@ fn parseDnsHostBody(body: []const u8) ?IpAddr {
 	return pcp.network;
 }
 
-/// Parse a multi-line rules string into a RuleSet.
+/// Parse a multi-line rules string into a RuleSet. It parses whatever it is
+/// handed, an unterminated last line included: a read of `netfilter-rules`
+/// must pass ruleFileBody first.
 pub fn parseRules(content: []const u8) RuleSet {
 	var ruleset = RuleSet{};
 	var lines = std.mem.splitScalar(u8, content, '\n');
@@ -865,6 +899,85 @@ pub fn parseRules(content: []const u8) RuleSet {
 	}
 
 	return ruleset;
+}
+
+/// The trailer line the renderer seals a `netfilter-rules` body with (see
+/// rule_file_trailer_prefix): it goes after the last byte of `body`, which must
+/// be empty or end in '\n' for ruleFileBody to accept the result.
+pub fn ruleFileTrailer(body: []const u8) [rule_file_trailer_len]u8 {
+	var out: [rule_file_trailer_len]u8 = undefined;
+	_ = std.fmt.bufPrint(&out, rule_file_trailer_prefix ++ "{x:0>8}\n", .{std.hash.Crc32.hash(body)}) catch unreachable;
+	return out;
+}
+
+/// The rules body of a `netfilter-rules` read, or null when the read is not ONE
+/// complete render. This is the only gate between a read of that file and
+/// parseRules, for both readers (the passt shim through readHeldRuleFile, the
+/// L7 proxy through l7proxy's readPolledInto).
+///
+/// Both readers can catch the file mid-write: it is rewritten truncate-in-place
+/// (passt's seccomp-boxed shim holds an fd on it, so it cannot be renamed over),
+/// and two renders can overlap. parseRules takes whatever it is given, an
+/// unterminated last fragment included, so a cut `allow tcp 192.0.2.3/32` reads
+/// as a /3, and the L7 funnel remaps, rendered last, are the first lines a cut
+/// loses. So a read installs only when ALL of these hold:
+///   * it is within rule_file_budget (a read that filled the readers' budget+1
+///     buffer is over it, so never a whole file);
+///   * it ends in a well-formed trailer: the prefix, exactly 8 lowercase hex
+///     digits, '\n';
+///   * the body before the trailer is empty or ends in '\n', so the trailer is a
+///     line of its own and no unterminated fragment ever reaches parseRules;
+///   * the CRC-32 of the body is the one the trailer names. A trailer alone
+///     would pass the file two overlapping in-place renders can leave, the
+///     shorter render's bytes over the tail of the longer one, which still ends
+///     in the longer one's trailer.
+/// The structural checks run first, so a torn read costs no hash.
+///
+/// parseRules itself stays as it is: dozens of tests feed it single
+/// unterminated lines on purpose, and the guarantee belongs to the file, not to
+/// the grammar.
+pub fn ruleFileBody(content: []const u8) ?[]const u8 {
+	if (content.len > rule_file_budget) return null;
+	if (content.len < rule_file_trailer_len) return null;
+	const split = content.len - rule_file_trailer_len;
+	const trailer = content[split..];
+	if (!std.mem.startsWith(u8, trailer, rule_file_trailer_prefix)) return null;
+	if (trailer[trailer.len - 1] != '\n') return null;
+	var want: u32 = 0;
+	for (trailer[rule_file_trailer_prefix.len .. trailer.len - 1]) |ch| {
+		const nibble: u32 = switch (ch) {
+			'0'...'9' => ch - '0',
+			'a'...'f' => ch - 'a' + 10,
+			else => return null,
+		};
+		want = (want << 4) | nibble;
+	}
+	const body = content[0..split];
+	if (body.len > 0 and body[body.len - 1] != '\n') return null;
+	if (std.hash.Crc32.hash(body) != want) return null;
+	return body;
+}
+
+/// The passt shim's whole reload step: rewind the fd it holds on
+/// `netfilter-rules`, read it into `buf` until EOF, an error or a full buffer,
+/// and return the body if the read is one complete render (ruleFileBody), else
+/// null, in which case the caller keeps the rule set it has.
+///
+/// lseek+read only, so it stays inside passt's seccomp profile: the shim opened
+/// the fd before seccomp and can never open() again. It lives here rather than
+/// in netfilter/main.zig because the shim cannot be linked into a test binary
+/// (it exports libc's own names), and a test of a copy would stop testing the
+/// shim the day the shim changed; l7proxy/reload_test.zig hammers it against
+/// the renderer's real writer.
+pub fn readHeldRuleFile(fd: c_int, buf: *[rule_file_read_len]u8) ?[]const u8 {
+	if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return null;
+	var total: usize = 0;
+	while (total < buf.len) {
+		const n = std.c.read(fd, buf[total..].ptr, buf.len - total);
+		if (n <= 0) break;
+		total += @intCast(n);
+	}
+	return ruleFileBody(buf[0..total]);
 }
 
 // --- L7 (vhost) rules ---
@@ -2462,4 +2575,195 @@ test "parseInjectHosts: exact-only, drops wildcards, comments, fail-open" {
 	parseInjectHosts("", &empty);
 	try std.testing.expectEqual(@as(usize, 0), empty.len);
 	try std.testing.expect(!empty.contains("notes.internal.test"));
+}
+
+// --- netfilter-rules framing (ruleFileBody / ruleFileTrailer) ---
+
+/// `body` sealed the way the renderer seals it (rules/reload.zig
+/// renderRuleFile), in `gpa` memory the caller frees.
+fn testSealed(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
+	const trailer = ruleFileTrailer(body);
+	const out = try gpa.alloc(u8, body.len + trailer.len);
+	@memcpy(out[0..body.len], body);
+	@memcpy(out[body.len..], &trailer);
+	return out;
+}
+
+const test_web: IpAddr = .{ .ipv4 = .{ 203, 0, 113, 9 } };
+
+test "ruleFileBody: every cut short of the whole file is refused, so a cut CIDR never yields a rule" {
+	const gpa = std.testing.allocator;
+
+	// What the gate is for. Handed straight to parseRules, a read cut inside the
+	// CIDR is a rule, and a far wider one: `/3` out of `/32`.
+	const line = "allow tcp 192.0.2.3/32:5432\n";
+	const cut = parseRules(line[0 .. std.mem.indexOf(u8, line, "/3").? + 2]);
+	try std.testing.expectEqual(@as(usize, 1), cut.len);
+	try std.testing.expectEqual(@as(u8, 3), cut.rules[0].prefix_len);
+
+	// Sealed, no cut at any byte gets past the gate, and the whole file is the
+	// one rule as written.
+	const sealed = try testSealed(gpa, line);
+	defer gpa.free(sealed);
+	for (0..sealed.len) |k| try std.testing.expect(ruleFileBody(sealed[0..k]) == null);
+	const body = ruleFileBody(sealed).?;
+	try std.testing.expectEqualStrings(line, body);
+	const rs = parseRules(body);
+	try std.testing.expectEqual(@as(usize, 1), rs.len);
+	try std.testing.expectEqual(@as(u8, 32), rs.rules[0].prefix_len);
+	try std.testing.expectEqual(@as(u16, 5432), rs.rules[0].port);
+
+	// The cuts a trailing-newline check alone would accept: on the line boundary
+	// before the funnel remaps, which the renderer emits last. That prefix parses
+	// cleanly and is the dangerous one: the catch-all allow is in and the funnel
+	// is not, so :443 goes out direct instead of through the L7 proxy.
+	const multi = "deny 10.0.0.0/8\n" ++
+		"deny 169.254.0.0/16\n" ++
+		"allow 0.0.0.0/0\n" ++
+		"remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18443\n" ++
+		"remap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:18444\n";
+	const lost = parseRules(multi[0..std.mem.indexOf(u8, multi, "remap ").?]);
+	try std.testing.expect(lost.evaluateRemap(.tcp, test_web, 443) == null);
+	try std.testing.expectEqual(Action.allow, lost.evaluate(.tcp, test_web, 443));
+
+	const sealed_multi = try testSealed(gpa, multi);
+	defer gpa.free(sealed_multi);
+	for (0..sealed_multi.len) |k| try std.testing.expect(ruleFileBody(sealed_multi[0..k]) == null);
+	const whole = parseRules(ruleFileBody(sealed_multi).?);
+	try std.testing.expectEqual(@as(u16, 18443), whole.evaluateRemap(.tcp, test_web, 443).?.port);
+	try std.testing.expectEqual(@as(u16, 18444), whole.evaluateRemap(.tcp, test_web, 80).?.port);
+}
+
+test "ruleFileBody: the file two overlapping in-place renders leave is refused" {
+	// Renders A (longer) and B both truncate before either writes; A writes all
+	// of itself, then B writes all of itself from offset 0. What is left is B's
+	// bytes over A's tail, and it still ENDS in A's well-formed trailer.
+	const gpa = std.testing.allocator;
+	const sealed_a = try testSealed(gpa, "deny 10.0.0.0/8\ndeny 172.16.0.0/12\ndeny 192.168.0.0/16\nallow 0.0.0.0/0\n" ++
+		"remap tcp 0.0.0.0/0:443 -> tcp 127.0.0.1:18443\nremap tcp 0.0.0.0/0:80 -> tcp 127.0.0.1:18444\n");
+	defer gpa.free(sealed_a);
+	const sealed_b = try testSealed(gpa, "allow 0.0.0.0/0\n");
+	defer gpa.free(sealed_b);
+	try std.testing.expect(sealed_a.len > sealed_b.len + rule_file_trailer_len);
+
+	const mixed = try gpa.alloc(u8, sealed_a.len);
+	defer gpa.free(mixed);
+	@memcpy(mixed[0..sealed_b.len], sealed_b);
+	@memcpy(mixed[sealed_b.len..], sealed_a[sealed_b.len..]);
+
+	// Every structural check passes on it -- within the budget, A's trailer as
+	// its last line, a body that ends in '\n' -- so this pins the CRC itself.
+	try std.testing.expect(std.mem.endsWith(u8, mixed, sealed_a[sealed_a.len - rule_file_trailer_len ..]));
+	try std.testing.expectEqual(@as(u8, '\n'), mixed[mixed.len - rule_file_trailer_len - 1]);
+	try std.testing.expect(ruleFileBody(mixed) == null);
+	// Each render on its own installs.
+	try std.testing.expect(ruleFileBody(sealed_a) != null);
+	try std.testing.expect(ruleFileBody(sealed_b) != null);
+}
+
+test "ruleFileBody: the trailer is strict" {
+	const gpa = std.testing.allocator;
+	// A body whose CRC has a leading zero hex digit (0976690e), so the 7- and
+	// 9-digit spellings below carry the SAME value and only the shape refuses.
+	const body = "allow 0.0.0.0/0\n# 4\n";
+	const good = try testSealed(gpa, body);
+	defer gpa.free(good);
+	try std.testing.expectEqualStrings(rule_file_trailer_prefix ++ "0976690e\n", good[body.len..]);
+	try std.testing.expectEqualStrings(body, ruleFileBody(good).?);
+
+	const bad_shapes = [_][]const u8{
+		// uppercase hex
+		body ++ rule_file_trailer_prefix ++ "0976690E\n",
+		// 7 digits, 9 digits
+		body ++ rule_file_trailer_prefix ++ "976690e\n",
+		body ++ rule_file_trailer_prefix ++ "00976690e\n",
+		// no final newline
+		body ++ rule_file_trailer_prefix ++ "0976690e",
+		// a stray byte after the trailer
+		body ++ rule_file_trailer_prefix ++ "0976690e\n\n",
+		body ++ rule_file_trailer_prefix ++ "0976690e\nx",
+		// no trailer at all
+		body,
+		"",
+	};
+	for (bad_shapes) |s| try std.testing.expect(ruleFileBody(s) == null);
+
+	// A body that does not end in '\n' is refused even with its own correct CRC:
+	// the trailer would not be a line of its own, and the body's last line would
+	// reach parseRules unterminated.
+	const unterminated = try testSealed(gpa, "allow 0.0.0.0/0");
+	defer gpa.free(unterminated);
+	try std.testing.expect(ruleFileBody(unterminated) == null);
+
+	// A trailer-only file is a legitimate render (nothing to enforce): it installs
+	// as the empty body, which keeps the struct defaults.
+	const empty = ruleFileTrailer("");
+	try std.testing.expectEqualStrings("", ruleFileBody(&empty).?);
+	try std.testing.expect(parseRules(ruleFileBody(&empty).?).implicit_dns_allow);
+}
+
+/// Fill `buf` with `#` comment lines of up to 64 bytes, each ending in '\n'.
+fn fillCommentLines(buf: []u8) void {
+	@memset(buf, '#');
+	var i: usize = 63;
+	while (i < buf.len) : (i += 64) buf[i] = '\n';
+	buf[buf.len - 1] = '\n';
+}
+
+test "ruleFileBody: exactly rule_file_budget bytes is accepted, one more is refused" {
+	const gpa = std.testing.allocator;
+	const at_len = rule_file_budget - rule_file_trailer_len;
+
+	const at_body = try gpa.alloc(u8, at_len);
+	defer gpa.free(at_body);
+	fillCommentLines(at_body);
+	const at = try testSealed(gpa, at_body);
+	defer gpa.free(at);
+	try std.testing.expectEqual(rule_file_budget, at.len);
+	try std.testing.expectEqual(at_len, ruleFileBody(at).?.len);
+
+	// One byte longer and otherwise just as well-formed (its own correct CRC):
+	// the length alone refuses it. A reader's budget+1 buffer is what a read of
+	// such a file fills.
+	const over_body = try gpa.alloc(u8, at_len + 1);
+	defer gpa.free(over_body);
+	fillCommentLines(over_body);
+	const over = try testSealed(gpa, over_body);
+	defer gpa.free(over);
+	try std.testing.expectEqual(rule_file_read_len, over.len);
+	try std.testing.expect(ruleFileBody(over) == null);
+}
+
+test "ruleFileTrailer: golden values shared with the Python, Go and shell fixtures" {
+	// The fixtures that hand-write a netfilter-rules file seal it themselves:
+	// tests/test_remap_deadline.py and tests/test_darwin.py with zlib.crc32,
+	// tests/ech-probe-interop/worker.go with crc32.ChecksumIEEE, and
+	// zig/test-reload.sh with these literal values. All of them are this CRC.
+	const cases = [_]struct { body: []const u8, crc: []const u8 }{
+		.{ .body = "", .crc = "00000000" },
+		.{ .body = "deny 0.0.0.0/0\n", .crc = "62285a93" },
+		.{ .body = "allow 0.0.0.0/0\n", .crc = "9b11376b" },
+		.{ .body = "deny 10.0.0.0/8\nallow 0.0.0.0/0\n", .crc = "64548f60" },
+	};
+	for (cases) |cs| {
+		const t = ruleFileTrailer(cs.body);
+		try std.testing.expectEqualStrings(rule_file_trailer_prefix, t[0..rule_file_trailer_prefix.len]);
+		try std.testing.expectEqualStrings(cs.crc, t[rule_file_trailer_prefix.len .. t.len - 1]);
+		try std.testing.expectEqual(@as(u8, '\n'), t[t.len - 1]);
+	}
+	// The algorithm itself: CRC-32/ISO-HDLC's published check value.
+	try std.testing.expectEqual(@as(u32, 0xcbf43926), std.hash.Crc32.hash("123456789"));
+}
+
+test "RuleSet.fail_closed denies everything, port 53 included" {
+	const fc = &RuleSet.fail_closed;
+	try std.testing.expectEqual(Action.deny, fc.evaluate(.tcp, test_web, 443));
+	try std.testing.expectEqual(Action.deny, fc.evaluate(.udp, .{ .ipv4 = .{ 198, 51, 100, 1 } }, 53));
+	try std.testing.expectEqual(Action.deny, fc.evaluate(.tcp, .{ .ipv4 = .{ 127, 0, 0, 53 } }, 53));
+	try std.testing.expect(fc.evaluateRemap(.tcp, test_web, 443) == null);
+	// The struct default -- what an EMPTY render parses to -- is unchanged: the
+	// implicit port-53 allow stays until a rendered `no-implicit-dns` removes it.
+	const empty = &RuleSet{};
+	try std.testing.expectEqual(Action.allow, empty.evaluate(.udp, .{ .ipv4 = .{ 198, 51, 100, 1 } }, 53));
+	try std.testing.expectEqual(Action.deny, empty.evaluate(.tcp, test_web, 443));
 }

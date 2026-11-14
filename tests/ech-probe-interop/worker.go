@@ -26,6 +26,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net"
 	"os"
@@ -63,6 +64,13 @@ const (
 	gateL4Rules = "deny " + ipL4Deny + "/32\nallow 0.0.0.0/0\n"
 	gateL7Rules = "mode passthrough\nallow " + plainName + "\nallow " + tls12Name + "\ndeny " + denied + "\n"
 )
+
+// sealRules ends a netfilter-rules body with the trailer the renderer writes
+// (filter.ruleFileTrailer): its CRC-32 as 8 lowercase hex digits. The proxy
+// ignores a netfilter-rules file without it. l7-rules carries no trailer.
+func sealRules(body string) string {
+	return fmt.Sprintf("%s# cogbox-rules-end crc32=%08x\n", body, crc32.ChecksumIEEE([]byte(body)))
+}
 
 // isolate refuses to run outside a private user + network namespace, then
 // puts the origin addresses on lo and binds a private /etc (hosts + a files-only
@@ -185,7 +193,7 @@ func startGateProxy(cogbox, tmp, name string, extra ...string) (*gateProxy, erro
 	if err := os.MkdirAll(home, 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(rt, "netfilter-rules"), []byte(gateL4Rules), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(rt, "netfilter-rules"), []byte(sealRules(gateL4Rules)), 0o644); err != nil {
 		return nil, err
 	}
 	if err := os.WriteFile(filepath.Join(rt, "l7-rules"), []byte(gateL7Rules), 0o644); err != nil {

@@ -243,6 +243,8 @@ pub fn build(b: *std.Build) void {
 		.optimize = optimize,
 	});
 	remap_test_mod.addImport("filter", filter_mod);
+	// main.zig's guard tests run the verb's edit + save through the rules module.
+	remap_test_mod.addImport("rules_module", rules_mod);
 	const remap_tests = b.addTest(.{
 		.root_module = remap_test_mod,
 	});

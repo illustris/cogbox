@@ -10,7 +10,7 @@ set -euo pipefail
 # Manual check for the mosh reply-socket exemption (not scripted here: it
 # needs a routable non-loopback address on the box). Run passt under the
 # shim with the knob and a matching forward, e.g.
-#   COGBOX_MOSH_UDP_FORWARD=60000-60031 NETFILTER_RULES=<deny-all rules> \
+#   COGBOX_MOSH_UDP_FORWARD=60000-60031 NETFILTER_RULES=<deny-all rules, sealed as in Test 1> \
 #   LD_PRELOAD=<libnetfilter.so> passt --foreground -u <addr>/60000-60031 ...
 # then from another host `echo hi | nc -u <addr> 60005`: passt's stderr must
 # NOT show "Couldn't connect flow socket" (the reply socket is bound to
@@ -35,8 +35,11 @@ trap 'kill "$PASST_PID" 2>/dev/null || true; rm -rf "$TESTDIR"' EXIT
 RULES="$TESTDIR/rules"
 SOCK="$TESTDIR/passt.sock"
 
+# Every rules file below ends in the trailer the renderer seals netfilter-rules
+# with (filter.ruleFileTrailer: the CRC-32 of the lines above it); the shim
+# ignores a file without one. filter.zig's golden-value test pins these three.
 echo "=== Test 1: passt starts with initial rules ==="
-echo "deny 0.0.0.0/0" > "$RULES"
+printf 'deny 0.0.0.0/0\n# cogbox-rules-end crc32=62285a93\n' > "$RULES"
 
 NETFILTER_RULES="$RULES" LD_PRELOAD="$LIB" \
 	"$PASST" --foreground --socket "$SOCK" &
@@ -51,7 +54,7 @@ echo "PASS: passt started (PID $PASST_PID)"
 
 echo ""
 echo "=== Test 2: SIGUSR1 reload ==="
-echo "allow 0.0.0.0/0" > "$RULES"
+printf 'allow 0.0.0.0/0\n# cogbox-rules-end crc32=9b11376b\n' > "$RULES"
 kill -USR1 "$PASST_PID"
 sleep 1
 
@@ -65,7 +68,7 @@ echo "PASS: passt survived SIGUSR1 reload"
 echo ""
 echo "=== Test 3: multiple rapid reloads ==="
 for i in 1 2 3 4 5; do
-	printf 'deny 10.0.0.0/8\nallow 0.0.0.0/0\n' > "$RULES"
+	printf 'deny 10.0.0.0/8\nallow 0.0.0.0/0\n# cogbox-rules-end crc32=64548f60\n' > "$RULES"
 	kill -USR1 "$PASST_PID"
 done
 sleep 1

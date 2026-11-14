@@ -18,6 +18,13 @@ import tempfile
 import threading
 import time
 import unittest
+import zlib
+
+
+def sealed(body):
+    # The trailer the renderer ends every netfilter-rules with
+    # (filter.ruleFileTrailer); the shim ignores a file without it.
+    return body + "# cogbox-rules-end crc32=%08x\n" % (zlib.crc32(body.encode()) & 0xffffffff)
 
 
 def client():
@@ -74,7 +81,7 @@ class RemapDeadlineTest(unittest.TestCase):
             listener.settimeout(15)
             port = listener.getsockname()[1]
             rules = Path(tmp) / "rules"
-            rules.write_text(f"remap tcp 203.0.113.7/32:443 -> tcp 127.0.0.1:{port}\n")
+            rules.write_text(sealed(f"remap tcp 203.0.113.7/32:443 -> tcp 127.0.0.1:{port}\n"))
             errors = []
             greeting_seen = threading.Event()
             stalled_closed = threading.Event()

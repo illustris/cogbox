@@ -146,7 +146,11 @@ var listen_addr_host: u32 = 0x7f000001;
 // microsecond-short memory scans; reloads (the only writer, in the accept
 // thread) are rare, so spinning is cheaper than a futex.
 var rules_lock = std.atomic.Value(bool).init(false);
-var cidr_rs: filter.RuleSet = .{};
+// Deny-all, port 53 included, until loadRules installs a complete
+// netfilter-rules (see readPolledInto), and again whenever the file is gone.
+// No new flow is decided from it, or from the two tables below, until the
+// first reload has read every wire file (WireState).
+var cidr_rs: filter.RuleSet = filter.RuleSet.fail_closed;
 var l7_rs: filter.L7RuleSet = .{};
 // Hosts the terminate-tier addon injects a host-side credential into (read from
 // <runtime>/l7-inject-hosts, reloaded alongside the rules). Used to route a
@@ -185,6 +189,12 @@ pub fn run(_: std.mem.Allocator, io: std.Io, runtime_dir: []const u8, l7_base: u
 	ech_io = io;
 	ech_probe_enabled = ech_probe;
 	const ech_state: []const u8 = if (ech_probe) "on" else "off";
+	// Soft descriptor limit up to the hard one (Darwin: OPEN_MAX), best effort.
+	// The connections this proxy takes hold two descriptors each, up to
+	// max_conns of them, which is past the usual soft 1024 (Darwin's is 256):
+	// left there, a guest holding connections open can leave accept(2) and a
+	// reload's open(2) failing with EMFILE.
+	std.process.raiseFileDescriptorLimit();
 	installSignals();
 	loadRules();
 
@@ -267,182 +277,346 @@ fn statKeyOf(fd: c_int) ?FileKey {
 	};
 }
 
-/// Read one runtime file the renderer writes TRUNCATE-IN-PLACE, with the polled
-/// reader's shape the addon and authproxy/conf.zig already use: stat -> read ->
-/// re-stat over (mtime_ns, size), and discard the read if the key moved.
+/// Whether the open(2) that just failed found no file at the path (ENOENT, or
+/// ENOTDIR for a path component that is not a directory), as opposed to a file
+/// that is there but could not be opened -- out of descriptors, permissions --
+/// and so may still hold the policy in force. Read errno before any other call.
+fn openFailedMissing() bool {
+	const e = std.c._errno().*;
+	return e == c.ENOENT or e == c.ENOTDIR;
+}
+
+/// What one poll of `netfilter-rules` decided (readPolledInto).
+pub const PolledRead = union(enum) {
+	/// One complete render: install this body (a slice of the caller's buffer).
+	install: []const u8,
+	/// No file at the path (openFailedMissing): there is no rendered policy to
+	/// keep, so the caller enforces filter.RuleSet.fail_closed.
+	absent,
+	/// The file is there but could not be opened -- out of descriptors, which a
+	/// guest holding the proxy's connections open can bring about, or
+	/// permissions. The policy in force may be one the proxy has not seen, so it
+	/// decides no new flow until a read gets through (WireState), and retries.
+	unreadable,
+	/// The writer moved the file under the read (the stat key changed), or a
+	/// stat failed: retry, keeping the installed set.
+	moved,
+	/// A settled read that is not one complete render -- empty, cut, two renders
+	/// mixed, over the budget, no matching trailer: keep the installed set.
+	refused,
+};
+
+/// Read `netfilter-rules`, the one runtime file the renderer writes
+/// TRUNCATE-IN-PLACE: passt's seccomp-boxed shim holds an fd on it and a rename
+/// would strand the shim on the unlinked inode, so it cannot be published
+/// atomically (reload.writeRuntimeFileInPlace). This proxy is its SECOND reader,
+/// opening by path, driven by a `reload_pending` flag its SIGHUP handler may have
+/// taken from an EARLIER render while a later, overlapping one is still inside
+/// that window -- and two overlapping renders can leave the shorter one's bytes
+/// over the longer one's tail.
 ///
-/// `netfilter-rules` is the only such file. passt's seccomp-boxed shim holds an
-/// fd on it and a rename would strand the shim on the unlinked inode, so it
-/// cannot be published atomically (reload.writeRuntimeFileInPlace) -- and this
-/// proxy is its SECOND reader, opening by path, driven by a `reload_pending`
-/// flag its SIGHUP handler may have taken from an EARLIER render while a later,
-/// overlapping one is still inside that window. An empty CIDR set is deny-all
-/// egress (RuleSet.evaluate's default), so installing a torn read blackholes the
-/// guest until some later render signals again.
+/// What tells a complete file from all of those is the file itself: the renderer
+/// seals every render with a CRC-32 trailer within a shared byte budget, and
+/// filter.ruleFileBody -- the same gate the shim's loader goes through -- accepts
+/// nothing else. `buf` is that budget plus one byte, so a read that fills it is
+/// over the budget and refused, never parsed as a prefix (which would lose the
+/// L7 funnel remaps first: they are rendered last). An EMPTY file is refused like
+/// any other non-render; an instance whose rules narrow to nothing still renders
+/// its trailer line, so that policy installs on the first read.
 ///
-/// Returns null when the read must be DISCARDED: the caller keeps the set it
-/// already installed and re-raises `reload_pending`, so the next accept-loop
-/// iteration retries on settled bytes. That retry is not immediate: the loop's
-/// poll(..., 1000) bounds one iteration at ~1s, so a discard costs up to a second
-/// of the PREVIOUS set standing, and a settled narrowing-to-empty -- which needs
-/// two rounds, refuse then install -- up to ~1-2s. Fail-STATIC for that window is
-/// the trade, and it is the right one here: the alternative is deny-all egress.
+/// The polled reader's shape the addon and authproxy/conf.zig use stays in front
+/// of the gate -- stat -> read -> re-stat over (mtime_ns, size) on the open fd --
+/// so a read the writer moved under is `.moved`, told apart from a settled
+/// refusal.
 ///
-/// Two discard conditions for a TEAR, and the second is the one the key alone
-/// misses. A reader that lands wholly inside the truncate -- after createFile
-/// emptied the file, before the writer's first flush -- sees a STABLE key of
-/// (t, 0) across both stats and reads zero bytes. So a zero-length read is
-/// discarded too while the caller says its current set came from a file that HAD
-/// content.
-///
-/// But only until the same empty is seen twice, which is what `settle` carries.
-/// An instance whose rules legitimately narrow to nothing renders an EMPTY
-/// netfilter-rules (renderRules emits nothing for an L4-only config with no
-/// rules left), and refusing that forever would pin the previous, WIDER set --
-/// the mirror image of the fail-open this reader exists to avoid, and worse,
-/// because it would never clear. So: the first empty read is discarded and its
-/// key remembered; if the very next read returns the same key, the file is
-/// settled-empty and the empty set is installed. A render cannot hold the same
-/// mtime_ns across two of our reads -- the whole in-place write is a truncate
-/// plus a few KB of writeAll -- so this cannot launder a tear.
-///
-/// One thing this reader does NOT defend, and the reason the "never installs
-/// torn or partial bytes" claim is scoped to a TEAR: a SETTLED file larger than
-/// the caller's buffer. readAllInto fills the 16 KiB loadRules gives this file
-/// (nf_buf) and stops, so what installs is a PREFIX of the render -- a
-/// pre-existing cap, not a tear, and one the key cannot tell from a whole read.
-/// The cap stays (16 KiB is ~500 CIDR rules, well past anything the renderer
-/// emits in the field) and the truncation is at least the NARROWING direction --
-/// an unrendered rule stops being allowed, deny-all being this file's default --
-/// but it is no longer SILENT: the first read that hits it is refused with a
-/// warning, and the prefix installs on the retry that finds the same key.
-/// Refusing it forever is the one thing that would be worse: it would pin the
-/// previous, WIDER set with nothing left to clear it, exactly the never-clearing
-/// fail-open the settled-empty rule above exists to avoid.
+/// Neither installs anything: the caller keeps the CIDR set it has and re-raises
+/// `reload_pending`, so the next accept-loop iteration reads again, within the
+/// loop's poll(..., 1000), ~1s. Fail-STATIC for that window, and the set it keeps
+/// is the last complete render, never a policy nobody rendered. `refused_key` is
+/// the caller's memory of the last settled refusal, so a file that STAYS refused
+/// (one an older cogbox or a hand edit left) is logged once rather than on every
+/// retry. A zero-length file is not logged at all: it is the truncate window, or
+/// a writer that died before writing, and the next render replaces it.
 pub fn readPolledInto(
 	rt: []const u8,
 	name: []const u8,
-	buf: []u8,
-	prev_had_content: bool,
-	settle: *?FileKey,
-) ?[]const u8 {
+	buf: *[filter.rule_file_read_len]u8,
+	refused_key: *?FileKey,
+) PolledRead {
 	var path_buf: [4096]u8 = undefined;
 	const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ rt, name }) catch {
-		settle.* = null;
-		return buf[0..0];
+		refused_key.* = null;
+		return .absent;
 	};
 	const fd = @"open"(path.ptr, O_RDONLY, 0);
-	// A missing or unreadable file is NOT a tear: it is the honest empty state
-	// (deny-all), exactly as this reader treated it before the hardening.
 	if (fd < 0) {
-		settle.* = null;
-		return buf[0..0];
+		// Only a file that is not there at all leaves no rendered policy, and the
+		// caller falls back to deny-all. One that is there but cannot be opened
+		// right now -- out of descriptors, which a guest holding the proxy's
+		// connections open can cause, or permissions -- may hold a narrower
+		// policy than the set installed, so it is neither taken for missing nor
+		// kept on: the caller stops deciding new flows until a retry reads it.
+		if (!openFailedMissing()) return .unreadable;
+		refused_key.* = null;
+		return .absent;
 	}
 	defer _ = c.close(fd);
 
-	const k1 = statKeyOf(fd) orelse return null;
+	const k1 = statKeyOf(fd) orelse return .moved;
 	const total = readAllInto(fd, buf);
-	const k2 = statKeyOf(fd) orelse return null;
-	if (k1.mtime_ns != k2.mtime_ns or k1.size != k2.size) return null;
+	const k2 = statKeyOf(fd) orelse return .moved;
+	if (k1.mtime_ns != k2.mtime_ns or k1.size != k2.size) return .moved;
 
-	// Settled, but bigger than the buffer: refuse once (loudly), install the
-	// prefix on the retry. `settle` carries the once-ness for the same reason it
-	// does for the empty read -- the key is stable, so nothing else can tell a
-	// first sighting from a retry -- and is deliberately LEFT set on the install
-	// so a permanently oversized file warns per render, not per poll.
-	if (total == buf.len and k1.size > total) {
-		if (settle.*) |s| {
-			if (s.mtime_ns == k1.mtime_ns and s.size == k1.size) return buf[0..total];
-		}
-		settle.* = k1;
+	if (filter.ruleFileBody(buf[0..total])) |body| {
+		refused_key.* = null;
+		return .{ .install = body };
+	}
+	const known = if (refused_key.*) |k| k.mtime_ns == k1.mtime_ns and k.size == k1.size else false;
+	if (!known) {
+		refused_key.* = k1;
 		// Suppressed under `zig build test` the way the auth proxy's pid lines
-		// are: the oversize path HAS a test (reload_test.zig), and a warning on
-		// stderr from a passing test is reported by the build runner as an
-		// unexpected write.
-		if (!@import("builtin").is_test) {
-			logLine("l7proxy: netfilter-rules is {d} bytes, over the {d}-byte read buffer; installing the first {d} on the next reload", .{ k1.size, buf.len, total });
+		// are: the refusal HAS tests (reload_test.zig), and a warning on stderr
+		// from a passing test is reported by the build runner as an unexpected
+		// write.
+		if (!@import("builtin").is_test and k1.size != 0) {
+			logLine("l7proxy: netfilter-rules ({d} bytes) is not one complete render (over the {d}-byte budget, or no matching trailer); keeping the installed rule set", .{ k1.size, filter.rule_file_budget });
 		}
-		return null;
 	}
-
-	if (total == 0 and prev_had_content) {
-		if (settle.*) |s| {
-			if (s.mtime_ns == k1.mtime_ns and s.size == k1.size) {
-				settle.* = null;
-				return buf[0..0];
-			}
-		}
-		settle.* = k1;
-		return null;
-	}
-	settle.* = null;
-	return buf[0..total];
+	return .refused;
 }
 
-/// readPolledInto's caller-side state for `netfilter-rules`: the byte count the
-/// installed CIDR set was parsed from (0 before the first install, and 0 again
-/// once a settled-empty file is installed), and the key of a read already refused
-/// for a reason the key alone cannot re-check on the retry -- a zero-length read,
-/// or one the 16 KiB buffer truncated. Guarded by `rules_lock` like the rulesets
-/// themselves -- socks5 mode runs TWO accept loops (one per front-door
-/// listener), so two loadRules calls can be in flight at once.
-var nf_installed_len: usize = 0;
-var nf_settle: ?FileKey = null;
+/// The CIDR set one poll of `netfilter-rules` installs, or null when it installs
+/// nothing and the caller keeps the set it has and retries (loadRules). A
+/// missing file is deny-all, port 53 included: there is no rendered policy to
+/// keep.
+///
+/// An unreadable file is NOT answered with that deny-all. RuleSet.fail_closed
+/// carries no `hard-deny` lines, and hardBlocked is the only check this set
+/// gets on an L7-allowed dial (dialUpstream) or a terminate handoff
+/// (firstVettedAddr), so the swap would drop the enclosing host's own addresses
+/// from the floor of every flow still resolving its upstream -- a window a
+/// guest can open with a descriptor shortage and an owner can stretch with a
+/// slow DNS answer -- while denying none of those flows. The proxy refuses new
+/// flows instead (WireState), and the set it keeps bounds the ones in flight.
+/// `pub` for reload_test.zig.
+pub fn cidrSetFor(nf: PolledRead) ?filter.RuleSet {
+	return switch (nf) {
+		.install => |body| filter.parseRules(body),
+		.absent => filter.RuleSet.fail_closed,
+		.unreadable, .moved, .refused => null,
+	};
+}
+
+/// Whether loadRules must run again on the next accept-loop iteration: it kept
+/// a table rather than install what the file holds -- a `netfilter-rules` read
+/// the writer moved under, that could not be opened, or that is not one
+/// complete render, or an L7 wire file it could not read whole. Any of those can
+/// pass (a read inside a write, a descriptor shortage, a file replaced during
+/// the read), and the signal for the render that started this reload has been
+/// consumed, so without the retry a kept table -- one that may lack a deny the
+/// render just added -- would stand until some unrelated later render, and a
+/// proxy that stopped taking new flows (WireState) would stay stopped. `pub`
+/// for reload_test.zig.
+pub fn reloadAgain(nf: PolledRead, l7: WholeRead, inj: WholeRead) bool {
+	const nf_kept = switch (nf) {
+		.install, .absent => false,
+		.unreadable, .moved, .refused => true,
+	};
+	return nf_kept or l7 == .keep or inj == .keep;
+}
+
+/// Which of its three wire files the proxy holds a current reading of. It
+/// decides a new flow only while it holds all three (complete); otherwise the
+/// worker refuses the flow, logged `reason=rules-not-loaded`.
+///
+/// That refusal is the proxy's deny-all, because its tables cannot express one:
+/// an L7 `allow` supersedes the CIDR set (dialUpstream then checks only the hard
+/// floor), the terminate tier is handed on after that same floor check
+/// (firstVettedAddr), and an empty L7 table sends every host to the CIDR set, so
+/// no value of the three both denies every flow and keeps the `hard-deny` floor
+/// that flows already dialing still check.
+///
+/// - `netfilter-rules` counts once a complete render installs (or the file is
+///   missing: RuleSet.fail_closed). It stops counting when the file is there but
+///   cannot be opened: a descriptor shortage, which a guest can bring about by
+///   holding connections open, would otherwise keep new flows on a set an
+///   operator has since narrowed. A refused or moved read changes nothing: the
+///   set in force is still the last complete render, or still none.
+/// - `l7-rules` and `l7-inject-hosts` count while the last reload read them
+///   whole (a missing one is the empty document).
+///
+/// Nothing counts at start, so no flow is taken before a reload has read every
+/// file. `pub` for reload_test.zig.
+pub const WireState = struct {
+	netfilter_rules: bool = false,
+	l7_rules: bool = false,
+	l7_inject_hosts: bool = false,
+
+	pub fn complete(self: WireState) bool {
+		return self.netfilter_rules and self.l7_rules and self.l7_inject_hosts;
+	}
+
+	/// The state one reload's three reads leave.
+	pub fn after(self: WireState, nf: PolledRead, l7: WholeRead, inj: WholeRead) WireState {
+		return .{
+			.netfilter_rules = switch (nf) {
+				.install, .absent => true,
+				.unreadable => false,
+				.moved, .refused => self.netfilter_rules,
+			},
+			.l7_rules = l7 != .keep,
+			.l7_inject_hosts = inj != .keep,
+		};
+	}
+};
+
+/// readPolledInto's caller-side state for `netfilter-rules`: the key of the last
+/// settled read it refused, so a file that stays refused is logged once. Guarded
+/// by `rules_lock` like the rulesets themselves -- socks5 mode runs TWO accept
+/// loops (one per front-door listener), so two loadRules calls can be in flight
+/// at once.
+var nf_refused: ?FileKey = null;
+
+/// The proxy's WireState, and whether the last line logged about it said the
+/// proxy is refusing new connections, so a refusal and its end are logged once
+/// each, not on every retry. Guarded by `rules_lock` with the tables the state
+/// qualifies: a worker reads it in the critical section it decides a flow in.
+var wire_state: WireState = .{};
+var refusing_logged: bool = false;
 
 /// Re-read the three wire files this proxy owns. Every read opens BY PATH (not a
 /// held fd, unlike passt's seccomp-boxed shim in netfilter/main.zig), so for the
 /// two the renderer writes atomically -- l7-rules and l7-inject-hosts -- a reload
 /// resolves either the old inode or the new one and neither can be half-written.
+/// Both are read WHOLE (readWholeAlloc), because a prefix of either is wider than
+/// the file: a cut path allows more, and renderL7's trailing `deny <host>` lines
+/// are the first a cut loses. One that cannot be read whole leaves the table it
+/// fed in place, stops the proxy deciding new flows until a retry reads it
+/// (WireState, reloadAgain); only a missing one is empty.
 ///
 /// `netfilter-rules` is the EXCEPTION: it is still written truncate-then-rewrite
 /// IN PLACE (reload.writeRuntimeFileInPlace), so it goes through readPolledInto
-/// instead -- a torn read leaves the previous CIDR set standing and re-raises
-/// `reload_pending`, which the accept loop consumes on its next iteration. Render
-/// serialisation is no longer what bounds this window.
+/// instead -- only one complete render installs; anything else leaves the
+/// previous CIDR set standing and re-raises `reload_pending`, which the accept
+/// loop consumes on its next iteration. A missing file is deny-all
+/// (RuleSet.fail_closed), as it is before the first complete file; one that is
+/// there but cannot be opened stops new flows like an unreadable L7 file.
 ///
 /// The multi-file window survives regardless -- these are three separate files --
 /// which is why the renderer still pins its write order (reload.writeWireFiles).
 fn loadRules() void {
 	const rt = runtime_dir_buf[0..runtime_dir_len];
-	var nf_buf: [16384]u8 = undefined;
-	var l7_buf: [16384]u8 = undefined;
-	var inj_buf: [16384]u8 = undefined;
+	var nf_buf: [filter.rule_file_read_len]u8 = undefined;
 
 	// Snapshot the polled reader's state, do the I/O outside the lock (the
 	// critical sections here are meant to stay memory-scan short), publish it
 	// back below. Two accept loops racing this is bounded: they read the SAME
-	// file, so the worst a lost update costs is one extra discard-and-retry.
+	// file, so the worst a lost update costs is one extra log line.
 	lockRules();
-	const prev_had_content = nf_installed_len > 0;
-	var settle = nf_settle;
+	var refused = nf_refused;
 	unlockRules();
 
-	const nf = readPolledInto(rt, "netfilter-rules", &nf_buf, prev_had_content, &settle);
-	const l7 = readFileInto(rt, "l7-rules", &l7_buf);
-	const inj = readFileInto(rt, "l7-inject-hosts", &inj_buf);
+	const nf = readPolledInto(rt, "netfilter-rules", &nf_buf, &refused);
+	// Freed at return, after the lock below is released.
+	const l7 = readWholeAlloc(rt, "l7-rules");
+	defer l7.deinit();
+	const inj = readWholeAlloc(rt, "l7-inject-hosts");
+	defer inj.deinit();
 
-	lockRules();
-	defer unlockRules();
-	nf_settle = settle;
-	if (nf) |bytes| {
-		cidr_rs = filter.parseRules(bytes);
-		nf_installed_len = bytes.len;
-	} else {
+	var state: WireState = undefined;
+	var log_refusing = false;
+	var log_taking = false;
+	{
+		lockRules();
+		defer unlockRules();
+		nf_refused = refused;
+		if (cidrSetFor(nf)) |rs| cidr_rs = rs;
+		switch (l7) {
+			.bytes => |b| filter.parseL7Rules(b.content, &l7_rs),
+			.keep => {},
+		}
+		switch (inj) {
+			.bytes => |b| filter.parseInjectHosts(b.content, &inject_hosts),
+			.keep => {},
+		}
+		wire_state = wire_state.after(nf, l7, inj);
+		state = wire_state;
 		// Raised AFTER the accept loop's swap consumed the flag, so it survives
 		// to the next iteration rather than being cleared by the caller.
-		reload_pending.store(true, .release);
+		if (reloadAgain(nf, l7, inj)) reload_pending.store(true, .release);
+		log_refusing = !state.complete() and !refusing_logged;
+		log_taking = state.complete() and refusing_logged;
+		refusing_logged = !state.complete();
 	}
-	filter.parseL7Rules(l7, &l7_rs);
-	filter.parseInjectHosts(inj, &inject_hosts);
+
+	if (!@import("builtin").is_test) {
+		if (log_refusing) {
+			const nf_word: []const u8 = if (state.netfilter_rules) "read" else if (nf == .unreadable) "could not be opened" else "has no complete render";
+			const l7_word: []const u8 = if (state.l7_rules) "read" else "not read whole";
+			const inj_word: []const u8 = if (state.l7_inject_hosts) "read" else "not read whole";
+			logLine("l7proxy: refusing new connections until every wire file is read: netfilter-rules {s}, l7-rules {s}, l7-inject-hosts {s} (an L7 file is read whole or not at all, up to {d} bytes); retrying about every second", .{ nf_word, l7_word, inj_word, wire_file_read_limit });
+		}
+		if (log_taking) logLine("l7proxy: every wire file read; taking new connections again", .{});
+	}
 }
 
-fn readFileInto(rt: []const u8, name: []const u8, buf: []u8) []const u8 {
+/// The most l7-rules or l7-inject-hosts may hold and still be read. Far past
+/// what either parser keeps (filter.max_l7_rules lines, filter.max_inject_hosts
+/// hosts), so it bounds the allocation for a corrupt file and is no rule budget.
+pub const wire_file_read_limit: usize = 1 << 20;
+
+/// One whole-file read of a wire file the renderer renames into place
+/// (readWholeAlloc). `pub` for reload_test.zig.
+pub const WholeRead = union(enum) {
+	/// The whole file. `alloc` is what to free once it is parsed: null for a
+	/// missing file, which reads as the empty document.
+	bytes: struct { content: []const u8, alloc: ?[]u8 = null },
+	/// Not read whole -- there but not openable (out of descriptors,
+	/// permissions), over wire_file_read_limit, out of memory, a failed stat, or
+	/// a size that does not match what was read: leave the installed table in
+	/// place, decide no new flow (WireState) and read again (reloadAgain).
+	keep,
+
+	pub fn deinit(self: WholeRead) void {
+		switch (self) {
+			.bytes => |b| if (b.alloc) |a| std.heap.page_allocator.free(a),
+			.keep => {},
+		}
+	}
+};
+
+/// Read `<rt>/<name>` whole, or not at all. A missing file is the empty
+/// document, exactly as it was when these files were read into a fixed buffer;
+/// what changed is that a file past that buffer is no longer cut to a prefix.
+/// `pub` for reload_test.zig.
+pub fn readWholeAlloc(rt: []const u8, name: []const u8) WholeRead {
 	var path_buf: [4096]u8 = undefined;
-	const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ rt, name }) catch return buf[0..0];
+	const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ rt, name }) catch return .{ .bytes = .{ .content = "" } };
 	const fd = @"open"(path.ptr, O_RDONLY, 0);
-	if (fd < 0) return buf[0..0];
+	if (fd < 0) {
+		// Only a file that is not there is the empty document. One that is there
+		// but cannot be opened right now -- out of descriptors, which a guest
+		// holding the proxy's connections open can cause, or permissions -- is
+		// not read, like any other file this cannot read whole: parsing "" in its
+		// place would empty the table, and an empty l7-rules sends every host to
+		// the L4 decision, past the deny lines the file holds.
+		if (openFailedMissing()) return .{ .bytes = .{ .content = "" } };
+		return .keep;
+	}
 	defer _ = c.close(fd);
-	return buf[0..readAllInto(fd, buf)];
+
+	const key = statKeyOf(fd) orelse return .keep;
+	if (key.size > wire_file_read_limit) return .keep;
+	const size: usize = @intCast(key.size);
+	// One byte past the size the stat reported, so a file that grew under the
+	// read comes back longer than `size` instead of looking whole.
+	const alloc = std.heap.page_allocator.alloc(u8, size + 1) catch return .keep;
+	const total = readAllInto(fd, alloc);
+	if (total != size) {
+		std.heap.page_allocator.free(alloc);
+		return .keep;
+	}
+	return .{ .bytes = .{ .content = alloc[0..total], .alloc = alloc } };
 }
 
 fn readAllInto(fd: c_int, buf: []u8) usize {
@@ -607,10 +781,18 @@ fn worker(client_fd: c_int) void {
 	}
 
 	lockRules();
+	const loaded = wire_state.complete();
 	const needs_term = l7_rs.needsTerminate(host);
 	const verdict = l7_rs.evaluateFull(host, path, method);
 	const needs_inject = inject_hosts.contains(host);
 	unlockRules();
+	// Read in the same critical section as the tables: a flow decided after a
+	// reload that could not read the policy is refused, never decided from the
+	// tables that reload left in place (WireState).
+	if (!loaded) {
+		logReject(orig, host, "rules-not-loaded");
+		return;
+	}
 
 	// Route to the terminate backend (mitmproxy + the enforcement/injection
 	// addon) when:
@@ -1119,8 +1301,15 @@ pub fn rawL4Allowed(rs: *const filter.RuleSet, orig: Orig) bool {
 /// no-SNI hello).
 fn rawL4Splice(client_fd: c_int, orig: Orig, buffered: []const u8, deny_reason: []const u8) void {
 	lockRules();
+	const loaded = wire_state.complete();
 	const allowed = rawL4Allowed(&cidr_rs, orig);
 	unlockRules();
+	// As for a named flow (worker): none is spliced while the proxy cannot read
+	// its policy (WireState).
+	if (!loaded) {
+		logReject(orig, "?", "rules-not-loaded");
+		return;
+	}
 	if (!allowed) {
 		logReject(orig, "?", deny_reason);
 		return;

@@ -147,6 +147,64 @@ pub fn reloadLive(allocator: std.mem.Allocator, io: std.Io, runtime_path: []cons
 	return sent;
 }
 
+/// Measure the `netfilter-rules` file the loaded config would render (sealed,
+/// trailer included) against the limits its readers impose -- the shared byte
+/// budget and the remap table. The `rules` and `remap` verbs take it before and
+/// after an edit and refuse, BEFORE saving, the one that does not fit and grows
+/// (checkRuleFileGrowth).
+///
+/// From the config's OWN `.network`, without the managed inject seeds
+/// maybeReload adds: the seeds write into the tree's arena through a shallow
+/// copy (see reloadLive), and this tree is about to be saved. A seed can add the
+/// L7 prologue and funnel lines, so an edit this passes can still render over
+/// the limit once seeded; writeRuntimeRules refuses that one itself.
+pub fn measureRuleFile(allocator: std.mem.Allocator, loaded: *config.Loaded) !reload.RuleFileFit {
+	const net = try loaded.network();
+	var out: std.ArrayList(u8) = .empty;
+	defer out.deinit(allocator);
+	return reload.renderRuleFile(allocator, net.*, l7Base(loaded), &out);
+}
+
+/// Refuse an edit whose rendered rules file would not fit (reload.RuleFileFit)
+/// AND is larger than before it, by either measure. Same grow-only shape, and
+/// same reason, as l7/cli.zig checkTotalCap: an instance can already be over
+/// the limit (an older cogbox wrote no budget, a hand-edited config), and a
+/// guard that refused every edit there would refuse the `del` or the narrowing
+/// `set` that brings it back. Taking rules away must never be the operation
+/// that fails; such an edit saves, and its render still refuses until the file
+/// fits.
+pub fn checkRuleFileGrowth(before: reload.RuleFileFit, after: reload.RuleFileFit) reload.RuleFileError!void {
+	if (after.fits() or !after.grewFrom(before)) return;
+	return reload.ruleFileFitError(after);
+}
+
+/// The refusal both verbs print for a checkRuleFileGrowth error, into `buf`.
+pub fn ruleFileRefusalMessage(buf: []u8, err: reload.RuleFileError, after: reload.RuleFileFit) []const u8 {
+	return switch (err) {
+		error.RuleFileOverBudget => std.fmt.bufPrint(buf, "refused: the rendered rules file would be {d} bytes, over the {d}-byte budget; delete rules first", .{ after.bytes, filter.rule_file_budget }),
+		error.RemapTableFull => std.fmt.bufPrint(buf, "refused: the rendered rules file would carry {d} remap lines, over the {d} the filter keeps ({s})", .{ after.remap_lines, filter.max_remap_rules, reload.remapTailNote(after) }),
+	} catch "refused: the rendered rules file would not fit";
+}
+
+/// A pre-save refusal (checkRuleFileGrowth): which limit, and the measurement
+/// ruleFileRefusalMessage reports.
+pub const Refusal = struct {
+	err: reload.RuleFileError,
+	after: reload.RuleFileFit,
+};
+
+/// The growth guard and the save behind it, for an edit already applied to
+/// `loaded`'s tree that measured `before` ahead of the edit. A refusal comes
+/// back with NOTHING saved; otherwise the config is saved and null comes back.
+/// Every verb that can grow the file (rules add/set, remap add/set) saves
+/// through this, so none of them can save ahead of the guard.
+pub fn saveUnlessGrownOver(allocator: std.mem.Allocator, io: std.Io, config_path: []const u8, before: reload.RuleFileFit, loaded: *config.Loaded) !?Refusal {
+	const after = try measureRuleFile(allocator, loaded);
+	checkRuleFileGrowth(before, after) catch |err| return .{ .err = err, .after = after };
+	try config.save(allocator, io, config_path, loaded.root().*);
+	return null;
+}
+
 /// Resolved secret-store directories (caller owns both slices).
 pub const SecretDirs = struct {
 	global: []const u8,
@@ -357,13 +415,13 @@ fn cmdAdd(
 		a.cidr;
 	defer if (a.proto != null) allocator.free(spec);
 
-	insertAddRule(tree_alloc, rules_arr, a, spec) catch |err| switch (err) {
+	const refused = addRuleAndSave(allocator, io, args.config_path, tree_alloc, rules_arr, a, spec, loaded) catch |err| switch (err) {
 		error.IndexOutOfRange => return die(allocator, io, "position out of range (must be 1..{d})", .{rules_arr.items.len + 1}, 65),
 		error.InvalidCidr => return die(allocator, io, "invalid rule: {s}", .{spec}, 65),
 		else => return err,
 	};
+	if (refused) |r| dieRefused(allocator, io, r);
 
-	try config.save(allocator, io, args.config_path, loaded.root().*);
 	const action_str = switch (a.action) {
 		.allow => "allow",
 		.deny => "deny",
@@ -374,6 +432,22 @@ fn cmdAdd(
 		try announce(allocator, io, "Added: {s} {s}", .{ action_str, spec });
 	}
 	try maybeReload(allocator, io, args.runtime_path, loaded);
+}
+
+/// `rules add` past its argument checks: the edit (insertAddRule), then the save
+/// behind the growth guard. A refusal comes back with the config unsaved.
+fn addRuleAndSave(allocator: std.mem.Allocator, io: std.Io, config_path: []const u8, tree_alloc: std.mem.Allocator, rules_arr: *std.json.Array, a: cli.AddArgs, spec: []const u8, loaded: *config.Loaded) !?Refusal {
+	const before = try measureRuleFile(allocator, loaded);
+	try insertAddRule(tree_alloc, rules_arr, a, spec);
+	return saveUnlessGrownOver(allocator, io, config_path, before, loaded);
+}
+
+/// `rules set` past stdin parsing: replace the table, then the save behind the
+/// growth guard. A refusal comes back with the config unsaved.
+fn replaceRulesAndSave(allocator: std.mem.Allocator, io: std.Io, config_path: []const u8, rules_arr: *std.json.Array, pairs: []const rule.Pair, loaded: *config.Loaded) !?Refusal {
+	const before = try measureRuleFile(allocator, loaded);
+	try rule.replaceAll(loaded.treeAllocator(), rules_arr, pairs);
+	return saveUnlessGrownOver(allocator, io, config_path, before, loaded);
 }
 
 /// `rules add`'s edit of the loaded tree: insert the rule `spec` (at `a.pos`,
@@ -454,8 +528,7 @@ fn cmdSet(
 		p.cidr = owned_storage.items[o.off .. o.off + o.len];
 	}
 
-	try rule.replaceAll(loaded.treeAllocator(), rules_arr, pairs.items);
-	try config.save(allocator, io, args.config_path, loaded.root().*);
+	if (try replaceRulesAndSave(allocator, io, args.config_path, rules_arr, pairs.items, loaded)) |r| dieRefused(allocator, io, r);
 	try announce(allocator, io, "Rules replaced.", .{});
 	try maybeReload(allocator, io, args.runtime_path, loaded);
 }
@@ -486,6 +559,11 @@ fn die(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args:
 	const msg = std.fmt.allocPrint(allocator, "cogbox rules: error: " ++ fmt ++ "\n", args) catch "cogbox rules: error: (message too long)\n";
 	writeStderr(io, msg) catch {};
 	std.process.exit(code);
+}
+
+fn dieRefused(allocator: std.mem.Allocator, io: std.Io, r: Refusal) noreturn {
+	var msg_buf: [256]u8 = undefined;
+	die(allocator, io, "{s}", .{ruleFileRefusalMessage(&msg_buf, r.err, r.after)}, 65);
 }
 
 test "resolveSecretDirs honors env overrides, else derives from config_path" {
@@ -1499,4 +1577,259 @@ test "rules add --plugin stamps the tag and approved: true; a plain add stamps n
 	// A refused insert changes nothing.
 	try t.expectError(error.IndexOutOfRange, insertAddRule(tree, rules_arr, .{ .action = .allow, .cidr = "192.0.2.0/24", .pos = 9 }, "192.0.2.0/24"));
 	try t.expectEqual(@as(usize, 3), rules_arr.items.len);
+}
+
+test "checkRuleFileGrowth: refuses only an edit that does not fit AND grew" {
+	const t = std.testing;
+	const budget = filter.rule_file_budget;
+	const max = filter.max_remap_rules;
+	const Fit = reload.RuleFileFit;
+	const Case = struct { before: Fit, after: Fit, want: ?reload.RuleFileError };
+	const cases = [_]Case{
+		// Fits: fine, whatever it was before.
+		.{ .before = .{ .bytes = budget + 500, .remap_lines = max + 3 }, .after = .{ .bytes = budget, .remap_lines = max }, .want = null },
+		.{ .before = .{ .bytes = 100, .remap_lines = 0 }, .after = .{ .bytes = budget, .remap_lines = max }, .want = null },
+		// Does not fit, and grew: refused, naming the limit it is over.
+		.{ .before = .{ .bytes = budget, .remap_lines = 2 }, .after = .{ .bytes = budget + 1, .remap_lines = 2 }, .want = error.RuleFileOverBudget },
+		.{ .before = .{ .bytes = 1000, .remap_lines = max }, .after = .{ .bytes = 1050, .remap_lines = max + 1 }, .want = error.RemapTableFull },
+		// Grew by one measure only: still refused. A `remap set` that swaps long
+		// remaps for more, shorter ones shrinks the file and grows the count.
+		.{ .before = .{ .bytes = 5000, .remap_lines = max }, .after = .{ .bytes = 4990, .remap_lines = max + 1 }, .want = error.RemapTableFull },
+		// Does not fit but shrank -- a `del` on an instance already over: the way
+		// back, never refused.
+		.{ .before = .{ .bytes = budget + 500, .remap_lines = 2 }, .after = .{ .bytes = budget + 371, .remap_lines = 2 }, .want = null },
+		.{ .before = .{ .bytes = 1100, .remap_lines = max + 2 }, .after = .{ .bytes = 1050, .remap_lines = max + 1 }, .want = null },
+		// Does not fit and did not change -- a `set` of the same rules.
+		.{ .before = .{ .bytes = budget + 1, .remap_lines = 2 }, .after = .{ .bytes = budget + 1, .remap_lines = 2 }, .want = null },
+	};
+	for (cases) |cs| {
+		if (cs.want) |e| {
+			try t.expectError(e, checkRuleFileGrowth(cs.before, cs.after));
+		} else {
+			try checkRuleFileGrowth(cs.before, cs.after);
+		}
+	}
+}
+
+/// A `rules add` spec at the verb's 128-byte line maximum: `tcp`, then the
+/// padding the verb accepts after a proto, then `198.51.100.<i>/32`. Rendered,
+/// `allow <spec>\n` is 129 bytes.
+fn paddedSpec(buf: *[128]u8, i: usize) ![]const u8 {
+	var addr_buf: [32]u8 = undefined;
+	const addr = try std.fmt.bufPrint(&addr_buf, "198.51.100.{d}/32", .{i % 256});
+	const len = buf.len - "allow ".len;
+	@memcpy(buf[0..3], "tcp");
+	@memset(buf[3 .. len - addr.len], ' ');
+	@memcpy(buf[len - addr.len .. len], addr);
+	return buf[0..len];
+}
+
+test "the rules edit that crosses the budget is refused; a forced over-budget re-render fails and leaves netfilter-rules intact" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpInstanceLayout(gpa, io, "{\"rules\":[],\"l7\":{\"rules\":[{\"allow\":\"a.example.com\"}]}}");
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+	const cfg_path = try std.fs.path.join(gpa, &.{ root, "instances", "web", "config.json" });
+	defer gpa.free(cfg_path);
+	const rt = try std.fs.path.join(gpa, &.{ root, "rt" });
+	defer gpa.free(rt);
+	try writeDeadPasstPid(gpa, io, rt);
+
+	var loaded = try config.load(gpa, io, cfg_path);
+	defer loaded.deinit();
+	const rules_arr = try loaded.rules();
+	const tree = loaded.treeAllocator();
+
+	// 252 rules at the verb's line maximum, through the verb's own insert: with
+	// the L7 prologue's four lines that is exactly the 256 the parser keeps, and
+	// the file lands just under the budget -- one more such line does not fit.
+	var spec_buf: [128]u8 = undefined;
+	for (0..filter.max_rules - 4) |i| {
+		const spec = try paddedSpec(&spec_buf, i);
+		try insertAddRule(tree, rules_arr, .{ .action = .allow, .cidr = spec }, spec);
+	}
+	const full = try measureRuleFile(gpa, &loaded);
+	try std.testing.expect(full.fits());
+	try std.testing.expect(full.bytes + 129 > filter.rule_file_budget);
+
+	// The live render publishes it: F1, sealed, the size the guard measured.
+	try maybeReload(gpa, io, rt, &loaded);
+	const f1 = try readRuntimeFile(gpa, io, root, "netfilter-rules");
+	defer gpa.free(f1);
+	try std.testing.expect(filter.ruleFileBody(f1) != null);
+	try std.testing.expectEqual(full.bytes, f1.len);
+
+	// `rules add` of one more: the edit crosses the budget, so the verb refuses it
+	// (exit 65, before config.save) and says which limit.
+	const before = try measureRuleFile(gpa, &loaded);
+	{
+		const spec = try paddedSpec(&spec_buf, 252);
+		try insertAddRule(tree, rules_arr, .{ .action = .allow, .cidr = spec }, spec);
+	}
+	const after = try measureRuleFile(gpa, &loaded);
+	try std.testing.expectError(error.RuleFileOverBudget, checkRuleFileGrowth(before, after));
+	var msg_buf: [256]u8 = undefined;
+	const msg = ruleFileRefusalMessage(&msg_buf, error.RuleFileOverBudget, after);
+	try std.testing.expect(std.mem.indexOf(u8, msg, "over the 32768-byte budget") != null);
+
+	// Push the over-budget tree through the live render anyway (what a verb
+	// without the guard, or a seed, would do): the render refuses, and the file
+	// both readers hold is still F1, byte for byte.
+	try std.testing.expectError(error.RuleFileOverBudget, maybeReload(gpa, io, rt, &loaded));
+	const f2 = try readRuntimeFile(gpa, io, root, "netfilter-rules");
+	defer gpa.free(f2);
+	try std.testing.expectEqualSlices(u8, f1, f2);
+
+	// The way back is never refused: from further over the budget, a `del` that
+	// still leaves the file over it goes through, because it shrinks.
+	{
+		const spec = try paddedSpec(&spec_buf, 253);
+		try insertAddRule(tree, rules_arr, .{ .action = .allow, .cidr = spec }, spec);
+	}
+	const before_over = try measureRuleFile(gpa, &loaded);
+	try rule.delete(rules_arr, 1);
+	const after_smaller = try measureRuleFile(gpa, &loaded);
+	try std.testing.expect(!after_smaller.fits());
+	try checkRuleFileGrowth(before_over, after_smaller);
+}
+
+test "the remap table guard counts the L7 funnels" {
+	const gpa = std.testing.allocator;
+	var loaded: config.Loaded = .{
+		.parsed = try std.json.parseFromSlice(std.json.Value, gpa,
+			\\{"network":{"rules":[{"allow":"0.0.0.0/0"}],"remap":[],"l7":{"rules":[{"allow":"a.example.com"}]}}}
+		, .{}),
+		.path = "zig-render-test-unused/config.json",
+	};
+	defer loaded.deinit();
+	const tree = loaded.treeAllocator();
+	const net = try loaded.network();
+	const remap_arr = &net.object.getPtr("remap").?.array;
+
+	const appendRemap = struct {
+		fn f(arena: std.mem.Allocator, arr: *std.json.Array, i: usize) !void {
+			var from: [64]u8 = undefined;
+			var to: [64]u8 = undefined;
+			var obj: std.json.ObjectMap = .empty;
+			try obj.put(arena, "from", .{ .string = try arena.dupe(u8, try std.fmt.bufPrint(&from, "tcp 192.0.2.{d}/32:{d}", .{ i, 8000 + i })) });
+			try obj.put(arena, "to", .{ .string = try arena.dupe(u8, try std.fmt.bufPrint(&to, "tcp 127.0.0.1:{d}", .{9000 + i})) });
+			try arr.append(.{ .object = obj });
+		}
+	}.f;
+
+	// 62 user remaps and the two funnel remaps L7 adds after them: the filter's
+	// remap table, exactly full.
+	for (0..filter.max_remap_rules - 2) |i| try appendRemap(tree, remap_arr, i);
+	const before = try measureRuleFile(gpa, &loaded);
+	try std.testing.expectEqual(@as(usize, filter.max_remap_rules), before.remap_lines);
+	try std.testing.expect(before.fits());
+
+	// A 63rd -- what `remap add` would append: the second funnel would be the
+	// line the filter drops, so the guard refuses it.
+	try appendRemap(tree, remap_arr, filter.max_remap_rules - 2);
+	const after = try measureRuleFile(gpa, &loaded);
+	try std.testing.expectEqual(@as(usize, filter.max_remap_rules + 1), after.remap_lines);
+	try std.testing.expectError(error.RemapTableFull, checkRuleFileGrowth(before, after));
+	var msg_buf: [256]u8 = undefined;
+	const l7_msg = ruleFileRefusalMessage(&msg_buf, error.RemapTableFull, after);
+	try std.testing.expect(std.mem.indexOf(u8, l7_msg, "65 remap lines, over the 64") != null);
+	try std.testing.expect(std.mem.indexOf(u8, l7_msg, "L7 funnel") != null);
+
+	// The same 63 with L7 off fit: the two funnel lines are what tipped it.
+	_ = net.object.orderedRemove("l7");
+	const l4_only = try measureRuleFile(gpa, &loaded);
+	try std.testing.expectEqual(@as(usize, filter.max_remap_rules - 1), l4_only.remap_lines);
+	try std.testing.expect(l4_only.fits());
+
+	// With L7 off, two more user remaps overflow the table on their own, and the
+	// refusal says what is really lost: user remaps, not a funnel that is not there.
+	try appendRemap(tree, remap_arr, filter.max_remap_rules - 1);
+	try appendRemap(tree, remap_arr, filter.max_remap_rules);
+	const l4_over = try measureRuleFile(gpa, &loaded);
+	try std.testing.expectEqual(@as(usize, filter.max_remap_rules + 1), l4_over.remap_lines);
+	try std.testing.expectError(error.RemapTableFull, checkRuleFileGrowth(l4_only, l4_over));
+	const l4_msg = ruleFileRefusalMessage(&msg_buf, error.RemapTableFull, l4_over);
+	try std.testing.expect(std.mem.indexOf(u8, l4_msg, "65 remap lines, over the 64") != null);
+	try std.testing.expect(std.mem.indexOf(u8, l4_msg, "funnel") == null);
+	try std.testing.expect(std.mem.indexOf(u8, l4_msg, "user remaps") != null);
+}
+
+test "rules add and rules set run the growth guard before config.save: an over-budget edit is refused and the saved config is unchanged" {
+	const gpa = std.testing.allocator;
+	var threaded: std.Io.Threaded = .init(gpa, .{});
+	defer threaded.deinit();
+	const io = threaded.io();
+	const cwd = std.Io.Dir.cwd();
+
+	const root = try tmpInstanceLayout(gpa, io, "{\"rules\":[],\"l7\":{\"rules\":[{\"allow\":\"a.example.com\"}]}}");
+	defer gpa.free(root);
+	defer cwd.deleteTree(io, root) catch {};
+	const cfg_path = try std.fs.path.join(gpa, &.{ root, "instances", "web", "config.json" });
+	defer gpa.free(cfg_path);
+
+	// A saved config exactly at the budget's edge (as in the test above): 252
+	// rules at the verb's line maximum. Any one more such rule does not fit.
+	{
+		var loaded = try config.load(gpa, io, cfg_path);
+		defer loaded.deinit();
+		const rules_arr = try loaded.rules();
+		var spec_buf: [128]u8 = undefined;
+		for (0..filter.max_rules - 4) |i| {
+			const spec = try paddedSpec(&spec_buf, i);
+			try insertAddRule(loaded.treeAllocator(), rules_arr, .{ .action = .allow, .cidr = spec }, spec);
+		}
+		try std.testing.expect((try measureRuleFile(gpa, &loaded)).fits());
+		try config.save(gpa, io, cfg_path, loaded.root().*);
+	}
+	const saved = try readWholeFile(gpa, io, cfg_path);
+	defer gpa.free(saved);
+
+	// `rules add` (cmdAdd's edit + save): refused, and the file on disk is the
+	// one saved before it, byte for byte.
+	{
+		var loaded = try config.load(gpa, io, cfg_path);
+		defer loaded.deinit();
+		var spec_buf: [128]u8 = undefined;
+		const spec = try paddedSpec(&spec_buf, 252);
+		const r = (try addRuleAndSave(gpa, io, cfg_path, loaded.treeAllocator(), try loaded.rules(), .{ .action = .allow, .cidr = spec }, spec, &loaded)) orelse return error.TestUnexpectedResult;
+		try std.testing.expectEqual(error.RuleFileOverBudget, r.err);
+		const now = try readWholeFile(gpa, io, cfg_path);
+		defer gpa.free(now);
+		try std.testing.expectEqualSlices(u8, saved, now);
+	}
+
+	// `rules set` (cmdSet's edit + save) of the same 253: refused, file unchanged.
+	var specs: [filter.max_rules - 3][128]u8 = undefined;
+	var pairs: [filter.max_rules - 3]rule.Pair = undefined;
+	for (&specs, &pairs, 0..) |*buf, *p, i| p.* = .{ .action = .allow, .cidr = try paddedSpec(buf, i) };
+	{
+		var loaded = try config.load(gpa, io, cfg_path);
+		defer loaded.deinit();
+		const r = (try replaceRulesAndSave(gpa, io, cfg_path, try loaded.rules(), &pairs, &loaded)) orelse return error.TestUnexpectedResult;
+		try std.testing.expectEqual(error.RuleFileOverBudget, r.err);
+		const now = try readWholeFile(gpa, io, cfg_path);
+		defer gpa.free(now);
+		try std.testing.expectEqualSlices(u8, saved, now);
+	}
+
+	// And both still save an edit that fits: the guard sits in front of the save,
+	// it does not replace it.
+	{
+		var loaded = try config.load(gpa, io, cfg_path);
+		defer loaded.deinit();
+		try std.testing.expect((try replaceRulesAndSave(gpa, io, cfg_path, try loaded.rules(), pairs[0..1], &loaded)) == null);
+		try std.testing.expect((try addRuleAndSave(gpa, io, cfg_path, loaded.treeAllocator(), try loaded.rules(), .{ .action = .deny, .cidr = "192.0.2.0/24" }, "192.0.2.0/24", &loaded)) == null);
+	}
+	{
+		var loaded = try config.load(gpa, io, cfg_path);
+		defer loaded.deinit();
+		const rules_arr = try loaded.rules();
+		try std.testing.expectEqual(@as(usize, 2), rules_arr.items.len);
+		try std.testing.expectEqualStrings("192.0.2.0/24", rules_arr.items[1].object.get("deny").?.string);
+	}
 }
