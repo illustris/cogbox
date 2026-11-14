@@ -25,7 +25,7 @@ The release gate executes all seven package version paths, boots the full VM che
 The model is symmetric and opt-in:
 
 - **All enabled harness binaries are always installed** in the guest, regardless of which host-state directories are active. Codex remains excluded unless enabled at build time.
-- **Host state is created only for harnesses you actually use.** On first init, the wrapper checks for any pre-existing harness config on the host and treats those harnesses as active. If none are found, it prompts you to choose. The active list is recorded at `<datadir>/.config/active-harnesses`.
+- **Host state is created only for harnesses you actually use.** On first init, the wrapper checks for any pre-existing harness config on the host and treats those harnesses as active. If none are found, it prompts you to choose. The active list is recorded at `<datadir>/.config/active-harnesses` by every launch pass except a `cogbox init` against a running instance, and never through a `.config` the guest turned into a symlink (see [internals](internals.md#directory-layout)).
 - **A single overlay image** (`harness-overlay.img`) backs persistent state for all harnesses, with per-harness subdirectories inside (`/var/lib/harness-rw/<harness>/<pathkey>/{upper,work}` and `/var/lib/harness-rw/<harness>/{cache,state}` for ephemeral paths). Resizing `overlaySize` covers all harnesses at once.
 
 Host state shared across all instances:

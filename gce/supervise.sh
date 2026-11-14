@@ -729,6 +729,9 @@ fi
 # here, the previous run's having died with the unit's cgroup. One that outlived
 # that kill could race the checks, and leg (e) refuses its boot right after.
 #
+# cogbox-launch.sh carries the same pair for its own writes into the share (its
+# share_put takes the bytes on stdin); a fix to one belongs in both.
+#
 # share_dir <path>: <path>, whose parent is a real directory, as a real
 # directory -- made when absent, never through a symlink -- or fail.
 share_dir() {

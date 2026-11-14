@@ -44,12 +44,19 @@ Data (VM state, overlays) is stored per-instance under `~/.local/share/cogbox/in
     default/
       harness-overlay.img      # shared ext4 overlay for all harnesses
       .config/active-harnesses # newline-separated list of active harnesses
+      .config/overlay-size     # size for a re-created harness-overlay.img
+      .config/store-overlay-size # only when config.json sets storeOverlaySize
+      .config/authorized_keys  # the guest's SSH keys, unioned with cogbox's key at each start
+      environment.json         # guest copy of the environment record; the host never reads it
+      .app-launch              # this launch's identity, checked by the guest before provisioning
       git-hosts.json           # git hosts the guest reaches through git grants (written by `cogbox l7`; docs/authproxy.md)
     work/
       harness-overlay.img
 ```
 
 The keypair sits in the data-dir root, a sibling of `instances/`. Only `instances/<name>/` is 9p-mounted into a guest, so the private key never enters the sandbox. It is generated automatically and reused across all instances; generation is idempotent and re-runs on every launch, so an existing setup gains the key on upgrade and a deleted key is regenerated. `--no-auto-keys` at first init skips generation and writes a durable opt-out marker (`~/.config/cogbox/no-cogbox-key`) so a later plain launch does not re-create the key. The Zig `ssh` and `start` verbs pin ssh to it -- `ssh -i <data>/cogbox_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=none` -- so the user's agent and `~/.ssh` keys are not offered and no agent is contacted (a gpg-agent can't stall or prompt on connect). Under `--no-auto-keys`, where the key is absent, ssh falls back to the user's agent and `~/.ssh` keys.
+
+`instances/<name>/` is the guest's read-write 9p share (`/var/lib/cogbox`), so a symlink, FIFO or device node the guest makes there is a real one on the host, where the launcher may be root (GCE, Proxmox, the Kubernetes pod, `sudo`). The launcher never writes through such a name. Each file it writes there is a temp file in its own directory renamed over the name with `mv -T`, which replaces whatever the guest left at the name without following or opening it, and fails on a directory: one at a `.config` file or at `environment.json` costs only that file, with a warning (one at `.app-launch` fails the launch). A `.config` that is a symlink or not a directory is not written through either: the launcher warns and the launch goes on without those advisory files. Writes below the share's root happen only under the instance's lifetime lock (`<runtime>.lock`, held by every running guest's launcher), since a running guest could swap a checked directory for a link: a start writes `overlay-size`, `store-overlay-size` and `authorized_keys` after winning it, so their warnings are in the instance's `cogbox.log` (see below), and every launch pass writes `active-harnesses` only after taking it without waiting (or when no lock file exists yet), so `cogbox init` on a running instance leaves that file alone. At the root, `environment.json` is copied into a temp file created by the same open that writes it (`O_EXCL`), so even beside a running guest nothing goes through a name the guest made, and the legacy `claude-overlay.img` rename and the `machine-state.img` aside are single renames. A `machine-state.img` that is not a regular file is renamed to `machine-state.img.not-a-file-<UTC timestamp>` before the runner can create or open the pool through it.
 
 ## Runtime directory and 9p shares
 

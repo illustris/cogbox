@@ -3,6 +3,8 @@ import json
 import os
 import pwd
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -109,6 +111,57 @@ class EnvironmentTests(unittest.TestCase):
             self.assertEqual(marker.stat().st_mode & 0o777, 0o644)
             self.assertEqual(foreign.read_text(), "unchanged")
             self.assertEqual(list(self.data.glob(".app-launch.*")), [])
+
+    def test_guest_mirror_replaces_a_link_to_a_host_directory(self):
+        # A rename without -T would move the mirror INTO the guest's target.
+        outside = self.root / "outside"
+        outside.mkdir()
+        mirror = self.data / "environment.json"
+        mirror.symlink_to(outside)
+        result = self.run_context(NEW_INSTANCE_CONFIG="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(mirror.is_symlink())
+        self.assertTrue(mirror.is_file())
+        self.assertEqual(mirror.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(mirror.read_bytes(), (self.config / "environment.json").read_bytes())
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(sorted(p.name for p in self.data.iterdir()), ["environment.json"])
+
+    def test_guest_mirror_directory_warns_and_continues(self):
+        # Only a directory fails the rename: the copy is the guest's loss, not
+        # the boot's, and no temp file is left beside it.
+        mirror = self.data / "environment.json"
+        mirror.mkdir()
+        result = self.run_context()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning", result.stderr)
+        self.assertIn("environment.json", result.stderr)
+        self.assertTrue(mirror.is_dir())
+        self.assertEqual(list(mirror.iterdir()), [])
+        self.assertEqual(sorted(p.name for p in self.data.iterdir()), ["environment.json"])
+
+    def test_guest_mirror_temp_taken_by_a_link_is_never_followed(self):
+        # This runs beside a live guest under `cogbox init`, which owns the
+        # temp file's name as soon as it exists. Worst case, a mktemp whose
+        # name in the share already holds the guest's link to a host file:
+        # nothing is copied or chmodded through it; the pass fails instead.
+        victim = self.root / "victim"
+        victim.write_text("unchanged")
+        victim.chmod(0o600)
+        shim = self.root / "bin"
+        shim.mkdir()
+        (shim / "mktemp").write_text(
+            "#!" + shutil.which("bash") + "\n"
+            + "name=$(" + shlex.quote(shutil.which("mktemp")) + ' "$@") || exit\n'
+            + 'case "$name" in "$REAL_DATA"/*) rm -f -- "$name"; ln -s "$VICTIM" "$name" ;; esac\n'
+            + 'echo "$name"\n')
+        (shim / "mktemp").chmod(0o755)
+        result = self.run_context(NEW_INSTANCE_CONFIG="1", VICTIM=str(victim),
+                                  PATH=str(shim) + os.pathsep + os.environ["PATH"])
+        self.assertEqual(result.returncode, 70, result.stderr)
+        self.assertEqual(victim.read_text(), "unchanged")
+        self.assertEqual(victim.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.mode(), "local")
 
     def test_sudo_metadata_belongs_to_local_operator_only(self):
         (self.root / "launch").write_text("launch")

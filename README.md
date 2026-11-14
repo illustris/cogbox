@@ -317,6 +317,8 @@ data mounted into a VM, and is reused across all instances. (Under
 `--no-auto-keys`, where no cogbox key exists, `cogbox ssh` instead falls
 back to your agent and `~/.ssh` keys.)
 
+The guest's copy is written at each start into the instance's data share (`.config/authorized_keys`, which the guest copies to `/root/.ssh/authorized_keys` at boot) through a temp file and `mv -T`, so a symlink or FIFO left at that name is replaced, not followed. If the guest has made `.config` a symlink or a non-directory, the copy is skipped with a warning in the instance's `cogbox.log` (in its runtime directory, see [internals](docs/internals.md#runtime-directory-and-9p-shares)), and the guest keeps the keys it has.
+
 `--no-auto-keys` at first init skips generating this key and records the
 opt-out (at `~/.config/cogbox/no-cogbox-key`), so a later plain `cogbox
 start` won't silently re-create it -- the guest stays reachable only via

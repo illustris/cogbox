@@ -6658,6 +6658,7 @@
 			} ''
 				export HOME=$TMPDIR
 				bash ${./tests/test_launch_flags.sh} ${./cogbox-launch.sh} ${./cogbox-shutdown.sh} ${./zig/src/plugin/apply.zig}
+				bash ${./tests/test_launch_share_writes.sh} ${./cogbox-launch.sh} ${./cogbox-shutdown.sh}
 				python3 ${./tests/test_runtime_base.py} ${./cogbox-launch.sh} -v
 				python3 ${./tests/test_app_environment.py} ${./cogbox-launch.sh} -v
 				touch $out

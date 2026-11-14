@@ -146,6 +146,43 @@ die() {
 	exit "${2:-70}"
 }
 
+# -- Writes into the guest's data share ----------------------------
+# Every name below REAL_DATA, the instance data dir, is the GUEST's: that dir is
+# its read-write 9p data share (/var/lib/cogbox, security_model=none), so a
+# symlink, FIFO or device node the guest makes there is a real one on this
+# host, and this launcher runs as root on GCE, PVE, in the k8s pod and under
+# sudo. So nothing here creates, opens, truncates, moves into or deletes through
+# such a name. A file is a temp file made in its own directory and renamed over
+# the name with `mv -T`, which replaces whatever sits there -- a symlink, a
+# FIFO, a device node -- without following or opening it, and fails on a
+# directory instead of moving the file into it. The share's root is this host's
+# (cogbox init made it, and a guest cannot replace its own mount). Below it, a
+# directory share_dir vetted stays vetted only while no guest runs, so write
+# there only while holding the instance's lifetime lock (<runtime>.lock), which
+# every running guest's launcher holds.
+#
+# Twin of share_dir/share_put in gce/supervise.sh (leg (c)); this share_put
+# takes its bytes on stdin so several-line and empty files keep their exact
+# bytes; a fix to one belongs in the other.
+#
+# share_dir <path>: <path>, whose parent is a real directory, as a real
+# directory -- made when absent, never through a symlink -- or fail.
+share_dir() {
+	[ -e "$1" ] || [ -L "$1" ] || mkdir -- "$1"
+	[ -d "$1" ] && [ ! -L "$1" ]
+}
+# share_put <dir> <name>: <dir>/<name> replaced by stdin, mode 0644. Always fed
+# by a pipe or a redirect: a bare call would read the terminal.
+share_put() {
+	local tmp
+	tmp=$(mktemp "$1/.$2.XXXXXX") || return 1
+	if cat > "$tmp" && chmod 0644 "$tmp" && mv -fT -- "$tmp" "$1/$2"; then
+		return 0
+	fi
+	rm -f -- "$tmp"
+	return 1
+}
+
 # Generate cogbox's own SSH keypair ($COGBOX_SSH_KEY{,.pub}) once, host-side, so
 # `cogbox ssh` has a default identity that works out of the box without relying
 # on the user's personal keys or agent. Idempotent: a no-op if the key already
@@ -849,7 +886,8 @@ fi
 # verbatim; the in-image upper/work shuffle into claude-code/config/
 # is handled by harness-setup-dirs.service inside the guest.
 if [ -d "$REAL_DATA" ] && [ -f "$REAL_DATA/claude-overlay.img" ] && [ ! -f "$REAL_DATA/harness-overlay.img" ]; then
-	mv "$REAL_DATA/claude-overlay.img" "$REAL_DATA/harness-overlay.img"
+	# -T: a guest link at the new name is replaced, never moved into.
+	mv -T -- "$REAL_DATA/claude-overlay.img" "$REAL_DATA/harness-overlay.img"
 fi
 
 # -- Auto-port assignment -----------------------------------------
@@ -1190,9 +1228,34 @@ if [ "${#ITEMS[@]}" -gt 0 ]; then
 	done
 fi
 
-# Persist the active-harness list so subsequent runs don't re-prompt.
-mkdir -p "$REAL_DATA/.config"
-printf '%s\n' "${ACTIVE_HARNESSES[@]}" > "$ACTIVE_HARNESSES_FILE"
+# Persist the active-harness list so subsequent runs don't re-prompt. .config is
+# below the share's root, so this writes only under the instance's lifetime lock
+# (see share_dir), taken without waiting -- config, then lifetime, is the lock
+# order -- and dropped at once. A running guest's launcher holds it, so `cogbox
+# init` on a live instance leaves the list as it is, and the next start's passes
+# write it. No lock file means no launcher of this instance ever ran a guest (a
+# running one keeps the file, and nothing unlinks it), so the write needs no
+# lock then. The lock is opened read-only and never created here: a root-made
+# lock from a sudo pass would stop a later non-sudo start opening it to write.
+# Closed at once, whatever happened: an fd still open at a re-exec below would
+# hand the next hop a held lock, and its daemon pass's own flock would fail. The
+# braces keep 2>/dev/null to the exec, as in apply_instance_running.
+_ah_lock=""; _ah_free=0
+if [ ! -e "${RUNTIME}.lock" ]; then
+	_ah_free=1
+elif { exec {_ah_lock}<"${RUNTIME}.lock"; } 2>/dev/null && $CONFIG_FLOCK -w 0 "$_ah_lock"; then
+	_ah_free=1
+fi
+if [ "$_ah_free" = 1 ]; then
+	if share_dir "$REAL_DATA/.config"; then
+		printf '%s\n' "${ACTIVE_HARNESSES[@]}" | share_put "$REAL_DATA/.config" active-harnesses \
+			|| echo "cogbox-launch: warning: could not record the active harnesses at $ACTIVE_HARNESSES_FILE" >&2
+	else
+		echo "cogbox-launch: warning: $REAL_DATA/.config is a symlink or not a directory; the active harnesses were not recorded" >&2
+	fi
+fi
+[ -z "$_ah_lock" ] || exec {_ah_lock}<&-
+unset _ah_lock _ah_free
 
 # Generate cogbox's own SSH key (idempotent). Runs every launch, not just first
 # init, so instances created before this feature gain it on the next start and a
@@ -1262,11 +1325,26 @@ if [ "$_write_environment" = 1 ]; then
 	[ "$SUDO_INVOCATION" != 1 ] || chown "$REAL_USER" "$_environment"
 fi
 # The guest can write this shared tree, so the host NEVER reads the mirror
-# when deciding whether to provision a local credential.
-_env_tmp=$(mktemp "$REAL_DATA/environment.XXXXXX") || die "cannot stage guest environment context" 70
-if ! cp "$_environment" "$_env_tmp" || ! chmod 0644 "$_env_tmp" || ! mv -f "$_env_tmp" "$REAL_DATA/environment.json"; then
-	rm -f "$_env_tmp"
+# when deciding whether to provision a local credential. It owns every name in
+# the tree too (see share_dir), its copy's and, once made, the temp file's, and
+# this may run beside a live guest (`cogbox init` has no running check, and no
+# lifetime lock is held here), so nothing here goes through a name after making
+# it: the temp file is created by the one open that writes it (dd conv=excl:
+# O_EXCL, which fails on any name already there, at a name mktemp -u picks)
+# under umask 022, which makes it 0644 with no chmod, and `mv -T` renames it
+# over environment.json, replacing a link, FIFO or device node there without
+# following or opening it. Only a directory the guest left at that name fails
+# the rename: that costs the guest only this descriptive copy, which it then
+# reads as mode unknown, as it always has with a directory there, so it warns
+# and goes on.
+_env_tmp=$(mktemp -u "$REAL_DATA/environment.XXXXXX") || die "cannot stage guest environment context" 70
+if ! (umask 022 && dd if="$_environment" of="$_env_tmp" conv=excl status=none); then
+	rm -f -- "$_env_tmp"
 	die "cannot publish guest environment context" 70
+fi
+if ! mv -fT -- "$_env_tmp" "$REAL_DATA/environment.json"; then
+	rm -f -- "$_env_tmp"
+	echo "cogbox-launch: warning: could not publish the guest environment context at $REAL_DATA/environment.json; the guest keeps whatever is at that name" >&2
 fi
 
 # -- Re-exec with per-instance extensions overlaid ----------------
@@ -2448,45 +2526,6 @@ else
 	fi
 fi
 
-# -- Write VM-side config into the data directory ------------------
-mkdir -p "$REAL_DATA/.config"
-echo "$OVERLAY_SIZE" > "$REAL_DATA/.config/overlay-size"
-# Only write the store-overlay size when one was actually configured. An ABSENT
-# file means "use the size the flake declared"; a present file means "remount to
-# this", and resize-store-overlay.service reads it on every boot. Writing an empty
-# file would make that unit remount to size= (invalid), so remove instead -- and
-# removing it is also how an instance created before this change stops being
-# pinned to the old 16G once its config.json no longer names a size.
-# Note the reach: an instance created BEFORE this change still has an explicit
-# storeOverlaySize in its config.json, so it keeps being pinned to whatever that
-# says until the key is removed. Deliberate -- silently rewriting a user's instance
-# config is worse than a stale size, and the hosted profile is covered anyway
-# because resize-store-overlay.service is gated off there.
-if [ -n "$STORE_OVERLAY_SIZE" ]; then
-	echo "$STORE_OVERLAY_SIZE" > "$REAL_DATA/.config/store-overlay-size"
-else
-	rm -f "$REAL_DATA/.config/store-overlay-size"
-fi
-# The VM's authorized_keys is the user-managed file (per-instance override, else
-# the shared one) unioned with cogbox's own pubkey, so `cogbox ssh` works out of
-# the box. The union is keyed on the key file's existence, not the AUTO_KEYS
-# flag: once generated the key is always honored, and a --no-auto-keys-only
-# setup (no key file) gets exactly its user-provided keys.
-if [ -n "$INSTANCE_NAME" ] && [ -f "$INSTANCE_CONFIG_DIR/authorized_keys" ]; then
-	AUTHKEYS_SRC="$INSTANCE_CONFIG_DIR/authorized_keys"
-else
-	AUTHKEYS_SRC="$CONFIG_DIR/authorized_keys"
-fi
-# The `echo` between the two sources forces a record boundary: a user-managed
-# authorized_keys with no trailing newline would otherwise splice its last key
-# onto the cogbox pubkey, corrupting both. The grep then drops the resulting
-# blank line(s) (and any comment/blank lines); sort -u dedupes.
-{
-	[ -f "$AUTHKEYS_SRC" ] && cat "$AUTHKEYS_SRC"
-	echo
-	[ -f "$COGBOX_SSH_KEY.pub" ] && cat "$COGBOX_SSH_KEY.pub"
-} | grep -v '^[[:space:]]*\(#\|$\)' | sort -u > "$REAL_DATA/.config/authorized_keys"
-
 # -- Set up runtime symlink directory for QEMU ---------------------
 # Single-starter guard. The lock lives beside (not inside) $RUNTIME so the
 # rm -rf below cannot clear it. Two near-simultaneous `cogbox start` for the
@@ -2531,6 +2570,56 @@ fi
 # earlier survives. O(1) renames only; the old base goes to the trash.
 if [ -n "$BOOT_SNAP_ID" ] || [ -d "$APPLY_DIR" ]; then
 	promote_boot_snapshot
+fi
+
+# -- Write VM-side config into the data directory ------------------
+# Only once this pass owns the lifetime lock (see share_dir): no guest of this
+# instance then runs to change .config between the check and the writes, a
+# start that loses the lock rewrites nothing beside a running guest, and the
+# warnings land in the cogbox.log reopened above.
+_share_cfg="$REAL_DATA/.config"
+if share_dir "$_share_cfg"; then
+	echo "$OVERLAY_SIZE" | share_put "$_share_cfg" overlay-size \
+		|| echo "cogbox-launch: warning: could not write $_share_cfg/overlay-size" >&2
+	# Only write the store-overlay size when one was actually configured. An ABSENT
+	# file means "use the size the flake declared"; a present file means "remount to
+	# this", and resize-store-overlay.service reads it on every boot. Writing an empty
+	# file would make that unit remount to size= (invalid), so remove instead -- and
+	# removing it is also how an instance created before this change stops being
+	# pinned to the old 16G once its config.json no longer names a size.
+	# Note the reach: an instance created BEFORE this change still has an explicit
+	# storeOverlaySize in its config.json, so it keeps being pinned to whatever that
+	# says until the key is removed. Deliberate -- silently rewriting a user's instance
+	# config is worse than a stale size, and the hosted profile is covered anyway
+	# because resize-store-overlay.service is gated off there.
+	if [ -n "$STORE_OVERLAY_SIZE" ]; then
+		echo "$STORE_OVERLAY_SIZE" | share_put "$_share_cfg" store-overlay-size \
+			|| echo "cogbox-launch: warning: could not write $_share_cfg/store-overlay-size" >&2
+	else
+		rm -f -- "$_share_cfg/store-overlay-size"
+	fi
+	# The VM's authorized_keys is the user-managed file (per-instance override, else
+	# the shared one) unioned with cogbox's own pubkey, so `cogbox ssh` works out of
+	# the box. The union is keyed on the key file's existence, not the AUTO_KEYS
+	# flag: once generated the key is always honored, and a --no-auto-keys-only
+	# setup (no key file) gets exactly its user-provided keys.
+	if [ -n "$INSTANCE_NAME" ] && [ -f "$INSTANCE_CONFIG_DIR/authorized_keys" ]; then
+		AUTHKEYS_SRC="$INSTANCE_CONFIG_DIR/authorized_keys"
+	else
+		AUTHKEYS_SRC="$CONFIG_DIR/authorized_keys"
+	fi
+	# The `echo` between the two sources forces a record boundary: a user-managed
+	# authorized_keys with no trailing newline would otherwise splice its last key
+	# onto the cogbox pubkey, corrupting both. The grep then drops the resulting
+	# blank line(s) (and any comment/blank lines); sort -u dedupes.
+	{
+		[ -f "$AUTHKEYS_SRC" ] && cat "$AUTHKEYS_SRC"
+		echo
+		[ -f "$COGBOX_SSH_KEY.pub" ] && cat "$COGBOX_SSH_KEY.pub"
+	} | grep -v '^[[:space:]]*\(#\|$\)' | sort -u | share_put "$_share_cfg" authorized_keys \
+		|| echo "cogbox-launch: warning: could not write $_share_cfg/authorized_keys" >&2
+else
+	echo "cogbox-launch: warning: $_share_cfg is a symlink or not a directory; overlay-size, store-overlay-size and authorized_keys were not written, so the guest keeps what it has" >&2
 fi
 
 # Shutdown handlers + run identity BEFORE the port probe below: a stop request
@@ -2833,9 +2922,29 @@ ln -sfn "$REAL_DATA" "$RUNTIME/data"
 # lower can supply again, and its history is a boot that WEDGED because a corrupt
 # image was kept. This is a host-side data pool. Different bytes, different rule.
 MACHINE_STATE_IMG="$RUNTIME/data/machine-state.img"
+# The name is the guest's, like every name in its share (see share_dir), and
+# the runner's autoCreate guard (`[ ! -e ]`) and QEMU's open both follow it
+# (see the machine-state volume in flake.nix): a dangling link would get the
+# pool made at a host path the guest chose, then written through its block
+# device, and a link to a host file, or a device node, would be opened as its
+# disk. So anything but a regular file is renamed aside first, which moves the
+# name and never what it points at (-L first: -f follows a link). Renamed,
+# never removed, as below. No guest runs here (this pass owns the lifetime
+# lock), and where no machine-state volume is configured (hosted, ephemeral)
+# only the guest makes the name, so the rename only moves its own entry.
+if [ -L "$MACHINE_STATE_IMG" ] || { [ -e "$MACHINE_STATE_IMG" ] && [ ! -f "$MACHINE_STATE_IMG" ]; }; then
+	_ms_aside="$MACHINE_STATE_IMG.not-a-file-$(date -u +%Y%m%d%H%M%S)"
+	if mv -T -- "$MACHINE_STATE_IMG" "$_ms_aside"; then
+		echo "cogbox: $MACHINE_STATE_IMG is not a regular file (a link, FIFO, device node or directory, which only the guest makes there); moved it to $_ms_aside without following it" >&2
+	else
+		echo "cogbox: $MACHINE_STATE_IMG is not a regular file and could not be moved aside; refusing to start rather than letting the runner create or open the pool through it" >&2
+		exit 1
+	fi
+fi
 if [ -f "$MACHINE_STATE_IMG" ] && ! @dumpe2fs@ -h "$MACHINE_STATE_IMG" >/dev/null 2>&1; then
 	MACHINE_STATE_ASIDE="$MACHINE_STATE_IMG.corrupt-$(date -u +%Y%m%d%H%M%S)"
-	if mv "$MACHINE_STATE_IMG" "$MACHINE_STATE_ASIDE"; then
+	# -T: a guest link at the predictable aside name is replaced, never moved into.
+	if mv -T -- "$MACHINE_STATE_IMG" "$MACHINE_STATE_ASIDE"; then
 		echo "cogbox: $MACHINE_STATE_IMG has no readable ext4 primary superblock (interrupted first format, or a crash mid-write); moved it to $MACHINE_STATE_ASIDE and letting the runner create a fresh one. It is NOT deleted -- if it was a populated pool, ext4 keeps backup superblocks and 'e2fsck -b 32768 $MACHINE_STATE_ASIDE' is the repair." >&2
 	else
 		echo "cogbox: $MACHINE_STATE_IMG has no readable ext4 primary superblock and could not be moved aside; refusing to start rather than booting a guest whose data pool cannot mount" >&2
